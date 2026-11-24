@@ -48,6 +48,8 @@ $ErrorActionPreference = "Stop"
 $script:InstancePattern = '^pid_(?<Pid>[0-9]+)_luid_(?<LuidHigh>0x[0-9A-Fa-f]+)_(?<LuidLow>0x[0-9A-Fa-f]+)_phys_(?<Phys>[0-9]+)(?:#[0-9]+)?$'
 $script:StartupTimeoutSeconds = 20
 $script:BaselineSettleMilliseconds = 1000
+$script:MainWindowMinimumWidth = 320
+$script:MainWindowMinimumHeight = 200
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
 
 function Limit-Text {
@@ -423,6 +425,8 @@ function Stop-IsolatedTaskMan {
     )
 
     $warnings = @()
+    $closeRequested = $false
+    $closeTimedOut = $false
     $Process.Refresh()
     if ($Process.HasExited) {
         return [pscustomobject]@{
@@ -432,7 +436,6 @@ function Stop-IsolatedTaskMan {
     }
 
     if (-not $TrayMode) {
-        $closeRequested = $false
         try {
             $closeRequested = $Process.CloseMainWindow()
         } catch {
@@ -447,17 +450,27 @@ function Stop-IsolatedTaskMan {
             }
         }
         if ($closeRequested) {
-            $warnings += "Visible TaskMan did not exit within 5 seconds after CloseMainWindow(); falling back to exact-PID Kill()."
+            $closeTimedOut = $true
         } elseif (-not $Process.HasExited) {
             $warnings += "Visible TaskMan had no main window to close; falling back to exact-PID Kill()."
         }
 
         $Process.Refresh()
         if ($Process.HasExited) {
+            if ($closeRequested) {
+                $warnings += "Visible TaskMan exited just after the five-second CloseMainWindow grace period."
+                return [pscustomobject]@{
+                    StopReason = "VisibleWindowClosedGracefullyLate"
+                    Warnings = $warnings
+                }
+            }
             return [pscustomobject]@{
                 StopReason = "ProcessExitedBeforeProbeStop"
                 Warnings = $warnings
             }
+        }
+        if ($closeTimedOut) {
+            $warnings += "Visible TaskMan did not exit within 5 seconds after CloseMainWindow(); falling back to exact-PID Kill()."
         }
     }
 
@@ -466,6 +479,12 @@ function Stop-IsolatedTaskMan {
     } catch {
         $Process.Refresh()
         if (-not $Process.HasExited) { throw }
+        if ($closeRequested) {
+            return [pscustomobject]@{
+                StopReason = "VisibleWindowClosedGracefullyLate"
+                Warnings = $warnings
+            }
+        }
         return [pscustomobject]@{
             StopReason = "ProcessExitedBeforeProbeStop"
             Warnings = $warnings
@@ -760,6 +779,230 @@ function Test-PathUnderTemp {
     return $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Initialize-TaskManWindowInspector {
+    if ($null -ne ("TaskManGpuProbe.WindowInspector" -as [type])) { return }
+
+    $source = @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace TaskManGpuProbe
+{
+    public sealed class TopLevelWindowInfo
+    {
+        public long Handle { get; set; }
+        public string Title { get; set; }
+        public bool Visible { get; set; }
+        public bool ToolWindow { get; set; }
+        public int Left { get; set; }
+        public int Top { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+    }
+
+    public static class WindowInspector
+    {
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLengthW(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtrW(IntPtr hWnd, int index);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        private static extern int GetWindowLongW(IntPtr hWnd, int index);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        private static long GetExtendedStyle(IntPtr hWnd)
+        {
+            if (IntPtr.Size == 8) return GetWindowLongPtrW(hWnd, -20).ToInt64();
+            return GetWindowLongW(hWnd, -20);
+        }
+
+        public static TopLevelWindowInfo[] GetTopLevelWindows(uint processId)
+        {
+            List<TopLevelWindowInfo> results = new List<TopLevelWindowInfo>();
+            bool enumerated = EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+            {
+                uint windowProcessId;
+                GetWindowThreadProcessId(hWnd, out windowProcessId);
+                if (windowProcessId != processId) return true;
+
+                int length = GetWindowTextLengthW(hWnd);
+                StringBuilder title = new StringBuilder(length + 1);
+                if (length > 0) GetWindowTextW(hWnd, title, title.Capacity);
+
+                RECT rect;
+                bool hasRect = GetWindowRect(hWnd, out rect);
+                TopLevelWindowInfo info = new TopLevelWindowInfo();
+                info.Handle = hWnd.ToInt64();
+                info.Title = title.ToString();
+                info.Visible = IsWindowVisible(hWnd);
+                info.ToolWindow = (GetExtendedStyle(hWnd) & 0x80L) != 0;
+                info.Left = hasRect ? rect.Left : 0;
+                info.Top = hasRect ? rect.Top : 0;
+                info.Width = hasRect ? Math.Max(0, rect.Right - rect.Left) : 0;
+                info.Height = hasRect ? Math.Max(0, rect.Bottom - rect.Top) : 0;
+                results.Add(info);
+                return true;
+            }, IntPtr.Zero);
+
+            if (!enumerated)
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "EnumWindows failed."
+                );
+            }
+            return results.ToArray();
+        }
+    }
+}
+'@
+
+    try {
+        Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+    } catch {
+        throw "Could not initialize the exact-child window inspector: $($_.Exception.Message)"
+    }
+}
+
+function ConvertTo-TaskManWindowEvidence {
+    param($Window)
+
+    $title = [string]$Window.Title
+    $hasTitle = -not [string]::IsNullOrWhiteSpace($title)
+    $mainSized = (
+        $Window.Width -ge $script:MainWindowMinimumWidth -and
+        $Window.Height -ge $script:MainWindowMinimumHeight
+    )
+    $candidate = (
+        $Window.Visible -and
+        $hasTitle -and
+        -not $Window.ToolWindow -and
+        $mainSized
+    )
+    return [pscustomobject]@{
+        Handle = "0x{0:X}" -f [uint64]$Window.Handle
+        Title = $title
+        Visible = [bool]$Window.Visible
+        ToolWindow = [bool]$Window.ToolWindow
+        Width = [int]$Window.Width
+        Height = [int]$Window.Height
+        MainSized = [bool]$mainSized
+        MainWindowCandidate = [bool]$candidate
+    }
+}
+
+function Get-ExactChildWindowCheck {
+    param(
+        [int]$ProcessId,
+        [int]$Sequence,
+        [string]$Phase
+    )
+
+    $timestamp = [DateTime]::UtcNow.ToString("o")
+    try {
+        $rawWindows = @(
+            [TaskManGpuProbe.WindowInspector]::GetTopLevelWindows([uint32]$ProcessId)
+        )
+    } catch {
+        return [pscustomobject]@{
+            Sequence = $Sequence
+            Phase = $Phase
+            TimestampUtc = $timestamp
+            CheckSucceeded = $false
+            Error = $_.Exception.Message
+            TopLevelWindowCount = 0
+            VisibleMainWindow = $false
+            MainWindowCandidates = @()
+            Windows = @()
+        }
+    }
+
+    $windows = @(
+        foreach ($window in $rawWindows) {
+            ConvertTo-TaskManWindowEvidence -Window $window
+        }
+    )
+    $candidates = @($windows | Where-Object { $_.MainWindowCandidate })
+
+    return [pscustomobject]@{
+        Sequence = $Sequence
+        Phase = $Phase
+        TimestampUtc = $timestamp
+        CheckSucceeded = $true
+        Error = ""
+        TopLevelWindowCount = $windows.Count
+        VisibleMainWindow = $candidates.Count -gt 0
+        MainWindowCandidates = $candidates
+        Windows = $windows
+    }
+}
+
+function Add-WindowCheckEvidence {
+    param(
+        [System.Collections.ArrayList]$Checks,
+        [System.Collections.IDictionary]$Result,
+        [int]$ProcessId,
+        [int]$Sequence,
+        [string]$Phase,
+        [bool]$EnforceHidden
+    )
+
+    $check = Get-ExactChildWindowCheck -ProcessId $ProcessId -Sequence $Sequence -Phase $Phase
+    [void]$Checks.Add($check)
+    $Result["WindowChecks"] = @($Checks.ToArray())
+    $Result["VisibleMainWindowObserved"] = @(
+        $Checks | Where-Object { $_.VisibleMainWindow }
+    ).Count -gt 0
+    $Result["WindowChecksSucceeded"] = @(
+        $Checks | Where-Object { -not $_.CheckSucceeded }
+    ).Count -eq 0
+    $Result["HiddenWindowEvidenceValid"] = (
+        $Checks.Count -gt 0 -and
+        [bool]$Result["WindowChecksSucceeded"] -and
+        -not [bool]$Result["VisibleMainWindowObserved"]
+    )
+
+    if ($EnforceHidden -and -not $check.CheckSucceeded) {
+        $Result["Assessment"] = "HiddenWindowCheckUnavailable"
+        throw "Tray-mode hidden-window check failed during '$Phase': $($check.Error)"
+    }
+    if ($EnforceHidden -and [bool]$Result["VisibleMainWindowObserved"]) {
+        $Result["Assessment"] = "HiddenMainWindowVisible"
+        throw "Tray mode expected a hidden main window, but spawned PID $ProcessId exposed a visible main-sized window during '$Phase'."
+    }
+    return $check
+}
+
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "gpu-memory-probe.ps1 requires Windows performance counters."
 }
@@ -800,9 +1043,16 @@ $result = [ordered]@{
     ReadinessMarker = $null
     RendererEvidence = $null
     BaselineSettleMilliseconds = $script:BaselineSettleMilliseconds
+    WindowMinimumWidth = $script:MainWindowMinimumWidth
+    WindowMinimumHeight = $script:MainWindowMinimumHeight
+    WindowChecks = @()
+    WindowChecksSucceeded = $false
+    VisibleMainWindowObserved = $false
+    HiddenWindowEvidenceValid = $false
     BaselineState = $null
     BaselineDedicatedBytes = $null
     BaselineSharedBytes = $null
+    PeakState = "Unknown"
     PeakDedicatedBytes = $null
     PeakSharedBytes = $null
     FinalState = $null
@@ -870,6 +1120,9 @@ try {
         Set-Content -LiteralPath (Join-Path $configDirectory "config.ini") -Value $seedConfig -Encoding Ascii
     }
 
+    Initialize-TaskManWindowInspector
+    $windowChecks = New-Object System.Collections.ArrayList
+
     $started = Start-IsolatedTaskMan `
         -ExecutablePath $executablePath `
         -DataDirectory $dataDirectory `
@@ -899,6 +1152,13 @@ try {
 
     Start-Sleep -Milliseconds $script:BaselineSettleMilliseconds
     Assert-SpawnedTaskManAlive -Process $process -Phase "after the baseline settle window"
+    $null = Add-WindowCheckEvidence `
+        -Checks $windowChecks `
+        -Result $result `
+        -ProcessId $process.Id `
+        -Sequence -1 `
+        -Phase "after readiness and settle, before baseline" `
+        -EnforceHidden $trayMode
 
     $measureTimer = [Diagnostics.Stopwatch]::StartNew()
     $baseline = Measure-GpuCounterSample `
@@ -908,6 +1168,13 @@ try {
         -ElapsedMilliseconds 0
     Assert-SpawnedTaskManAlive -Process $process -Phase "during the baseline GPU memory sample"
     $samples += $baseline
+    $null = Add-WindowCheckEvidence `
+        -Checks $windowChecks `
+        -Result $result `
+        -ProcessId $process.Id `
+        -Sequence $baseline.Sequence `
+        -Phase "after baseline sample" `
+        -EnforceHidden $trayMode
 
     while ($measureTimer.Elapsed.TotalSeconds -lt $Seconds) {
         Assert-SpawnedTaskManAlive -Process $process -Phase "before the next GPU memory sample"
@@ -920,19 +1187,24 @@ try {
         Start-Sleep -Milliseconds $sleepMilliseconds
 
         Assert-SpawnedTaskManAlive -Process $process -Phase "after the measurement interval"
-        $samples += Measure-GpuCounterSample `
+        $sample = Measure-GpuCounterSample `
             -CounterSet $counterSet `
             -ProcessId $process.Id `
             -Sequence $samples.Count `
             -ElapsedMilliseconds $measureTimer.ElapsedMilliseconds
+        $samples += $sample
         Assert-SpawnedTaskManAlive -Process $process -Phase "during GPU memory sampling"
+        $null = Add-WindowCheckEvidence `
+            -Checks $windowChecks `
+            -Result $result `
+            -ProcessId $process.Id `
+            -Sequence $sample.Sequence `
+            -Phase "after sample $($sample.Sequence)" `
+            -EnforceHidden $trayMode
     }
     $measureTimer.Stop()
 
     $finalSample = $samples[$samples.Count - 1]
-    if ($finalSample.Outcome -eq "Unavailable" -or $finalSample.Outcome -eq "Incomplete") {
-        throw "The final GPU Process Memory sample was $($finalSample.Outcome): $($finalSample.Error)"
-    }
 
     $baselineDedicated = Get-InterpretedMetric -Sample $baseline -TrayMode $trayMode -Metric "DedicatedBytes"
     $baselineShared = Get-InterpretedMetric -Sample $baseline -TrayMode $trayMode -Metric "SharedBytes"
@@ -978,6 +1250,29 @@ try {
         "Sample $($_.Sequence) ($($_.Outcome)): $($_.Error)"
     })
     $warnings += @($sampleErrors | Select-Object -Unique)
+
+    $invalidPeakSamples = (
+        $result["IncompleteSampleCount"] +
+        $result["UnavailableSampleCount"] +
+        $(if ($trayMode) { 0 } else { $result["AbsentSampleCount"] })
+    )
+    if ($null -eq $result["PeakDedicatedBytes"] -or $null -eq $result["PeakSharedBytes"]) {
+        $result["PeakState"] = "Unknown"
+    } elseif ($invalidPeakSamples -gt 0) {
+        $result["PeakState"] = "LowerBound"
+        $warnings += "Peak values are a lower bound because $invalidPeakSamples sample(s) were unavailable, incomplete, or absent without a byte value."
+    } else {
+        $result["PeakState"] = "Exact"
+    }
+
+    if ($finalSample.Outcome -eq "Unavailable" -or $finalSample.Outcome -eq "Incomplete") {
+        $result["Assessment"] = "FinalSample$($finalSample.Outcome)"
+        throw "The final GPU Process Memory sample was $($finalSample.Outcome): $($finalSample.Error)"
+    }
+    if ($trayMode -and -not [bool]$result["HiddenWindowEvidenceValid"]) {
+        $result["Assessment"] = "HiddenWindowEvidenceUnavailable"
+        throw "No HiddenZero assessment is possible without successful exact-child window evidence."
+    }
 
     if ($trayMode) {
         if ($finalSample.Outcome -eq "Absent") {
@@ -1100,18 +1395,25 @@ if ($Json) {
         $result["ReadinessMarker"],
         $result["BaselineSettleMilliseconds"])
 
+    $windowCheckCount = @($result["WindowChecks"]).Count
     $summary = [pscustomobject][ordered]@{
         Baseline = "{0} dedicated, {1} shared ({2})" -f
             (Format-ByteCount $result["BaselineDedicatedBytes"]),
             (Format-ByteCount $result["BaselineSharedBytes"]),
             $result["BaselineState"]
-        Peak = "{0} dedicated, {1} shared" -f
+        Peak = "{0} dedicated, {1} shared ({2})" -f
             (Format-ByteCount $result["PeakDedicatedBytes"]),
-            (Format-ByteCount $result["PeakSharedBytes"])
+            (Format-ByteCount $result["PeakSharedBytes"]),
+            $result["PeakState"]
         Final = "{0} dedicated, {1} shared ({2})" -f
             (Format-ByteCount $result["FinalDedicatedBytes"]),
             (Format-ByteCount $result["FinalSharedBytes"]),
             $result["FinalState"]
+        WindowEvidence = "checks={0}; succeeded={1}; visibleMain={2}; hiddenValid={3}" -f
+            $windowCheckCount,
+            $result["WindowChecksSucceeded"],
+            $result["VisibleMainWindowObserved"],
+            $result["HiddenWindowEvidenceValid"]
         Assessment = $result["Assessment"]
         Samples = $result["SampleCount"]
         Stop = $result["StopReason"]

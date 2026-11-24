@@ -119,8 +119,12 @@ sums every matching LUID. Readiness comes from either the isolated log's
 the child to stay alive through a one-second settle window before taking the
 baseline. It reports baseline, peak, final, LUID details, exit/error text, or
 explicit unavailable values. Tray mode treats a valid counter query with no
-child GPU-process instance as 0 B; visible mode reports that absence as
-`Unknown` rather than inventing zero. Every launch uses
+child GPU-process instance as 0 B only when exact-child Win32 window checks
+also see no visible, titled, non-toolwindow window at least 320x200 after the
+settle and after every sample. Small/toolwindow/titleless taskbar-overlay
+windows are excluded. A visible main-sized window makes the probe fail rather
+than emit `HiddenZero`; visible mode reports counter absence as `Unknown`
+rather than inventing zero. Every launch uses
 `--instance-unresponsive`, so an installed hidden instance cannot absorb it by
 single-instance handoff. Inherited `TASKMAN_*`, `WGPU_*`, `RUST_LOG`, and
 `RUST_BACKTRACE` variables are removed from the child environment before the
@@ -137,18 +141,23 @@ The normal user token is sufficient; no elevation is requested. `vulkan` is
 accepted by the interface, but Windows builds currently expose only D3D12 and
 will report the renderer startup error.
 
-The probe deliberately forces `TASKMAN_TAB=performance`, whose hidden demand
-starts no per-process network/disk ETW sessions. Tray mode therefore uses
-exact-PID termination and cannot strand those machine-wide traces. Visible mode
-first calls `Process.CloseMainWindow()` and allows five seconds for graceful
-shutdown; if no window can be closed or shutdown times out, it warns and falls
-back to killing only the exact child.
+The probe deliberately forces `TASKMAN_TAB=performance`. During this unattended
+probe run, that demand starts no per-process network/disk ETW sessions, so tray
+mode's exact-PID termination cannot strand those machine-wide traces. That
+guarantee does not extend to interactive use, where switching or restoring tabs
+can change demand. Visible mode first calls `Process.CloseMainWindow()` and
+allows five seconds for graceful shutdown; if no window can be closed or
+shutdown times out, it warns and falls back to killing only the exact child. A
+window that exits just after the grace period is classified as a late graceful
+exit rather than an unexpected process exit.
 
 The baseline is a settled post-start sample, not by itself a steady-state
 proof, and it excludes transients before readiness. Dedicated/shared values
 describe this process only: driver, compositor, or desktop allocations can
 remain even when TaskMan reports 0 B, and a released allocation can persist in
-driver bookkeeping. For a same-process close-to-tray comparison, launch a
+driver bookkeeping. `PeakState` distinguishes exact peaks from lower bounds
+caused by unavailable, incomplete, or otherwise uninterpreted samples and from
+wholly unknown peaks. For a same-process close-to-tray comparison, launch a
 visible instance, note its PID's GPU dedicated/shared columns in Task Manager
 Details, close the window to the tray, let Task Manager refresh, and compare the
 same PID; use a separate tray launch as the control.
