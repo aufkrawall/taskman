@@ -1015,7 +1015,10 @@ mod tests {
 
         let mut snapshots = TextureSnapshots::default();
         let mut deltas = epaint::textures::TexturesDelta::default();
-        deltas.push(id, ImageDelta::full(full, epaint::textures::TextureOptions::NEAREST));
+        deltas.push(
+            id,
+            ImageDelta::full(full, epaint::textures::TextureOptions::NEAREST),
+        );
         snapshots.record(&deltas);
         deltas.clear();
 

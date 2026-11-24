@@ -1749,24 +1749,14 @@ mod tests {
         let mut underused_updates = BUFFER_SHRINK_AFTER_UPDATES - 2;
 
         assert_eq!(
-            capacity_after_sustained_underuse(
-                capacity,
-                required,
-                &mut underused_updates,
-                initial
-            ),
+            capacity_after_sustained_underuse(capacity, required, &mut underused_updates, initial),
             None,
             "a buffer must not shrink on a single small frame"
         );
         assert_eq!(underused_updates, BUFFER_SHRINK_AFTER_UPDATES - 1);
 
         assert_eq!(
-            capacity_after_sustained_underuse(
-                capacity,
-                required,
-                &mut underused_updates,
-                initial
-            ),
+            capacity_after_sustained_underuse(capacity, required, &mut underused_updates, initial),
             Some(2 * required)
         );
         assert_eq!(underused_updates, 0);

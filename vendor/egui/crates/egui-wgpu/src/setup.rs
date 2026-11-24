@@ -296,14 +296,12 @@ impl WgpuSetupCreateNew {
 
             native_adapter_selector: None,
 
-            device_descriptor: Arc::new(|adapter| {
-                wgpu::DeviceDescriptor {
-                    label: Some("egui wgpu device"),
-                    required_features: requested_dual_source_blending(adapter.features()),
-                    required_limits: gui_device_limits(adapter.get_info().backend),
-                    memory_hints: gui_device_memory_hints(),
-                    ..Default::default()
-                }
+            device_descriptor: Arc::new(|adapter| wgpu::DeviceDescriptor {
+                label: Some("egui wgpu device"),
+                required_features: requested_dual_source_blending(adapter.features()),
+                required_limits: gui_device_limits(adapter.get_info().backend),
+                memory_hints: gui_device_memory_hints(),
+                ..Default::default()
             }),
         }
     }
@@ -325,7 +323,10 @@ mod tests {
 
         for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
             let limits = gui_device_limits(backend);
-            assert_eq!(limits.max_texture_dimension_2d, GUI_MAX_TEXTURE_DIMENSION_2D);
+            assert_eq!(
+                limits.max_texture_dimension_2d,
+                GUI_MAX_TEXTURE_DIMENSION_2D
+            );
             assert_eq!(
                 limits.max_non_sampler_bindings,
                 GUI_MAX_NON_SAMPLER_BINDINGS

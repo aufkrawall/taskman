@@ -676,11 +676,10 @@ impl WgpuWinitRunning<'_> {
             let is_visible = viewports
                 .get(&viewport_id)
                 .is_some_and(|viewport| viewport_is_visible(viewport, integration.is_first_frame));
-            let descendant_visible = is_visible_descendant_with(
-                viewports,
-                viewport_id,
-                &|viewport| viewport_is_visible(viewport, false),
-            );
+            let descendant_visible =
+                is_visible_descendant_with(viewports, viewport_id, &|viewport| {
+                    viewport_is_visible(viewport, false)
+                });
             let show_ui = FrameVisibility::new(is_visible, descendant_visible).run_ui;
 
             let gpu_target = if is_visible {
@@ -1316,11 +1315,9 @@ fn render_immediate_viewport(
                 return;
             };
             let paint_self = viewport_is_visible(viewport, false);
-            let descendant_visible = is_visible_descendant_with(
-                viewports,
-                ids.this,
-                &|viewport| viewport_is_visible(viewport, false),
-            );
+            let descendant_visible = is_visible_descendant_with(viewports, ids.this, &|viewport| {
+                viewport_is_visible(viewport, false)
+            });
             FrameVisibility::new(paint_self, descendant_visible)
         };
         if !visibility.run_ui {
@@ -1331,8 +1328,7 @@ fn render_immediate_viewport(
             let Some(viewport) = viewports.get_mut(&ids.this) else {
                 return;
             };
-            let (Some(window), Some(egui_winit)) =
-                (&viewport.window, viewport.egui_winit.as_mut())
+            let (Some(window), Some(egui_winit)) = (&viewport.window, viewport.egui_winit.as_mut())
             else {
                 return;
             };
@@ -1585,7 +1581,10 @@ mod tests {
         let child = ViewportId::from_hash_of("visible-child");
         let grandchild = ViewportId::from_hash_of("hidden-grandchild");
         let mut viewports = Viewports::default();
-        viewports.insert(ViewportId::ROOT, test_viewport(ViewportId::ROOT, ViewportId::ROOT));
+        viewports.insert(
+            ViewportId::ROOT,
+            test_viewport(ViewportId::ROOT, ViewportId::ROOT),
+        );
         viewports.insert(child, test_viewport(child, ViewportId::ROOT));
         viewports.insert(grandchild, test_viewport(grandchild, child));
 
@@ -1602,22 +1601,44 @@ mod tests {
             ViewportId::ROOT,
             &|viewport| viewport.ids.this == grandchild,
         ));
-        let no_visible_descendant = is_visible_descendant_with(
-            &viewports,
-            ViewportId::ROOT,
-            &|_: &Viewport| false,
-        );
+        let no_visible_descendant =
+            is_visible_descendant_with(&viewports, ViewportId::ROOT, &|_: &Viewport| false);
         assert!(!no_visible_descendant);
         assert!(!FrameVisibility::new(false, no_visible_descendant).run_ui);
     }
 
     #[test]
     fn visibility_honours_occlusion_hide_and_first_frame_reveal() {
-        assert!(!effective_viewport_visible(Some(false), None, Some(true), true));
-        assert!(!effective_viewport_visible(Some(true), Some(false), Some(true), false));
-        assert!(!effective_viewport_visible(Some(true), Some(false), Some(true), true));
-        assert!(!effective_viewport_visible(Some(true), None, Some(false), false));
-        assert!(effective_viewport_visible(Some(true), None, Some(false), true));
+        assert!(!effective_viewport_visible(
+            Some(false),
+            None,
+            Some(true),
+            true
+        ));
+        assert!(!effective_viewport_visible(
+            Some(true),
+            Some(false),
+            Some(true),
+            false
+        ));
+        assert!(!effective_viewport_visible(
+            Some(true),
+            Some(false),
+            Some(true),
+            true
+        ));
+        assert!(!effective_viewport_visible(
+            Some(true),
+            None,
+            Some(false),
+            false
+        ));
+        assert!(effective_viewport_visible(
+            Some(true),
+            None,
+            Some(false),
+            true
+        ));
         assert!(effective_viewport_visible(None, Some(true), None, false));
         assert!(!effective_viewport_visible(None, Some(false), None, false));
     }
@@ -1628,8 +1649,15 @@ mod tests {
 
         assert!(first_frame_reveal_from_commands(&[]));
         assert!(!first_frame_reveal_from_commands(&[Visible(false)]));
-        assert!(first_frame_reveal_from_commands(&[Visible(false), Visible(true)]));
-        assert!(!first_frame_reveal_from_commands(&[Visible(true), Close, Visible(false)]));
+        assert!(first_frame_reveal_from_commands(&[
+            Visible(false),
+            Visible(true)
+        ]));
+        assert!(!first_frame_reveal_from_commands(&[
+            Visible(true),
+            Close,
+            Visible(false)
+        ]));
     }
 
     #[test]
