@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-11-24 (Linux desktop-role and GPU/Linux LCD text residuals)
+Last verified: 2026-11-24 (Linux per-process CPU attribution, icon-chain snapshots, and the Wayland full-paint residual)
 
 Primary sources:
 - `AGENTS.md`
@@ -454,12 +454,13 @@ remain follow-up rather than being simulated in headless tests:
   it needs `NSWorkspace`/`objc2-app-kit` FFI that no gate on this host can
   compile or exercise; the 0.1.32 changelog is scoped to Windows/Linux until
   that exists.
-- **Icon cache invalidation is restart-scoped.** Textures are keyed by image
-  path and the Linux `IconResolver` (including the XDG theme name) is a
-  `OnceLock`, so replacing an app at the same path or switching the desktop
-  icon theme keeps the old icon until TaskMan restarts. Re-reading XSettings
-  per lookup or statting every row per frame was rejected as UI-thread work;
-  a future fix should re-key on theme/mtime and invalidate explicitly.
+- **Icon textures are keyed by image path and never invalidated.** Replacing an
+  app at the same path keeps the old icon until TaskMan restarts. Re-reading
+  XSettings per lookup or statting every row per frame was rejected as
+  UI-thread work; a future fix should re-key on the theme and the file's mtime
+  and invalidate explicitly. The resolver's own snapshot (theme chain,
+  desktop-file index) is the other half of this rule — see
+  § 2026-11-24 Linux CPU-renderer, per-process CPU, and icon residuals.
 - **Restore acknowledgement still falls back to a 2 s deadline.** The
   "painted" signal is the app's `ui` pass (main.rs), which runs before the
   software backend's `present_rects`; a failed present therefore still lets
@@ -586,6 +587,44 @@ remain follow-up rather than being simulated in headless tests:
   but downstream exhaustive literals and old field access still break. If the
   crate is consumed externally, introduce a builder/accessor contract or a
   deliberate compatibility major bump.
+
+### 2026-11-24 Linux CPU-renderer, per-process CPU, and icon residuals
+
+- **A Wayland frame is always painted in full.** The tile tracker may only
+  paint incrementally into a buffer whose contents are exactly one frame old,
+  and softbuffer's Wayland backend keeps two `wl_shm` buffers and swaps them per
+  present, so a leased buffer is 0 or 2 frames old and never 1. Wayland
+  therefore full-paints every frame and the 64×64 damage path only saves work on
+  X11 and Windows. Restoring tile skipping there needs a damage cache PER buffer
+  slot, not a per-frame one; do not "fix" it by reintroducing a local
+  "we presented something" flag, which is exactly what left black boxes and
+  stale regions on screen.
+- **X11 and Wayland have no OS invalid-update region.** Windows merges
+  `GetUpdateRect` into the present set, so a frame with zero changed egui tiles
+  still blits what the compositor asked for. Neither softbuffer backend offers an
+  equivalent, so a zero-damage X11 frame presents nothing. A surface the
+  compositor discards is only recovered through the force-full-paint path (a
+  resize, a reveal, an unpainted surface), never by a delivered damage rectangle.
+- **Linux per-process CPU cannot attribute everything.** A process that exits
+  inside a window takes its last ticks with it, and irq/softirq time is not
+  attributable to a process at all, so the rows sum to slightly less than the
+  machine header (measured ~0.6 % of capacity). A process first seen in a window
+  reports `None` — one dash for one window — rather than a fabricated 0 %;
+  Windows credits newborn processes their in-window time, which is the honest
+  difference between the two accountants, not a bug to be evened out.
+- **Icons: PNG only, and a miss costs a chain walk.** The resolver has no SVG
+  rasterizer (an offline build cannot link one), so an app whose theme icon
+  exists only as SVG falls back to the generic `application-x-executable` glyph.
+  A footprint miss walks the whole transitive theme chain and every size
+  directory in it before giving up — roughly 3.4k `stat` calls per distinct
+  missing image, deduped by the icon cache's 30 s failure retry TTL and, on
+  Processes/Details, behind the per-frame icon memo, so neither a repaint nor a
+  scroll frame repeats it. A footprint hit is cheap.
+- **Icon theme resolution is a process-lifetime snapshot.** The theme chain and
+  the desktop-file index are resolved once per process (the texture half of the
+  same rule is § 2026-11-22 above), so switching the desktop icon theme keeps the
+  chain the process started with. Re-resolving per lookup would mean reading
+  XSettings and walking `index.theme` files on the UI thread for every row.
 
 ## Row/total audit leftovers (2026-10-21)
 
