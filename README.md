@@ -146,6 +146,22 @@ Release packaging produces two ways to install:
   prompt with `taskman.exe --core-service=install --core-service-user=<sid>`
   (or skip the service; protected actions then ask for elevation).
 
+## Variable refresh rate on Windows
+
+With the D3D12 renderer on Windows, add `taskman.exe` to its own application
+profile in the GPU driver and disable variable refresh rate (VRR) for it.
+TaskMan presents only when something on screen changes, and a VRR display
+follows that idle presentation rate: the refresh rate swings with every burst
+of input, and the panel can flicker or dim while the window just sits there.
+
+- **NVIDIA:** create a new profile for `taskman.exe` in NVIDIA Profile
+  Inspector, then set **Gsync - Application State** to **Force Off**.
+- **AMD Radeon:** add `taskman.exe` under the driver panel's application
+  profiles and disable VRR inside that added profile.
+
+None of this is necessary with CPU rendering: the CPU renderer never creates a
+DXGI swapchain, so the driver never considers TaskMan a VRR candidate.
+
 ## Repository layout
 
 | Path | What it is |
