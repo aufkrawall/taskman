@@ -383,10 +383,10 @@ const WHEEL_SMOOTHING_RESIDUAL_PX: f32 = 0.01;
 
 /// Delta-time to hand to [`WheelState::after_events`] for the wheel smoothing kernel.
 ///
-/// TASKMAN-FORK (#14): the follow-up smoothing frames are scheduled with a
+/// TASKMAN-FORK (#17): the follow-up smoothing frames are scheduled with a
 /// duration (`wants_repaint_after`), so `stable_dt` is `predicted_dt` for them
 /// and under-reports every frame that really arrived late (frame hitch, timer
-/// slip, coalesced wheel repaint). The exponential would then advance as if
+/// slip, coalesced wheel repaint). The burst decay would then advance as if
 /// less time had passed, stretching the tail into visible late mini-steps, so
 /// prefer the honestly measured `unstable_dt`.
 ///
@@ -460,14 +460,19 @@ impl InputState {
         self.wheel.smooth_wheel_delta = Vec2::ZERO;
         self.wheel.smooth_zoom_delta = Vec2::ZERO;
 
-        // TASKMAN-FORK (#14): whether a burst is already running, sampled before
+        // TASKMAN-FORK (#17): whether a burst is already running, sampled before
         // this pass folds its events in. Only a running burst may be charged the
         // measured frame gap: on the pass that *starts* one, `unstable_dt`
         // measured the time before the notch existed, and at the top of the
         // accepted window (0.1 s) that is the whole decay budget — the kernel
         // would land the entire notch in this one frame.
-        let wheel_burst_running = self.wheel.unprocessed_wheel_delta != Vec2::ZERO
-            || self.wheel.unprocessed_zoom_delta != Vec2::ZERO;
+        //
+        // Same predicate as the follow-up-frame chain below, so a residual small
+        // enough that the chain stopped servicing it cannot mark the next notch
+        // as running and charge it a gap measured before it arrived.
+        let wheel_burst_running = self.wheel.unprocessed_wheel_delta.abs().max_elem()
+            > WHEEL_SMOOTHING_RESIDUAL_PX
+            || self.wheel.unprocessed_zoom_delta.abs().max_elem() > WHEEL_SMOOTHING_RESIDUAL_PX;
 
         for event in &mut new.events {
             match event {
@@ -523,10 +528,13 @@ impl InputState {
         }
 
         let smooth_scroll_delta = {
-            // TASKMAN-FORK (#14): a running burst gets the measured frame time,
+            // TASKMAN-FORK (#17): a running burst gets the measured frame time,
             // not `stable_dt` (== `predicted_dt` on these follow-up frames). The
             // pass that starts a burst is charged the nominal cadence instead,
-            // see `wheel_burst_running` above.
+            // see `wheel_burst_running` above; that keeps the merge's kernel
+            // from spending its whole clock budget on the arrival pass for any
+            // display interval below `WHEEL_SMOOTHING_DT_MAX` (a 100 ms interval
+            // cannot be smoothed, and lands in one pass by design).
             let dt = if wheel_burst_running {
                 wheel_smoothing_dt(unstable_dt, new.predicted_dt)
             } else {
@@ -1997,8 +2005,8 @@ mod tests {
         let predicted_dt = 1.0 / 240.0;
 
         // Implausible measurements fall back to the nominal cadence: 0 ms would
-        // land nothing, and the 1 s first pass of a default `InputState` (or a
-        // resume from suspend) would jump the scroll.
+        // land nothing, and a resume from suspend, a debugger stop or a long
+        // hitch would jump the scroll.
         for unstable_dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0e9] {
             assert_eq!(wheel_smoothing_dt(unstable_dt, predicted_dt), predicted_dt);
         }
@@ -2059,6 +2067,14 @@ mod tests {
         );
     }
 
+    /// The follow-up frame chain terminates: it keeps asking for display-cadence
+    /// frames while an impulse is pending and stops once it is spent.
+    ///
+    /// This pins termination and the cadence, not the residual threshold — both
+    /// kernels in this tree land their last sliver far above
+    /// `WHEEL_SMOOTHING_RESIDUAL_PX`, so the runs here never pass through the
+    /// `(0.01, 0.2]` px band that the threshold exists for. That case is
+    /// `sub_pixel_residual_still_requests_its_frame`.
     #[test]
     fn residual_tail_keeps_requesting_frames_until_exhausted() {
         let predicted_dt = 1.0 / 240.0;
