@@ -658,14 +658,20 @@ struct Layout {
     cols: Vec<(f32, f32)>,
 }
 
+/// One value cell: its heat intensity and the text it shows.
+///
+/// The text BORROWS by default because a table paints its visible cells on
+/// every repaint, and formatting them there re-created every string on a
+/// scroll frame. Callers that already own a formatted string (`format!`, a
+/// `String` from their own model) keep passing it unchanged.
 #[derive(Debug, Clone)]
-pub struct HeatCell {
+pub struct HeatCell<'a> {
     pub intensity: f32,
-    pub text: String,
+    pub text: std::borrow::Cow<'a, str>,
 }
 
-impl HeatCell {
-    pub fn new(intensity: f32, text: impl Into<String>) -> Self {
+impl<'a> HeatCell<'a> {
+    pub fn new(intensity: f32, text: impl Into<std::borrow::Cow<'a, str>>) -> Self {
         Self {
             intensity,
             text: text.into(),
@@ -1487,7 +1493,7 @@ impl TmTable {
         pal: &Palette,
         row: Rect,
         from: usize,
-        cells: &[HeatCell],
+        cells: &[HeatCell<'_>],
     ) {
         let painter = ui.painter_at(row.expand(2.0));
         for (k, cell_data) in cells.iter().enumerate() {
@@ -1515,7 +1521,7 @@ impl TmTable {
             ui.painter_at(cell).text(
                 Pos2::new(cell.right() - 10.0, cell.center().y),
                 Align2::RIGHT_CENTER,
-                &cell_data.text,
+                &*cell_data.text,
                 FontId::proportional(FONT_ROW),
                 pal.text,
             );

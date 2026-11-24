@@ -102,6 +102,11 @@ pub struct RowData {
     /// before virtualization (audit P0.2): exactly 1.0 marks the column's
     /// top consumer.
     pub heat: [f32; VALUE_COLS],
+    /// The numeric cell text by LOGICAL value index, formatted with the model
+    /// (see `normalize_heat`, which finalizes both). Repaints re-use it: a
+    /// scroll frame shows the same rows with the same values, and formatting
+    /// them per frame re-created every visible string of the list.
+    pub cells: [String; VALUE_COLS],
     pub net_available: bool,
     /// False while the per-process disk trace is not running. Rendered "—";
     /// a zero here would claim the process touched no disk.
@@ -217,6 +222,13 @@ impl State {
 struct Cache {
     key: (u64, u64, String, usize, bool),
     rows: Vec<DisplayRow>,
+    /// Display indices of the SELECTABLE rows, in display order.
+    ///
+    /// Selection movement, its Shift range and the scroll request all need
+    /// exactly this sequence, and it is a property of the built model (rows
+    /// plus expansion state, both in `key`). Building it with the model keeps
+    /// the per-repaint path from re-filtering every row of the list.
+    selectable: Vec<usize>,
 }
 
 /// Issue an Efficiency-mode toggle driven by the SNAPSHOT's OS-reported
@@ -366,16 +378,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     if cache_stale {
         let expanded = app.processes_state.expanded.clone();
         let groups = app.processes_state.group_collapsed;
+        let built = build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups);
+        let selectable = selectable_indices(&built, &expanded);
         cache = Some(Cache {
             key: key.clone(),
-            rows: build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups),
+            rows: built,
+            selectable,
         });
         app.note_table_model_rebuild();
     }
-    let rows = match cache.as_ref() {
-        Some(cache) => &cache.rows,
-        None => return,
-    };
+    let Some(model) = cache.as_ref() else { return };
+    let rows = &model.rows;
+    let selectable = &model.selectable;
 
     // Task-Manager-style type navigation: typed letters accumulate into a
     // word, so "svc" lands on svchost.exe instead of jumping to whatever
@@ -412,7 +426,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
-    handle_keyboard_navigation(app, ui.ctx(), rows, dialog_open);
+    handle_keyboard_navigation(app, ui.ctx(), rows, selectable, dialog_open);
 
     let agg = Aggregates::from_snapshot(&snap);
     let logical_aggs = agg.strings();
@@ -425,8 +439,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // table can bring it into view vertically even when it lies outside the
     // currently rendered virtualization window.
     let focus_row = app.processes_state.scroll_to_pid.take().and_then(|pid| {
-        rows.iter()
-            .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid && row_is_selectable(p, &app.processes_state.expanded)))
+        selectable
+            .iter()
+            .copied()
+            .find(|&index| matches!(rows.get(index), Some(DisplayRow::Process(p)) if p.pid == pid))
     });
 
     // Keep the viewport pinned to the rows the user is looking at when the
@@ -434,19 +450,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // exit anywhere, including above the viewport. The selected row wins
     // while it is visible; when the selection is an expanded family head the
     // visible highlighted row is its concrete child, not the aggregate row,
-    // so resolve the key through the selectable row.
-    let selected_key = app.selection.primary().and_then(|id| {
-        rows.iter().find_map(|row| match row {
-            DisplayRow::Process(row)
-                if row.pid == id.pid
-                    && row.start_epoch_s == id.start_epoch_s
-                    && row_is_selectable(row, &app.processes_state.expanded) =>
-            {
-                Some(process_row_key(row))
-            }
-            _ => None,
+    // so resolve the key through the selectable row. Only a rebuilt model
+    // consumes it (`scrolled_rows` reads `prefer_key` on its anchor branch),
+    // so a plain scroll frame never pays for the scan.
+    let selected_key = if cache_stale {
+        app.selection.primary().and_then(|id| {
+            rows.iter().find_map(|row| match row {
+                DisplayRow::Process(row)
+                    if row.pid == id.pid
+                        && row.start_epoch_s == id.start_epoch_s
+                        && row_is_selectable(row, &app.processes_state.expanded) =>
+                {
+                    Some(process_row_key(row))
+                }
+                _ => None,
+            })
         })
-    });
+    } else {
+        None
+    };
     let key_of = |i: usize| rows.get(i).map_or(u64::MAX, display_row_key);
     let anchor = tablekit::ScrollAnchor {
         model_changed: cache_stale,
@@ -521,36 +543,30 @@ fn handle_keyboard_navigation(
     app: &mut TaskManApp,
     ctx: &egui::Context,
     rows: &[DisplayRow],
+    selectable: &[usize],
     dialog_open: bool,
 ) {
-    let process_rows: Vec<(usize, &RowData)> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(display_idx, row)| match row {
-            DisplayRow::Process(row) if row_is_selectable(row, &app.processes_state.expanded) => {
-                Some((display_idx, row))
-            }
-            _ => None,
-        })
-        .collect();
-    if search::content_has_focus(ctx) && app.selection.is_empty() && !process_rows.is_empty() {
+    if search::content_has_focus(ctx) && app.selection.is_empty() && !selectable.is_empty() {
         // Re-select at the position the vanished selection occupied (End
         // task, or the process exiting on its own) instead of jumping the
         // view to the top of the list.
-        let at =
-            selection_fallback_index(app.processes_state.last_selected_pos, process_rows.len());
-        select_row(app, process_rows[at].1);
+        let at = selection_fallback_index(app.processes_state.last_selected_pos, selectable.len());
+        if let Some(row) = selectable_row(rows, selectable, at) {
+            select_row(app, row);
+        }
     }
     let selected_pid = app.selection.primary().map(|p| p.pid);
-    let selected_pos =
-        selected_pid.and_then(|pid| process_rows.iter().position(|(_, row)| row.pid == pid));
+    let selected_pos = selected_pid.and_then(|pid| {
+        (0..selectable.len())
+            .position(|i| selectable_row(rows, selectable, i).is_some_and(|r| r.pid == pid))
+    });
     app.processes_state.last_selected_pos = selected_pos;
     // The display order is only materialized for the two gestures that need
-    // it. This runs every frame over the whole process list.
+    // it, never per frame.
     let order = || -> Vec<crate::app::ProcessIdentity> {
-        process_rows
-            .iter()
-            .map(|(_, row)| identity_of(row))
+        (0..selectable.len())
+            .filter_map(|i| selectable_row(rows, selectable, i))
+            .map(identity_of)
             .collect()
     };
     let select_all = std::mem::take(&mut app.select_all_requested)
@@ -570,8 +586,8 @@ fn handle_keyboard_navigation(
     // move (see `tablekit::header_has_focus`).
     if let Some(nav) =
         search::list_nav(ctx, dialog_open).filter(|_| !tablekit::header_has_focus(ctx, "processes"))
-        && let Some(next) = search::moved_index(process_rows.len(), selected_pos, nav, page_rows)
-        && let Some((_, row)) = process_rows.get(next)
+        && let Some(next) = search::moved_index(selectable.len(), selected_pos, nav, page_rows)
+        && let Some(row) = selectable_row(rows, selectable, next)
     {
         if ctx.input(|i| i.modifiers.shift) {
             app.selection.select_range(identity_of(row), &order());
@@ -590,12 +606,12 @@ fn handle_keyboard_navigation(
                 i.key_pressed(egui::Key::Enter),
             )
         });
-        let primary = app
-            .selection
-            .primary()
-            .cloned()
-            .and_then(|primary| process_rows.iter().find(|(_, row)| row.pid == primary.pid));
-        if let Some((_, row)) = primary {
+        let primary = app.selection.primary().cloned().and_then(|primary| {
+            (0..selectable.len())
+                .filter_map(|i| selectable_row(rows, selectable, i))
+                .find(|row| row.pid == primary.pid)
+        });
+        if let Some(row) = primary {
             if space {
                 // The focused row of a multi-select list toggles in and out.
                 app.selection.toggle(identity_of(row), &order());
@@ -621,13 +637,13 @@ fn handle_keyboard_navigation(
     let Some(pid) = app.selection.primary().map(|p| p.pid) else {
         return;
     };
-    let Some(display_idx) = rows
-        .iter()
-        .position(|row| matches!(row, DisplayRow::Process(p) if p.pid == pid && row_is_selectable(p, &app.processes_state.expanded)))
+    let Some(slot) = (0..selectable.len())
+        .position(|i| selectable_row(rows, selectable, i).is_some_and(|r| r.pid == pid))
     else {
         return;
     };
-    let DisplayRow::Process(current) = &rows[display_idx] else {
+    let display_idx = selectable[slot];
+    let Some(DisplayRow::Process(current)) = rows.get(display_idx) else {
         return;
     };
 
@@ -772,6 +788,37 @@ fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
 
 fn row_is_selectable(row: &RowData, expanded: &HashSet<u32>) -> bool {
     !row.synthetic && (!row.aggregate || !expanded.contains(&row.pid))
+}
+
+/// Display indices of every selectable row, in display order — the sequence
+/// arrow movement, Shift ranges and the scroll request all walk.
+fn selectable_indices(rows: &[DisplayRow], expanded: &HashSet<u32>) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| match row {
+            DisplayRow::Process(row) if row_is_selectable(row, expanded) => Some(index),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A selectable row's data, addressed by its SELECTABLE position.
+///
+/// The model build records which display rows are selectable, so nothing on
+/// the repaint path has to re-filter the list: the selection layer runs every
+/// frame, a rebuild only when the data or the ordering changed.
+fn selectable_row<'a>(
+    rows: &'a [DisplayRow],
+    selectable: &[usize],
+    index: usize,
+) -> Option<&'a RowData> {
+    selectable
+        .get(index)
+        .and_then(|&display| rows.get(display))
+        .and_then(|row| match row {
+            DisplayRow::Process(row) => Some(row),
+            DisplayRow::GroupHeader(..) => None,
+        })
 }
 
 fn resolve_termination_targets(
@@ -1077,12 +1124,14 @@ fn row_ui(
 
     // Heat cells: intensities were normalized per column across the whole
     // display model during cache build (audit P0.2); here we only paint.
-    // Cells follow the user's column order; `values`/`heat` never do.
-    let cells: Vec<HeatCell> = app
+    // Cells follow the user's column order; `values`/`heat` never do. The text
+    // is part of the same built model (`RowData::cells`), so a repaint borrows
+    // it instead of formatting every visible cell again.
+    let cells: Vec<HeatCell<'_>> = app
         .processes_state
         .value_order
         .iter()
-        .map(|&li| HeatCell::new(row.heat[li], value_text(row, li)))
+        .map(|&li| HeatCell::new(row.heat[li], row.cells[li].as_str()))
         .collect();
     table.heat_cells(ui, pal, rect, FIXED_COLS, &cells);
     let unknown = [
@@ -2105,6 +2154,7 @@ fn emit_flat_with_family_groups(
                     .collect(),
                 values: repr.get(&p.pid).copied().unwrap_or([0.0; VALUE_COLS]),
                 heat: [0.0; VALUE_COLS],
+                cells: std::array::from_fn(|_| String::new()),
                 net_available,
                 disk_available,
                 gpu_available,
@@ -2544,6 +2594,11 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
                 0.0
             }
         });
+        // Same reason as `heat`: this is the model's final form, so the cell
+        // text is formatted here once instead of on every repaint. `values`
+        // and the availability flags never change after this point.
+        let cells = std::array::from_fn(|i| value_text(d, i));
+        d.cells = cells;
     }
 }
 
@@ -2559,6 +2614,7 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
         heat: [0.0; VALUE_COLS],
+        cells: std::array::from_fn(|_| String::new()),
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         disk_available: disk_known(p),
         gpu_available: gpu_known(p),
@@ -2607,6 +2663,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
         heat: [0.0; VALUE_COLS],
+        cells: std::array::from_fn(|_| String::new()),
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         disk_available: disk_known(p),
         gpu_available: gpu_known(p),
@@ -2787,6 +2844,7 @@ fn emit_tree<'a>(
                 .collect(),
             values: shown[&root.pid],
             heat: [0.0; VALUE_COLS],
+            cells: std::array::from_fn(|_| String::new()),
             net_available,
             disk_available,
             gpu_available,
@@ -3130,6 +3188,122 @@ mod tests {
             processes: ps,
             ..Default::default()
         }
+    }
+
+    /// The cached index must be EXACTLY what filtering the model produced:
+    /// navigation, Shift ranges and the scroll request all address rows
+    /// through it, so a dropped or reordered entry moves the selection onto
+    /// the wrong process.
+    #[test]
+    fn the_cached_selectable_index_matches_filtering_the_model() {
+        let snap = snap_of(vec![
+            proc(1, None, "explorer.exe", ProcCategory::App),
+            proc(2, None, "svchost.exe", ProcCategory::System),
+            pseudo(3, "Terminated Processes", ProcCategory::Background),
+            proc(4, None, "updatehelper.exe", ProcCategory::Background),
+        ]);
+        let expanded = HashSet::new();
+        let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 4]);
+        let selectable = selectable_indices(&rows, &expanded);
+
+        let expected: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| match row {
+                DisplayRow::Process(row) if row_is_selectable(row, &expanded) => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selectable, expected, "the index must be the same sequence");
+        assert!(
+            !selectable.is_empty(),
+            "a populated model has selectable rows"
+        );
+        for (position, &display) in selectable.iter().enumerate() {
+            let addressed = selectable_row(&rows, &selectable, position).expect("in range");
+            let DisplayRow::Process(row) = &rows[display] else {
+                panic!("a selectable index must address a process row");
+            };
+            assert_eq!(addressed.pid, row.pid);
+        }
+        assert!(
+            selectable_row(&rows, &selectable, selectable.len()).is_none(),
+            "past the end there is no row"
+        );
+    }
+
+    /// The index depends on the expansion state, which is why it lives inside
+    /// the model cache: an expanded family head is a virtual parent, not a
+    /// selectable row, and its members take over.
+    #[test]
+    fn the_selectable_index_follows_the_expansion_state() {
+        let head = proc(10, None, "brave.exe", ProcCategory::Background);
+        let mut aggregate = make_flat_row(&head);
+        let DisplayRow::Process(row) = &mut aggregate else {
+            unreachable!("make_flat_row builds a process row")
+        };
+        row.aggregate = true;
+        let rows = vec![
+            DisplayRow::GroupHeader(1, 2),
+            aggregate,
+            make_flat_row(&proc(11, Some(10), "brave.exe", ProcCategory::Background)),
+            make_flat_row(&pseudo(12, "Terminated", ProcCategory::Background)),
+        ];
+
+        assert_eq!(
+            selectable_indices(&rows, &HashSet::new()),
+            vec![1, 2],
+            "a collapsed family head stands in for its members; the synthetic \
+             accounting row is never selectable"
+        );
+        assert_eq!(
+            selectable_indices(&rows, &HashSet::from([10])),
+            vec![2],
+            "an expanded family head is a virtual parent, not a selectable row"
+        );
+    }
+
+    /// The cell text is built with the model now, so it must be EXACTLY what
+    /// the paint used to format per frame — and a source that never measured
+    /// must still read as unavailable, never as a fabricated zero.
+    #[test]
+    fn cached_cell_text_matches_the_model_and_never_invents_a_zero() {
+        let mut measured = proc(21, None, "measured.exe", ProcCategory::Background);
+        measured.net_recv_bps = Some(1_750.0);
+        measured.disk_active_pct = Some(93.0);
+        measured.gpu_util_pct = Some(64.0);
+        let mut unmeasured = proc(22, None, "unmeasured.exe", ProcCategory::Background);
+        unmeasured.net_recv_bps = None;
+        unmeasured.net_sent_bps = None;
+        unmeasured.disk_active_pct = None;
+        unmeasured.gpu_util_pct = None;
+        let snap = snap_of(vec![measured, unmeasured]);
+        let empty = HashSet::new();
+        let rows = build_display_rows(&snap, "", 0, true, &empty, &[false; 4]);
+
+        for row in rows.iter().filter_map(|r| match r {
+            DisplayRow::Process(row) => Some(row),
+            DisplayRow::GroupHeader(..) => None,
+        }) {
+            for li in 0..VALUE_COLS {
+                assert_eq!(
+                    row.cells[li],
+                    value_columns::value_text(li, row.values[li], value_known(row, li)),
+                    "cached text of column {li} for pid {}",
+                    row.pid
+                );
+            }
+        }
+        let unmeasured = rows
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::Process(row) if row.pid == 22 => Some(row),
+                _ => None,
+            })
+            .expect("the unmeasured process has a row");
+        assert_eq!(unmeasured.cells[NET_VALUE], "\u{2014}");
+        assert_eq!(unmeasured.cells[DISK_ACT_VALUE], "\u{2014}");
+        assert_eq!(unmeasured.cells[GPU_VALUE], "\u{2014}");
     }
 
     #[test]
