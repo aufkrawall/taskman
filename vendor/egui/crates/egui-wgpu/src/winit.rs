@@ -467,7 +467,6 @@ impl Painter {
     /// the font atlas survive the interruption. Capabilities needed to create other
     /// windows, such as [`Self::max_texture_side()`], are retained.
     pub fn suspend(&mut self) {
-        let texture_ids: Vec<_> = self.texture_snapshots.ids().copied().collect();
         self.surfaces.clear();
         self.depth_texture_view.clear();
         self.msaa_texture_view.clear();
@@ -489,8 +488,8 @@ impl Painter {
 
         {
             let mut renderer = render_state.renderer.write();
-            for id in texture_ids {
-                renderer.free_texture(&id);
+            for id in self.texture_snapshots.ids() {
+                renderer.free_texture(id);
             }
         }
 

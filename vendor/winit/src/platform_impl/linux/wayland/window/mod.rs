@@ -364,10 +364,12 @@ impl Window {
         self.window_state.lock().unwrap().has_focus()
     }
 
+    /// Wayland has no direct visibility query or compositor-level minimize query.
+    ///
+    /// The xdg-shell `SUSPENDED` repaint hint is the available hidden/minimized signal.
     #[inline]
     pub fn is_minimized(&self) -> Option<bool> {
-        // XXX clients don't know whether they are minimized or not.
-        None
+        Some(self.window_state.lock().unwrap().is_suspended())
     }
 
     #[inline]

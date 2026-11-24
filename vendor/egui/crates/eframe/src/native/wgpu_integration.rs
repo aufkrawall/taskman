@@ -898,7 +898,11 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            integration.post_rendering(window, true);
+            let reveal_first_frame = match viewport_output.get(&ViewportId::ROOT) {
+                Some(output) => first_frame_reveal_from_commands(&output.commands),
+                None => true,
+            };
+            integration.post_rendering(window, reveal_first_frame);
 
             vsync_secs
         } else {
@@ -1201,8 +1205,8 @@ fn effective_viewport_visible(
     native_window_visible: Option<bool>,
     first_frame_reveal: bool,
 ) -> bool {
-    info_visible.unwrap_or(true)
-        && (app_visible.unwrap_or(true) || native_window_visible == Some(true))
+    !matches!(app_visible, Some(false))
+        && info_visible.unwrap_or(true)
         && (first_frame_reveal || native_window_visible != Some(false))
 }
 
@@ -1247,6 +1251,16 @@ fn visible_viewport_with_window(viewports: &Viewports) -> Option<(ViewportId, Ar
             .as_ref()
             .map(|window| (viewport.ids.this, Arc::clone(window)))
     })
+}
+
+fn first_frame_reveal_from_commands(commands: &[egui::ViewportCommand]) -> bool {
+    let mut reveal = true;
+    for command in commands {
+        if let egui::ViewportCommand::Visible(visible) = command {
+            reveal = *visible;
+        }
+    }
+    reveal
 }
 
 fn render_immediate_viewport(
@@ -1587,10 +1601,21 @@ mod tests {
     #[test]
     fn visibility_honours_occlusion_hide_and_first_frame_reveal() {
         assert!(!effective_viewport_visible(Some(false), None, Some(true), true));
-        assert!(effective_viewport_visible(Some(true), Some(false), Some(true), false));
+        assert!(!effective_viewport_visible(Some(true), Some(false), Some(true), false));
+        assert!(!effective_viewport_visible(Some(true), Some(false), Some(true), true));
         assert!(!effective_viewport_visible(Some(true), None, Some(false), false));
         assert!(effective_viewport_visible(Some(true), None, Some(false), true));
         assert!(effective_viewport_visible(None, Some(true), None, false));
         assert!(!effective_viewport_visible(None, Some(false), None, false));
+    }
+
+    #[test]
+    fn last_first_frame_visibility_command_wins() {
+        use egui::ViewportCommand::{Close, Visible};
+
+        assert!(first_frame_reveal_from_commands(&[]));
+        assert!(!first_frame_reveal_from_commands(&[Visible(false)]));
+        assert!(first_frame_reveal_from_commands(&[Visible(false), Visible(true)]));
+        assert!(!first_frame_reveal_from_commands(&[Visible(true), Close, Visible(false)]));
     }
 }

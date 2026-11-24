@@ -162,6 +162,10 @@ pub struct WindowState {
     frame: Option<WinitFrame>,
 }
 
+fn is_suspended_state(state: XdgWindowState) -> bool {
+    state.contains(XdgWindowState::SUSPENDED)
+}
+
 impl WindowState {
     /// Create new window state.
     pub fn new(
@@ -582,6 +586,17 @@ impl WindowState {
     #[inline]
     pub fn is_configured(&self) -> bool {
         self.last_configure.is_some()
+    }
+
+    /// Whether the compositor marked this toplevel as suspended.
+    ///
+    /// xdg-shell's suspended state is the standardized repaint hint available when a
+    /// Wayland toplevel is hidden or minimized; clients have no direct visibility query.
+    #[inline]
+    pub fn is_suspended(&self) -> bool {
+        self.last_configure
+            .as_ref()
+            .is_some_and(|configure| is_suspended_state(configure.state))
     }
 
     #[inline]
@@ -1216,5 +1231,18 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
         Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
         Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
         None => sctk_adwaita::FrameConfig::auto(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspended_state_detection_tracks_xdg_window_state() {
+        assert!(!is_suspended_state(XdgWindowState::empty()));
+        assert!(is_suspended_state(XdgWindowState::SUSPENDED));
+        assert!(is_suspended_state(XdgWindowState::SUSPENDED | XdgWindowState::ACTIVATED));
+        assert!(!is_suspended_state(XdgWindowState::ACTIVATED | XdgWindowState::MAXIMIZED));
     }
 }
