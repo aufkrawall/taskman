@@ -131,9 +131,9 @@ impl TextureStore {
         self.textures.get(&id)
     }
 
-    /// Monotonic generation counter for `id` (bumped on full upload, on a partial update
-    /// that changes texels which already held content, and on free), used by tile damage
-    /// tracking.
+    /// Monotonic generation counter for `id` (bumped on full upload, on any partial update
+    /// of a non-atlas texture, on an atlas partial update that changes texels which already
+    /// held content, and on free), used by tile damage tracking.
     pub fn generation(&self, id: TextureId) -> u64 {
         self.generations.get(&id).copied().unwrap_or(0)
     }
@@ -217,9 +217,14 @@ impl TextureStore {
                 // allocated cell is always written in full -- both rasterizers loop over the
                 // whole width x height rect, zero coverage included -- and a zero-sized glyph
                 // is never allocated, so a cell cannot be partly occupied when it is reused.
-                // What would be missed is a patch writing content into transparent texels
-                // *inside* a still-live cell, which the allocator above never emits. Any
-                // other texture patched in place may change pixels of existing meshes.
+                // One case still escapes it: right after an overflow restart a new cell of a
+                // different size can overlap a still-live glyph cell and write content into
+                // that cell's transparent texels, which compares as "empty" and does not bump.
+                // That state cannot outlive the next pass: overflow pins `fill_ratio()` at 1.0,
+                // so `Fonts::begin_pass` recreates the whole atlas and the upload that follows
+                // is a full one that does bump -- at worst one frame of stale glyphs, in the
+                // state epaint already logs a warning about. Any other texture patched in place
+                // may change pixels of existing meshes.
                 if id != TextureId::Managed(0) || overwrote_live_texels {
                     self.bump_generation(id);
                 }
