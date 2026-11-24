@@ -1,3 +1,21 @@
+## 2026-11-24 - Hidden WGPU VRAM lifecycle and memory probe
+
+- eframe now avoids creating a WGPU surface/device for hidden viewports. When no viewport is
+  visible, app logic still ticks, but the frame's render-state clone, surfaces, renderer
+  textures, swapchain and `RenderState`/device are released. A visible repaint recreates them.
+- The suspended renderer retains CPU snapshots of managed full/partial texture updates and
+  replays them after recreation. This preserves the font atlas and icon textures; the
+  snapshots are removed on egui texture free and do not keep GPU resources alive.
+- Explicit `Visible(false)` now suppresses eframe's first-frame reveal and is authoritative
+  over a native window that still reports visible for a frame. Wayland's xdg-shell
+  `SUSPENDED` configure state is surfaced through winit as the hidden/minimized signal.
+- Visible WGPU allocation now selects `MemoryHints::MemoryUsage`, caps D3D12's non-sampler
+  descriptor heap at 8,192, and shrinks vertex/index buffers after sustained low use.
+- Added `tools/gpu-memory-probe.ps1` to measure one isolated child's per-LUID dedicated/shared
+  GPU-process memory. It isolates config/data, sanitizes inherited renderer controls, proves
+  Tray readiness, verifies a visible main window does not appear in hidden mode, and keeps
+  ETW-producing pages out of unattended runs.
+
 ## 2026-11-23 - Wayland classification final review corrections
 
 - The Linux collector now has one classifier mapper that passes

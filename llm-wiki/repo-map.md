@@ -578,9 +578,11 @@ than portable CI.
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded
 workspace.
 
-`vendor/winit/` is a single-crate patch of winit 0.30.13: `TASKMAN_WINDOW_BAND`
-makes window creation use `CreateWindowInBand` so an always-on-top TaskMan
-window can be created in native Task Manager's band 16, above the Start menu.
-`vendor/winit/TASKMAN-FORK.md` documents the change and the rebase steps;
+`vendor/winit/` is a patch of winit 0.30.13: `TASKMAN_WINDOW_BAND` makes window
+creation use `CreateWindowInBand` so an always-on-top TaskMan window can be
+created in native Task Manager's band 16, above the Start menu; other patches
+reset failed event-loop creation, harden Windows painting/capture/DPI paths, and
+expose xdg-shell `SUSPENDED` as Wayland's minimized/hidden signal.
+`vendor/winit/TASKMAN-FORK.md` documents the changes and rebase steps;
 `tools/check-fork.ps1` gates it too (clippy + tests, no fmt — upstream's tree
 is not formatted with this nightly rustfmt).

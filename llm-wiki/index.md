@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-11-23 (Linux privileged actions and current platform map)
+Last cross-checked: 2026-11-24 (hidden WGPU lifecycle, resident-memory tuning, and GPU probe)
 
 Primary sources:
 

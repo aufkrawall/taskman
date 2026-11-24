@@ -2,7 +2,7 @@
 
 This directory is a vendored copy of [`winit`](https://github.com/rust-windowing/winit)
 **0.30.13** (crates.io), reached only through `[patch.crates-io]` in the root
-`Cargo.toml`. It carries three patches.
+`Cargo.toml`. It carries four patches.
 
 ## 1. Window band for always-on-top
 
@@ -97,11 +97,30 @@ fixed upstream; the synthesized button release and the display-change
 invalidation are defensible upstream too, but this fork needs them now and
 carries them as one reviewed patch.
 
+## 4. Wayland suspended toplevels report minimized
+
+Wayland has no direct client query for window visibility or compositor minimize
+state. xdg-shell v6 added the `SUSPENDED` toplevel state to tell a client that
+repaint is suspended; SCTK already records it in `WindowConfigure.state`.
+
+### Files touched
+
+- `src/platform_impl/linux/wayland/window/state.rs`
+  - `WindowState::is_suspended()` tests `XdgWindowState::SUSPENDED` on the last
+    configure and has a pure bitflags regression test.
+- `src/platform_impl/linux/wayland/window/mod.rs`
+  - `Window::is_minimized()` returns `Some(window_state.is_suspended())` instead
+    of always returning `None`.
+
+Winit already queues a redraw for every configure, so eframe's visibility pass
+observes both suspension and resume. A compositor that does not advertise
+xdg-shell v6's suspended state remains unable to prove that the window is hidden.
+
 ## Rebase procedure
 
 1. Copy the new upstream crate over this directory (keep the deleted
    `Cargo.lock` deleted).
-2. Re-apply the three changes above; the marker comments start with
+2. Re-apply the four changes above; the marker comments start with
    `TaskMan fork:` (`grep -n "TaskMan fork:" vendor/winit/src` lists them).
 3. `pwsh tools/check-fork.ps1` (clippy + tests for this fork; `cargo fmt` is
    deliberately skipped because upstream's tree is not formatted with this

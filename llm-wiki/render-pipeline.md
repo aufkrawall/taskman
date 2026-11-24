@@ -4,7 +4,8 @@ Last verified: 2026-11-24 (GPU LCD path, manual D3D12/Vulkan validation, and Lin
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
-- `vendor/winit/TASKMAN-FORK.md` (window-band patch for always-on-top)
+- `vendor/winit/TASKMAN-FORK.md` (window-band, event-loop, Win32 reliability, and Wayland
+  suspended-state patches)
 - `vendor/egui/crates/egui_software/` (the CPU rasterizer)
 - `vendor/egui/crates/egui-wgpu/src/{renderer.rs,egui_lcd.wgsl}` (the GPU LCD path)
 - `vendor/egui/crates/eframe/src/native/software_integration.rs`
@@ -132,6 +133,26 @@ surface and presents with `BitBlt`, for four reasons that are all failure behavi
 Paint and present failures are **never fatal**: they warn, mark the surface unpainted and
 schedule a 50 ms retry. `EventResult::Wait` (not `RepaintNow`) is returned from inside
 `WM_PAINT`, because scheduling a repaint synchronously there recurses into the same paint.
+
+**Resident WGPU state follows viewport visibility.** eframe creates a device and surface only
+for a visible viewport. When no viewport remains on screen, hidden logic ticks continue, but
+`EpiIntegration::frame.wgpu_render_state` is cleared, all surfaces/depth/MSAA/capture state
+and managed renderer textures are freed, and the painter's `RenderState` and device are
+dropped. A later visible repaint recreates the device/renderer/surface. Managed textures are
+snapshotted on the CPU as egui uploads full or partial images; the latest full image is
+replayed into the replacement renderer so the font atlas and cached row icons survive the
+round-trip. An explicit `Visible(false)` suppresses eframe's first-frame reveal.
+
+Wayland has no direct window-visibility or minimize query. The vendored winit exposes
+xdg-shell v6's `SUSPENDED` configure hint through `Window::is_minimized()`, which makes a
+compositor-minimized or repaint-suspended toplevel enter the same hidden path. Compositors
+that do not advertise that hint remain a platform limitation.
+
+Visible WGPU sessions use `wgpu::MemoryHints::MemoryUsage`, cap D3D12's eager non-sampler
+descriptor heap at 8,192 bindings, and shrink historical vertex/index buffers after sustained
+low use. These settings lower allocation floors; they do not remove the LCD pipeline or change
+rendering. Device-loss recovery and custom callback/`WgpuSetup::Existing` resources remain
+outside the managed restore guarantee.
 
 ## Sub-pixel rendering, concretely
 

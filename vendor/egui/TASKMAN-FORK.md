@@ -339,6 +339,23 @@ It fails if the opt-in variable or a non-CPU D3D12/Vulkan adapter with
 color-glyph coverage is not practical; synthetic premultiplied color texels are covered in
 software and policy tests.
 
+### 16. `egui-wgpu` + `eframe`: release resident GPU state while hidden
+
+The renderer follows viewport visibility instead of keeping a dormant device and swapchain
+alive in the tray.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/eframe/src/native/wgpu_integration.rs` | Tracks explicit app visibility, does not call `set_window()` for hidden viewports, clears the `Frame` render-state clone, and calls `Painter::suspend()` after the final visible surface hides. Keeps logic-only ticks and visible-descendant rendering; the last first-frame `Visible` command controls eframe's reveal. | A hidden surface must not keep a device/swapchain merely because eframe still owns its viewport. |
+| `crates/egui-wgpu/src/winit.rs` | `Painter::suspend()` drops surfaces, depth/MSAA/capture state, managed textures and `RenderState`; CPU `TextureSnapshots` compose full/partial image updates and replay them into the replacement renderer. `max_texture_side` and subpixel capability remain cached. `destroy()` uses the same path. | egui sends texture bytes once and keeps metadata only, so dropping a renderer without replay loses the font atlas/icons. |
+| `crates/egui-wgpu/src/setup.rs` | Requests `MemoryHints::MemoryUsage`, caps native non-sampler bindings at 8,192, and retains the 8,192px texture-dimension limit. | wgpu's performance hints start with 128/64 MiB device/host blocks and D3D12 eagerly sizes its visible descriptor heap from a one-million-binding default. |
+| `crates/egui-wgpu/src/renderer.rs` | Shrinks vertex/index buffers only after 120 mostly-underused updates (including empty/callback-only frames), to twice the live requirement with an initial-capacity floor. | Large history cards should not pin an oversized buffer for the rest of the session. |
+
+**Coverage:** hardware-free tests cover root visibility/descendant decisions, first-frame
+command precedence, partial/full texture snapshot composition, texture free, allocation
+policy, and buffer-shrink hysteresis. The release gate exercises the renderer under the
+platform backend; the GPU-memory probe is the live end-to-end measurement.
+
 ## Rebase runbook
 
 ```
@@ -419,3 +436,10 @@ Things that are safe today but would silently break the sub-pixel path:
 - **`RowVisuals` / `glyph_vertex_range` changes** in `text_layout.rs`. The software text path
   consumes that mesh directly; it is the reason our glyph geometry is provably identical to
   the GPU backends rather than a reimplementation.
+- **Hidden GPU suspension.** Do not drop `RenderState` without clearing
+  `EpiIntegration::frame.wgpu_render_state` and preserving the managed-texture CPU snapshots.
+  Dropping it without replay loses glyph/icon textures; leaving any render-state clone keeps
+  the device and VRAM resident.
+- **First-frame reveal.** A final root `Visible(false)` must reach
+  `EpiIntegration::post_rendering(..., false)` or a start-in-tray launch flashes and can keep
+  a hidden surface allocated.

@@ -98,6 +98,19 @@ items across Phases 2–6. The following concrete gaps remain:
     manual GPU suite cannot create a real color glyph. Synthetic premultiplied color
     texels are covered in software, and renderer policy keeps all non-LCD texels on the
     ordinary blend. Revisit if upstream adds color-glyph rasterization.
+- **WGPU hidden-state restore has bounded scope.** eframe's `CreateNew` path releases the
+  surfaces, managed textures, renderer and device that it owns while TaskMan is hidden.
+  `WgpuSetup::Existing` keeps its configured device handle by design, and an application
+  retaining another `RenderState` clone or custom paint-callback GPU resources can keep
+  memory resident or require callback recreation. TaskMan uses `CreateNew`, retains no
+  clone, and installs no WGPU paint callbacks. Automatic recovery after a hard device-loss
+  event and capability drift on a replacement device are also not implemented; normal
+  suspend/recreate selects the same surface-compatible adapter.
+- **Wayland hidden-state signal depends on xdg-shell v6.** The winit fork maps the
+  `SUSPENDED` xdg-toplevel configure state to `Window::is_minimized()`, and winit requests a
+  redraw whenever a configure arrives. A compositor that does not advertise the state (or
+  omits it when minimizing) provides no client-side proof that the window is hidden, so the
+  Vulkan window can remain resident on that legacy/non-compliant path.
 - **Software rendering performance: SUPERSEDED.** CPU mode directly rasterizes
   the UI. The old WARP path measured about 14 cores at 2.9 fps. D3D12 and Vulkan
   select a surface-compatible GPU.

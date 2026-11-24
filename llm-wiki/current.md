@@ -647,6 +647,11 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   (`DWMWA_CLOAK`) before it is shown and uncloaked two frames later, once a
   real frame has been presented — a hidden window is never painted, so there
   was nothing behind it when `ShowWindow` composed it.
+- **GPU-resident state follows visibility.** Hiding the last surface to the
+  tray/minimized state/occlusion drops the WGPU surface, renderer, texture cache
+  and device while app logic continues; the visible path recreates them lazily
+  and replays CPU texture snapshots. Visible sessions use memory-oriented wgpu
+  allocator hints and a bounded D3D12 descriptor heap.
 - **egui's scroll-edge fades are off.** They read as shadows lying on the
   tables.
 - **Row names split by page**: Details shows the image name only

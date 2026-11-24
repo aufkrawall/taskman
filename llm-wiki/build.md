@@ -290,6 +290,14 @@ bytes. The final service/tray/reliability build is 13,873,664 bytes versus the
 the new features. The separate always-running service is 1,378,816 bytes. See
 `debug-tools.md` for overrides.
 
+The WGPU device requests `MemoryHints::MemoryUsage`, because this 2D monitor UI has
+small, infrequent uploads and does not benefit from wgpu's performance-sized
+suballocation blocks. D3D12's `max_non_sampler_bindings` is capped at 8,192,
+which still leaves ample room for the bounded icon cache plus custom UI bind
+groups but avoids the default million-entry visible descriptor heap. Hidden
+windows release the device and swapchain entirely rather than keeping this
+state resident at a lower frame rate.
+
 The service has no GUI/eframe dependency. Keeping it in a separate binary
 prevents an always-running renderer, GPU stack, or broad GUI parser from
 becoming part of the LocalSystem attack surface.

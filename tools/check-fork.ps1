@@ -12,7 +12,8 @@
     not lint egui's demo, plot, extras or kittest crates -- we never build those, they carry
     upstream's own lint debt, and failing on it would make every rebase a cleanup project.
 
-    `vendor/winit` is a single-crate patch (window band 16, see
+    `vendor/winit` carries a small set of platform patches (window band, event-loop
+    reset, Win32 reliability, and Wayland suspended-state reporting; see
     vendor/winit/TASKMAN-FORK.md). It gets clippy + tests but NOT `cargo fmt`: upstream's
     tree is not formatted with this nightly rustfmt (1,100+ diffs in untouched files), and
     reformatting it would turn every rebase into a churn exercise.
