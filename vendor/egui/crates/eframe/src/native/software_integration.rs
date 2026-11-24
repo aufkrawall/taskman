@@ -576,21 +576,24 @@ mod platform_surface {
 
     /// One frame's pixels, in the shape the shared paint path asks for.
     ///
-    /// `softbuffer` hands out a `Buffer` that derefs to the pixel slice but
-    /// knows nothing about the lifetime of its contents, which the shared path
-    /// needs for `age()`: every softbuffer backend reuses the same segment (X11
-    /// and Wayland both keep one back buffer), so the pixels survive a frame
-    /// once one has been presented into them.
+    /// `softbuffer` hands out a `Buffer` that derefs to the pixel slice and also
+    /// reports the age of its contents. That age is the only sound answer to the
+    /// question the shared paint path asks: a backend may hand back a buffer that
+    /// was never painted (`age == 0`) or one that holds the frame from *two*
+    /// presents ago (`age == 2`; Wayland keeps two `wl_shm` buffers and swaps them
+    /// on every present, and a released buffer's contents are undefined).
+    /// Painting incrementally into either one leaves every undamaged pixel as
+    /// whatever that buffer happened to contain -- stale or uninitialised
+    /// regions, which is exactly how the Linux window ends up with black boxes.
     pub(super) struct FrameBuffer<'a> {
         buffer: softbuffer::Buffer<'a, Arc<Window>, Arc<Window>>,
-        age: u8,
     }
 
     impl FrameBuffer<'_> {
-        /// `1` when this buffer already holds presented pixels, `0` for a
-        /// first frame that must be painted in full.
+        /// `softbuffer`'s own age: `1` only for the buffer that was presented on
+        /// the previous frame, at the size the pixels were painted at.
         pub(super) fn age(&self) -> u8 {
-            self.age
+            self.buffer.age()
         }
 
         pub(super) fn pixels_mut(&mut self) -> &mut [u32] {
@@ -604,8 +607,6 @@ mod platform_surface {
         surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
         _context: softbuffer::Context<Arc<Window>>,
         pub(super) size: (u32, u32),
-        /// A frame reached the window, so the reused buffer holds real pixels.
-        presented: bool,
     }
 
     impl SurfaceState {
@@ -621,7 +622,6 @@ mod platform_surface {
                 surface,
                 _context: context,
                 size: (0, 0),
-                presented: false,
             })
         }
 
@@ -641,12 +641,11 @@ mod platform_surface {
         }
 
         pub(super) fn buffer_mut(&mut self) -> Result<FrameBuffer<'_>, String> {
-            let age = u8::from(self.presented);
             let buffer = self
                 .surface
                 .buffer_mut()
                 .map_err(|err| format!("softbuffer buffer: {err}"))?;
-            Ok(FrameBuffer { buffer, age })
+            Ok(FrameBuffer { buffer })
         }
 
         #[expect(clippy::unused_self)]
@@ -689,7 +688,6 @@ mod platform_surface {
                 }
             };
             presented.map_err(|err| format!("softbuffer present: {err}"))?;
-            self.presented = true;
             Ok(())
         }
     }
@@ -1537,6 +1535,33 @@ mod tests {
         // Any buffer age other than 1 (new/resized/failed present) forces full.
         assert!(should_force_full_paint(true, true, 0));
         assert!(should_force_full_paint(true, true, 2));
+    }
+
+    /// `softbuffer`'s Wayland backend keeps two `wl_shm` buffers and swaps them on every
+    /// present, so after the first present no buffer is ever one age old: the one it hands
+    /// back holds pixels from two presents ago, or nothing at all. Only `age == 1` may be
+    /// painted incrementally, so a ring needs a full paint on every frame -- painting just
+    /// the changed tiles into a buffer that never held the rest of the frame is what left
+    /// black boxes and stale regions on Linux.
+    #[test]
+    fn a_two_buffer_ring_always_needs_a_full_paint() {
+        let mut front_age = 0u8;
+        let mut back_age = 0u8;
+        let mut presented_while_visible = false;
+        for frame in 0..6 {
+            assert!(
+                should_force_full_paint(frame > 0, presented_while_visible, back_age),
+                "frame {frame}: a buffer of age {back_age} was painted incrementally"
+            );
+            presented_while_visible = true;
+            // Exactly what `softbuffer` does on a present: swap, then age both buffers.
+            let mut next_back = front_age;
+            if next_back != 0 {
+                next_back += 1;
+            }
+            front_age = 1;
+            back_age = next_back;
+        }
     }
 
     #[test]

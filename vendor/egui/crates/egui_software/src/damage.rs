@@ -51,7 +51,13 @@ pub(crate) struct FrameKey {
     pub contrast_bits: u32,
     pub round_rects_to_pixels: bool,
     pub round_text_to_pixels: bool,
+    pub round_line_segments_to_pixels: bool,
     pub coarse_tessellation_culling: bool,
+    pub feathering: bool,
+    pub feathering_size_bits: u32,
+    pub prerasterized_discs: bool,
+    pub bezier_tolerance_bits: u32,
+    pub epsilon_bits: u32,
     pub font_tex_size: [usize; 2],
 }
 
@@ -79,9 +85,20 @@ impl FrameKey {
             subpixel: subpixel as u8,
             gamma_bits: f32_bits(gamma),
             contrast_bits: f32_bits(contrast),
+            // Every tessellation option that changes pixels for unmodified shapes, not just
+            // the ones the app happens to set at startup: a tile hash is only sound if two
+            // frames with equal hashes and an equal key really do produce equal pixels.
+            // The `debug_*` toggles are deliberately absent: they change the shapes that are
+            // emitted, which the shape hash already covers.
             round_rects_to_pixels: ctx.options.round_rects_to_pixels,
             round_text_to_pixels: ctx.options.round_text_to_pixels,
+            round_line_segments_to_pixels: ctx.options.round_line_segments_to_pixels,
             coarse_tessellation_culling: ctx.options.coarse_tessellation_culling,
+            feathering: ctx.options.feathering,
+            feathering_size_bits: f32_bits(ctx.options.feathering_size_in_pixels),
+            prerasterized_discs: ctx.options.prerasterized_discs,
+            bezier_tolerance_bits: f32_bits(ctx.options.bezier_tolerance),
+            epsilon_bits: f32_bits(ctx.options.epsilon),
             font_tex_size: ctx.font_tex_size,
         }
     }
@@ -598,6 +615,11 @@ fn hash_clipped_shape(
             h.write_f32(*radius);
             h.write_color(*fill);
             h.write_stroke(*stroke);
+            // A small filled circle can be tessellated through a prerasterized disc that
+            // lives in the font atlas, so its pixels may depend on that atlas even though the
+            // shape names no texture. Hashing the atlas here keeps that invariant local
+            // instead of relying on the atlas size and gamma/contrast being keyed too.
+            h.write_texture_id(TextureId::Managed(0), textures);
         }
         Shape::Ellipse(EllipseShape {
             center,
@@ -708,6 +730,13 @@ mod tests {
         }
     }
 
+    fn clipped_rect(clip: Rect, rect: Rect, fill: Color32) -> ClippedShape {
+        ClippedShape {
+            clip_rect: clip,
+            shape: Shape::rect_filled(rect, CornerRadius::ZERO, fill),
+        }
+    }
+
     fn setup_painter() -> Painter {
         let mut p = Painter::new();
         p.set_texture(
@@ -718,6 +747,157 @@ mod tests {
             ),
         );
         p
+    }
+
+    /// With no shapes at all every tile hash is identical from frame to frame, so only the
+    /// frame key can force the repaint. Anything that changes pixels but is missing from
+    /// the key leaves stale tiles behind.
+    #[test]
+    fn global_render_state_changes_force_full_damage() {
+        let mut painter = setup_painter();
+        let mut ctx = shape_ctx();
+        let mut buf = vec![0u32; (W * H) as usize];
+        let mut target = Target::new(&mut buf, W, H).unwrap();
+
+        let first = painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), BG, true);
+        assert_eq!(first.dirty_tiles, first.total_tiles);
+        let same = painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), BG, false);
+        assert_eq!(same.dirty_tiles, 0, "an identical frame must not repaint");
+
+        // Each step below changes exactly one input of the frame key, so the full
+        // invalidation can only come from that input.
+        ctx.pixels_per_point = 2.0;
+        let scaled = painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), BG, false);
+        assert_eq!(scaled.dirty_tiles, scaled.total_tiles, "pixels per point");
+
+        let white =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(white.dirty_tiles, white.total_tiles, "clear colour");
+
+        ctx.options.feathering = false;
+        let plain =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(plain.dirty_tiles, plain.total_tiles, "feathering");
+
+        ctx.font_tex_size = [2048, 64];
+        let atlas =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(atlas.dirty_tiles, atlas.total_tiles, "font atlas size");
+
+        ctx.options.bezier_tolerance = 0.5;
+        let curves =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(curves.dirty_tiles, curves.total_tiles, "bezier tolerance");
+
+        ctx.options.epsilon = 1.0e-3;
+        let epsilon =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(epsilon.dirty_tiles, epsilon.total_tiles, "float epsilon");
+    }
+
+    /// Damage rects are physical pixels and must stay inside the target even when the window
+    /// size is not a multiple of the tile size: the present path turns each one into a
+    /// `softbuffer::Rect`, where an out-of-range rect is a present error, and a gap would
+    /// leave painted tiles unpresented.
+    #[test]
+    fn odd_sized_targets_get_in_bounds_disjoint_damage_rects() {
+        const OW: u32 = 200; // four tiles wide; the last one is 8 px
+        const OH: u32 = 130; // three tile rows; the last one is 2 px
+        let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(OW as f32, OH as f32));
+        let bg = clipped_rect(clip, clip, Color32::from_rgb(30, 30, 30));
+        let dot = Rect::from_min_max(pos2(188.0, 118.0), pos2(200.0, 130.0));
+        let dot_a = clipped_rect(clip, dot, Color32::from_rgb(60, 60, 60));
+        let dot_b = clipped_rect(clip, dot, Color32::from_rgb(0, 120, 212));
+        let frame_a = vec![bg.clone(), dot_a];
+        let frame_b = vec![bg, dot_b];
+
+        let mut painter = setup_painter();
+        let ctx = shape_ctx();
+        let mut buf = vec![0u32; (OW * OH) as usize];
+        {
+            let mut target = Target::new(&mut buf, OW, OH).unwrap();
+            let first = painter.paint_shapes_damaged(&mut target, &ctx, frame_a, BG, true);
+            assert_eq!(first.dirty_tiles, first.total_tiles);
+            assert_eq!(first.total_tiles, 12, "4 x 3 tiles at 200 x 130");
+
+            let second =
+                painter.paint_shapes_damaged(&mut target, &ctx, frame_b.clone(), BG, false);
+            assert!(
+                second.dirty_tiles > 0 && second.dirty_tiles < second.total_tiles,
+                "expected partial damage, got {}/{} tiles",
+                second.dirty_tiles,
+                second.total_tiles
+            );
+            let mut clipped_corner = false;
+            for rect in &second.dirty_rects {
+                assert!(!rect.is_empty(), "empty damage rect {rect:?}");
+                assert!(rect.min_x >= 0 && rect.min_y >= 0, "negative {rect:?}");
+                assert!(
+                    rect.max_x <= OW as i32 && rect.max_y <= OH as i32,
+                    "past the edge {rect:?}"
+                );
+                clipped_corner |= rect.max_x == OW as i32 && rect.max_y == OH as i32;
+            }
+            assert!(clipped_corner, "the clipped corner tile is missing");
+            for (i, a) in second.dirty_rects.iter().enumerate() {
+                for b in &second.dirty_rects[i + 1..] {
+                    assert!(a.intersect(*b).is_empty(), "{a:?} overlaps {b:?}");
+                }
+            }
+        }
+
+        let mut full_painter = setup_painter();
+        let mut full_buf = vec![0u32; (OW * OH) as usize];
+        {
+            let mut target = Target::new(&mut full_buf, OW, OH).unwrap();
+            Painter::clear(&mut target, BG);
+            full_painter.paint_shapes(&mut target, &ctx, frame_b);
+        }
+
+        assert_eq!(
+            buf, full_buf,
+            "a damaged repaint at an odd size must match a full repaint bit-for-bit"
+        );
+    }
+
+    /// A mesh's pixels come from its texture, so a patch to that texture has to re-dirty the
+    /// tiles under the mesh even though the mesh itself is unchanged.
+    #[test]
+    fn patching_a_texture_dirties_the_tiles_that_draw_it() {
+        let mut painter = setup_painter();
+        let texture = TextureId::User(7);
+        let upload = ImageDelta::full(
+            ColorImage::new([2, 2], vec![Color32::RED; 4]),
+            TextureOptions::NEAREST,
+        );
+        painter.set_texture(texture, &upload);
+        let patch = ImageDelta::partial(
+            [0, 0],
+            ColorImage::new([1, 1], vec![Color32::GREEN]),
+            TextureOptions::NEAREST,
+        );
+        let ctx = shape_ctx();
+        let quad = Rect::from_min_max(pos2(0.0, 0.0), pos2(64.0, 64.0));
+        let mut mesh = epaint::Mesh::default();
+        mesh.add_colored_rect(quad, Color32::WHITE);
+        mesh.texture_id = texture;
+        let shapes = vec![ClippedShape {
+            clip_rect: full_clip(),
+            shape: Shape::Mesh(mesh),
+        }];
+
+        let mut buf = vec![0u32; (W * H) as usize];
+        let mut target = Target::new(&mut buf, W, H).unwrap();
+        painter.paint_shapes_damaged(&mut target, &ctx, shapes.clone(), BG, true);
+        let same = painter.paint_shapes_damaged(&mut target, &ctx, shapes.clone(), BG, false);
+        assert_eq!(same.dirty_tiles, 0, "an identical frame must not repaint");
+
+        painter.set_texture(texture, &patch);
+        let patched = painter.paint_shapes_damaged(&mut target, &ctx, shapes, BG, false);
+        assert!(
+            patched.dirty_tiles > 0,
+            "a texture patch left the mesh's tiles clean"
+        );
     }
 
     #[test]
