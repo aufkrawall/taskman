@@ -73,12 +73,12 @@ pub struct WheelState {
     /// `time` of the pass that started the current smoothing burst,
     /// or `None` when no delta is pending.
     ///
-    /// TASKMAN-FORK (#16): the burst is bounded in wall clock time from here,
+    /// TASKMAN-FORK (#17): the burst is bounded in wall clock time from here,
     /// see `WHEEL_BURST_DECAY_SECONDS`.
     pub burst_start: Option<f64>,
     /// How many passes the current smoothing burst has taken so far.
     ///
-    /// TASKMAN-FORK (#16): bounds the burst even when the `dt` it is given says
+    /// TASKMAN-FORK (#17): bounds the burst even when the `dt` it is given says
     /// less time passed than really did, see `WHEEL_BURST_MAX_FRAMES`.
     pub burst_frames: u32,
 }
@@ -99,7 +99,7 @@ impl Default for WheelState {
     }
 }
 
-// TASKMAN-FORK (#16): a wheel notch is smoothed as a *burst* — a finite decay
+// TASKMAN-FORK (#17): a wheel notch is smoothed as a *burst* — a finite decay
 // that lands on exactly zero — instead of the asymptotic filter upstream used.
 //
 // Upstream smoothed with `exponential_smooth_factor(0.90, 0.1, dt)`, i.e. 90 %
@@ -111,29 +111,45 @@ impl Default for WheelState {
 //
 // The curve below reaches 99.9 % in the same 0.1 s: `1 - 0.001^(dt / 0.1)` per
 // pass is 68.4 % at 60 Hz, 43.8 % at 120 Hz and 25.0 % at 240 Hz, so one 40 px
-// notch becomes 27.35 / 8.65 / 2.73 / 0.86 / 0.40 px at 60 Hz — five passes,
+// notch becomes 27.35 / 8.65 / 2.74 / 0.86 / 0.40 px at 60 Hz — five passes,
 // 83 ms, every step smaller than the one before it and the last one exact
 // (the bare curve would still be at 0.04 px after 0.1 s; the epsilon below
 // lands that sliver instead of dribbling it out).
+//
+// What the ending pass can land is bounded, not zero: the epsilon flush adds at
+// most `WHEEL_BURST_TAIL_EPSILON` (0.2 pt) to the curve's own step, which
+// measures 1.0 % of a notch at 30-60 Hz (0.40 px), 0.56 % at 120-240 Hz
+// (0.22 px); the clock budget lands whatever the curve still owes after the
+// full 0.1 s of decay, which is 0.1 % of the impulse by construction. Both are
+// sub-pixel for a single notch, and neither can leave a residual for a later
+// frame.
 const WHEEL_BURST_DECAY_SECONDS: f32 = 0.1;
 
 /// Fraction of a burst the decay curve delivers within
 /// [`WHEEL_BURST_DECAY_SECONDS`].
 const WHEEL_BURST_REACH: f32 = 0.999;
 
-/// Hard cap on the passes one burst may take, independent of `dt`.
+/// Failsafe cap on the passes one burst may take, independent of `dt`.
 ///
-/// 6 passes is 0.1 s at 60 Hz, i.e. the point where the time budget lands on
-/// its own; at higher refresh rates the burst lands earlier (after the same
-/// decreasing steps, just shorter), and an event loop that reports a nominal
-/// `dt` while its frames arrive late cannot stretch the tail past this.
-const WHEEL_BURST_MAX_FRAMES: u32 = 6;
+/// The curve needs 5 passes at 60 Hz, 10 at 120 Hz and 19 at 240 Hz, and the
+/// clock budget below ends any of those at its own 0.1 s. The cap only matters
+/// where `dt` is fine but a *large* impulse keeps the tail alive past the
+/// budget — a 640 px coalesced spin needs 32 passes at 500 Hz — so 64 keeps it
+/// out of the way of every honest frame rate up to ~640 Hz while still bounding
+/// the pathological case the clock cannot catch: a loop that reports a nominal
+/// `dt` while its frames really arrive far apart. The capped pass lands the
+/// whole remainder instead of decaying another fraction of it; a jump then is
+/// strictly better than a crawl, and by 64 honest passes at ≤ 100 ms of wall
+/// clock the remainder is sub-pixel anyway.
+const WHEEL_BURST_MAX_FRAMES: u32 = 64;
 
 /// A residual this small (in points) is not worth another frame — 0.2 pt is a
-/// fifth of a pixel, and `InputState::wants_repaint_after` only asks for a
-/// follow-up pass above this size, so a smaller remainder would surface on some
-/// later, unrelated frame as a lone mini-step. Deliver it in the current pass
-/// instead.
+/// fifth of a pixel, so delivering it as one step cannot be seen. It must stay
+/// comfortably above `WHEEL_SMOOTHING_RESIDUAL_PX` in `input_state/mod.rs`, the
+/// size below which `InputState::wants_repaint_after` stops asking for a
+/// follow-up pass: this epsilon lands every remainder that would otherwise be
+/// below that line, so no burst can leave a sliver for some later, unrelated
+/// frame to deliver as a lone mini-step.
 const WHEEL_BURST_TAIL_EPSILON: f32 = 0.2;
 
 impl WheelState {
@@ -210,9 +226,14 @@ impl WheelState {
                 } else {
                     // A new notch starts (or joins) a smoothing burst, so it gets
                     // its own budgets instead of inheriting the frames the
-                    // previous notch has already used (TASKMAN-FORK #16).
-                    self.burst_start = Some(time);
-                    self.burst_frames = 0;
+                    // previous notch has already used (TASKMAN-FORK #17). A
+                    // zero-delta report — a buffered `Move` with no travel — must
+                    // not restart them, or it could hold a pending residual's
+                    // clock budget open and clear its frame cap for free.
+                    if delta != Vec2::ZERO {
+                        self.burst_start = Some(time);
+                        self.burst_frames = 0;
+                    }
                     if is_zoom {
                         self.unprocessed_zoom_delta += delta;
                     } else {
@@ -230,6 +251,11 @@ impl WheelState {
                 self.smooth_zoom_delta += self.unprocessed_zoom_delta;
                 self.unprocessed_wheel_delta = Default::default();
                 self.unprocessed_zoom_delta = Default::default();
+                // The batch is delivered, so it must not leave a budget open:
+                // `advance_burst` would otherwise report a live burst with
+                // nothing pending until its next pass clears the fields.
+                self.burst_start = None;
+                self.burst_frames = 0;
             }
             crate::TouchPhase::Cancel => {
                 self.status = Status::Static;
@@ -238,6 +264,8 @@ impl WheelState {
                 self.unprocessed_zoom_delta = Default::default();
                 self.smooth_wheel_delta = Default::default();
                 self.smooth_zoom_delta = Default::default();
+                self.burst_start = None;
+                self.burst_frames = 0;
             }
         }
     }
@@ -263,14 +291,13 @@ impl WheelState {
 
     /// Deliver one pass of the current smoothing burst.
     ///
-    /// TASKMAN-FORK (#16): the burst is bounded twice — by wall clock, from the
-    /// pass that started it, and by frame count. The time bound keeps a late
-    /// frame from spreading the decay over more seconds than a notch should
-    /// take; the frame bound keeps a loop that under-reports `dt` (the smoothing
-    /// follow-ups are scheduled with a duration, so `stable_dt` is the
-    /// *predicted* frame time there) from spreading it over more passes. Once
-    /// either budget is spent, the pass delivers what is left instead of handing
-    /// back a tail for some later frame to dump.
+    /// TASKMAN-FORK (#17): the burst is bounded twice — by wall clock, from the
+    /// pass that started it, and by a failsafe frame count. The time bound keeps
+    /// a late frame from spreading the decay over more seconds than a notch
+    /// should take; the frame bound catches a loop that reports a nominal `dt`
+    /// while its frames arrive far apart. Either bound lands the whole
+    /// remainder in that pass instead of handing back a tail for some later
+    /// frame to dump.
     fn advance_burst(&mut self, time: f64, dt: f32) {
         if self.unprocessed_wheel_delta == Vec2::ZERO && self.unprocessed_zoom_delta == Vec2::ZERO {
             self.burst_start = None;
@@ -280,28 +307,44 @@ impl WheelState {
 
         let start = *self.burst_start.get_or_insert(time);
         let elapsed = (time - start).max(0.0);
-        let landing = elapsed + f64::from(dt) >= f64::from(WHEEL_BURST_DECAY_SECONDS)
-            || self.burst_frames + 1 >= WHEEL_BURST_MAX_FRAMES;
+        // Two separate triggers on purpose: the clock budget may end a burst
+        // mid-curve, so it hands over what the curve still owes; the frame cap
+        // is the failsafe for a `dt` that under-reports real time, so it has to
+        // stop the decay outright or it would keep crawling.
+        let over_budget = elapsed + f64::from(dt) >= f64::from(WHEEL_BURST_DECAY_SECONDS);
+        let over_cap = self.burst_frames + 1 >= WHEEL_BURST_MAX_FRAMES;
 
         let factor = crate::emath::exponential_smooth_factor(
             WHEEL_BURST_REACH,
             WHEEL_BURST_DECAY_SECONDS,
             dt,
         );
-        if factor <= 0.0 {
+        if factor.is_nan() || factor <= 0.0 {
             // A pass that did not advance time cannot advance the decay, and it
-            // must not spend the frame budget either.
+            // must not spend the frame budget either. A NaN `dt` would otherwise
+            // reach `burst_step` and turn both deltas into a residual that never
+            // equals zero.
             return;
         }
 
         // Scroll and zoom share the curve and the budgets, but never each
         // other's deltas.
         for d in 0..2 {
-            let wheel_step = burst_step(self.unprocessed_wheel_delta[d], factor, landing);
+            let wheel_step = burst_step(
+                self.unprocessed_wheel_delta[d],
+                factor,
+                over_budget,
+                over_cap,
+            );
             self.smooth_wheel_delta[d] += wheel_step;
             self.unprocessed_wheel_delta[d] -= wheel_step;
 
-            let zoom_step = burst_step(self.unprocessed_zoom_delta[d], factor, landing);
+            let zoom_step = burst_step(
+                self.unprocessed_zoom_delta[d],
+                factor,
+                over_budget,
+                over_cap,
+            );
             self.smooth_zoom_delta[d] += zoom_step;
             self.unprocessed_zoom_delta[d] -= zoom_step;
         }
@@ -380,26 +423,36 @@ impl WheelState {
 
 /// How much of one axis of a smoothing burst to hand to the UI this pass.
 ///
-/// TASKMAN-FORK (#16): returns the part of `left` to deliver and leaves the rest
+/// TASKMAN-FORK (#17): returns the part of `left` to deliver and leaves the rest
 /// as residual, so the caller can zero it explicitly once `left` is `0.0`.
-fn burst_step(left: f32, factor: f32, landing: bool) -> f32 {
+///
+/// `over_budget` ends a burst that has spent its 0.1 s of decay. What is left
+/// there is `(1 - reach)^(1 - dt / decay)` of the impulse — 0.32 % at 60 Hz,
+/// 1 % at 30 Hz — because the budget fires as soon as `elapsed + dt` reaches the
+/// window, so handing the rest over in this pass is a sub-pixel step for a
+/// single notch and reads as the decay reaching zero. `over_cap` is the
+/// failsafe: it stops the decay outright, see [`WHEEL_BURST_MAX_FRAMES`].
+fn burst_step(left: f32, factor: f32, over_budget: bool, over_cap: bool) -> f32 {
     let remaining = left.abs();
     if remaining == 0.0 {
         return 0.0;
     }
+    if over_cap {
+        return left;
+    }
 
-    // A natural pass delivers `factor` of what is left. The landing pass
-    // delivers all of it — but never more than the previous pass delivered, so
-    // the burst ends with a decreasing step instead of a jump;
-    // `factor / (1 - factor)` times the remainder is exactly the previous step.
-    let step = if landing {
-        (factor / (1.0 - factor) * remaining).min(remaining)
+    // A natural pass delivers `factor` of what is left; the pass that ends the
+    // budget delivers all of it.
+    let step = if over_budget {
+        remaining
     } else {
         factor * remaining
     };
 
     // Land early rather than leave a sliver that only a much later frame would
-    // deliver (see `WHEEL_BURST_TAIL_EPSILON`).
+    // deliver (see `WHEEL_BURST_TAIL_EPSILON`). The flush can be up to one
+    // epsilon larger than the step the curve wanted, which is at most a fifth of
+    // a pixel and therefore invisible.
     let step = if remaining - step <= WHEEL_BURST_TAIL_EPSILON {
         remaining
     } else {
@@ -417,10 +470,22 @@ mod tests {
     const DT_60: f32 = 1.0 / 60.0;
     const DT_120: f32 = 1.0 / 120.0;
 
-    /// One `Line` notch, in lines, and the points it is worth at the default
-    /// `InputOptions::line_scroll_speed` of 40.
+    /// One `Line` notch, in lines, and the points it is worth at the scroll
+    /// speed these tests pin.
     const NOTCH_LINES: f32 = 1.0;
     const NOTCH_PX: f32 = 40.0;
+
+    /// The `InputOptions` these tests feed the kernel.
+    ///
+    /// `line_scroll_speed` is pinned instead of taken from `InputOptions::default`,
+    /// which is 8.0 (not 40.0) on a wasm target — every notch expectation below
+    /// would silently be wrong there.
+    fn options() -> InputOptions {
+        InputOptions {
+            line_scroll_speed: 40.0,
+            ..Default::default()
+        }
+    }
 
     fn viewport() -> Rect {
         Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))
@@ -430,7 +495,7 @@ mod tests {
     fn wheel_notch(state: &mut WheelState, time: f64, modifiers: Modifiers, lines: f32) {
         state.on_wheel_event(
             viewport(),
-            &InputOptions::default(),
+            &options(),
             time,
             MouseWheelUnit::Line,
             vec2(0.0, lines),
@@ -544,23 +609,78 @@ mod tests {
         );
     }
 
-    /// The frame budget lands the burst too, and it lands it smoothly: the last
-    /// step is not bigger than the one before it.
+    /// The frame budget is a real cap: even when the reported `dt` under-reports
+    /// real time, the burst ends on the capped pass instead of decaying another
+    /// fraction of the remainder — which is what let the old tail crawl.
     #[test]
-    fn hard_frame_cap_lands_smoothly() {
-        // ~90 Hz: six passes are 66 ms, so the frame budget — not the 100 ms
-        // clock budget — is what ends this burst.
-        const DT_90: f32 = 0.011;
-        let (state, steps) = notch_and_run(DT_90, NOTCH_LINES, WHEEL_BURST_MAX_FRAMES as usize);
+    fn frame_cap_ends_the_burst_instead_of_crawling() {
+        // 1 ms reported frames: the bare curve needs ~100 passes to land 40 px,
+        // so only the frame cap can end this burst.
+        const DT_1MS: f32 = 0.001;
+        let mut state = WheelState::default();
+        let mut time = 0.0;
+        wheel_notch(&mut state, time, Modifiers::NONE, NOTCH_LINES);
 
-        let total: f32 = steps.iter().sum();
-        assert!(
-            (total - NOTCH_PX).abs() < 0.01,
-            "delivered {total} px instead of {NOTCH_PX} px: {steps:?}"
-        );
-        assert_eq!(state.unprocessed_wheel_delta, Vec2::ZERO);
-        for pair in steps.windows(2) {
-            assert!(pair[1] <= pair[0], "landing stepped up: {steps:?}");
+        let mut passes = 0;
+        while state.unprocessed_wheel_delta != Vec2::ZERO {
+            state.smooth_wheel_delta = Vec2::ZERO;
+            state.after_events(time, DT_1MS);
+            time += f64::from(DT_1MS);
+            passes += 1;
+            assert!(
+                passes <= WHEEL_BURST_MAX_FRAMES as usize,
+                "frame cap never ended the burst"
+            );
+        }
+
+        assert_eq!(passes, WHEEL_BURST_MAX_FRAMES as usize);
+        assert!(state.burst_start.is_none(), "burst budget was left open");
+    }
+
+    /// Whatever the refresh rate, one notch is completely delivered inside the
+    /// clock budget and never steps back up — the tail the user saw is gone.
+    #[test]
+    fn every_refresh_rate_lands_the_notch_quickly() {
+        for (name, dt) in [
+            ("60 Hz", DT_60),
+            ("120 Hz", DT_120),
+            ("240 Hz", 1.0 / 240.0),
+        ] {
+            let mut state = WheelState::default();
+            let mut time = 0.0;
+            wheel_notch(&mut state, time, Modifiers::NONE, NOTCH_LINES);
+
+            let mut steps = Vec::new();
+            let mut elapsed = 0.0_f32;
+            while state.unprocessed_wheel_delta != Vec2::ZERO {
+                state.smooth_wheel_delta = Vec2::ZERO;
+                state.after_events(time, dt);
+                steps.push(state.smooth_wheel_delta.y);
+                time += f64::from(dt);
+                elapsed += dt;
+                assert!(
+                    elapsed <= WHEEL_BURST_DECAY_SECONDS + dt,
+                    "{name}: burst still alive after {elapsed} s: {steps:?}"
+                );
+            }
+
+            let total: f32 = steps.iter().sum();
+            assert!(
+                (total - NOTCH_PX).abs() < 0.01,
+                "{name}: delivered {total} px instead of {NOTCH_PX} px: {steps:?}"
+            );
+            for pair in steps.windows(2) {
+                // The early-landing flush may deliver up to one epsilon more
+                // than the curve wanted (a fifth of a pixel, invisible); beyond
+                // the ending pass the decay never steps back up. (The budget and
+                // cap passes deliberately land the whole remainder, so this
+                // allowance does not cover them - neither is reached at these
+                // rates.)
+                assert!(
+                    pair[1] <= pair[0] + WHEEL_BURST_TAIL_EPSILON,
+                    "{name}: step grew again: {steps:?}"
+                );
+            }
         }
     }
 
