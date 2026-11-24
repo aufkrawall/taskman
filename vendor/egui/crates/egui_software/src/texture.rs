@@ -181,6 +181,7 @@ impl TextureStore {
                     return;
                 };
                 tex.options = delta.options;
+                let mut overwrote_live_texels = false;
                 for row in 0..h {
                     let dst_y = y + row;
                     if dst_y >= tex.height {
@@ -190,13 +191,24 @@ impl TextureStore {
                     let copy_w = w.min(tex.width.saturating_sub(x));
                     let src = &image.pixels[row * w..row * w + copy_w];
                     if let Some(dst) = tex.pixels.get_mut(dst_start..dst_start + copy_w) {
-                        dst.copy_from_slice(src);
+                        for (dst_px, src_px) in dst.iter_mut().zip(src) {
+                            if *dst_px != *src_px {
+                                // Changing a texel that already holds content is not a fresh
+                                // allocation: epaint's atlas reuses slots when it overflows
+                                // (the cursor restarts inside the atlas and live glyph cells
+                                // are overwritten with the new glyph), so shapes that sample
+                                // those texels no longer describe the pixels they draw.
+                                overwrote_live_texels |= *dst_px != Color32::TRANSPARENT;
+                                *dst_px = *src_px;
+                            }
+                        }
                     }
                 }
-                // Managed(0) is the font atlas: partial patches only allocate fresh
-                // glyph slots and never overwrite existing glyphs, whereas any other
-                // texture patched in-place may change pixels of existing meshes.
-                if id != TextureId::Managed(0) {
+                // Managed(0) is the font atlas: a patch that only fills empty glyph slots
+                // leaves every existing glyph untouched, so text tiles keep their hashes and
+                // a newly rasterized glyph does not force a full repaint. Any other texture
+                // patched in place may change pixels of existing meshes.
+                if id != TextureId::Managed(0) || overwrote_live_texels {
                     self.bump_generation(id);
                 }
             }
@@ -269,6 +281,65 @@ mod tests {
             tex.pixels[3 * 4],
             Color32::RED,
             "no wrap onto the row start"
+        );
+    }
+
+    /// A patch that only fills empty atlas space adds a glyph. Bumping the generation for
+    /// that would re-dirty every text tile in the window, so a newly rasterized glyph has
+    /// to stay cheap.
+    #[test]
+    fn a_patch_into_empty_atlas_space_keeps_the_generation() {
+        let mut store = TextureStore::default();
+        let id = TextureId::Managed(0);
+        let blank = solid(4, 4, Color32::TRANSPARENT);
+        store.set(id, &ImageDelta::full(blank, TextureOptions::NEAREST));
+        let before = store.generation(id);
+
+        let glyph = solid(2, 2, Color32::WHITE);
+        store.set(
+            id,
+            &ImageDelta::partial([1, 1], glyph, TextureOptions::NEAREST),
+        );
+
+        assert_eq!(store.get(id).unwrap().pixels[4 + 1], Color32::WHITE);
+        assert_eq!(
+            store.generation(id),
+            before,
+            "a fresh glyph slot must not invalidate the tiles showing other text"
+        );
+    }
+
+    /// epaint reuses atlas slots once the atlas overflows, so a patch can rewrite texels
+    /// that galleys in the same frame still sample. Those tiles keep their hashes unless
+    /// the generation moves, and then they never repaint: stale glyphs on screen.
+    #[test]
+    fn a_patch_that_rewrites_a_live_atlas_texel_bumps_the_generation() {
+        let mut store = TextureStore::default();
+        let id = TextureId::Managed(0);
+        let blank = solid(4, 4, Color32::TRANSPARENT);
+        store.set(id, &ImageDelta::full(blank, TextureOptions::NEAREST));
+        let glyph = solid(2, 2, Color32::WHITE);
+        store.set(
+            id,
+            &ImageDelta::partial([1, 1], glyph, TextureOptions::NEAREST),
+        );
+        let before = store.generation(id);
+
+        // Same slot, different coverage: one glyph evicted and replaced by another.
+        let evicted = solid(2, 2, Color32::from_white_alpha(96));
+        store.set(
+            id,
+            &ImageDelta::partial([1, 1], evicted, TextureOptions::NEAREST),
+        );
+
+        assert_eq!(
+            store.get(id).unwrap().pixels[4 + 1],
+            Color32::from_white_alpha(96)
+        );
+        assert_ne!(
+            store.generation(id),
+            before,
+            "rewriting a live glyph slot must invalidate the tiles sampling it"
         );
     }
 
