@@ -75,9 +75,21 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "fork: egui_software clippy failed ($LASTEXITCODE)" }
     }
 
+    # `software` is not a default feature, so everything behind it -- including
+    # `software_integration.rs`'s `mod platform_surface` and its buffer-age test -- is
+    # otherwise compiled by no gate at all. The parent workspace only links eframe; it
+    # never runs this crate's unit tests.
+    Write-Host '==> cargo clippy -p eframe --features software' -ForegroundColor Cyan
+    cargo clippy -p eframe --features software --all-targets
+    if ($LASTEXITCODE -ne 0) { throw "fork: eframe software clippy failed ($LASTEXITCODE)" }
+
     Write-Host '==> cargo test (fork)' -ForegroundColor Cyan
     cargo test @pkgArgs
     if ($LASTEXITCODE -ne 0) { throw "fork: cargo test failed ($LASTEXITCODE)" }
+
+    Write-Host '==> cargo test -p eframe --features software' -ForegroundColor Cyan
+    cargo test -p eframe --features software
+    if ($LASTEXITCODE -ne 0) { throw "fork: eframe software test failed ($LASTEXITCODE)" }
 } finally {
     Pop-Location
 }

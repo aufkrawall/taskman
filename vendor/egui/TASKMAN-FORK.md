@@ -280,12 +280,18 @@ Wayland repaints in full on every frame because its age never reaches 1. Making 
 incremental path safe behind a ring needs a damage cache per buffer slot, not a per-frame
 one.
 
-The frame key covers every input that can change a tile's pixels without changing a shape:
+The frame key covers every tessellation option that changes pixels for unmodified shapes:
 target size, `pixels_per_point`, clear colour, text mode, sub-pixel mode, gamma and
 contrast, `round_rects_to_pixels`, `round_text_to_pixels`, `round_line_segments_to_pixels`,
 `coarse_tessellation_culling`, `feathering`, `feathering_size_in_pixels`,
-`prerasterized_discs` and the font atlas size. A missing entry here does not show up as a
-test failure; it shows up as a stale region.
+`prerasterized_discs`, `bezier_tolerance`, `epsilon` and the font atlas size. The `debug_*`
+toggles are the deliberate exception: they change the shapes that get emitted, which the
+per-shape hash covers. A missing entry here does not show up as a test failure; it shows up
+as a stale region.
+
+`Shape::Circle` is hashed together with the font atlas even though the shape names no
+texture: a small filled circle can be tessellated through a prerasterized disc that lives in
+that atlas. The atlas size and gamma/contrast already implied it; the hash now states it.
 
 ### 13. `eframe` + `egui-winit` + `egui-wgpu`: window-reliability hardening
 

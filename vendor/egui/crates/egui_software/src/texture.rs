@@ -131,8 +131,9 @@ impl TextureStore {
         self.textures.get(&id)
     }
 
-    /// Monotonic generation counter for `id` (bumped on full upload, non-atlas
-    /// partial update, and free), used by tile damage tracking.
+    /// Monotonic generation counter for `id` (bumped on full upload, on a partial update
+    /// that changes texels which already held content, and on free), used by tile damage
+    /// tracking.
     pub fn generation(&self, id: TextureId) -> u64 {
         self.generations.get(&id).copied().unwrap_or(0)
     }
@@ -191,23 +192,34 @@ impl TextureStore {
                     let copy_w = w.min(tex.width.saturating_sub(x));
                     let src = &image.pixels[row * w..row * w + copy_w];
                     if let Some(dst) = tex.pixels.get_mut(dst_start..dst_start + copy_w) {
-                        for (dst_px, src_px) in dst.iter_mut().zip(src) {
-                            if *dst_px != *src_px {
-                                // Changing a texel that already holds content is not a fresh
-                                // allocation: epaint's atlas reuses slots when it overflows
-                                // (the cursor restarts inside the atlas and live glyph cells
-                                // are overwritten with the new glyph), so shapes that sample
-                                // those texels no longer describe the pixels they draw.
-                                overwrote_live_texels |= *dst_px != Color32::TRANSPARENT;
-                                *dst_px = *src_px;
+                        if id == TextureId::Managed(0) {
+                            // Only the atlas can rewrite texels an existing shape still
+                            // samples, so only the atlas needs the compare.
+                            for (dst_px, src_px) in dst.iter_mut().zip(src) {
+                                if *dst_px != *src_px {
+                                    overwrote_live_texels |= *dst_px != Color32::TRANSPARENT;
+                                    *dst_px = *src_px;
+                                }
                             }
+                        } else {
+                            dst.copy_from_slice(src);
                         }
                     }
                 }
-                // Managed(0) is the font atlas: a patch that only fills empty glyph slots
-                // leaves every existing glyph untouched, so text tiles keep their hashes and
-                // a newly rasterized glyph does not force a full repaint. Any other texture
-                // patched in place may change pixels of existing meshes.
+                // Managed(0) is the font atlas, where a patch that changes a texel already
+                // holding content is not a fresh allocation: epaint reuses slots when the
+                // atlas overflows (the cursor restarts at x = 0 inside the image and live
+                // glyph cells are overwritten), so shapes sampling those texels no longer
+                // describe the pixels they draw.
+                //
+                // Bumping only for that case keeps a newly rasterized glyph free, and the
+                // emptiness test is sound because of an allocator property, not by luck: an
+                // allocated cell is always written in full -- both rasterizers loop over the
+                // whole width x height rect, zero coverage included -- and a zero-sized glyph
+                // is never allocated, so a cell cannot be partly occupied when it is reused.
+                // What would be missed is a patch writing content into transparent texels
+                // *inside* a still-live cell, which the allocator above never emits. Any
+                // other texture patched in place may change pixels of existing meshes.
                 if id != TextureId::Managed(0) || overwrote_live_texels {
                     self.bump_generation(id);
                 }

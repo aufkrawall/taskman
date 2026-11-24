@@ -56,6 +56,8 @@ pub(crate) struct FrameKey {
     pub feathering: bool,
     pub feathering_size_bits: u32,
     pub prerasterized_discs: bool,
+    pub bezier_tolerance_bits: u32,
+    pub epsilon_bits: u32,
     pub font_tex_size: [usize; 2],
 }
 
@@ -83,9 +85,11 @@ impl FrameKey {
             subpixel: subpixel as u8,
             gamma_bits: f32_bits(gamma),
             contrast_bits: f32_bits(contrast),
-            // Every tessellation option that can change a pixel, not just the ones the
-            // app happens to set at startup: a tile hash is only sound if two frames
-            // with equal hashes and an equal key really do produce equal pixels.
+            // Every tessellation option that changes pixels for unmodified shapes, not just
+            // the ones the app happens to set at startup: a tile hash is only sound if two
+            // frames with equal hashes and an equal key really do produce equal pixels.
+            // The `debug_*` toggles are deliberately absent: they change the shapes that are
+            // emitted, which the shape hash already covers.
             round_rects_to_pixels: ctx.options.round_rects_to_pixels,
             round_text_to_pixels: ctx.options.round_text_to_pixels,
             round_line_segments_to_pixels: ctx.options.round_line_segments_to_pixels,
@@ -93,6 +97,8 @@ impl FrameKey {
             feathering: ctx.options.feathering,
             feathering_size_bits: f32_bits(ctx.options.feathering_size_in_pixels),
             prerasterized_discs: ctx.options.prerasterized_discs,
+            bezier_tolerance_bits: f32_bits(ctx.options.bezier_tolerance),
+            epsilon_bits: f32_bits(ctx.options.epsilon),
             font_tex_size: ctx.font_tex_size,
         }
     }
@@ -609,6 +615,11 @@ fn hash_clipped_shape(
             h.write_f32(*radius);
             h.write_color(*fill);
             h.write_stroke(*stroke);
+            // A small filled circle can be tessellated through a prerasterized disc that
+            // lives in the font atlas, so its pixels may depend on that atlas even though the
+            // shape names no texture. Hashing the atlas here keeps that invariant local
+            // instead of relying on the atlas size and gamma/contrast being keyed too.
+            h.write_texture_id(TextureId::Managed(0), textures);
         }
         Shape::Ellipse(EllipseShape {
             center,
@@ -772,6 +783,16 @@ mod tests {
         let atlas =
             painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
         assert_eq!(atlas.dirty_tiles, atlas.total_tiles, "font atlas size");
+
+        ctx.options.bezier_tolerance = 0.5;
+        let curves =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(curves.dirty_tiles, curves.total_tiles, "bezier tolerance");
+
+        ctx.options.epsilon = 1.0e-3;
+        let epsilon =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(epsilon.dirty_tiles, epsilon.total_tiles, "float epsilon");
     }
 
     /// Damage rects are physical pixels and must stay inside the target even when the window
