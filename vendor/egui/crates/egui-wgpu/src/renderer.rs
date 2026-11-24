@@ -303,6 +303,10 @@ struct SlicedBuffer {
 
 const BUFFER_SHRINK_MIN_CAPACITY: wgpu::BufferAddress = 1024 * 1024;
 const BUFFER_SHRINK_AFTER_UPDATES: u16 = 120;
+const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+    (std::mem::size_of::<Vertex>() * 1024) as _;
+const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+    (std::mem::size_of::<u32>() * 1024 * 3) as _;
 
 /// Return a replacement capacity after the buffer has remained mostly unused for long
 /// enough to rule out alternating large/small frames.
@@ -740,11 +744,6 @@ impl Renderer {
         } else {
             None
         };
-
-        const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
-            (std::mem::size_of::<Vertex>() * 1024) as _;
-        const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
-            (std::mem::size_of::<u32>() * 1024 * 3) as _;
 
         Self {
             pipeline,
@@ -1362,6 +1361,17 @@ impl Renderer {
                     Primitive::Callback(_) => {}
                 }
             }
+        } else {
+            self.index_buffer.slices.clear();
+            if let Some(capacity) = capacity_after_sustained_underuse(
+                self.index_buffer.capacity,
+                0,
+                &mut self.index_buffer.underused_updates,
+                INDEX_BUFFER_START_CAPACITY,
+            ) {
+                self.index_buffer.capacity = capacity;
+                self.index_buffer.buffer = create_index_buffer(device, capacity);
+            }
         }
         if vertex_count > 0 {
             profiling::scope!("vertices", vertex_count.to_string().as_str());
@@ -1415,6 +1425,17 @@ impl Renderer {
                     }
                     Primitive::Callback(_) => {}
                 }
+            }
+        } else {
+            self.vertex_buffer.slices.clear();
+            if let Some(capacity) = capacity_after_sustained_underuse(
+                self.vertex_buffer.capacity,
+                0,
+                &mut self.vertex_buffer.underused_updates,
+                VERTEX_BUFFER_START_CAPACITY,
+            ) {
+                self.vertex_buffer.capacity = capacity;
+                self.vertex_buffer.buffer = create_vertex_buffer(device, capacity);
             }
         }
 
@@ -1774,6 +1795,14 @@ mod tests {
             None,
             "small renderer buffers are not worth reallocating"
         );
+
+        let mut underused_updates = BUFFER_SHRINK_AFTER_UPDATES - 1;
+        assert_eq!(
+            capacity_after_sustained_underuse(capacity, 0, &mut underused_updates, initial),
+            Some(initial),
+            "a sustained empty or callback-only update must return to the initial capacity"
+        );
+        assert_eq!(underused_updates, 0);
     }
 
     #[test]
