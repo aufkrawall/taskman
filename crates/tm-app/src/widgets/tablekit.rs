@@ -2152,7 +2152,7 @@ mod tests {
         };
         let measured = painted(true);
         assert_eq!(measured, painted(false), "the two variants must paint alike");
-        assert!(!measured.is_empty(), "the cell paints exactly one text");
+        assert!(!measured.is_empty(), "the cell must paint text, and both variants must match");
         let (clip, text, _, galley) = &measured[0];
         assert_eq!(text, &overflowing, "the full string reaches the painter");
         assert!(

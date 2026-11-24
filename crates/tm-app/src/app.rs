@@ -521,15 +521,17 @@ struct InputStatsRecorder {
     model_rebuilds: u32,
     /// Rows whose icon the frame memo answered without touching the cache, and
     /// the icon cache lookups the row loops actually made. Processes and
-    /// Details report them; Services, Startup, App History, Users, Modules,
-    /// Threads and Connections still resolve one icon per row uncached, so they
-    /// are not part of these two numbers.
+    /// Details report them; App History, Startup and Users are the pages that
+    /// still resolve one icon per row uncached, so they are not part of these
+    /// two numbers. The remaining pages paint no row icon at all.
     icon_memo_hits: u64,
     icon_lookups: u64,
     /// Clipped-text measurements spent only to answer "is this cell clipped?".
-    /// Details is the only page that reports them: the other list pages still
-    /// measure every cell through `text_cell`, into a table-local counter
-    /// nothing reads.
+    /// Details is the only page that reports them: Connections, Hosted
+    /// services, Modules, Services, Startup, Threads and Users still measure
+    /// every text cell through `text_cell`, into a table-local counter nothing
+    /// reads. App History measures nothing — it paints through `heat_cells` and
+    /// a raw `painter.text`.
     text_measures: u64,
 }
 

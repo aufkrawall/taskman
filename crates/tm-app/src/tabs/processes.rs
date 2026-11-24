@@ -3250,9 +3250,13 @@ mod tests {
         );
         for (position, row) in expected.iter().enumerate() {
             let addressed = selectable_row(rows, &selectable, position).expect("in range");
+            // `aggregate` is part of the identity: an expanded family renders
+            // its virtual head AND the concrete member with the same
+            // pid + start epoch (see `process_row_key`), so without it a
+            // head-for-member mix-up would compare equal.
             assert_eq!(
-                (addressed.pid, addressed.start_epoch_s),
-                (row.pid, row.start_epoch_s),
+                (addressed.pid, addressed.start_epoch_s, addressed.aggregate),
+                (row.pid, row.start_epoch_s, row.aggregate),
                 "selectable position {position} addresses the wrong row"
             );
         }
@@ -3275,6 +3279,9 @@ mod tests {
             pseudo(4, "Terminated Processes", ProcCategory::Background),
             proc(5, None, "updatehelper.exe", ProcCategory::Background),
             proc(6, None, "svcbroker.exe", ProcCategory::Background),
+            // One image, one parent: collapses into an expandable family row.
+            proc(7, None, "brave.exe", ProcCategory::Background),
+            proc(8, Some(7), "brave.exe", ProcCategory::Background),
         ]);
         let expanded = HashSet::new();
         // The plain name-sorted model...
@@ -3293,10 +3300,17 @@ mod tests {
         );
         assert_selectable_index_is_exact(&searched, &expanded);
 
-        // ...and a resource-sorted model, where `sort_blocks_globally`
-        // re-orders whole blocks and the headers are gone.
+        // ...a resource-sorted model, where `sort_blocks_globally` re-orders
+        // whole blocks and the headers are gone...
         let by_cpu = build_display_rows(&snap, "", FIXED_COLS, false, &expanded, &[false; 4]);
         assert_selectable_index_is_exact(&by_cpu, &expanded);
+
+        // ...and one with a family OPEN, which is the only shape that renders an
+        // aggregate head and its concrete member side by side — the pid/start
+        // collision `aggregate` disambiguates.
+        let family_open = HashSet::from([7]);
+        let opened = build_display_rows(&snap, "", 0, true, &family_open, &[false; 4]);
+        assert_selectable_index_is_exact(&opened, &family_open);
     }
 
     /// Arrow-collapsing an aggregate parent selects that parent in the SAME
