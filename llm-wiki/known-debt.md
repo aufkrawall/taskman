@@ -107,10 +107,11 @@ items across Phases 2–6. The following concrete gaps remain:
   event and capability drift on a replacement device are also not implemented; normal
   suspend/recreate selects the same surface-compatible adapter.
 - **Wayland hidden-state signal depends on xdg-shell v6.** The winit fork maps the
-  `SUSPENDED` xdg-toplevel configure state to `Window::is_minimized()`, and winit requests a
-  redraw whenever a configure arrives. A compositor that does not advertise the state (or
-  omits it when minimizing) provides no client-side proof that the window is hidden, so the
-  Vulkan window can remain resident on that legacy/non-compliant path.
+  `SUSPENDED` xdg-toplevel configure state to `Window::is_minimized()`, requests a redraw on
+  every configure, and clears a pending frame-callback throttle when the suspended bit
+  changes. A compositor that does not advertise the state (or omits it when minimizing)
+  provides no client-side proof that the window is hidden, so the Vulkan window can remain
+  resident on that legacy/non-compliant path.
 - **Software rendering performance: SUPERSEDED.** CPU mode directly rasterizes
   the UI. The old WARP path measured about 14 cores at 2.9 fps. D3D12 and Vulkan
   select a surface-compatible GPU.

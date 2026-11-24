@@ -107,7 +107,10 @@ repaint is suspended; SCTK already records it in `WindowConfigure.state`.
 
 - `src/platform_impl/linux/wayland/window/state.rs`
   - `WindowState::is_suspended()` tests `XdgWindowState::SUSPENDED` on the last
-    configure and has a pure bitflags regression test.
+    configure and has pure bitflags regression tests.
+  - `WindowState::configure()` resets a pending frame-callback throttle when the
+    `SUSPENDED` bit changes, so the configure-triggered redraw is delivered even
+    when an invisible surface no longer receives its frame callback.
 - `src/platform_impl/linux/wayland/window/mod.rs`
   - `Window::is_minimized()` returns `Some(window_state.is_suspended())` instead
     of always returning `None`.

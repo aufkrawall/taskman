@@ -8,7 +8,8 @@
   snapshots are removed on egui texture free and do not keep GPU resources alive.
 - Explicit `Visible(false)` now suppresses eframe's first-frame reveal and is authoritative
   over a native window that still reports visible for a frame. Wayland's xdg-shell
-  `SUSPENDED` configure state is surfaced through winit as the hidden/minimized signal.
+  `SUSPENDED` configure state is surfaced through winit as the hidden/minimized signal; a
+  suspended-bit change also bypasses a pending frame-callback redraw throttle.
 - Visible WGPU allocation now selects `MemoryHints::MemoryUsage`, caps D3D12's non-sampler
   descriptor heap at 8,192, and shrinks vertex/index buffers after sustained low use.
 - Added `tools/gpu-memory-probe.ps1` to measure one isolated child's per-LUID dedicated/shared

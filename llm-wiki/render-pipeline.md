@@ -145,8 +145,10 @@ round-trip. An explicit `Visible(false)` suppresses eframe's first-frame reveal.
 
 Wayland has no direct window-visibility or minimize query. The vendored winit exposes
 xdg-shell v6's `SUSPENDED` configure hint through `Window::is_minimized()`, which makes a
-compositor-minimized or repaint-suspended toplevel enter the same hidden path. Compositors
-that do not advertise that hint remain a platform limitation.
+compositor-minimized or repaint-suspended toplevel enter the same hidden path. A configure
+that changes the suspended bit clears winit's pending frame-callback throttle, so the redraw
+is not lost when an invisible compositor stops delivering frame callbacks. Compositors that do
+not advertise that hint remain a platform limitation.
 
 Visible WGPU sessions use `wgpu::MemoryHints::MemoryUsage`, cap D3D12's eager non-sampler
 descriptor heap at 8,192 bindings, and shrink historical vertex/index buffers after sustained
