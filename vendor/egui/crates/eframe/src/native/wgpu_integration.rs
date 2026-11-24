@@ -111,6 +111,10 @@ pub struct Viewport {
     /// and on Android will also be destroyed if the application is paused.
     window: Option<Arc<Window>>,
 
+    /// The app's latest explicit visibility request. Kept separately from the native window
+    /// because Wayland reports visibility as unknown and does not implement `set_visible`.
+    app_visible: Option<bool>,
+
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
 }
@@ -347,6 +351,7 @@ impl<'app> WgpuWinitApp<'app> {
                 actions_requested: Default::default(),
                 viewport_ui_cb: None,
                 window: Some(window),
+                app_visible: None,
                 egui_winit: Some(egui_winit),
                 pending_delta: Default::default(),
             },
@@ -649,54 +654,78 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            let Some(viewport) = viewports.get_mut(&viewport_id) else {
+            let Some(viewport) = viewports.get(&viewport_id) else {
                 return Ok(EventResult::Wait);
             };
 
-            let Viewport {
-                viewport_ui_cb,
-                window,
-                egui_winit,
-                info,
-                ..
-            } = viewport;
-
-            let viewport_ui_cb = viewport_ui_cb.clone();
-
-            let Some(window) = window else {
+            let Some(window) = viewport.window.as_ref() else {
                 return Ok(EventResult::Wait);
             };
-            egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
+            let viewport_ui_cb = viewport.viewport_ui_cb.clone();
+            let window = Arc::clone(window);
 
-            let is_visible = viewport.info.visible().unwrap_or(true)
-                && (integration.is_first_frame || window.is_visible() != Some(false));
+            if let Some(viewport) = viewports.get_mut(&viewport_id) {
+                egui_winit::update_viewport_info(
+                    &mut viewport.info,
+                    &integration.egui_ctx,
+                    &window,
+                    false,
+                );
+            }
 
-            {
+            let is_visible = viewports
+                .get(&viewport_id)
+                .is_some_and(|viewport| viewport_is_visible(viewport, integration.is_first_frame));
+            let descendant_visible = is_visible_descendant_with(
+                viewports,
+                viewport_id,
+                &|viewport| viewport_is_visible(viewport, false),
+            );
+            let show_ui = FrameVisibility::new(is_visible, descendant_visible).run_ui;
+
+            let gpu_target = if is_visible {
+                Some((viewport_id, Arc::clone(&window)))
+            } else if show_ui && painter.render_state().is_none() {
+                visible_viewport_with_window(viewports)
+            } else {
+                None
+            };
+
+            if let Some((gpu_viewport_id, gpu_window)) = gpu_target {
                 profiling::scope!("set_window");
                 if let Err(err) =
-                    pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))
+                    pollster::block_on(painter.set_window(gpu_viewport_id, Some(gpu_window)))
                 {
                     if integration.is_first_frame {
                         return Err(err.into());
                     }
-                    log::warn!("Transient wgpu set_window failure for {viewport_id:?}: {err}");
+                    log::warn!("Transient wgpu set_window failure for {gpu_viewport_id:?}: {err}");
                     integration.egui_ctx.request_repaint_after_for(
                         std::time::Duration::from_millis(100),
-                        viewport_id,
+                        gpu_viewport_id,
                     );
                     return Ok(EventResult::Wait);
                 }
             }
 
-            let Some(egui_winit) = egui_winit.as_mut() else {
-                return Ok(EventResult::Wait);
-            };
-            let mut raw_input = egui_winit.take_egui_input(window);
-
-            let show_ui = is_visible || is_viewport_or_descendant_visible(viewports, viewport_id);
+            if show_ui || any_viewport_visible(viewports) {
+                integration.frame.wgpu_render_state = painter.render_state();
+            } else {
+                integration.frame.wgpu_render_state = None;
+                painter.suspend();
+            }
 
             integration.pre_update();
 
+            let mut raw_input = {
+                let Some(viewport) = viewports.get_mut(&viewport_id) else {
+                    return Ok(EventResult::Wait);
+                };
+                let Some(egui_winit) = viewport.egui_winit.as_mut() else {
+                    return Ok(EventResult::Wait);
+                };
+                egui_winit.take_egui_input(&window)
+            };
             raw_input.time = Some(integration.beginning.elapsed().as_secs_f64());
             raw_input.viewports = viewports
                 .iter()
@@ -746,17 +775,21 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            let now_visible = {
+            let (now_visible, any_visible_after) = {
                 let shared_ref = shared.borrow();
-                let window = shared_ref
-                    .viewports
-                    .get(&viewport_id)
-                    .and_then(|viewport| viewport.window.as_deref());
+                let viewport = shared_ref.viewports.get(&viewport_id);
+                let window = viewport.and_then(|viewport| viewport.window.as_deref());
                 sleep_if_invisible_or_minimized(window);
-                window.is_some_and(|w| {
-                    !crate::native::winit_integration::is_invisible_or_minimized(w)
-                })
+                (
+                    viewport.is_some_and(|viewport| viewport_is_visible(viewport, false)),
+                    any_viewport_visible(&shared_ref.viewports),
+                )
             };
+
+            if !any_visible_after {
+                integration.frame.wgpu_render_state = None;
+                shared.borrow_mut().painter.suspend();
+            }
 
             return Ok(if integration.should_close() {
                 EventResult::CloseRequested
@@ -784,6 +817,10 @@ impl WgpuWinitRunning<'_> {
             viewport_from_window,
             ..
         } = &mut *shared_mut;
+
+        // Immediate viewport rendering may have initialized the shared renderer while
+        // the parent UI ran. Keep the frame's public accessor in sync before paint.
+        integration.frame.wgpu_render_state = painter.render_state();
 
         let FullOutput {
             platform_output,
@@ -882,6 +919,13 @@ impl WgpuWinitRunning<'_> {
         viewports.retain(|id, _| active_viewports_ids.contains(id));
         viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
         painter.gc_viewports(&active_viewports_ids);
+
+        if any_viewport_visible(viewports) {
+            integration.frame.wgpu_render_state = painter.render_state();
+        } else {
+            integration.frame.wgpu_render_state = None;
+            painter.suspend();
+        }
 
         let window = viewport_from_window
             .get(&window_id)
@@ -1053,6 +1097,11 @@ impl Viewport {
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
     ) {
+        for command in &commands {
+            if let egui::ViewportCommand::Visible(visible) = command {
+                self.app_visible = Some(*visible);
+            }
+        }
         self.deferred_commands.append(&mut commands);
 
         if let Some(window) = self.window.as_ref() {
@@ -1087,12 +1136,6 @@ impl Viewport {
                 windows_id.insert(window.id(), viewport_id);
 
                 let window = Arc::new(window);
-
-                if let Err(err) =
-                    pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
-                {
-                    log::error!("on set_window: viewport_id {viewport_id:?} {err}");
-                }
 
                 self.egui_winit = Some(egui_winit::State::new(
                     egui_ctx.clone(),
@@ -1135,22 +1178,74 @@ fn create_window(
     Ok((window, viewport_builder))
 }
 
-/// Is this viewport, or any of its (transitive) descendant viewports, visible?
-///
-/// Immediate viewports are rendered inline while their parent's UI runs, so even
-/// if this viewport's window is occluded or minimized we must still run its UI to
-/// give any visible descendant a chance to be painted.
-fn is_viewport_or_descendant_visible(viewports: &Viewports, viewport_id: ViewportId) -> bool {
-    let Some(viewport) = viewports.get(&viewport_id) else {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameVisibility {
+    /// Whether this viewport's own surface should be painted.
+    paint_self: bool,
+    /// Whether this viewport's UI must run to reach a visible descendant.
+    run_ui: bool,
+}
+
+impl FrameVisibility {
+    fn new(paint_self: bool, descendant_visible: bool) -> Self {
+        Self {
+            paint_self,
+            run_ui: paint_self || descendant_visible,
+        }
+    }
+}
+
+fn effective_viewport_visible(
+    info_visible: Option<bool>,
+    app_visible: Option<bool>,
+    native_window_visible: Option<bool>,
+    first_frame_reveal: bool,
+) -> bool {
+    info_visible.unwrap_or(true)
+        && (app_visible.unwrap_or(true) || native_window_visible == Some(true))
+        && (first_frame_reveal || native_window_visible != Some(false))
+}
+
+fn viewport_is_visible(viewport: &Viewport, first_frame_reveal: bool) -> bool {
+    let Some(window) = &viewport.window else {
         return false;
     };
-    if viewport.info.visible().unwrap_or(true) {
-        return true;
-    }
+    effective_viewport_visible(
+        viewport.info.visible(),
+        viewport.app_visible,
+        window.is_visible(),
+        first_frame_reveal,
+    )
+}
+
+fn is_visible_descendant_with(
+    viewports: &Viewports,
+    viewport_id: ViewportId,
+    is_visible: &impl Fn(&Viewport) -> bool,
+) -> bool {
     viewports.values().any(|child| {
         child.ids.parent == viewport_id
             && child.ids.this != viewport_id
-            && is_viewport_or_descendant_visible(viewports, child.ids.this)
+            && (is_visible(child)
+                || is_visible_descendant_with(viewports, child.ids.this, is_visible))
+    })
+}
+
+fn any_viewport_visible(viewports: &Viewports) -> bool {
+    viewports
+        .values()
+        .any(|viewport| viewport_is_visible(viewport, false))
+}
+
+fn visible_viewport_with_window(viewports: &Viewports) -> Option<(ViewportId, Arc<Window>)> {
+    viewports.values().find_map(|viewport| {
+        if !viewport_is_visible(viewport, false) {
+            return None;
+        }
+        viewport
+            .window
+            .as_ref()
+            .map(|window| (viewport.ids.this, Arc::clone(window)))
     })
 }
 
@@ -1167,7 +1262,7 @@ fn render_immediate_viewport(
         mut viewport_ui_cb,
     } = immediate_viewport;
 
-    let input = {
+    let (input, paint_self) = {
         let SharedState {
             egui_ctx,
             viewports,
@@ -1190,18 +1285,41 @@ fn render_immediate_viewport(
             });
         }
 
-        let (Some(window), Some(egui_winit)) = (&viewport.window, &mut viewport.egui_winit) else {
-            return;
+        let visibility = {
+            let Some(viewport) = viewports.get(&ids.this) else {
+                return;
+            };
+            let paint_self = viewport_is_visible(viewport, false);
+            let descendant_visible = is_visible_descendant_with(
+                viewports,
+                ids.this,
+                &|viewport| viewport_is_visible(viewport, false),
+            );
+            FrameVisibility::new(paint_self, descendant_visible)
         };
-        egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
+        if !visibility.run_ui {
+            return;
+        }
 
-        let mut input = egui_winit.take_egui_input(window);
+        let mut input = {
+            let Some(viewport) = viewports.get_mut(&ids.this) else {
+                return;
+            };
+            let (Some(window), Some(egui_winit)) =
+                (&viewport.window, viewport.egui_winit.as_mut())
+            else {
+                return;
+            };
+            egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
+            egui_winit.take_egui_input(window)
+        };
+
         input.viewports = viewports
             .iter()
             .map(|(id, viewport)| (*id, viewport.info.clone()))
             .collect();
         input.time = Some(beginning.elapsed().as_secs_f64());
-        input
+        (input, visibility.paint_self)
     };
 
     let egui_ctx = shared.borrow().egui_ctx.clone();
@@ -1241,27 +1359,30 @@ fn render_immediate_viewport(
         return;
     };
 
-    {
-        profiling::scope!("set_window");
-        if let Err(err) = pollster::block_on(painter.set_window(ids.this, Some(Arc::clone(window))))
+    if paint_self {
         {
-            log::error!(
-                "when rendering viewport_id={:?}, set_window Error {err}",
-                ids.this
-            );
+            profiling::scope!("set_window");
+            if let Err(err) =
+                pollster::block_on(painter.set_window(ids.this, Some(Arc::clone(window))))
+            {
+                log::error!(
+                    "when rendering viewport_id={:?}, set_window Error {err}",
+                    ids.this
+                );
+            }
         }
-    }
 
-    let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
-    painter.paint_and_update_textures(
-        ids.this,
-        pixels_per_point,
-        [0.0, 0.0, 0.0, 0.0],
-        &clipped_primitives,
-        &mut viewport.pending_delta,
-        vec![],
-        window,
-    );
+        let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+        painter.paint_and_update_textures(
+            ids.this,
+            pixels_per_point,
+            [0.0, 0.0, 0.0, 0.0],
+            &clipped_primitives,
+            &mut viewport.pending_delta,
+            vec![],
+            window,
+        );
+    }
 
     egui_winit.handle_platform_output(window, platform_output);
 
@@ -1369,6 +1490,7 @@ fn initialize_or_update_viewport<'a>(
                 actions_requested: Vec::new(),
                 viewport_ui_cb,
                 window: None,
+                app_visible: None,
                 egui_winit: None,
                 pending_delta: Default::default(),
             })
@@ -1404,5 +1526,71 @@ fn initialize_or_update_viewport<'a>(
 
             entry.into_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_viewport(id: ViewportId, parent: ViewportId) -> Viewport {
+        Viewport {
+            ids: ViewportIdPair::from_self_and_parent(id, parent),
+            class: if id == ViewportId::ROOT {
+                ViewportClass::Root
+            } else {
+                ViewportClass::Immediate
+            },
+            builder: Default::default(),
+            deferred_commands: Vec::new(),
+            info: Default::default(),
+            actions_requested: Vec::new(),
+            pending_delta: Default::default(),
+            viewport_ui_cb: None,
+            window: None,
+            app_visible: None,
+            egui_winit: None,
+        }
+    }
+
+    #[test]
+    fn hidden_root_runs_ui_for_visible_descendant_without_painting_root() {
+        let child = ViewportId::from_hash_of("visible-child");
+        let grandchild = ViewportId::from_hash_of("hidden-grandchild");
+        let mut viewports = Viewports::default();
+        viewports.insert(ViewportId::ROOT, test_viewport(ViewportId::ROOT, ViewportId::ROOT));
+        viewports.insert(child, test_viewport(child, ViewportId::ROOT));
+        viewports.insert(grandchild, test_viewport(grandchild, child));
+
+        let descendant_visible =
+            is_visible_descendant_with(&viewports, ViewportId::ROOT, &|viewport| {
+                viewport.ids.this == child
+            });
+        let visibility = FrameVisibility::new(false, descendant_visible);
+
+        assert!(visibility.run_ui);
+        assert!(!visibility.paint_self);
+        assert!(is_visible_descendant_with(
+            &viewports,
+            ViewportId::ROOT,
+            &|viewport| viewport.ids.this == grandchild,
+        ));
+        let no_visible_descendant = is_visible_descendant_with(
+            &viewports,
+            ViewportId::ROOT,
+            &|_: &Viewport| false,
+        );
+        assert!(!no_visible_descendant);
+        assert!(!FrameVisibility::new(false, no_visible_descendant).run_ui);
+    }
+
+    #[test]
+    fn visibility_honours_occlusion_hide_and_first_frame_reveal() {
+        assert!(!effective_viewport_visible(Some(false), None, Some(true), true));
+        assert!(effective_viewport_visible(Some(true), Some(false), Some(true), false));
+        assert!(!effective_viewport_visible(Some(true), None, Some(false), false));
+        assert!(effective_viewport_visible(Some(true), None, Some(false), true));
+        assert!(effective_viewport_visible(None, Some(true), None, false));
+        assert!(!effective_viewport_visible(None, Some(false), None, false));
     }
 }

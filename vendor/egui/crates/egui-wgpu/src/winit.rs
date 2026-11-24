@@ -9,7 +9,7 @@ use crate::{
     capture::{CaptureReceiver, CaptureSender, CaptureState, capture_channel},
 };
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
-use std::{num::NonZeroU32, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
@@ -19,6 +19,117 @@ struct SurfaceState {
     resizing: bool,
     needs_reconfigure: bool,
     needs_recreate: bool,
+}
+
+#[derive(Clone)]
+struct TextureSnapshot {
+    image: epaint::ImageData,
+    options: epaint::textures::TextureOptions,
+}
+
+impl TextureSnapshot {
+    fn new(delta: &epaint::ImageDelta) -> Self {
+        Self {
+            image: delta.image.clone(),
+            options: delta.options,
+        }
+    }
+
+    /// Apply a texture delta to the CPU-side image that will rebuild the renderer.
+    fn update(&mut self, delta: &epaint::ImageDelta) -> bool {
+        let Some([x, y]) = delta.pos else {
+            *self = Self::new(delta);
+            return true;
+        };
+
+        let (epaint::ImageData::Color(dst), epaint::ImageData::Color(src)) =
+            (&mut self.image, &delta.image);
+        let dst = Arc::make_mut(dst);
+        let src = src.as_ref();
+
+        if x + src.size[0] > dst.size[0] || y + src.size[1] > dst.size[1] {
+            log::error!(
+                "Ignoring out-of-bounds texture update at ({x}, {y}) with size {:?} for {:?}",
+                src.size,
+                dst.size
+            );
+            return false;
+        }
+
+        let src_width = src.size[0];
+        let dst_width = dst.size[0];
+        for row in 0..src.size[1] {
+            let src_start = row * src_width;
+            let dst_start = (y + row) * dst_width + x;
+            dst.pixels[dst_start..dst_start + src_width]
+                .copy_from_slice(&src.pixels[src_start..src_start + src_width]);
+        }
+        self.options = delta.options;
+        true
+    }
+
+    fn full_delta(&self) -> epaint::ImageDelta {
+        epaint::ImageDelta::full(self.image.clone(), self.options)
+    }
+}
+
+/// CPU-side copies of every managed texture uploaded to the renderer.
+///
+/// `epaint::TextureManager` keeps metadata only, and egui emits texture data just once.
+/// Keeping the latest full image lets a suspended painter recreate its renderer without
+/// losing the font atlas or any images that are still in use.
+#[derive(Default)]
+struct TextureSnapshots {
+    textures: HashMap<epaint::TextureId, TextureSnapshot>,
+}
+
+impl TextureSnapshots {
+    #[expect(clippy::iter_over_hash_type)]
+    fn record(&mut self, delta: &epaint::textures::TexturesDelta) {
+        for (id, image_deltas) in &delta.set {
+            for image_delta in image_deltas {
+                match self.textures.entry(*id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().update(image_delta);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        if image_delta.is_whole() {
+                            entry.insert(TextureSnapshot::new(image_delta));
+                        } else {
+                            log::warn!(
+                                "Cannot replay partial texture update for unallocated {id:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for id in &delta.free {
+            self.textures.remove(id);
+        }
+    }
+
+    #[expect(clippy::iter_over_hash_type)]
+    fn replay_into(&self, render_state: &RenderState) {
+        if self.textures.is_empty() {
+            return;
+        }
+
+        let mut renderer = render_state.renderer.write();
+        for (id, texture) in &self.textures {
+            renderer.update_texture(
+                &render_state.device,
+                &render_state.queue,
+                *id,
+                &texture.full_delta(),
+            );
+        }
+    }
+
+    fn ids(&self) -> impl Iterator<Item = &epaint::TextureId> + '_ {
+        self.textures.keys()
+    }
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -35,6 +146,9 @@ pub struct Painter {
 
     instance: wgpu::Instance,
     render_state: Option<RenderState>,
+    texture_snapshots: TextureSnapshots,
+    max_texture_side: Option<usize>,
+    subpixel_text: Option<bool>,
 
     // Per viewport/window:
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
@@ -75,6 +189,9 @@ impl Painter {
 
             instance,
             render_state: None,
+            texture_snapshots: Default::default(),
+            max_texture_side: None,
+            subpixel_text: None,
 
             depth_texture_view: Default::default(),
             surfaces: Default::default(),
@@ -255,6 +372,10 @@ impl Painter {
             let render_state =
                 RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
                     .await?;
+            self.texture_snapshots.replay_into(&render_state);
+            self.max_texture_side =
+                Some(render_state.device.limits().max_texture_dimension_2d as usize);
+            self.subpixel_text = Some(render_state.renderer.read().has_subpixel_pipeline());
             self.render_state = Some(render_state);
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
@@ -321,25 +442,59 @@ impl Painter {
         self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
     }
 
-    /// Returns the maximum texture dimension supported if known
+    /// Returns the maximum texture dimension supported by the most recently initialized
+    /// device, if one has been created.
     ///
-    /// This API will only return a known dimension after `set_window()` has been called
-    /// at least once, since the underlying device and render state are initialized lazily
-    /// once we have a window (that may determine the choice of adapter/device).
+    /// This remains available after [`Self::suspend()`] so window systems that need the
+    /// capability while creating another window do not have to keep the GPU resident.
     pub fn max_texture_side(&self) -> Option<usize> {
-        self.render_state
-            .as_ref()
-            .map(|rs| rs.device.limits().max_texture_dimension_2d as usize)
+        self.max_texture_side
     }
 
     /// Whether this painter created the managed-font dual-source pipeline.
     ///
-    /// `None` means the render state has not been initialized yet. This reports the actual
-    /// device feature, not just what the selected adapter advertised.
+    /// `None` means no device has been initialized yet. The value remains available while
+    /// suspended and reports the actual feature of that last device, not just what the
+    /// selected adapter advertised.
     pub fn subpixel_text(&self) -> Option<bool> {
-        self.render_state
-            .as_ref()
-            .map(|rs| rs.renderer.read().has_subpixel_pipeline())
+        self.subpixel_text
+    }
+
+    /// Release all resident GPU objects while keeping the painter reusable.
+    ///
+    /// The next call to [`Self::set_window()`] recreates the device, renderer and surface
+    /// lazily. Managed textures are replayed from CPU-side snapshots so egui UI state and
+    /// the font atlas survive the interruption. Capabilities needed to create other
+    /// windows, such as [`Self::max_texture_side()`], are retained.
+    pub fn suspend(&mut self) {
+        let texture_ids: Vec<_> = self.texture_snapshots.ids().copied().collect();
+        self.surfaces.clear();
+        self.depth_texture_view.clear();
+        self.msaa_texture_view.clear();
+        self.screen_capture_state = None;
+
+        let Some(render_state) = self.render_state.take() else {
+            return;
+        };
+
+        // Finish submitted work before explicitly destroying textures. The timeout prevents
+        // a wedged GPU from blocking hide/minimize indefinitely; wgpu still defers the
+        // destruction safely when a submission takes longer than this.
+        if let Err(err) = render_state.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(250)),
+        }) {
+            log::debug!("WGPU did not become idle while suspending: {err}");
+        }
+
+        {
+            let mut renderer = render_state.renderer.write();
+            for id in texture_ids {
+                renderer.free_texture(&id);
+            }
+        }
+
+        drop(render_state);
     }
 
     fn resize_and_generate_depth_texture_view_and_msaa_view(
@@ -480,7 +635,7 @@ impl Painter {
                 height_in_pixels,
             );
         } else {
-            log::warn!(
+            log::debug!(
                 "Ignoring window resize notification with no surface created via Painter::set_window()"
             );
         }
@@ -558,6 +713,10 @@ impl Painter {
                 surface.needs_reconfigure = true;
             }
         }
+
+        // egui emits each texture change once. Record the resulting full images before
+        // draining the deltas so a later renderer recreation can restore them.
+        self.texture_snapshots.record(textures_delta);
 
         let Some(render_state) = self.render_state.as_mut() else {
             return vsync_sec;
@@ -824,8 +983,85 @@ impl Painter {
             .retain(|id, _| active_viewports.contains(id));
     }
 
-    #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     pub fn destroy(&mut self) {
-        // TODO(emilk): something here?
+        self.suspend();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epaint::{Color32, ColorImage, ImageDelta};
+
+    fn colors(texture: &TextureSnapshot) -> &[Color32] {
+        let epaint::ImageData::Color(image) = &texture.image;
+        &image.pixels
+    }
+
+    #[test]
+    fn texture_snapshots_compose_partial_updates_for_replay() {
+        let id = epaint::TextureId::default();
+        let full = ColorImage::new(
+            [3, 2],
+            vec![
+                Color32::from_rgb(1, 0, 0),
+                Color32::from_rgb(2, 0, 0),
+                Color32::from_rgb(3, 0, 0),
+                Color32::from_rgb(4, 0, 0),
+                Color32::from_rgb(5, 0, 0),
+                Color32::from_rgb(6, 0, 0),
+            ],
+        );
+        let patch = ColorImage::new([1, 1], vec![Color32::from_rgb(99, 0, 0)]);
+
+        let mut snapshots = TextureSnapshots::default();
+        let mut deltas = epaint::textures::TexturesDelta::default();
+        deltas.push(id, ImageDelta::full(full, epaint::textures::TextureOptions::NEAREST));
+        snapshots.record(&deltas);
+        deltas.clear();
+
+        deltas.push(
+            id,
+            ImageDelta::partial([1, 1], patch, epaint::textures::TextureOptions::LINEAR),
+        );
+        snapshots.record(&deltas);
+        deltas.clear();
+
+        let snapshot = &snapshots.textures[&id];
+        assert_eq!(snapshot.options, epaint::textures::TextureOptions::LINEAR);
+        assert_eq!(
+            colors(snapshot),
+            &[
+                Color32::from_rgb(1, 0, 0),
+                Color32::from_rgb(2, 0, 0),
+                Color32::from_rgb(3, 0, 0),
+                Color32::from_rgb(4, 0, 0),
+                Color32::from_rgb(99, 0, 0),
+                Color32::from_rgb(6, 0, 0),
+            ]
+        );
+        assert_eq!(snapshot.full_delta().pos, None);
+    }
+
+    #[test]
+    fn texture_snapshots_forget_freed_textures() {
+        let id = epaint::TextureId::default();
+        let mut snapshots = TextureSnapshots::default();
+        let mut deltas = epaint::textures::TexturesDelta::default();
+        deltas.push(
+            id,
+            ImageDelta::full(
+                ColorImage::filled([2, 2], Color32::WHITE),
+                epaint::textures::TextureOptions::NEAREST,
+            ),
+        );
+        snapshots.record(&deltas);
+        deltas.clear();
+        assert!(snapshots.textures.contains_key(&id));
+
+        deltas.free(id);
+        snapshots.record(&deltas);
+        deltas.clear();
+        assert!(!snapshots.textures.contains_key(&id));
     }
 }
