@@ -923,6 +923,10 @@ pub struct Row {
     pub io_ops_s: String,
     pub hard_faults_s: String,
     pub command_line_s: String,
+    /// True when the per-process CPU accountant could not attribute a share to
+    /// this row in the window, so its CPU cell reads "—" for lack of a
+    /// measurement rather than for lack of load.
+    pub cpu_unknown: bool,
     /// True when the per-process network source (an ETW session) produced
     /// nothing for this row, so its network cells read "—" for lack of a
     /// source rather than for lack of traffic.
@@ -2154,7 +2158,10 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         power_throttled: p.power_throttled == Some(true),
         user: p.user.clone().unwrap_or_else(|| "—".into()),
         user_sid: p.user_sid.clone().unwrap_or_else(|| "—".into()),
-        cpu_s: format::format_cpu_detail(p.cpu_pct),
+        cpu_s: p
+            .cpu_pct
+            .map(format::format_cpu_detail)
+            .unwrap_or_else(|| "—".into()),
         mem_s: format::format_k(p.mem_bytes),
         net_s: option_rate(process_network_rate(p)),
         net_recv_s: option_rate(p.net_recv_bps),
@@ -2214,6 +2221,9 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         io_ops_s: opt_per_second(p.io_ops_per_s),
         hard_faults_s: opt_per_second(p.hard_faults_per_s),
         command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
+        // The CPU accountant reports a share per window, so this is an
+        // unmeasured window rather than a down source.
+        cpu_unknown: p.cpu_pct.is_none(),
         // "Unknown" is a property of the SOURCE (all-or-nothing ETW/PDH
         // sessions), so a row that reports nothing from it can say why.
         net_unknown: p.net_recv_bps.is_none()
@@ -3587,6 +3597,7 @@ fn option_bytes(value: Option<u64>) -> String {
 /// numeric catalogue (this page's typed columns are a separate catalogue).
 fn unavailable_column_tip(cid: ColumnId) -> Option<&'static str> {
     match cid {
+        ColumnId::Cpu => Some(i18n::tr(K::CpuPerProcessUnavailable)),
         ColumnId::Network | ColumnId::NetworkReceive | ColumnId::NetworkSend => {
             Some(i18n::tr(K::NetPerProcessUnavailable))
         }
@@ -3601,6 +3612,7 @@ fn unavailable_column_tip(cid: ColumnId) -> Option<&'static str> {
 /// Whether this row's cell for `cid` is unknown because its source is down.
 fn column_value_unknown(row: &Row, cid: ColumnId) -> bool {
     match cid {
+        ColumnId::Cpu => row.cpu_unknown,
         ColumnId::Network | ColumnId::NetworkReceive | ColumnId::NetworkSend => row.net_unknown,
         ColumnId::DiskActivity => row.disk_activity_unknown,
         ColumnId::GpuUtil | ColumnId::GpuEngine | ColumnId::GpuDedicated | ColumnId::GpuShared => {
@@ -4233,7 +4245,10 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
             property_row(
                 ui,
                 i18n::tr(K::ColCpu),
-                format::format_pct_cell(process.cpu_pct),
+                process
+                    .cpu_pct
+                    .map(format::format_pct_cell)
+                    .unwrap_or_else(|| "—".into()),
                 false,
             );
             property_row(
@@ -5651,8 +5666,8 @@ mod tests {
                     b.user_sid = Some("S-1-5-19".into());
                 }
                 ColumnId::Cpu => {
-                    a.cpu_pct = 5.0;
-                    b.cpu_pct = 50.0;
+                    a.cpu_pct = Some(5.0);
+                    b.cpu_pct = Some(50.0);
                 }
                 ColumnId::Memory => {
                     a.mem_bytes = 100;

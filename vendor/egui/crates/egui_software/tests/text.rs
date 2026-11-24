@@ -441,3 +441,58 @@ fn the_underline_is_actually_drawn_by_the_blitter() {
         "the underline was not drawn (only {reddish} red pixels)"
     );
 }
+
+/// The tile hashes cover shape geometry, the galley and the atlas *generation* -- but the
+/// atlas can change the pixels under an unchanged galley: when epaint's atlas overflows it
+/// restarts its cursor inside the image and overwrites cells that already hold content. A
+/// patch that does that has to invalidate every text tile, or the window keeps drawing the
+/// evicted texels.
+#[test]
+fn rewriting_a_live_atlas_texel_dirties_the_text_tiles() {
+    let frame = capture(1.0, |ui| {
+        label(ui, "Atlas slot reuse 0123");
+    });
+
+    let mut painter = Painter::new();
+    for (id, delta) in &frame.textures {
+        painter.set_texture(*id, delta);
+    }
+    let atlas = TextureId::Managed(0);
+    let (x, y, current) = {
+        let store = painter.textures();
+        let tex = store.get(atlas).expect("the font atlas never arrived");
+        // Index 0 is the white texel `WHITE_UV` points at, not covered content.
+        let mut covered = tex.pixels.iter().skip(1);
+        let found = covered.position(|pixel| *pixel != Color32::TRANSPARENT);
+        let i = found.expect("the atlas holds no covered texel") + 1;
+        let (x, y) = (i % tex.width, i / tex.width);
+        (x, y, tex.pixels[i])
+    };
+    let overwritten = if current == Color32::WHITE {
+        Color32::from_rgb(0x20, 0x20, 0x20)
+    } else {
+        Color32::WHITE
+    };
+
+    let shapes = frame.shapes.clone();
+    let mut buf = vec![0u32; (W * H) as usize];
+    let mut target = Target::new(&mut buf, W, H).expect("target");
+    let first = painter.paint_shapes_damaged(&mut target, &frame.ctx, shapes.clone(), BG, true);
+    assert_eq!(first.dirty_tiles, first.total_tiles);
+
+    let same = painter.paint_shapes_damaged(&mut target, &frame.ctx, shapes.clone(), BG, false);
+    assert_eq!(same.dirty_tiles, 0, "an unchanged frame must not repaint");
+
+    // Same shapes, same galley, same atlas size: only the texel content changes.
+    let patch = egui::epaint::ImageDelta::partial(
+        [x, y],
+        egui::epaint::ColorImage::new([1, 1], vec![overwritten]),
+        egui::epaint::textures::TextureOptions::LINEAR,
+    );
+    painter.set_texture(atlas, &patch);
+    let after = painter.paint_shapes_damaged(&mut target, &frame.ctx, shapes, BG, false);
+    assert!(
+        after.dirty_tiles > 0,
+        "rewriting live atlas coverage left every text tile clean"
+    );
+}

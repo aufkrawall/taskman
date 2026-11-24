@@ -64,6 +64,10 @@ pub struct CpuSample {
     pub per_core_pct: Vec<f32>,
     pub per_core_kernel_pct: Vec<f32>,
     pub kernel_pct: f32,
+    /// CPU jiffies the measured window covered across every online CPU: the
+    /// machine's time capacity in that window, which per-process accounting
+    /// divides its own counter deltas by.
+    pub window_total_ticks: u64,
 }
 
 /// Keeps the previous `/proc/stat` counters and turns them into one measured
@@ -94,24 +98,32 @@ impl CpuStatSampler {
         let mut per_core_kernel_pct = Vec::with_capacity(current.cores.len());
         for (id, times) in &current.cores {
             let old = previous.cores.get(id)?;
-            let (total, kernel) = percentages(*old, *times)?;
-            per_core_pct.push(total);
-            per_core_kernel_pct.push(kernel);
+            let core = percentages(*old, *times)?;
+            per_core_pct.push(core.busy_pct);
+            per_core_kernel_pct.push(core.kernel_pct);
         }
 
         Some(CpuSample {
-            utilization_pct: aggregate.0,
+            utilization_pct: aggregate.busy_pct,
             per_core_pct,
             per_core_kernel_pct,
-            kernel_pct: aggregate.1,
+            kernel_pct: aggregate.kernel_pct,
+            window_total_ticks: aggregate.total_ticks,
         })
     }
 }
 
-/// Returns `(busy percent, kernel percent)` for one counter delta. Both are
-/// shares of all elapsed CPU jiffies in the window, so the kernel value never
-/// exceeds the utilization value.
-fn percentages(previous: CpuTimes, current: CpuTimes) -> Option<(f32, f32)> {
+/// One counter delta's derived shares and the capacity it covered.
+struct Percentages {
+    busy_pct: f32,
+    kernel_pct: f32,
+    total_ticks: u64,
+}
+
+/// Returns the busy and kernel shares of one counter delta, plus the total
+/// jiffies it covered. Both shares are fractions of all elapsed CPU jiffies in
+/// the window, so the kernel value never exceeds the utilization value.
+fn percentages(previous: CpuTimes, current: CpuTimes) -> Option<Percentages> {
     if current.counter_regressed(previous) {
         return None;
     }
@@ -126,7 +138,11 @@ fn percentages(previous: CpuTimes, current: CpuTimes) -> Option<(f32, f32)> {
     let busy = total.saturating_sub(idle);
     let utilization = (busy as f64 * 100.0 / total as f64).clamp(0.0, 100.0) as f32;
     let kernel = (kernel as f64 * 100.0 / total as f64).clamp(0.0, f64::from(utilization)) as f32;
-    Some((utilization, kernel))
+    Some(Percentages {
+        busy_pct: utilization,
+        kernel_pct: kernel,
+        total_ticks: total,
+    })
 }
 
 fn parse_proc_stat(text: &str) -> Option<ProcStat> {
@@ -209,6 +225,9 @@ cpu1 40 10 55 995 0 0 0 0 0 0
         assert_eq!(sample.kernel_pct, 10.0);
         assert_eq!(sample.per_core_pct, vec![25.0, 15.0]);
         assert_eq!(sample.per_core_kernel_pct, vec![5.0, 15.0]);
+        // The window covered 200 aggregate jiffies; per-process accounting
+        // normalizes its counter deltas by exactly this capacity.
+        assert_eq!(sample.window_total_ticks, 200);
     }
 
     #[test]

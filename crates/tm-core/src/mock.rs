@@ -19,14 +19,14 @@ pub fn snapshot(seed: u32) -> Snapshot {
     let mut p1 = ProcessEntry::new(1000 + seed % 7, "mockapp.exe");
     p1.category = ProcCategory::App;
     p1.has_window = true;
-    p1.cpu_pct = (s * 3.7) % 25.0;
+    p1.cpu_pct = Some((s * 3.7) % 25.0);
     p1.mem_bytes = 150_000_000 + (s as u64 * 1_000_003) % 400_000_000;
     p1.user = Some("alice".into());
     p1.cpu_time_s = Some(12.5 + s as f64);
 
     let mut p2 = ProcessEntry::new(2000, "backgroundsvc.exe");
     p2.category = ProcCategory::Background;
-    p2.cpu_pct = (s * 1.3) % 4.0;
+    p2.cpu_pct = Some((s * 1.3) % 4.0);
     p2.mem_bytes = 50_000_000;
 
     let mut p3 = ProcessEntry::new(4, "System");
@@ -35,7 +35,8 @@ pub fn snapshot(seed: u32) -> Snapshot {
     // The machine total covers the rows plus some load nobody owns, and the
     // per-core values average to it — a mock whose header sat below its own
     // rows taught nothing about the header/row invariant.
-    let busy = (p1.cpu_pct + p2.cpu_pct + (s * 2.9) % 20.0).min(100.0);
+    let busy =
+        (p1.cpu_pct.unwrap_or(0.0) + p2.cpu_pct.unwrap_or(0.0) + (s * 2.9) % 20.0).min(100.0);
     let swing = busy.min(100.0 - busy).min(5.0);
 
     Snapshot {
@@ -214,7 +215,7 @@ mod tests {
     fn mock_cpu_total_covers_rows_and_matches_cores() {
         for seed in 0..64 {
             let snap = snapshot(seed);
-            let rows: f32 = snap.processes.iter().map(|p| p.cpu_pct).sum();
+            let rows: f32 = snap.processes.iter().filter_map(|p| p.cpu_pct).sum();
             assert!(rows <= snap.cpu.utilization_pct + 1e-3, "seed {seed}");
             let mean =
                 snap.cpu.per_core_pct.iter().sum::<f32>() / snap.cpu.per_core_pct.len() as f32;

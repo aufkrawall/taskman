@@ -257,13 +257,41 @@ Plain oversight-style accessors, plausibly upstreamable. **Coverage:** exercised
 | File | Change | Why |
 | --- | --- | --- |
 | `crates/egui_software/src/damage.rs` | **new** — `DamageTracker`, `DamageStats`, 64×64 tile hashing, disjoint rect merging (`merge_dirty_tiles`), conservative per-shape pixel bounds, ABA-safe `Arc<Galley>` retention, content-hashed `Mesh`es | avoids clearing, rasterizing, and presenting all 3.6M pixels on hover changes or periodic ticks when only a small region changed, and skips painting/presenting completely when zero tiles changed |
-| `crates/egui_software/src/texture.rs` | per-texture monotonic `generation` counter (bumped on full upload, non-atlas partial update, and free) | ensures texture replacements/icon loads invalidate affected tiles |
+| `crates/egui_software/src/texture.rs` | per-texture monotonic `generation` counter (bumped on full upload, on any partial update of a non-atlas texture, on an atlas partial update that rewrites texels which already hold content, and on free) | ensures texture replacements/icon loads invalidate affected tiles; the extra atlas rule catches epaint's slot reuse (its overflow path restarts the cursor inside the atlas and overwrites live cells), while a fresh glyph slot still costs nothing because filling empty space never bumps |
 | `crates/egui_software/src/gamma.rs` | `TextGamma::gamma()` and `TextGamma::contrast()` getters | included in the frame damage key |
 | `crates/egui_software/src/lib.rs` | `Painter::paint_shapes_damaged`, `paint_with_scissor`, shared `paint_flat_shapes_in_rects` | clears and repaints only disjoint dirty rects with strict per-rect scissor clipping across fast rects, text + underlines, and tessellated batches |
-| `crates/eframe/src/native/software_integration.rs` | uses `paint_shapes_damaged`, forces full paint/present when `!has_presented_once \|\| !presented_while_visible \|\| buffer.age() != 1`, re-presents immediately once `post_rendering` reveals the initially hidden window, skips `present` when 0 tiles are dirty, calls `present_with_damage` for partial updates, records `SoftwareFrameStats` | eliminates full-window GDI `BitBlt`s when idle or partially damaged while preventing white unblitted tiles on startup/tray-restore/un-occlude |
+| `crates/eframe/src/native/software_integration.rs` | uses `paint_shapes_damaged`, forces full paint/present when `!has_presented_once \|\| !presented_while_visible \|\| buffer.age() != 1` where `age()` is `softbuffer::Buffer::age()` on X11/Wayland and the DIB's presented flag on Win32, re-presents immediately once `post_rendering` reveals the initially hidden window, skips `present` when 0 tiles are dirty, calls `present_with_damage` for partial updates, records `SoftwareFrameStats` | eliminates full-window `BitBlt`s when idle or partially damaged while preventing white unblitted tiles on startup/tray-restore/un-occlude |
 | `crates/eframe/src/lib.rs`, `src/native/mod.rs` | `SoftwareFrameStats`, `software_frame_stats_take()` (stubbed when `software` feature is off) | exposes pass/paint/present timings and tile-damage counts for `TASKMAN_INPUT_STATS=1` |
 
-**Coverage:** `egui_software`'s `damage::tests` (zero-damage identical frames, single-row change partial damage matching full paint bit-for-bit, draw-order swap detection, disjoint tile merging) and `tm-app`'s `render_snapshot::tests::damaged_repaint_matches_full_paint_on_real_widgets` (real `tablekit`/`chart`/`icons` widgets).
+**Coverage:** `egui_software`'s `damage::tests` (zero-damage identical frames, single-row change partial damage matching full paint bit-for-bit, draw-order swap detection, disjoint tile merging, in-bounds/disjoint rects at a non-tile-multiple size, frame-key invalidation for every render option, texture-patch invalidation), `texture.rs`'s atlas-slot tests (a fresh glyph slot keeps the generation, a rewritten live texel bumps it), `tests/text.rs`'s `rewriting_a_live_atlas_texel_dirties_the_text_tiles` (a real `egui` atlas, patched under an unchanged galley, must damage the text tiles), `eframe`'s `should_force_full_paint`/`rects_to_present`/`a_two_buffer_ring_always_needs_a_full_paint` tests, and `tm-app`'s `render_snapshot::tests::damaged_repaint_matches_full_paint_on_real_widgets` (real `tablekit`/`chart`/`icons` widgets).
+
+**Buffer identity is the whole contract, and only the surface knows it.** `DamageTracker`
+compares *shapes*; it cannot know whether the pixels it deliberately left alone still exist
+in the buffer it is handed. So the platform surface must report the buffer's own age and the
+paint path may only be incremental when that age is exactly 1. A local "we have presented
+something" flag is **not** equivalent, and was the cause of the Linux corruption: nothing in
+that flag changes when the backend hands out a *different* buffer. `softbuffer`'s Wayland
+backend keeps two `wl_shm` buffers and swaps them on every present, so the buffer it returns
+holds either unpainted memory (`age == 0`) or the frame from two presents ago (`age == 2`);
+painting only the changed tiles into it left every undamaged pixel stale or black, and
+`present_with_damage` then published exactly those tiles. X11 keeps one SHM segment per
+surface and resets its age when the segment is reallocated, so it keeps the incremental path;
+Wayland repaints in full on every frame because its age never reaches 1. Making the
+incremental path safe behind a ring needs a damage cache per buffer slot, not a per-frame
+one.
+
+The frame key covers every tessellation option that changes pixels for unmodified shapes:
+target size, `pixels_per_point`, clear colour, text mode, sub-pixel mode, gamma and
+contrast, `round_rects_to_pixels`, `round_text_to_pixels`, `round_line_segments_to_pixels`,
+`coarse_tessellation_culling`, `feathering`, `feathering_size_in_pixels`,
+`prerasterized_discs`, `bezier_tolerance`, `epsilon` and the font atlas size. The `debug_*`
+toggles are the deliberate exception: they change the shapes that get emitted, which the
+per-shape hash covers. A missing entry here does not show up as a test failure; it shows up
+as a stale region.
+
+`Shape::Circle` is hashed together with the font atlas even though the shape names no
+texture: a small filled circle can be tessellated through a prerasterized disc that lives in
+that atlas. The atlas size and gamma/contrast already implied it; the hash now states it.
 
 ### 13. `eframe` + `egui-winit` + `egui-wgpu`: window-reliability hardening
 

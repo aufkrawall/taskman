@@ -75,9 +75,28 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "fork: egui_software clippy failed ($LASTEXITCODE)" }
     }
 
+    # `software` is not a default feature, so this is the only place its code is *linted*
+    # and its unit tests are compiled and run. Hard compile errors were already caught:
+    # `build.py --check` builds eframe as a workspace dependency (`cargo clippy --workspace
+    # --all-targets --all-features`), `renderer_feature_check()` checks tm-app with only the
+    # `software` renderer, and `cross_check()` type-checks the Linux targets -- which is where
+    # the non-Windows present surface is really compiled. This step is host-only, so that
+    # surface stays with `cross_check()`.
+    # The feature list mirrors `crates/tm-app/Cargo.toml` plus the renderer under test (the
+    # same cfg `renderer_feature_check()` builds). eframe's defaults would add wgpu, links,
+    # web_screen_reader and winit's default features on top, a combination no build ships.
+    $eframeSoftware = 'accesskit,default_fonts,software,wayland,x11'
+    Write-Host '==> cargo clippy -p eframe (software renderer)' -ForegroundColor Cyan
+    cargo clippy -p eframe --no-default-features --features $eframeSoftware --all-targets
+    if ($LASTEXITCODE -ne 0) { throw "fork: eframe software clippy failed ($LASTEXITCODE)" }
+
     Write-Host '==> cargo test (fork)' -ForegroundColor Cyan
     cargo test @pkgArgs
     if ($LASTEXITCODE -ne 0) { throw "fork: cargo test failed ($LASTEXITCODE)" }
+
+    Write-Host '==> cargo test -p eframe (software renderer)' -ForegroundColor Cyan
+    cargo test -p eframe --no-default-features --features $eframeSoftware
+    if ($LASTEXITCODE -ne 0) { throw "fork: eframe software test failed ($LASTEXITCODE)" }
 } finally {
     Pop-Location
 }
