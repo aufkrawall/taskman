@@ -1,3 +1,10 @@
+## 2026-11-24 - Released v0.1.33; README covers the D3D12 VRR exclusion
+
+- Released v0.1.33 (`851af4d`, tag `v0.1.33`): Windows x86_64/arm64 zip and setup installers, Linux x86_64/arm64 glibc tarballs (zigbuild), each with a `.sha256`. The published Windows GUI and the published Linux x86_64 binary (real backend under WSL) both pass `--selfcheck`, both setup payloads verify, and `sha256sum -c` passes against the downloaded assets. `--check --audit --all-targets` was green on the tagged commit; the tag stays on the documented version-bump commit.
+- The bump commit also merged the two `### Improved` blocks that had accumulated under `## Unreleased` into one, so the 51 entries render as a single New/Improved/Fixed/Changed/Security sequence. Entry text is unchanged (bullet sets diff clean).
+- README gained a "Variable refresh rate on Windows" section: with D3D12, exclude `taskman.exe` from VRR (new profile + "Gsync - Application State" = "Force Off" in NVIDIA Profile Inspector, or an added `taskman.exe` application profile with VRR off in the Radeon panel). CPU rendering needs none of it because it never creates a DXGI swapchain.
+- `dist/` still had the v0.1.32 archives from the previous release next to the new ones; they are removed before upload so a stale file cannot be attached by a glob.
+
 ## 2026-11-24 - Hidden WGPU VRAM lifecycle and memory probe
 
 - eframe now avoids creating a WGPU surface/device for hidden viewports. When no viewport is
