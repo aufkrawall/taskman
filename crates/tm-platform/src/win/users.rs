@@ -29,7 +29,6 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
                 domain: (!domain.is_empty()).then_some(domain),
                 state: map_state(s.State.0),
                 logon_epoch_s: None,
-                cpu_pct: 0.0,
                 mem_bytes: 0,
                 process_count: 0,
             });

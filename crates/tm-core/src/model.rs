@@ -1037,9 +1037,11 @@ pub struct UserSession {
     pub domain: Option<String>,
     pub state: UserSessionState,
     pub logon_epoch_s: Option<i64>,
-    /// Aggregated stats filled from the latest snapshot.
-    pub cpu_pct: f32,
+    /// Not filled by any backend and not read by the Users page, whose Memory
+    /// column is rolled up from the process table — the only source that can
+    /// say "not measured" per window. A zero here is not a measurement.
     pub mem_bytes: u64,
+    /// Same state as `mem_bytes`: no backend fills it, nothing renders it.
     pub process_count: usize,
 }
 

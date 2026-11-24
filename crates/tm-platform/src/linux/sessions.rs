@@ -91,7 +91,6 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
                 .map(map_state)
                 .unwrap_or(UserSessionState::Unknown),
             logon_epoch_s: logon_epoch_s(boot_epoch_s, properties.timestamp_monotonic_us),
-            cpu_pct: 0.0,
             mem_bytes: 0,
             process_count: 0,
         });

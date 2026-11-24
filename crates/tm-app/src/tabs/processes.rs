@@ -105,6 +105,11 @@ pub struct RowData {
     pub heat: [f32; VALUE_COLS],
     /// False when this row's CPU share was not measured in the window; the
     /// cell then reads "—". A zero would claim an idle process.
+    ///
+    /// A GROUP row is a lower bound when only some of its members reported a
+    /// share: unmeasured members contribute nothing — the rule the network,
+    /// disk and GPU columns already follow — so the cell shows what was
+    /// measured, not the group's true total.
     pub cpu_available: bool,
     pub net_available: bool,
     /// False while the per-process disk trace is not running. Rendered "—";
@@ -122,7 +127,10 @@ pub struct RowData {
     pub synthetic: bool,
     /// Command line for a concrete process, when available.
     pub command_line: Option<String>,
-    /// Localized hover explanation (why CPU is unattributable), if any.
+    /// Localized row-level explanation for a "—" in the CPU column, if any;
+    /// pseudo-rows put their aggregate description here instead. It outranks
+    /// the name/command-line tooltip, so the reason for the dash is never
+    /// hidden behind it.
     pub tooltip: Option<String>,
 }
 
@@ -1084,11 +1092,14 @@ fn row_ui(
         .collect();
     table.heat_cells(ui, pal, rect, FIXED_COLS, &cells);
     let unknown = [
+        (CPU_VALUE, row.cpu_available),
         (NET_VALUE, row.net_available),
         (DISK_ACT_VALUE, row.disk_available),
         (GPU_VALUE, row.gpu_available),
     ];
-    let net_tip = unknown.iter().find_map(|&(li, available)| {
+    // Each candidate answers only for its own cell rect, so the CPU tip cannot
+    // mask the Net/Disk/GPU ones.
+    let unknown_tip = unknown.iter().find_map(|&(li, available)| {
         (!available)
             .then(|| unknown_cell_tip(ui, table, rect, app.processes_state.display_col(2 + li), li))
             .flatten()
@@ -1151,7 +1162,7 @@ fn row_ui(
     // status glyph under the cursor explains itself first; otherwise the
     // row's own explanation (e.g. unattributable CPU) applies.
     let fallback_tip = name_tip;
-    let resp = match (status_tip, net_tip, row.tooltip.clone(), fallback_tip) {
+    let resp = match (status_tip, unknown_tip, row.tooltip.clone(), fallback_tip) {
         (Some(tip), _, _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
         (None, Some(tip), _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
         (None, None, Some(tip), _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
@@ -1769,7 +1780,7 @@ fn build_display_rows(
         // belongs exclusively to the explicit virtual group rows below.
         let own = matched
             .iter()
-            .map(|process| (process.pid, own_values(process)))
+            .map(|process| (process.pid, own_cells(process)))
             .collect::<HashMap<_, _>>();
         sort_entries(&mut matched, sort_col, ascending, &own);
         for p in matched {
@@ -1876,13 +1887,16 @@ fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: 
         }
     }
     let vi = (sort_col - FIXED_COLS).min(VALUE_COLS - 1);
+    // `None` is a row that measured nothing: it ranks below a measured zero
+    // instead of tying with it, the same rule `sort_entries` applies.
+    let sort_key = |d: &RowData| value_known(d, vi).then_some(d.values[vi]);
     blocks.sort_by(|a, b| {
         let (Some(DisplayRow::Process(x)), Some(DisplayRow::Process(y))) = (a.first(), b.first())
         else {
             return std::cmp::Ordering::Equal;
         };
-        let o = x.values[vi]
-            .partial_cmp(&y.values[vi])
+        let o = sort_key(x)
+            .partial_cmp(&sort_key(y))
             .unwrap_or(std::cmp::Ordering::Equal);
         let o = if ascending { o } else { o.reverse() };
         // Equal values must not inherit an arbitrary emission order: without
@@ -1923,6 +1937,8 @@ fn joins_family(root: &ProcessEntry, kid: &ProcessEntry) -> bool {
     same_publisher
         && looks_like_helper_process(&kid.name)
         && !kid.has_window
+        // An unmeasured child is never promoted, so it can only join and
+        // spends its first window folded into the family.
         && kid.cpu_pct.is_none_or(|pct| pct < PROMOTE_CPU_PCT)
         && !is_system_boundary(&root.name)
         && !is_system_boundary(&kid.name)
@@ -1963,6 +1979,62 @@ fn default_value_order_ids() -> Vec<String> {
     value_columns::default_ids()
 }
 
+/// One row's numeric cells: the numbers the table paints, plus which of them
+/// the row actually measured.
+///
+/// One type for both jobs on purpose: the cell text, the heat band, the
+/// availability flags and the sort key all have to agree, and they drifted
+/// apart while the numbers and the availability were computed in two places.
+#[derive(Clone, Copy, Default)]
+struct CellValues {
+    /// What the cells paint. A cell `known` denies is 0.0 here, and the
+    /// availability flag keeps it hidden and un-heated.
+    display: [f64; VALUE_COLS],
+    known: [bool; VALUE_COLS],
+}
+
+impl CellValues {
+    /// Sort key for one LOGICAL column: `None` where the row measured
+    /// nothing, which orders strictly below a measured zero instead of tying
+    /// with it — the rule the Users tab rollups use for the same columns.
+    fn key(&self, li: usize) -> Option<f64> {
+        self.known[li].then_some(self.display[li])
+    }
+}
+
+/// Which columns the given processes measured. CPU, network, disk active time
+/// and GPU can be genuinely absent; Memory and the disk byte rates come
+/// straight off every process.
+fn known_columns(members: &[&ProcessEntry]) -> [bool; VALUE_COLS] {
+    [
+        members.iter().any(|member| member.cpu_pct.is_some()),
+        true,
+        true,
+        members
+            .iter()
+            .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some()),
+        members.iter().any(|member| member.disk_active_pct.is_some()),
+        members.iter().any(|member| member.gpu_util_pct.is_some()),
+    ]
+}
+
+/// The process's own values (no subtree aggregation).
+fn own_cells(p: &ProcessEntry) -> CellValues {
+    CellValues {
+        display: [
+            f64::from(p.cpu_pct.unwrap_or(0.0)),
+            p.mem_bytes as f64,
+            p.disk_read_bps + p.disk_write_bps,
+            p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
+            // Shares of one measured total, so summing them over a display
+            // subtree is exactly as meaningful as summing the rates above.
+            f64::from(p.disk_active_pct.unwrap_or(0.0)),
+            f64::from(p.gpu_util_pct.unwrap_or(0.0)),
+        ],
+        known: known_columns(&[p]),
+    }
+}
+
 /// Sum of the members' OWN values — except Disk active time and GPU, which
 /// are the busiest disk / engine across the members like the machine totals,
 /// not the sum of each member's busiest one (see [`DiskGroupLoad`] and
@@ -1970,21 +2042,26 @@ fn default_value_order_ids() -> Vec<String> {
 ///
 /// Not the subtree aggregate: a family may now leave foreign descendants
 /// outside itself, and those are rendered as their own rows. Counting them in
-/// the group row too would show the same load twice.
-fn family_values(members: &[&ProcessEntry]) -> [f64; VALUE_COLS] {
-    let mut total = [0.0f64; VALUE_COLS];
+/// the group row too would show the same load twice. A member that measured
+/// nothing contributes nothing, so a group value is a lower bound; the
+/// availability flag says whether anything was measured at all.
+fn family_cells(members: &[&ProcessEntry]) -> CellValues {
+    let mut display = [0.0f64; VALUE_COLS];
     let mut disk = DiskGroupLoad::default();
     let mut gpu = GpuGroupLoad::default();
     for member in members {
-        for (slot, value) in total.iter_mut().zip(own_values(member)) {
+        for (slot, value) in display.iter_mut().zip(own_cells(member).display) {
             *slot += value;
         }
         disk.add(member);
         gpu.add(member);
     }
-    total[DISK_ACT_VALUE] = f64::from(disk.active_pct().unwrap_or(0.0));
-    total[GPU_VALUE] = f64::from(gpu.util_pct().unwrap_or(0.0));
-    total
+    display[DISK_ACT_VALUE] = f64::from(disk.active_pct().unwrap_or(0.0));
+    display[GPU_VALUE] = f64::from(gpu.util_pct().unwrap_or(0.0));
+    CellValues {
+        display,
+        known: known_columns(members),
+    }
 }
 
 /// Repeat runs of one program started by one parent — eight `node.exe` under
@@ -2066,12 +2143,12 @@ fn emit_flat_with_family_groups(
         family_heads.insert(head, run);
     }
 
-    let mut repr: HashMap<u32, [f64; VALUE_COLS]> = HashMap::with_capacity(members.len());
+    let mut repr: HashMap<u32, CellValues> = HashMap::with_capacity(members.len());
     for p in members {
         if let Some(fam) = family_heads.get(&p.pid) {
-            repr.insert(p.pid, family_values(fam));
+            repr.insert(p.pid, family_cells(fam));
         } else if !swallowed.contains(&p.pid) {
-            repr.insert(p.pid, own_values(p));
+            repr.insert(p.pid, own_cells(p));
         }
     }
     let mut display: Vec<&ProcessEntry> = members
@@ -2083,12 +2160,7 @@ fn emit_flat_with_family_groups(
 
     for p in display {
         if let Some(fam) = family_heads.get(&p.pid) {
-            let cpu_available = fam.iter().any(|member| cpu_known(member));
-            let net_available = fam
-                .iter()
-                .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
-            let disk_available = fam.iter().any(|member| disk_known(member));
-            let gpu_available = fam.iter().any(|member| gpu_known(member));
+            let cells = repr.get(&p.pid).copied().unwrap_or_default();
             out.push(DisplayRow::Process(RowData {
                 pid: p.pid,
                 start_epoch_s: p.creation_identity(),
@@ -2102,12 +2174,12 @@ fn emit_flat_with_family_groups(
                     .filter(|member| !member.synthetic)
                     .map(|member| process_identity(member))
                     .collect(),
-                values: repr.get(&p.pid).copied().unwrap_or([0.0; VALUE_COLS]),
+                values: cells.display,
                 heat: [0.0; VALUE_COLS],
-                cpu_available,
-                net_available,
-                disk_available,
-                gpu_available,
+                cpu_available: cells.known[CPU_VALUE],
+                net_available: cells.known[NET_VALUE],
+                disk_available: cells.known[DISK_ACT_VALUE],
+                gpu_available: cells.known[GPU_VALUE],
                 status: if fam
                     .iter()
                     .any(|member| member.status == ProcStatus::NotResponding)
@@ -2141,7 +2213,7 @@ fn emit_flat_with_family_groups(
                     .collect::<Vec<_>>();
                 let own = rest
                     .iter()
-                    .map(|member| (member.pid, own_values(member)))
+                    .map(|member| (member.pid, own_cells(member)))
                     .collect::<HashMap<_, _>>();
                 sort_entries(&mut rest, sort_col, ascending, &own);
                 for member in rest {
@@ -2549,6 +2621,7 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
 }
 
 fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
+    let cells = own_cells(p);
     DisplayRow::Process(RowData {
         pid: p.pid,
         start_epoch_s: p.creation_identity(),
@@ -2558,51 +2631,23 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         children: false,
         aggregate: false,
         termination_targets: vec![process_identity(p)],
-        values: own_values(p),
+        values: cells.display,
         heat: [0.0; VALUE_COLS],
-        cpu_available: cpu_known(p),
-        net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
-        disk_available: disk_known(p),
-        gpu_available: gpu_known(p),
+        cpu_available: cells.known[CPU_VALUE],
+        net_available: cells.known[NET_VALUE],
+        disk_available: cells.known[DISK_ACT_VALUE],
+        gpu_available: cells.known[GPU_VALUE],
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
         command_line: process_command_line(p),
-        tooltip: synthetic_tooltip(p),
+        tooltip: synthetic_tooltip(p).or_else(|| cpu_tooltip(cells.known[CPU_VALUE])),
     })
-}
-
-/// The process's own resource values (no subtree aggregation).
-fn own_values(p: &ProcessEntry) -> [f64; VALUE_COLS] {
-    [
-        f64::from(p.cpu_pct.unwrap_or(0.0)),
-        p.mem_bytes as f64,
-        p.disk_read_bps + p.disk_write_bps,
-        p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
-        // Shares of one measured total, so summing them over a display subtree
-        // is exactly as meaningful as summing the rates above.
-        f64::from(p.disk_active_pct.unwrap_or(0.0)),
-        f64::from(p.gpu_util_pct.unwrap_or(0.0)),
-    ]
-}
-
-/// Whether the per-process CPU accountant measured this process' share.
-fn cpu_known(p: &ProcessEntry) -> bool {
-    p.cpu_pct.is_some()
-}
-
-/// Whether the per-process disk trace produced a value for this process.
-fn disk_known(p: &ProcessEntry) -> bool {
-    p.disk_active_pct.is_some()
-}
-
-/// Whether the per-process GPU counters produced a value for this process.
-fn gpu_known(p: &ProcessEntry) -> bool {
-    p.gpu_util_pct.is_some()
 }
 
 /// Flat Background/Windows row: plain name, own values, no expand handle.
 fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
+    let cells = own_cells(p);
     DisplayRow::Process(RowData {
         pid: p.pid,
         start_epoch_s: p.creation_identity(),
@@ -2612,17 +2657,17 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         children: false,
         aggregate: false,
         termination_targets: vec![process_identity(p)],
-        values: own_values(p),
+        values: cells.display,
         heat: [0.0; VALUE_COLS],
-        cpu_available: cpu_known(p),
-        net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
-        disk_available: disk_known(p),
-        gpu_available: gpu_known(p),
+        cpu_available: cells.known[CPU_VALUE],
+        net_available: cells.known[NET_VALUE],
+        disk_available: cells.known[DISK_ACT_VALUE],
+        gpu_available: cells.known[GPU_VALUE],
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
         command_line: process_command_line(p),
-        tooltip: synthetic_tooltip(p),
+        tooltip: synthetic_tooltip(p).or_else(|| cpu_tooltip(cells.known[CPU_VALUE])),
     })
 }
 
@@ -2653,6 +2698,13 @@ fn synthetic_tooltip(p: &ProcessEntry) -> Option<String> {
         .as_deref()
         .filter(|d| !d.is_empty())
         .map(|d| i18n::trf(K::TerminatedTooltip, &[d]))
+}
+
+/// Row-level form of the CPU cell tip: a real process whose share was not
+/// measured explains the dash wherever the pointer sits in its row, not only
+/// over the CPU cell. Pseudo-rows keep their own aggregate description.
+fn cpu_tooltip(available: bool) -> Option<String> {
+    (!available).then(|| i18n::tr(K::CpuPerProcessUnavailable).to_string())
 }
 
 /// Build the parent→child topology used only by the Processes presentation.
@@ -2750,15 +2802,15 @@ fn emit_tree<'a>(
     // also counted descendants of other categories, which are rows of their
     // own, and a sum of GPU values is not what a group row shows.
     let mut groups: HashMap<u32, Vec<&ProcessEntry>> = HashMap::with_capacity(roots.len());
-    let mut shown: HashMap<u32, [f64; VALUE_COLS]> = HashMap::with_capacity(roots.len());
+    let mut shown: HashMap<u32, CellValues> = HashMap::with_capacity(roots.len());
     for root in roots {
         let members = tree_group_members(root, children);
-        let values = if members.len() <= 1 {
-            own_values(root)
+        let cells = if members.len() <= 1 {
+            own_cells(root)
         } else {
-            family_values(&members)
+            family_cells(&members)
         };
-        shown.insert(root.pid, values);
+        shown.insert(root.pid, cells);
         groups.insert(root.pid, members);
     }
     let mut sorted_roots: Vec<&ProcessEntry> = roots.to_vec();
@@ -2772,12 +2824,7 @@ fn emit_tree<'a>(
             out.push(make_own_row(root, 0));
             continue;
         }
-        let cpu_available = members.iter().any(|member| cpu_known(member));
-        let net_available = members
-            .iter()
-            .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
-        let disk_available = members.iter().any(|member| disk_known(member));
-        let gpu_available = members.iter().any(|member| gpu_known(member));
+        let cells = shown[&root.pid];
         out.push(DisplayRow::Process(RowData {
             pid: root.pid,
             // Selection identity must be the same token `identity_is_live`
@@ -2794,17 +2841,17 @@ fn emit_tree<'a>(
                 .filter(|member| !member.synthetic)
                 .map(|member| process_identity(member))
                 .collect(),
-            values: shown[&root.pid],
+            values: cells.display,
             heat: [0.0; VALUE_COLS],
-            cpu_available,
-            net_available,
-            disk_available,
-            gpu_available,
+            cpu_available: cells.known[CPU_VALUE],
+            net_available: cells.known[NET_VALUE],
+            disk_available: cells.known[DISK_ACT_VALUE],
+            gpu_available: cells.known[GPU_VALUE],
             status: subtree.status(root.pid),
             power_throttled: subtree.efficiency(root.pid),
             synthetic: false,
             command_line: None,
-            tooltip: None,
+            tooltip: cpu_tooltip(cells.known[CPU_VALUE]),
         }));
 
         if expanded.contains(&root.pid) {
@@ -2842,7 +2889,7 @@ fn emit_expanded_tree_members<'a>(
 ) {
     let own = members
         .iter()
-        .map(|process| (process.pid, own_values(process)))
+        .map(|process| (process.pid, own_cells(process)))
         .collect::<HashMap<_, _>>();
     let member_pids = members
         .iter()
@@ -2991,9 +3038,12 @@ fn sort_entries(
     v: &mut [&ProcessEntry],
     col: usize,
     asc: bool,
-    subtree: &HashMap<u32, [f64; VALUE_COLS]>,
+    cells: &HashMap<u32, CellValues>,
 ) {
-    let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
+    // `None` where the row measured nothing, so an unmeasured cell ranks
+    // strictly below a measured zero instead of tying with it — the same rule
+    // the Users tab rollups apply to these columns.
+    let sv = |p: &ProcessEntry, i: usize| cells.get(&p.pid).and_then(|c| c.key(i));
     // `col` is a LOGICAL column, so this arm covers every value column that
     // exists rather than a hand-written list. The hand-written one stopped at
     // 5, which meant Disk active time and GPU quietly sorted by NAME.
@@ -4261,6 +4311,67 @@ mod tests {
         assert!(by_pid[&10].heat[GPU_VALUE] > 0.0);
     }
 
+    /// Sort cells for a row that measured everything, with `value` in one
+    /// column and zeros elsewhere.
+    fn every_column_measured(li: usize, value: f64) -> CellValues {
+        let mut cells = CellValues {
+            display: [0.0; VALUE_COLS],
+            known: [true; VALUE_COLS],
+        };
+        cells.display[li] = value;
+        cells
+    }
+
+    /// A dash is not a zero: an unmeasured cell ranks strictly below a
+    /// measured 0.0, and equal cells keep the deterministic pid order — the
+    /// rule the Users tab rollups already apply to these columns.
+    #[test]
+    fn unmeasured_cells_sort_below_a_measured_zero() {
+        let mut idle = ProcessEntry::new(1, "idle.exe");
+        idle.cpu_pct = Some(0.0);
+        let mut fresh = ProcessEntry::new(2, "fresh.exe");
+        fresh.cpu_pct = None;
+        let cells = HashMap::from([
+            (idle.pid, own_cells(&idle)),
+            (fresh.pid, own_cells(&fresh)),
+        ]);
+        assert_eq!(own_cells(&idle).key(CPU_VALUE), Some(0.0));
+        assert_eq!(own_cells(&fresh).key(CPU_VALUE), None);
+
+        // Highest first: the measured 0.0 % outranks the dash.
+        let mut rows = vec![&fresh, &idle];
+        sort_entries(&mut rows, FIXED_COLS + CPU_VALUE, false, &cells);
+        assert_eq!(
+            rows.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![idle.pid, fresh.pid]
+        );
+        // Lowest first: the dash falls to the bottom, not into a tie with the
+        // real zero.
+        let mut rows = vec![&fresh, &idle];
+        sort_entries(&mut rows, FIXED_COLS + CPU_VALUE, true, &cells);
+        assert_eq!(
+            rows.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![fresh.pid, idle.pid]
+        );
+
+        // Two measured zeros are ordered by pid whatever the emission order
+        // was, so a hash-map walk cannot reshuffle them between samples.
+        let mut later = ProcessEntry::new(9, "later.exe");
+        later.cpu_pct = Some(0.0);
+        let mut earlier = ProcessEntry::new(3, "earlier.exe");
+        earlier.cpu_pct = Some(0.0);
+        let cells = HashMap::from([
+            (later.pid, own_cells(&later)),
+            (earlier.pid, own_cells(&earlier)),
+        ]);
+        let mut rows = vec![&later, &earlier];
+        sort_entries(&mut rows, FIXED_COLS + CPU_VALUE, false, &cells);
+        assert_eq!(
+            rows.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![earlier.pid, later.pid]
+        );
+    }
+
     /// Every value column must sort by ITS value. The old hand-written match
     /// stopped at column 5, so Disk active time and GPU fell through to the
     /// name comparison and the click looked like it did nothing.
@@ -4271,17 +4382,14 @@ mod tests {
             let mut high = ProcessEntry::new(2, "aaa-high.exe");
             // Names are deliberately reversed: a column that falls back to
             // the name comparison produces the opposite order.
-            let mut subtree = HashMap::new();
-            let mut low_values = [0.0f64; VALUE_COLS];
-            let mut high_values = [0.0f64; VALUE_COLS];
-            low_values[li] = 1.0;
-            high_values[li] = 9.0;
-            subtree.insert(low.pid, low_values);
-            subtree.insert(high.pid, high_values);
+            let cells = HashMap::from([
+                (low.pid, every_column_measured(li, 1.0)),
+                (high.pid, every_column_measured(li, 9.0)),
+            ]);
             low.cpu_pct = Some(0.0);
             high.cpu_pct = Some(0.0);
             let mut rows = vec![&low, &high];
-            sort_entries(&mut rows, FIXED_COLS + li, false, &subtree);
+            sort_entries(&mut rows, FIXED_COLS + li, false, &cells);
             assert_eq!(
                 rows[0].pid, high.pid,
                 "column {li} ({}) did not sort by its own value",

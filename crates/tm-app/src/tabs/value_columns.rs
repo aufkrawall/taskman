@@ -209,9 +209,10 @@ pub fn value_text(li: usize, value: f64, known: bool) -> String {
 }
 
 /// Why a column can read "—", for the hover explanation. `None` where the
-/// column has no localized explanation yet.
+/// column is always measurable and a dash would be a bug, not a limitation.
 pub fn unavailable_tip(li: usize) -> Option<&'static str> {
     match li {
+        CPU => Some(i18n::tr(K::CpuPerProcessUnavailable)),
         NET => Some(i18n::tr(K::NetPerProcessUnavailable)),
         DISK_ACT => Some(i18n::tr(K::DiskPerProcessUnavailable)),
         GPU => Some(i18n::tr(K::GpuPerProcessUnavailable)),

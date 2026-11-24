@@ -101,6 +101,21 @@ pub fn run(mock: bool) -> i32 {
             "engine_count": g.engines.len(),
         })).collect::<Vec<_>>(),
         "users_sessions_capable": session_capability,
+        // How many rows carry a measured CPU share, and how many real
+        // processes show the honest dash. A healthy tick measures every
+        // process except one it has only seen once, so `readings: 0` with
+        // `cpu.utilization_pct_available` true is the regression signature:
+        // the accountant stopped reporting while the header stayed honest.
+        "process_cpu_readings": snap
+            .processes
+            .iter()
+            .filter(|p| p.cpu_pct.is_some())
+            .count(),
+        "process_cpu_unknown": snap
+            .processes
+            .iter()
+            .filter(|p| !p.synthetic && p.cpu_pct.is_none())
+            .count(),
         // How many processes carry a per-process network reading. `0` with a
         // running trace is a real answer; the provider is simply unavailable
         // without administrator rights.

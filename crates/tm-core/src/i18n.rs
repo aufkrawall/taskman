@@ -742,6 +742,10 @@ keys! {
         "Subpixel-Darstellung (ClearType/LCD) wird verwendet, wenn Anzeige und Plattform sie unterstützen; andernfalls wird der Text in Graustufen geglättet.",
         "Sub-pixel rendering (ClearType/LCD) is used when the display and platform support it; otherwise text is grayscale anti-aliased."
     ],
+    CpuPerProcessUnavailable => [
+        "Für diesen Prozess ließ sich im Messfenster kein CPU-Anteil ermitteln.",
+        "No CPU share could be attributed to this process in the sampling window."
+    ],
     NetPerProcessUnavailable => [
         "Netzwerk pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
         "Per-process network needs administrator rights (ETW session)."
