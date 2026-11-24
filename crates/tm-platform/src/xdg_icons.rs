@@ -70,7 +70,23 @@ const WRAPPER_BINARIES: &[&str] = &[
     "electron",
     "steam",
     "xdg-open",
+    // Execution prefixes: they are followed by the real binary, so the prefix
+    // itself must never be indexed as an application — one shared `env` or
+    // `sudo` would otherwise collect every app that uses it.
+    "env",
+    "sudo",
+    "setsid",
+    "nohup",
+    "nice",
 ];
+
+/// `Exec=` prefixes that are followed by the binary they run, so the prefix
+/// token is skipped instead of becoming the executable name.
+const EXEC_PREFIXES: &[&str] = &["env", "sudo", "setsid", "nohup", "nice"];
+
+/// The Flatpak launcher. Its entries run `<launcher> run … --command=<app>`;
+/// inside the sandbox the process is the command, not the launcher.
+const FLATPAK_LAUNCHER: &str = "flatpak";
 
 /// Icon names that stand for "an application without an icon of its own", in
 /// fallback order: the standard executable icon every theme ships (the
@@ -95,6 +111,10 @@ pub struct IconLookup {
     pub pixmaps: Vec<PathBuf>,
     /// Name of the current icon theme (e.g. from the GTK settings), if known.
     pub theme: Option<String>,
+    /// `$HOME/.icons`: the spec's legacy per-user icon dir, which hand-installed
+    /// themes and icons still use. Searched with the themes and again for plain
+    /// pixmap files.
+    pub home_icons: Option<PathBuf>,
 }
 
 impl IconLookup {
@@ -122,28 +142,49 @@ impl IconLookup {
             }
         }
         let theme = current_icon_theme(home.as_deref());
-        let pixmaps = pixmap_dirs(&data_dirs);
+        let home_icons = home.as_ref().map(|h| h.join(".icons"));
+        let pixmaps = pixmap_dirs(&data_dirs, home_icons.as_deref());
         Self {
             data_dirs,
             pixmaps,
             theme,
+            home_icons,
         }
     }
 
-    /// `<data dir>/icons`, highest precedence first.
+    /// Icon theme dirs, highest precedence first: each `<data dir>/icons` plus
+    /// [`IconLookup::home_icons`], which belongs with the per-user data home
+    /// (index 0) and not at the end where the system themes would win.
     fn icon_dirs(&self) -> Vec<PathBuf> {
-        self.data_dirs.iter().map(|d| d.join("icons")).collect()
+        let mut dirs: Vec<PathBuf> = self.data_dirs.iter().map(|d| d.join("icons")).collect();
+        if let Some(legacy) = &self.home_icons
+            && !dirs.contains(legacy)
+        {
+            let at = dirs.len().min(1);
+            dirs.insert(at, legacy.clone());
+        }
+        dirs
     }
 }
 
 /// Legacy pixmaps dirs for `data_dirs`, highest precedence first.
 ///
 /// Hand-installed icons land in `<data dir>/pixmaps` (`~/.local/share/pixmaps`
-/// on a stock desktop, `/usr/local/share/pixmaps` for local packages) and
-/// packaged ones in the historical `/usr/share/pixmaps`, which is not
-/// necessarily an entry of `$XDG_DATA_DIRS`.
-fn pixmap_dirs(data_dirs: &[PathBuf]) -> Vec<PathBuf> {
+/// on a stock desktop, `/usr/local/share/pixmaps` for local packages), loose
+/// files of hand-installed apps in `$HOME/.icons`, and packaged ones in the
+/// historical `/usr/share/pixmaps`, which is not necessarily an entry of
+/// `$XDG_DATA_DIRS`.
+fn pixmap_dirs(data_dirs: &[PathBuf], home_icons: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = data_dirs.iter().map(|d| d.join("pixmaps")).collect();
+    // `$HOME/.icons` also holds loose files of hand-installed apps: it ranks
+    // with the per-user data home, ahead of the system dirs.
+    if let Some(home_icons) = home_icons {
+        let home_icons = home_icons.to_path_buf();
+        if !dirs.contains(&home_icons) {
+            let at = dirs.len().min(1);
+            dirs.insert(at, home_icons);
+        }
+    }
     let legacy = PathBuf::from("/usr/share/pixmaps");
     if !dirs.contains(&legacy) {
         dirs.push(legacy);
@@ -409,6 +450,20 @@ impl IconResolver {
     }
 }
 
+/// Entries of `dir`, sorted by path.
+///
+/// `read_dir` order is filesystem-defined (hash-ordered on ext4, name-ordered on
+/// NTFS), so it must not decide which desktop file wins a shared executable
+/// name — that made one app's icon depend on the machine or on a reinstall.
+fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    paths
+}
+
 /// Scan `<data_dir>/applications` (recursively, one level of subdirs is
 /// enough for KDE's legacy layout) for `.desktop` files and index their
 /// `Icon=` by exe basename. Matching rules: the desktop file's own id, plus
@@ -423,15 +478,7 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
         let apps = data_dir.join("applications");
         let mut stack = vec![(apps, 0u8)];
         while let Some((dir, depth)) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            // `read_dir` order is filesystem-defined, so it must not decide
-            // which desktop file wins a shared executable name: that made one
-            // app's icon depend on the machine (or on a reinstall).
-            let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-            paths.sort();
-            for p in paths {
+            for p in sorted_dir_paths(&dir) {
                 if p.is_dir() {
                     if depth < MAX_DEPTH {
                         stack.push((p, depth + 1));
@@ -499,36 +546,47 @@ struct DesktopEntry {
 
 impl DesktopEntry {
     /// Executable basenames (lowercase) this entry can appear as in a process
-    /// list, most specific first.
+    /// list.
     ///
-    /// `Exec=` wins; `TryExec=` is the detached-program fallback the spec
-    /// defines for exactly this question ("is this entry's program installed"),
-    /// and covers entries whose `Exec=` hides the binary behind a shell or an
-    /// interpreter. A wrapper binary itself is never a name — a `.desktop` for
-    /// a Python app must not relabel the interpreter — but the command a
-    /// Flatpak launcher starts *inside* the sandbox is one, because that is the
-    /// executable the process list shows.
+    /// `Exec=` wins whenever it names the program itself. When it names a
+    /// launcher instead — a Flatpak launcher, a shell, an interpreter — the
+    /// launcher must not be relabelled with this app's icon, and the entry's
+    /// own `TryExec=` (the spec's "this entry's program") is the only remaining
+    /// honest name. A Flatpak launcher additionally names the command it starts
+    /// *inside* the sandbox, because that is the executable the process list
+    /// shows.
     fn executable_names(&self) -> Vec<String> {
         let mut names = Vec::new();
-        let exec = self
+        let base = self
             .exec
             .as_deref()
             .and_then(exec_first_binary)
             .and_then(|binary| binary_basename(&binary));
-        if let Some(base) = exec {
-            if is_wrapper_binary(&base) {
+        match base.as_deref() {
+            Some(base) if base == FLATPAK_LAUNCHER => {
                 names.extend(self.exec.as_deref().and_then(flatpak_command));
-            } else {
-                names.push(base);
+                push_try_exec(&mut names, self.try_exec.as_deref());
             }
-        }
-        if let Some(base) = self.try_exec.as_deref().and_then(binary_basename)
-            && !is_wrapper_binary(&base)
-            && !names.contains(&base)
-        {
-            names.push(base);
+            Some(base) if is_wrapper_binary(base) => {
+                push_try_exec(&mut names, self.try_exec.as_deref());
+            }
+            Some(base) => names.push(base.to_string()),
+            None => {}
         }
         names
+    }
+}
+
+/// `TryExec=` as a fallback executable name, used only where `Exec=` cannot
+/// name the program: a program the entry merely launches through a launcher is
+/// still that entry's program, but anything else would widen attribution past
+/// what the entry declares.
+fn push_try_exec(names: &mut Vec<String>, try_exec: Option<&str>) {
+    if let Some(base) = try_exec.and_then(binary_basename)
+        && !is_wrapper_binary(&base)
+        && !names.contains(&base)
+    {
+        names.push(base);
     }
 }
 
@@ -587,7 +645,9 @@ fn is_wrapper_binary(name: &str) -> bool {
 
 /// The executable a `flatpak run` command line starts inside its sandbox,
 /// from `--command=<name>`: the sandboxed process is that binary, while
-/// `flatpak` itself is only a launcher.
+/// `flatpak` itself is only a launcher. Only a launcher command line is
+/// scraped — a shell wrapper that happens to mention `--command=` in its
+/// argument string must not name an executable.
 fn flatpak_command(exec: &str) -> Option<String> {
     let tokens: Vec<&str> = exec.split_whitespace().skip(1).collect();
     for (index, token) in tokens.iter().enumerate() {
@@ -598,6 +658,11 @@ fn flatpak_command(exec: &str) -> Option<String> {
         } else {
             continue;
         };
+        // `--command` without a usable value leaves the next token as an
+        // option (`--arch=x86_64`), which is no executable name.
+        if value.starts_with('-') {
+            continue;
+        }
         if let Some(base) = binary_basename(value)
             && !is_wrapper_binary(&base)
         {
@@ -608,14 +673,21 @@ fn flatpak_command(exec: &str) -> Option<String> {
 }
 
 /// First meaningful token of a desktop `Exec=` line: strip field codes
-/// (`%u`, `%F`, ...), then skip `env`/`sudo` and `VAR=value` prefixes.
+/// (`%u`, `%F`, ...), then skip execution prefixes (`env`, `sudo`, `setsid`,
+/// `nohup`, `nice` — also their absolute paths and flags) and `VAR=value`
+/// assignments.
 fn exec_first_binary(exec: &str) -> Option<String> {
     let mut tokens = exec.split_whitespace();
     let mut first = tokens.next()?;
     loop {
-        let lower = first.to_ascii_lowercase();
-        if lower == "env" || lower == "sudo" {
+        let is_prefix = binary_basename(first)
+            .is_some_and(|base| EXEC_PREFIXES.contains(&base.as_str()));
+        if is_prefix {
             first = tokens.next()?;
+            // `env -i FOO=1 app`, `sudo -E app`: flags are not the binary.
+            while first.starts_with('-') {
+                first = tokens.next()?;
+            }
             continue;
         }
         if first.contains('=') && !first.contains('/') {
@@ -726,16 +798,18 @@ fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBu
                 let Some(size_name) = size_entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                let size = size_name
-                    .split('x')
-                    .next()
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .unwrap_or(0);
-                candidates.push((size, size_entry.path()));
+                candidates.push((dir_size_from_name(&size_name), size_entry.path()));
             }
         }
     }
-    candidates.sort_by_key(|(size, _)| size.abs_diff(TARGET_SIZE));
+    // Pixel size first (closest to the target), then the path: a `read_dir`
+    // order must never decide between two same-size directories.
+    candidates.sort_by(|(a_size, a_dir), (b_size, b_dir)| {
+        a_size
+            .abs_diff(TARGET_SIZE)
+            .cmp(&b_size.abs_diff(TARGET_SIZE))
+            .then_with(|| a_dir.cmp(b_dir))
+    });
     for (_, dir) in candidates {
         // The icon may sit directly in the size dir (rare) or one context
         // level deeper (the standard layout).
@@ -755,16 +829,55 @@ fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBu
     None
 }
 
+/// Pixel size encoded in a size-directory name: `16x16` → 16, `48x48/apps` →
+/// 48, `16x16@2` → 32 (an `@N` directory holds `N ×` the pixels), and anything
+/// unparseable → 0, i.e. ranked last.
+fn dir_size_from_name(size_name: &str) -> u32 {
+    let base = match size_name.split_once('@') {
+        Some((base, _)) => base,
+        None => size_name,
+    };
+    let size = base
+        .split('x')
+        .next()
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
+    size.saturating_mul(name_scale(size_name))
+}
+
+/// Pixel multiplier encoded in a theme directory name (`16x16@2/apps` → 2), for
+/// themes that list their hidpi dirs in `ScaledDirectories=` without a matching
+/// `Scale=` key.
+fn name_scale(dir: &str) -> u32 {
+    dir.split_once('@')
+        .and_then(|(_, rest)| rest.split('/').next())
+        .and_then(|rest| rest.parse::<u32>().ok())
+        .filter(|scale| *scale > 0)
+        .unwrap_or(1)
+}
+
+/// Comma-separated `index.theme` list value, trimmed and without empty items.
+fn index_theme_list(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+}
+
 /// `(pixel size, subdir)` pairs from a theme's `index.theme`: the
-/// `Directories=` list of `[Icon Theme]`, each with the `Size=` and `Scale=`
-/// of its own section.
+/// `Directories=` and `ScaledDirectories=` lists of `[Icon Theme]`, each with
+/// the `Size=` and `Scale=` of its own section.
 ///
 /// The pixel size is `Size × Scale`: a `16x16@2` directory holds 32 px files
-/// (`Size=16 Scale=2`), and ranking on `Size` alone preferred a 16 px asset
-/// over that sharper one.
+/// (`Size=16 Scale=2`), and ranking on `Size` alone preferred a 16 px asset over
+/// that sharper one. `ScaledDirectories=` is where Adwaita/Breeze-style themes
+/// declare their hidpi dirs, and a missing `Scale=` is taken from the `@N` in
+/// the directory name.
 fn theme_directories(theme_dir: &Path) -> Option<Vec<(u32, String)>> {
     let text = std::fs::read_to_string(theme_dir.join("index.theme")).ok()?;
     let mut dirs: Vec<String> = Vec::new();
+    let mut scaled_dirs: Vec<String> = Vec::new();
     let mut sizes: HashMap<String, u32> = HashMap::new();
     let mut scales: HashMap<String, u32> = HashMap::new();
     let mut in_theme = false;
@@ -777,11 +890,10 @@ fn theme_directories(theme_dir: &Path) -> Option<Vec<(u32, String)>> {
             continue;
         }
         if in_theme && let Some(v) = line.strip_prefix("Directories=") {
-            dirs.extend(
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
+            dirs.extend(index_theme_list(v));
+        }
+        if in_theme && let Some(v) = line.strip_prefix("ScaledDirectories=") {
+            scaled_dirs.extend(index_theme_list(v));
         }
         if !in_theme
             && let (Some(sec), Some(v)) = (&section, line.strip_prefix("Size="))
@@ -799,14 +911,15 @@ fn theme_directories(theme_dir: &Path) -> Option<Vec<(u32, String)>> {
             scales.insert(sec.clone(), n);
         }
     }
-    if dirs.is_empty() {
+    if dirs.is_empty() && scaled_dirs.is_empty() {
         return None;
     }
+    dirs.extend(scaled_dirs);
     Some(
         dirs.into_iter()
             .map(|d| {
                 let size = sizes.get(&d).copied().unwrap_or(0);
-                let scale = scales.get(&d).copied().unwrap_or(1);
+                let scale = scales.get(&d).copied().unwrap_or_else(|| name_scale(&d));
                 (size.saturating_mul(scale), d)
             })
             .collect(),
@@ -1049,6 +1162,7 @@ mod tests {
                 data_dirs: vec![self.root.join("share")],
                 pixmaps: vec![self.root.join("pixmaps")],
                 theme: Some("custom".into()),
+                home_icons: Some(self.root.join("home").join(".icons")),
             }
         }
     }
@@ -1403,6 +1517,13 @@ mod tests {
                 &format!("[Desktop Entry]\nName=Shared\nExec=/usr/bin/sharedapp\nIcon={icon}\n"),
             );
         }
+        // The invariant itself, so it holds on NTFS (name-ordered enumeration)
+        // exactly as on a hash-ordered filesystem: the candidate list is sorted
+        // and the tie-break therefore defined.
+        let paths = sorted_dir_paths(&sb.root.join("share/applications"));
+        assert_eq!(paths.len(), 2);
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]), "{paths:?}");
+        assert!(paths[0].ends_with("aaa.desktop"), "{paths:?}");
         let index = build_desktop_index(&[sb.root.join("share")]);
         assert_eq!(
             index.get("sharedapp").map(String::as_str),
@@ -1433,7 +1554,19 @@ mod tests {
     /// image.
     #[test]
     fn wrapper_detection_keeps_similarly_named_apps() {
-        for wrapper in ["python", "python3", "python3.12", "nodejs18", "sh", "flatpak"] {
+        for wrapper in [
+            "python",
+            "python3",
+            "python3.12",
+            "nodejs18",
+            "sh",
+            "flatpak",
+            "env",
+            "sudo",
+            "setsid",
+            "nohup",
+            "nice",
+        ] {
             assert!(is_wrapper_binary(wrapper), "{wrapper} is a wrapper");
         }
         for app in ["shotcut", "python-tool", "code", "firefox", "gnome-terminal"] {
@@ -1462,6 +1595,82 @@ mod tests {
             !index.contains_key("flatpak"),
             "flatpak is only a launcher, not the app's image"
         );
+    }
+
+    /// `TryExec=` is only a fallback: an entry whose `Exec=` names its program
+    /// must not additionally claim the `TryExec` binary, which belongs to a
+    /// different process.
+    #[test]
+    fn try_exec_does_not_widen_a_trustworthy_exec() {
+        let sb = Sandbox::new("try-exec-honest");
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Foo.desktop"),
+            "[Desktop Entry]\nName=Foo\nExec=/usr/bin/foo\nTryExec=/usr/bin/bar\nIcon=foo-icon\n",
+        );
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        assert_eq!(index.get("foo").map(String::as_str), Some("foo-icon"));
+        assert!(
+            !index.contains_key("bar"),
+            "bar is a different program, not Foo's image"
+        );
+    }
+
+    /// An absolute `/usr/bin/env` prefix is the same execution prefix as a bare
+    /// `env`: it must be skipped, not indexed as the shared `env` binary.
+    #[test]
+    fn absolute_env_prefix_is_skipped_not_indexed() {
+        let sb = Sandbox::new("env-prefix");
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Wrapped.desktop"),
+            "[Desktop Entry]\nName=Wrapped\nExec=/usr/bin/env FOO=1 /opt/wrapped/bin/wrapped %U\n\
+             Icon=wrapped-icon\n",
+        );
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        assert_eq!(
+            index.get("wrapped").map(String::as_str),
+            Some("wrapped-icon")
+        );
+        assert!(
+            !index.contains_key("env"),
+            "env only starts the app and must not collect its icon"
+        );
+    }
+
+    /// Only a Flatpak launcher is scraped for `--command=`: a shell wrapper that
+    /// merely mentions that switch in its argument string must not name an
+    /// executable (`sh -c "… --command=spotify"` is not a Spotify entry).
+    #[test]
+    fn flatpak_command_is_only_read_from_the_launcher() {
+        let sb = Sandbox::new("flatpak-negative");
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Guise.desktop"),
+            "[Desktop Entry]\nName=Guise\n\
+             Exec=sh -c \"/opt/guise/bin/guise --command=spotify %f\"\nIcon=guise-icon\n",
+        );
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        assert!(
+            !index.contains_key("spotify"),
+            "spotify is another application's image"
+        );
+        assert!(!index.contains_key("sh"));
+    }
+
+    /// A `--command` whose value is another option is not an executable name.
+    #[test]
+    fn flatpak_command_ignores_option_values() {
+        assert_eq!(
+            flatpak_command("flatpak run --command=app"),
+            Some("app".into())
+        );
+        assert_eq!(
+            flatpak_command("flatpak run --command app"),
+            Some("app".into())
+        );
+        assert_eq!(
+            flatpak_command("flatpak run --command --arch=x86_64 org.example.App"),
+            None
+        );
+        assert_eq!(flatpak_command("flatpak run org.example.App"), None);
     }
 
     /// `TryExec=` names the program an entry needs, so an entry whose `Exec=`
@@ -1508,20 +1717,54 @@ mod tests {
     }
 
     /// Pixmaps are read from every data dir (a per-user install lives in
-    /// `~/.local/share/pixmaps`), with the historical path last and only once.
+    /// `~/.local/share/pixmaps`), then from the legacy `$HOME/.icons` of
+    /// hand-installed apps, with the historical system path last and only once.
     #[test]
     fn pixmaps_are_read_from_every_data_dir() {
-        let dirs = pixmap_dirs(&[
-            PathBuf::from("/home/u/.local/share"),
-            PathBuf::from("/usr/share"),
-        ]);
+        let dirs = pixmap_dirs(
+            &[
+                PathBuf::from("/home/u/.local/share"),
+                PathBuf::from("/usr/share"),
+            ],
+            Some(Path::new("/home/u/.icons")),
+        );
         assert_eq!(
             dirs,
             [
                 PathBuf::from("/home/u/.local/share/pixmaps"),
+                PathBuf::from("/home/u/.icons"),
                 PathBuf::from("/usr/share/pixmaps"),
             ]
         );
+        // Without a home dir the list is only the data dirs' pixmaps plus the
+        // legacy tail.
+        assert_eq!(
+            pixmap_dirs(&[PathBuf::from("/usr/share")], None),
+            [PathBuf::from("/usr/share/pixmaps")]
+        );
+    }
+
+    /// `$HOME/.icons` is the spec's legacy per-user icon dir; hand-installed
+    /// themes live there and nowhere else.
+    #[test]
+    fn legacy_home_icons_dir_is_searched_for_themes() {
+        let sb = Sandbox::new("home-icons");
+        write_desktop(
+            &sb.root.join("home/.icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=32x32/apps\n\n\
+             [32x32/apps]\nSize=32\nType=Fixed\n",
+        );
+        write_png(
+            &sb.root.join("home/.icons/custom/32x32/apps/handmade.png"),
+            32,
+            32,
+            [8, 8, 8, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let f = r
+            .find_icon_file("handmade")
+            .expect("theme below $HOME/.icons");
+        assert!(f.ends_with(".icons/custom/32x32/apps/handmade.png"));
     }
 
     /// Without a configured theme the spec's `default` theme supplies the real
@@ -1604,14 +1847,16 @@ mod tests {
         assert_eq!(chain, ["a", "b", "hicolor"]);
     }
 
-    /// `Size=` alone under-ranks a hidpi directory: `16x16@2` holds 32 px files
-    /// and must win over the 16 px copy in `16x16`.
+    /// A hidpi directory holds `Scale ×` the pixels of its `Size=`, and themes
+    /// declare those dirs in `ScaledDirectories=` — ranking on the `Directories=`
+    /// list with `Size=` alone missed them entirely.
     #[test]
     fn scaled_size_dirs_are_ranked_by_pixel_size() {
         let sb = Sandbox::new("scale");
         write_desktop(
             &sb.root.join("share/icons/custom/index.theme"),
-            "[Icon Theme]\nName=Custom\nDirectories=16x16/apps,16x16@2/apps\n\n\
+            "[Icon Theme]\nName=Custom\nDirectories=16x16/apps\n\
+             ScaledDirectories=16x16@2/apps\n\n\
              [16x16/apps]\nSize=16\nType=Fixed\n\n\
              [16x16@2/apps]\nSize=16\nScale=2\nType=Fixed\n",
         );
@@ -1630,6 +1875,75 @@ mod tests {
         let r = IconResolver::new(sb.lookup());
         let f = r.find_icon_file("sharp").expect("found");
         assert!(f.ends_with("16x16@2/apps/sharp.png"), "{f:?}");
+    }
+
+    /// A theme without a `Scale=` key still marks the multiplier in the
+    /// directory name — and its hidpi dirs may be listed in
+    /// `ScaledDirectories=` only: `16x16@3` must rank as 48 px, not as 16.
+    #[test]
+    fn scaled_directory_name_supplies_a_missing_scale() {
+        let sb = Sandbox::new("scale-name");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=8x8/apps\n\
+             ScaledDirectories=16x16@3/apps\n\n\
+             [8x8/apps]\nSize=8\nType=Fixed\n\n\
+             [16x16@3/apps]\nSize=16\nType=Fixed\n",
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/8x8/apps/sharp.png"),
+            8,
+            8,
+            [1, 1, 1, 255],
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/16x16@3/apps/sharp.png"),
+            48,
+            48,
+            [3, 3, 3, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let f = r.find_icon_file("sharp").expect("found");
+        assert!(f.ends_with("16x16@3/apps/sharp.png"), "{f:?}");
+    }
+
+    /// The size-directory scan (no `index.theme`) takes the multiplier from the
+    /// name too, otherwise `16x16@2` ties with `16x16` and `read_dir` order
+    /// decides which file the row gets.
+    #[test]
+    fn size_directory_names_carry_the_hidpi_multiplier() {
+        assert_eq!(dir_size_from_name("16x16"), 16);
+        assert_eq!(dir_size_from_name("48x48/apps"), 48);
+        assert_eq!(dir_size_from_name("16x16@2"), 32);
+        assert_eq!(dir_size_from_name("16x16@2/apps"), 32);
+        assert_eq!(dir_size_from_name("scalable"), 0);
+        assert_eq!(dir_size_from_name("16x16@x"), 16);
+        assert_eq!(name_scale("16x16@2/apps"), 2);
+        assert_eq!(name_scale("16x16/apps"), 1);
+        assert_eq!(name_scale("scalable/apps"), 1);
+        assert_eq!(name_scale("16x16@0/apps"), 1);
+    }
+
+    /// End to end through the no-index.theme branch: the sharper `@2` directory
+    /// wins on its pixel size, not on its position in the directory listing.
+    #[test]
+    fn hidpi_size_directory_wins_without_an_index_theme() {
+        let sb = Sandbox::new("scale-noindex");
+        write_png(
+            &sb.root.join("share/icons/custom/16x16/apps/plain.png"),
+            16,
+            16,
+            [1, 1, 1, 255],
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/16x16@2/apps/plain.png"),
+            32,
+            32,
+            [2, 2, 2, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let f = r.find_icon_file("plain").expect("found");
+        assert!(f.ends_with("16x16@2/apps/plain.png"), "{f:?}");
     }
 
     /// SVG is skipped while a size directory is scanned, so the PNG in the
