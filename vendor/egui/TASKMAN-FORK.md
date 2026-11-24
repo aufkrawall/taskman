@@ -288,7 +288,7 @@ and `window_focus_loss_releases_held_pointer_buttons_without_click` (egui-winit/
 
 | File | Change | Why |
 | --- | --- | --- |
-| `crates/egui-winit/src/lib.rs` | `WindowEvent::MouseWheel` no longer returns `repaint: true` unconditionally. A per-window `WheelRepaintThrottle` allows the first wheel event through immediately, then limits further wheel repaints to one per display refresh and arms exactly one trailing repaint through `Context::request_repaint_after_at_least_for`. Adjacent line-unit `Move` events with identical modifiers are summed componentwise in a `WheelEventBuffer`; pixel-unit and phased touchpad events remain individual events. Zero-delta Start/End/Cancel phases still request their delivery frame so touchpad scroll state cannot remain stale. `take_egui_input` supplies the measured display interval as `RawInput::predicted_dt`. Buffered input is flushed before any non-wheel event and again in `take_egui_input`, preserving unit, modifier, phase and click order while the trailing frame carries the final accumulated delta. New `WheelRepaintStats` / `wheel_repaint_stats_take` counters are emitted by `TASKMAN_INPUT_STATS=1` as wheel, coalesced, immediate and trailing counts | On Windows every wheel event caused a synchronous full UI pass, so a high-resolution or rapidly spinning wheel can run layout, tessellation, rasterization and presentation many times per display refresh. The cadence makes scrolling update at the rate that can be seen while keeping the immediate first response and a guaranteed final frame; line deltas are accumulated without changing horizontal/vertical direction, and point events are deliberately not summed because egui uses their per-event magnitude for touchpad smoothing |
+| `crates/egui-winit/src/lib.rs` | `WindowEvent::MouseWheel` no longer returns `repaint: true` unconditionally. A per-window `WheelRepaintThrottle` allows the first wheel event through immediately, then limits further wheel repaints to one per display refresh and arms exactly one trailing repaint through `Context::request_repaint_after_at_least_for`. Adjacent line-unit `Move` events with identical modifiers are summed componentwise in a `WheelEventBuffer`; pixel-unit and phased touchpad events remain individual events. Zero-delta Start/End/Cancel phases still request their delivery frame so touchpad scroll state cannot remain stale. `take_egui_input` supplies the measured display interval as `RawInput::predicted_dt`. Buffered input is flushed before any non-wheel event and again in `take_egui_input`, preserving unit, modifier, phase and click order while the trailing frame carries the final accumulated delta. New `WheelRepaintStats` / `wheel_repaint_stats_take` counters are emitted by `TASKMAN_INPUT_STATS=1` as wheel, coalesced, immediate and trailing counts. A wheel report that asks for no repaint of its own still resolves an expired trailing token when a nonzero line delta is queued, so a token eframe dropped cannot hold the buffered notch back for an unrelated event; a report with no queued (or only a zero) delta stays a plain `Skip` and keeps the repaint budget for the next real notch. Scoped to non-Windows zero-delta `Move` reports, since `WM_MOUSEWHEEL` always carries a notch. | On Windows every wheel event caused a synchronous full UI pass, so a high-resolution or rapidly spinning wheel can run layout, tessellation, rasterization and presentation many times per display refresh. The cadence makes scrolling update at the rate that can be seen while keeping the immediate first response and a guaranteed final frame; line deltas are accumulated without changing horizontal/vertical direction, and point events are deliberately not summed because egui uses their per-event magnitude for touchpad smoothing |
 | `crates/egui/src/context.rs` | `request_repaint_after_at_least_for` schedules without subtracting the predicted frame time. Input-driven follow-up frames use it, while ordinary at-most repaint requests retain upstream behavior | `request_repaint_after_for` intentionally wakes early by one predicted frame, which collapsed every sub-16 ms delay used by high-refresh input throttles to an immediate request |
 | `crates/egui/src/input_state/mod.rs` + `wheel_state.rs` | wheel-only Move input no longer counts as an immediate repaint trigger; Start/End/Cancel still do. Remaining line-wheel smoothing requests one frame at `predicted_dt`; any non-wheel event still requests an immediate frame. Scroll and zoom smoothing are tracked separately, so modifier groups in one batch cannot recolor the whole batch. End commits a same-pass Move before resetting touch state | The input state used to schedule back-to-back frames for every smoothing pass, bypassing the wheel throttle and keeping the UI at event frequency instead of the display cadence; batched modifier changes could also apply the wrong zoom mode |
 | `crates/tm-app/src/app.rs` | consumes `wheel_repaint_stats_take()` into the existing once-per-second `TASKMAN_INPUT_STATS=1` record | keeps the wheel decision counters in the same diagnostic line as pointer-move and frame timings, with no per-event logging |
@@ -300,7 +300,9 @@ diagnostics counters. `input_state` tests pin wheel-only cadence versus mixed im
 zero-delta lifecycle delivery, Start+Move+End delta preservation, and per-event scroll/zoom
 splitting. The context test proves egui no longer turns a sub-16 ms smoothing delay into zero,
 and the winit test advances past an unconsumed trailing token to prove it cannot wedge later
-wheel reports. The tests are deterministic and do not sleep.
+wheel reports. A zero-delta report after a lost trailing token delivers the queued notch exactly
+once, and one with nothing to rescue keeps its repaint budget. The tests are deterministic and do
+not sleep.
 
 ### 15. `egui-wgpu` + software fallback: dual-source LCD text
 
@@ -360,6 +362,31 @@ platform backend; the GPU-memory probe is the live end-to-end measurement.
 `RenderState` clones, `WgpuSetup::Existing`, hidden immediate-viewport callbacks, hard
 device-loss recovery and adapter-capability drift remain generic eframe residuals documented in
 `llm-wiki/known-debt.md`.
+
+### 17. `egui` + `egui-winit`: the wheel smoothing burst
+
+A single wheel notch used to decay asymptotically: upstream's
+`exponential_smooth_factor(0.90, 0.1, dt)` delivered 90 % of a 40 px notch in 0.1 s and then
+trickled the remaining 3–4 px out for another 0.1–0.2 s in ever-smaller discrete steps, ended by
+a `< 1.0` px lump flush. Because the operator was charged the *predicted* frame time on every
+duration-scheduled frame, a frame that really arrived late decayed too little and stretched that
+trickle in wall-clock time — which is the "delayed mini-scroll after the real scrolling" the
+report describes. The last sliver then surfaced on an unrelated later frame, because the
+follow-up chain stopped asking for frames at 0.2 px of residual.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui/src/input_state/wheel_state.rs` | `WheelState` keeps a burst budget (`burst_start`, `burst_frames`). The decay reaches `WHEEL_BURST_REACH = 0.999` inside `WHEEL_BURST_DECAY_SECONDS = 0.1`, and a burst is ended by the clock budget (`elapsed + dt >= 0.1`) or by the `WHEEL_BURST_MAX_FRAMES = 64` failsafe — both land the whole remainder, the budget pass landing `(1 - reach)^(1 - dt/decay)` of the impulse. A residual at or below `WHEEL_BURST_TAIL_EPSILON = 0.2` pt lands early, so no sliver is left for a later frame. `End`/`Cancel` clear the budget, and a zero-delta report does not restart it; a NaN `dt` never reaches the step. | The upstream filter has no end: its tail is asymptotic, its last step is a lump, and its wall-clock length depends on frame timing. A notch should be over when it looks over, with every step smaller than the one before it and nothing pending afterwards. |
+| `crates/egui/src/input_state/mod.rs` | A burst that is already running is charged the measured `unstable_dt` instead of `stable_dt`/`predicted_dt` (clamped to `[WHEEL_SMOOTHING_DT_MIN, WHEEL_SMOOTHING_DT_MAX]`, falling back to the nominal cadence when implausible). The pass that *starts* a burst is charged the nominal cadence, because its `unstable_dt` measured the time before the notch arrived. `wants_repaint_after` keeps requesting display-cadence follow-up frames while any residual exceeds `WHEEL_SMOOTHING_RESIDUAL_PX = 0.01` px instead of 0.2 px. | Cheap follow-up frames mean `stable_dt` is the nominal cadence there, so a late frame under-reported elapsed time and stretched the decay; and stopping at 0.2 px deferred the last sliver to some unrelated frame, which read as a lone late mini-scroll. |
+
+**Coverage:** `wheel_state`'s tests pin that one notch lands in full (within 0.01 px) with
+monotonically non-increasing steps, that the frame cap really terminates a starved loop, that
+60/120/240 Hz all land inside the clock budget, that a 400 px impulse is still spread over
+several passes, that a converged burst delivers nothing on later passes, and that zoom keeps its
+own residual. `input_state`'s tests pin the measured-dt path (a 50 ms pass lands more than a 5 ms
+pass), the plausibility clamp, that a residual between the new epsilon and the old 0.2 px still
+gets its frame, and that the follow-up chain terminates. The tests are deterministic and do not
+sleep.
 
 ## Rebase runbook
 
