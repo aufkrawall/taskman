@@ -364,8 +364,8 @@ impl Default for InputState {
 
 /// Upper bound for the delta-time handed to the wheel smoothing kernel.
 ///
-/// Same bound as the upstream `stable_dt.at_most(0.1)`, so a stall can never
-/// land a whole scroll impulse in one giant step.
+/// Same bound as the upstream `stable_dt.at_most(0.1)`, so a stall can never be
+/// charged more than a tenth of a second of decay at once.
 const WHEEL_SMOOTHING_DT_MAX: f32 = 0.1;
 
 /// Lower bound for the delta-time handed to the wheel smoothing kernel.
@@ -374,6 +374,11 @@ const WHEEL_SMOOTHING_DT_MAX: f32 = 0.1;
 const WHEEL_SMOOTHING_DT_MIN: f32 = 0.001;
 
 /// Residual (`px`) below which we stop asking for wheel smoothing frames.
+///
+/// Kept far below `WHEEL_BURST_TAIL_EPSILON` in `wheel_state.rs`, the remainder
+/// the kernel lands early: this only has to be small enough that no kernel
+/// residual can hide below it, and positive so float dust cannot spin an
+/// endless chain of follow-up frames.
 const WHEEL_SMOOTHING_RESIDUAL_PX: f32 = 0.01;
 
 /// Delta-time to hand to [`WheelState::after_events`] for the wheel smoothing kernel.
@@ -385,10 +390,11 @@ const WHEEL_SMOOTHING_RESIDUAL_PX: f32 = 0.01;
 /// less time had passed, stretching the tail into visible late mini-steps, so
 /// prefer the honestly measured `unstable_dt`.
 ///
-/// `unstable_dt` is only trusted when it is plausible for one frame; it is a
-/// whole second on the first pass of a default `InputState` and can be minutes
-/// after a suspend, which would jump the scroll. Anything implausible falls
-/// back to the nominal cadence, and both paths are clamped.
+/// `unstable_dt` is only trusted when it is plausible for one frame. It is
+/// unbounded after a suspend, a debugger stop or a long hitch, and charging that
+/// to the decay would land the rest of the notch in one step; anything outside
+/// `(0, WHEEL_SMOOTHING_DT_MAX]` falls back to the nominal cadence, and both
+/// paths are clamped.
 fn wheel_smoothing_dt(unstable_dt: f32, predicted_dt: f32) -> f32 {
     let predicted_dt = if predicted_dt.is_finite() && predicted_dt > 0.0 {
         predicted_dt
@@ -409,7 +415,7 @@ fn wheel_smoothing_dt(unstable_dt: f32, predicted_dt: f32) -> f32 {
 
 fn wheel_smoothing_repaint_delay(predicted_dt: f32) -> Duration {
     let seconds = if predicted_dt.is_finite() && predicted_dt > 0.0 {
-        predicted_dt.clamp(0.001, 0.1)
+        predicted_dt.clamp(WHEEL_SMOOTHING_DT_MIN, WHEEL_SMOOTHING_DT_MAX)
     } else {
         1.0 / 60.0
     };
@@ -453,6 +459,15 @@ impl InputState {
 
         self.wheel.smooth_wheel_delta = Vec2::ZERO;
         self.wheel.smooth_zoom_delta = Vec2::ZERO;
+
+        // TASKMAN-FORK (#14): whether a burst is already running, sampled before
+        // this pass folds its events in. Only a running burst may be charged the
+        // measured frame gap: on the pass that *starts* one, `unstable_dt`
+        // measured the time before the notch existed, and at the top of the
+        // accepted window (0.1 s) that is the whole decay budget — the kernel
+        // would land the entire notch in this one frame.
+        let wheel_burst_running = self.wheel.unprocessed_wheel_delta != Vec2::ZERO
+            || self.wheel.unprocessed_zoom_delta != Vec2::ZERO;
 
         for event in &mut new.events {
             match event {
@@ -508,9 +523,15 @@ impl InputState {
         }
 
         let smooth_scroll_delta = {
-            // TASKMAN-FORK (#14): the smoothing kernel gets the measured frame
-            // time, not `stable_dt` (== `predicted_dt` on these follow-up frames).
-            let dt = wheel_smoothing_dt(unstable_dt, new.predicted_dt);
+            // TASKMAN-FORK (#14): a running burst gets the measured frame time,
+            // not `stable_dt` (== `predicted_dt` on these follow-up frames). The
+            // pass that starts a burst is charged the nominal cadence instead,
+            // see `wheel_burst_running` above.
+            let dt = if wheel_burst_running {
+                wheel_smoothing_dt(unstable_dt, new.predicted_dt)
+            } else {
+                wheel_smoothing_dt(new.predicted_dt, new.predicted_dt)
+            };
             self.wheel.after_events(time, dt);
 
             zoom_factor_delta *= (options.scroll_zoom_speed
@@ -2097,6 +2118,38 @@ mod tests {
             residual <= WHEEL_SMOOTHING_RESIDUAL_PX,
             "residual {residual} px still pending after {frames} frames"
         );
+        assert!(frames > 0, "the notch never asked for a follow-up frame");
+    }
+
+    /// A residual smaller than the old 0.2 px cut-off still gets its frame.
+    ///
+    /// The kernels in this tree land their last sliver at
+    /// `WHEEL_BURST_TAIL_EPSILON`, so this path is only reachable with the
+    /// upstream kernel or a hand-set residual — but it is the reason the
+    /// threshold is 0.01 px, and nothing else pins it.
+    #[test]
+    fn sub_pixel_residual_still_requests_its_frame() {
+        let predicted_dt = 1.0 / 240.0;
+        let cadence = Duration::from_secs_f32(predicted_dt);
+
+        let mut state = InputState::default().begin_pass(
+            RawInput {
+                time: Some(f64::from(predicted_dt)),
+                predicted_dt,
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+
+        // Between the new epsilon and the upstream 0.2 px one.
+        state.wheel.unprocessed_wheel_delta = vec2(0.0, 0.15);
+        assert_eq!(state.wants_repaint_after(), Some(cadence));
+
+        // And the converged state asks for nothing, so the chain ends.
+        state.wheel.unprocessed_wheel_delta = Vec2::ZERO;
+        assert_eq!(state.wants_repaint_after(), None);
     }
 
     #[test]
