@@ -691,26 +691,35 @@ pub fn norm(value: f64, max: f64) -> f32 {
 ///
 /// `None` is a legitimate key: rows without an image share the platform's
 /// default application icon, which is its own cache lookup.
-type IconMemo = std::collections::HashMap<Option<String>, Option<egui::TextureHandle>>;
+///
+/// A small VECTOR, not a map, on purpose: a table shows tens of DISTINCT images
+/// per frame however many rows it has, and the hit path must not allocate or
+/// copy the path — building a map key would do both on every row of every
+/// repaint, which is most of what this memo exists to avoid.
+type IconMemo = Vec<(Option<String>, Option<egui::TextureHandle>)>;
 
-/// Answer `key` from `memo`, resolving it on the first ask.
+/// Answer `key` from the linear `memo`, resolving it on the first ask.
 ///
 /// Kept separate from [`TmTable::row_icon`] so the "exactly one resolution per
-/// distinct key" contract is testable without a platform or a texture.
-fn memoize<K, V>(
-    memo: &std::cell::RefCell<std::collections::HashMap<K, V>>,
-    key: K,
+/// distinct key, and a hit allocates nothing" contract is testable without a
+/// platform or a texture.
+fn memoize<V: Clone>(
+    memo: &std::cell::RefCell<Vec<(Option<String>, V)>>,
+    key: Option<&str>,
     resolve: impl FnOnce() -> V,
-) -> V
-where
-    K: Eq + std::hash::Hash,
-    V: Clone,
-{
-    if let Some(cached) = memo.borrow().get(&key).cloned() {
-        return cached;
+) -> V {
+    // The comparison is against the BORROWED key: no path copy on a hit.
+    if let Some(value) = memo
+        .borrow()
+        .iter()
+        .find(|(cached, _)| cached.as_deref() == key)
+        .map(|(_, value)| value.clone())
+    {
+        return value;
     }
     let value = resolve();
-    memo.borrow_mut().insert(key, value.clone());
+    // Only a miss materializes the key, and only once per distinct image.
+    memo.borrow_mut().push((key.map(str::to_owned), value.clone()));
     value
 }
 
@@ -1616,7 +1625,7 @@ impl TmTable {
         path: Option<&str>,
     ) -> Option<egui::TextureHandle> {
         self.icon_calls.set(self.icon_calls.get() + 1);
-        memoize(&self.icon_memo, path.map(str::to_owned), || {
+        memoize(&self.icon_memo, path, || {
             self.icon_lookups.set(self.icon_lookups.get() + 1);
             icons.icon_or_default(ctx, actions, path)
         })
@@ -2036,7 +2045,8 @@ mod tests {
     }
 
     /// One row's icon must be resolved once per frame, however many rows show
-    /// the same image.
+    /// the same image — and a remembered answer must be reachable without
+    /// allocating.
     ///
     /// Regression: the row loop called the icon cache for every visible row,
     /// and a process list repeats one image across many of them (a browser's
@@ -2046,8 +2056,8 @@ mod tests {
     /// recomputed dozens of times per repaint, i.e. on every scroll frame.
     #[test]
     fn memoized_lookup_resolves_each_distinct_key_exactly_once() {
-        let memo: std::cell::RefCell<std::collections::HashMap<Option<String>, usize>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        let memo: std::cell::RefCell<Vec<(Option<String>, usize)>> =
+            std::cell::RefCell::new(Vec::new());
         let resolutions = std::cell::Cell::new(0usize);
         let mut resolve = || {
             resolutions.set(resolutions.get() + 1);
@@ -2055,33 +2065,35 @@ mod tests {
         };
 
         for _ in 0..5 {
-            assert_eq!(
-                memoize(&memo, Some("svchost.exe".to_string()), &mut resolve),
-                1
-            );
+            // A borrowed key every time: the hit path must not need an owned
+            // one, which is what makes it allocation-free.
+            assert_eq!(memoize(&memo, Some("svchost.exe"), &mut resolve), 1);
         }
+        assert_eq!(
+            memo.borrow().len(),
+            1,
+            "repeated hits must not grow the memo"
+        );
         // A second distinct image, and the path-less rows, each resolve once.
         for _ in 0..3 {
-            assert_eq!(
-                memoize(&memo, Some("/usr/bin/firefox".to_string()), &mut resolve),
-                2
-            );
+            assert_eq!(memoize(&memo, Some("/usr/bin/firefox"), &mut resolve), 2);
             assert_eq!(memoize(&memo, None, &mut resolve), 3);
         }
         assert_eq!(resolutions.get(), 3, "one resolution per distinct image");
+        assert_eq!(memo.borrow().len(), 3);
     }
 
     /// The memo must not fuse two different images into one answer — a wrong
     /// icon is a visible lie about which executable a row is.
     #[test]
     fn memoized_lookup_keeps_distinct_paths_apart() {
-        let memo: std::cell::RefCell<std::collections::HashMap<Option<String>, Option<u8>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        let memo: std::cell::RefCell<Vec<(Option<String>, Option<u8>)>> =
+            std::cell::RefCell::new(Vec::new());
         assert_eq!(memoize(&memo, None, || Some(7)), Some(7));
-        assert_eq!(memoize(&memo, Some("a.exe".to_string()), || None), None);
-        assert_eq!(memoize(&memo, Some("b.exe".to_string()), || Some(9)), Some(9));
+        assert_eq!(memoize(&memo, Some("a.exe"), || None), None);
+        assert_eq!(memoize(&memo, Some("b.exe"), || Some(9)), Some(9));
         // A remembered "no icon for this image" is an answer too, never a miss.
-        assert_eq!(memoize(&memo, Some("a.exe".to_string()), || Some(1)), None);
+        assert_eq!(memoize(&memo, Some("a.exe"), || Some(1)), None);
         assert_eq!(memo.borrow().len(), 3);
     }
 
@@ -2089,9 +2101,14 @@ mod tests {
     ///
     /// It exists to skip the text layout that only answers "is this cell
     /// clipped?", so any difference in what lands on screen would be a bug —
-    /// a table that opted out would show its cells shifted or missing.
+    /// a table that opted out would show its cells shifted or missing. The
+    /// string is WIDER than the column on purpose: the clipped case is the one
+    /// the measurement was computed for, so that is the case equivalence has to
+    /// hold for.
     #[test]
     fn unmeasured_text_cell_paints_the_same_text_as_the_measured_one() {
+        // Several times the 340 pt Name column.
+        let overflowing = "Row ".repeat(40);
         let painted = |measured: bool| {
             let ctx = egui::Context::default();
             let table = table();
@@ -2104,13 +2121,13 @@ mod tests {
                     egui::CentralPanel::default().show(root, |ui| {
                         let (rect, _) = table.row(ui, &crate::theme::DARK, false, "t");
                         if measured {
-                            table.text_cell(ui, rect, 0, "Row", &crate::theme::DARK, false);
+                            table.text_cell(ui, rect, 0, &overflowing, &crate::theme::DARK, false);
                         } else {
                             table.text_cell_unmeasured(
                                 ui,
                                 rect,
                                 0,
-                                "Row",
+                                &overflowing,
                                 &crate::theme::DARK,
                                 false,
                             );
@@ -2121,13 +2138,27 @@ mod tests {
             out.shapes
                 .iter()
                 .filter_map(|clipped| match &clipped.shape {
-                    egui::Shape::Text(text) => Some((text.galley.job.text.clone(), text.pos)),
+                    // Clip rect AND galley: neither variant may ellipsize or
+                    // clip differently just because one of them measured.
+                    egui::Shape::Text(text) => Some((
+                        clipped.clip_rect,
+                        text.galley.job.text.clone(),
+                        text.pos,
+                        text.galley.size(),
+                    )),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(painted(true), painted(false));
-        assert_eq!(painted(true).len(), 1, "the cell paints exactly one text");
+        let measured = painted(true);
+        assert_eq!(measured, painted(false), "the two variants must paint alike");
+        assert!(!measured.is_empty(), "the cell paints exactly one text");
+        let (clip, text, _, galley) = &measured[0];
+        assert_eq!(text, &overflowing, "the full string reaches the painter");
+        assert!(
+            galley.x > clip.width(),
+            "the test string must overflow its cell ({galley:?} vs {clip:?})"
+        );
     }
 
     /// The disk headers must never invent a zero.
