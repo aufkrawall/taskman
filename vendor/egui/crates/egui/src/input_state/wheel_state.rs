@@ -112,8 +112,8 @@ impl Default for WheelState {
 // The curve below reaches 99.9 % in the same 0.1 s: `1 - 0.001^(dt / 0.1)` per
 // pass is 68.4 % at 60 Hz, 43.8 % at 120 Hz and 25.0 % at 240 Hz, so one 40 px
 // notch becomes 27.35 / 8.65 / 2.74 / 0.86 / 0.40 px at 60 Hz — five passes,
-// 83 ms, every step smaller than the one before it and the last one exact
-// (the bare curve would still be at 0.04 px after 0.1 s; the epsilon below
+// 83 ms, every step smaller than the one before it at that rate and the last one
+// exact (the bare curve would still be at 0.04 px after 0.1 s; the epsilon below
 // lands that sliver instead of dribbling it out).
 //
 // What the ending pass can land is bounded, not zero: the epsilon flush adds at
@@ -132,15 +132,15 @@ const WHEEL_BURST_REACH: f32 = 0.999;
 /// Failsafe cap on the passes one burst may take, independent of `dt`.
 ///
 /// The curve needs 5 passes at 60 Hz, 10 at 120 Hz and 19 at 240 Hz, and the
-/// clock budget below ends any of those at its own 0.1 s. The cap only matters
-/// where `dt` is fine but a *large* impulse keeps the tail alive past the
-/// budget — a 640 px coalesced spin needs 32 passes at 500 Hz — so 64 keeps it
-/// out of the way of every honest frame rate up to ~640 Hz while still bounding
-/// the pathological case the clock cannot catch: a loop that reports a nominal
-/// `dt` while its frames really arrive far apart. The capped pass lands the
-/// whole remainder instead of decaying another fraction of it; a jump then is
-/// strictly better than a crawl, and by 64 honest passes at ≤ 100 ms of wall
-/// clock the remainder is sub-pixel anyway.
+/// clock budget below ends any of those at its own 0.1 s — a 640 px coalesced
+/// spin at 500 Hz still lands through the budget, at pass 50, with 0.7 px left.
+/// The cap only binds where 64 passes cover less than the decay window, i.e.
+/// above ~640 Hz, or where the clock budget is fooled: a loop whose `dt` *and*
+/// `time` both advance nominally while its frames really arrive far apart. Both
+/// are worth bounding, because there the decay would otherwise crawl for
+/// seconds. The capped pass lands the whole remainder instead of decaying
+/// another fraction of it; a jump then is strictly better than a crawl, and by
+/// then the remainder is sub-pixel whenever the clock was honest.
 const WHEEL_BURST_MAX_FRAMES: u32 = 64;
 
 /// A residual this small (in points) is not worth another frame — 0.2 pt is a
@@ -247,6 +247,12 @@ impl WheelState {
                 // A coalesced batch can contain Start, a real Move and End in
                 // one frame. Commit the accumulated line delta before ending
                 // so the movement reaches the UI in this same pass.
+                //
+                // This also lands the residual of a burst that started on an
+                // earlier pass, which is upstream's behaviour and the right
+                // moment for it: an `End` is the end of the gesture, so the last
+                // of its movement belongs to this frame rather than to a
+                // follow-up one.
                 self.smooth_wheel_delta += self.unprocessed_wheel_delta;
                 self.smooth_zoom_delta += self.unprocessed_zoom_delta;
                 self.unprocessed_wheel_delta = Default::default();
@@ -746,5 +752,24 @@ mod tests {
                 "zoom {zoom_steps:?} vs scroll {scroll_steps:?}"
             );
         }
+    }
+
+    /// The kernel's landing epsilon must stay visible to the follow-up-frame
+    /// chain.
+    ///
+    /// `InputState::wants_repaint_after` keeps asking for display-cadence
+    /// frames while a residual exceeds `WHEEL_SMOOTHING_RESIDUAL_PX` (0.01 px)
+    /// in `input_state`. The kernel lands every remainder at or below
+    /// `WHEEL_BURST_TAIL_EPSILON`, so a
+    /// residual is always exactly `0` or comfortably above that threshold and no
+    /// sliver can hide below it forever. Raising the threshold past the epsilon,
+    /// or lowering the epsilon below the threshold, would strand a tail with
+    /// nothing left to deliver it.
+    #[test]
+    fn the_landing_epsilon_stays_above_the_repaint_residual() {
+        assert!(
+            WHEEL_BURST_TAIL_EPSILON > super::super::WHEEL_SMOOTHING_RESIDUAL_PX,
+            "the landing epsilon must leave nothing hidden below the repaint residual"
+        );
     }
 }

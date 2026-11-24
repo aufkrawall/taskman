@@ -2070,8 +2070,8 @@ mod tests {
     /// The follow-up frame chain terminates: it keeps asking for display-cadence
     /// frames while an impulse is pending and stops once it is spent.
     ///
-    /// This pins termination and the cadence, not the residual threshold — both
-    /// kernels in this tree land their last sliver far above
+    /// This pins termination and the cadence, not the residual threshold — the
+    /// burst kernel lands its last sliver far above
     /// `WHEEL_SMOOTHING_RESIDUAL_PX`, so the runs here never pass through the
     /// `(0.01, 0.2]` px band that the threshold exists for. That case is
     /// `sub_pixel_residual_still_requests_its_frame`.
@@ -2139,10 +2139,10 @@ mod tests {
 
     /// A residual smaller than the old 0.2 px cut-off still gets its frame.
     ///
-    /// The kernels in this tree land their last sliver at
-    /// `WHEEL_BURST_TAIL_EPSILON`, so this path is only reachable with the
-    /// upstream kernel or a hand-set residual — but it is the reason the
-    /// threshold is 0.01 px, and nothing else pins it.
+    /// The burst kernel lands its last sliver at `WHEEL_BURST_TAIL_EPSILON`, so
+    /// in the shipped configuration this path is only reachable with a hand-set
+    /// residual — but it is the reason the threshold is 0.01 px instead of the
+    /// upstream 0.2 px, and nothing else pins that band.
     #[test]
     fn sub_pixel_residual_still_requests_its_frame() {
         let predicted_dt = 1.0 / 240.0;

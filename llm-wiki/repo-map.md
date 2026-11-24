@@ -562,8 +562,10 @@ divergence #5), and genuinely modal `Window`s plus public accesskit
 reparenting (divergence #6 — the keyboard/screen-reader model depends on both).
 The smaller later divergences are the text-cursor blink restart (#7), text-selection
 preservation on secondary click (#8), no raw device-input registration (#9, pinned by
-a Windows test in `eframe`'s `native/run.rs`), wheel coalescing (#14), and the
-dual-source LCD font pipeline plus transformed-text grayscale fallback (#15).
+a Windows test in `eframe`'s `native/run.rs`), wheel coalescing (#14), the
+dual-source LCD font pipeline plus transformed-text grayscale fallback (#15),
+releasing resident GPU state while hidden (#16), and the wheel smoothing burst
+(#17).
 Linux capability parameters come from `tm-platform/src/fontconfig_text.rs`, which
 caches a trusted absolute `fc-match` query, maps `antialias`/`rgba`/`lcdfilter`,
 and bounds/reaps the process. LCD glyph texels use `(cov_r,cov_g,cov_b,0)`; WGPU
