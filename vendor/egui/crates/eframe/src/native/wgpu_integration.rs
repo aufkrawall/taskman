@@ -851,6 +851,7 @@ impl WgpuWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
+        let mut first_frame_reveal_in_progress = false;
         let vsync_secs = if is_visible {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
@@ -902,6 +903,7 @@ impl WgpuWinitRunning<'_> {
                 Some(output) => first_frame_reveal_from_commands(&output.commands),
                 None => true,
             };
+            first_frame_reveal_in_progress = integration.is_first_frame && reveal_first_frame;
             integration.post_rendering(window, reveal_first_frame);
 
             vsync_secs
@@ -924,7 +926,7 @@ impl WgpuWinitRunning<'_> {
         viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
         painter.gc_viewports(&active_viewports_ids);
 
-        if any_viewport_visible(viewports) {
+        if any_viewport_visible(viewports) || first_frame_reveal_in_progress {
             integration.frame.wgpu_render_state = painter.render_state();
         } else {
             integration.frame.wgpu_render_state = None;
@@ -1101,12 +1103,12 @@ impl Viewport {
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
     ) {
-        for command in &commands {
+        self.deferred_commands.append(&mut commands);
+        for command in &self.deferred_commands {
             if let egui::ViewportCommand::Visible(visible) = command {
                 self.app_visible = Some(*visible);
             }
         }
-        self.deferred_commands.append(&mut commands);
 
         if let Some(window) = self.window.as_ref() {
             egui_winit::process_viewport_commands(
@@ -1261,6 +1263,16 @@ fn first_frame_reveal_from_commands(commands: &[egui::ViewportCommand]) -> bool 
         }
     }
     reveal
+}
+
+fn initial_app_visibility(viewport_id: ViewportId, builder_visible: Option<bool>) -> Option<bool> {
+    if viewport_id == ViewportId::ROOT {
+        // eframe deliberately starts the root hidden so its first painted frame can
+        // reveal without a white flash; that implementation detail is not an app request.
+        None
+    } else {
+        builder_visible
+    }
 }
 
 fn render_immediate_viewport(
@@ -1495,6 +1507,7 @@ fn initialize_or_update_viewport<'a>(
         Entry::Vacant(entry) => {
             // New viewport:
             log::debug!("Creating new viewport {:?} ({:?})", ids.this, builder.title);
+            let app_visible = initial_app_visibility(ids.this, builder.visible);
             entry.insert(Viewport {
                 ids,
                 class,
@@ -1504,7 +1517,7 @@ fn initialize_or_update_viewport<'a>(
                 actions_requested: Vec::new(),
                 viewport_ui_cb,
                 window: None,
-                app_visible: None,
+                app_visible,
                 egui_winit: None,
                 pending_delta: Default::default(),
             })
@@ -1617,5 +1630,29 @@ mod tests {
         assert!(!first_frame_reveal_from_commands(&[Visible(false)]));
         assert!(first_frame_reveal_from_commands(&[Visible(false), Visible(true)]));
         assert!(!first_frame_reveal_from_commands(&[Visible(true), Close, Visible(false)]));
+    }
+
+    #[test]
+    fn root_builder_visibility_is_not_treated_as_an_app_hide() {
+        let child = ViewportId::from_hash_of("builder-visible-child");
+
+        assert_eq!(initial_app_visibility(ViewportId::ROOT, Some(false)), None);
+        assert_eq!(initial_app_visibility(child, Some(false)), Some(false));
+        assert_eq!(initial_app_visibility(child, Some(true)), Some(true));
+    }
+
+    #[test]
+    fn deferred_visibility_commands_update_app_visibility() {
+        use egui::ViewportCommand::Visible;
+
+        let child = ViewportId::from_hash_of("deferred-visible-child");
+        let mut viewport = test_viewport(child, ViewportId::ROOT);
+        viewport.deferred_commands.push(Visible(false));
+
+        viewport.process_commands(&egui::Context::default(), vec![Visible(true)]);
+        assert_eq!(viewport.app_visible, Some(true));
+
+        viewport.process_commands(&egui::Context::default(), vec![Visible(false)]);
+        assert_eq!(viewport.app_visible, Some(false));
     }
 }
