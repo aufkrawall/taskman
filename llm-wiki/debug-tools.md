@@ -1,12 +1,13 @@
 # Debug Tools
 
-Last cross-checked: 2026-10-26
+Last cross-checked: 2026-11-24
 
 Primary sources:
 - `AGENTS.md`
 - `crates/tm-app/src/main.rs`
 - `crates/tm-app/src/app.rs`
 - `tools/capture.ps1`
+- `tools/gpu-memory-probe.ps1`
 
 ## General rules
 
@@ -96,6 +97,70 @@ normal GUI log.
   `repaint_now`, `trailing`, `active`), software-renderer frame timings
   (`pass_avg/max_ms`, `paint_avg/max_ms`, `present_avg/max_ms`), tile-damage
   skips/counts, AccessKit activation status, and top `ctx.repaint_causes()`.
+
+### Per-process GPU memory
+
+`tools/gpu-memory-probe.ps1` samples Windows' user-visible
+`GPU Process Memory` dedicated/shared counters for one isolated TaskMan child.
+It defaults to `target/release/taskman.exe`, renderer `d3d12`, and tray mode:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\gpu-memory-probe.ps1 -Renderer d3d12 -Tray
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\gpu-memory-probe.ps1 -Renderer d3d12 -Visible -Seconds 30
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\gpu-memory-probe.ps1 -Tray -TaskbarMonitor -Renderer d3d12
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\gpu-memory-probe.ps1 -Executable .\target\debug\taskman.exe -Renderer cpu -Visible -Json
+```
+
+The probe discovers the localized counter object and counter labels through
+`Get-Counter`, then queries only `pid_<child-PID>_luid_*_phys_*` instances and
+sums every matching LUID. Readiness comes from either the isolated log's
+`engine started` marker or its renderer-ready
+`phase="subpixel_capability_resolved"` startup record; the probe then requires
+the child to stay alive through a one-second settle window before taking the
+baseline. It reports baseline, peak, final, LUID details, exit/error text, or
+explicit unavailable values. Tray mode treats a valid counter query with no
+child GPU-process instance as 0 B only when exact-child Win32 window checks
+also see no visible, titled, non-toolwindow window at least 320x200 after the
+settle and after every sample. Small/toolwindow/titleless taskbar-overlay
+windows are excluded. A visible main-sized window makes the probe fail rather
+than emit `HiddenZero`; visible mode reports counter absence as `Unknown`
+rather than inventing zero. Every launch uses
+`--instance-unresponsive`, so an installed hidden instance cannot absorb it by
+single-instance handoff. Inherited `TASKMAN_*`, `WGPU_*`, `RUST_LOG`, and
+`RUST_BACKTRACE` variables are removed from the child environment before the
+probe sets its own values.
+
+`-TaskbarMonitor` is valid only with tray mode and seeds the isolated
+`config.ini` with `taskbar_monitor_enabled=true` and `close_to_tray=true`;
+`-Tray -TaskbarMonitor -Renderer d3d12` is the closest reproduction of a hidden
+main window plus the software taskbar stats overlay. Omit it for a pure hidden
+baseline. Fresh
+`TASKMAN_DATA_DIR`/`TASKMAN_CONFIG_DIR` directories are used, and only the
+spawned process is stopped and only its own temporary directory is removed.
+The normal user token is sufficient; no elevation is requested. `vulkan` is
+accepted by the interface, but Windows builds currently expose only D3D12 and
+will report the renderer startup error.
+
+The probe deliberately forces `TASKMAN_TAB=performance`. During this unattended
+probe run, that demand starts no per-process network/disk ETW sessions, so tray
+mode's exact-PID termination cannot strand those machine-wide traces. That
+guarantee does not extend to interactive use, where switching or restoring tabs
+can change demand. Visible mode first calls `Process.CloseMainWindow()` and
+allows five seconds for graceful shutdown; if no window can be closed or
+shutdown times out, it warns and falls back to killing only the exact child. A
+window that exits just after the grace period is classified as a late graceful
+exit rather than an unexpected process exit.
+
+The baseline is a settled post-start sample, not by itself a steady-state
+proof, and it excludes transients before readiness. Dedicated/shared values
+describe this process only: driver, compositor, or desktop allocations can
+remain even when TaskMan reports 0 B, and a released allocation can persist in
+driver bookkeeping. `PeakState` distinguishes exact peaks from lower bounds
+caused by unavailable, incomplete, or otherwise uninterpreted samples and from
+wholly unknown peaks. For a same-process close-to-tray comparison, launch a
+visible instance, note its PID's GPU dedicated/shared columns in Task Manager
+Details, close the window to the tray, let Task Manager refresh, and compare the
+same PID; use a separate tray launch as the control.
 
 ## UI/capture diagnostics
 

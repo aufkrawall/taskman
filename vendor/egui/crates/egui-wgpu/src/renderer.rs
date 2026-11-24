@@ -298,6 +298,44 @@ struct SlicedBuffer {
     buffer: wgpu::Buffer,
     slices: Vec<Range<usize>>,
     capacity: wgpu::BufferAddress,
+    underused_updates: u16,
+}
+
+const BUFFER_SHRINK_MIN_CAPACITY: wgpu::BufferAddress = 1024 * 1024;
+const BUFFER_SHRINK_AFTER_UPDATES: u16 = 120;
+const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+    (std::mem::size_of::<Vertex>() * 1024) as _;
+const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
+    (std::mem::size_of::<u32>() * 1024 * 3) as _;
+
+/// Return a replacement capacity after the buffer has remained mostly unused for long
+/// enough to rule out alternating large/small frames.
+fn capacity_after_sustained_underuse(
+    capacity: wgpu::BufferAddress,
+    required: wgpu::BufferAddress,
+    underused_updates: &mut u16,
+    initial_capacity: wgpu::BufferAddress,
+) -> Option<wgpu::BufferAddress> {
+    if capacity <= initial_capacity
+        || capacity < BUFFER_SHRINK_MIN_CAPACITY
+        || required > capacity / 4
+    {
+        *underused_updates = 0;
+        return None;
+    }
+
+    *underused_updates = underused_updates.saturating_add(1);
+    if *underused_updates < BUFFER_SHRINK_AFTER_UPDATES {
+        return None;
+    }
+
+    *underused_updates = 0;
+    Some(
+        required
+            .saturating_mul(2)
+            .max(initial_capacity)
+            .min(capacity),
+    )
 }
 
 pub struct Texture {
@@ -707,11 +745,6 @@ impl Renderer {
             None
         };
 
-        const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
-            (std::mem::size_of::<Vertex>() * 1024) as _;
-        const INDEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
-            (std::mem::size_of::<u32>() * 1024 * 3) as _;
-
         Self {
             pipeline,
             lcd_pipeline,
@@ -722,11 +755,13 @@ impl Renderer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
                 capacity: VERTEX_BUFFER_START_CAPACITY,
+                underused_updates: 0,
             },
             index_buffer: SlicedBuffer {
                 buffer: create_index_buffer(device, INDEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
                 capacity: INDEX_BUFFER_START_CAPACITY,
+                underused_updates: 0,
             },
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
@@ -1282,9 +1317,18 @@ impl Renderer {
             let required_index_buffer_size = (std::mem::size_of::<u32>() * index_count) as u64;
             if self.index_buffer.capacity < required_index_buffer_size {
                 // Resize index buffer if needed.
+                self.index_buffer.underused_updates = 0;
                 self.index_buffer.capacity =
                     (self.index_buffer.capacity * 2).at_least(required_index_buffer_size);
                 self.index_buffer.buffer = create_index_buffer(device, self.index_buffer.capacity);
+            } else if let Some(capacity) = capacity_after_sustained_underuse(
+                self.index_buffer.capacity,
+                required_index_buffer_size,
+                &mut self.index_buffer.underused_updates,
+                INDEX_BUFFER_START_CAPACITY,
+            ) {
+                self.index_buffer.capacity = capacity;
+                self.index_buffer.buffer = create_index_buffer(device, capacity);
             }
 
             let index_buffer_staging = queue.write_buffer_with(
@@ -1317,6 +1361,17 @@ impl Renderer {
                     Primitive::Callback(_) => {}
                 }
             }
+        } else {
+            self.index_buffer.slices.clear();
+            if let Some(capacity) = capacity_after_sustained_underuse(
+                self.index_buffer.capacity,
+                0,
+                &mut self.index_buffer.underused_updates,
+                INDEX_BUFFER_START_CAPACITY,
+            ) {
+                self.index_buffer.capacity = capacity;
+                self.index_buffer.buffer = create_index_buffer(device, capacity);
+            }
         }
         if vertex_count > 0 {
             profiling::scope!("vertices", vertex_count.to_string().as_str());
@@ -1326,10 +1381,19 @@ impl Renderer {
             let required_vertex_buffer_size = (std::mem::size_of::<Vertex>() * vertex_count) as u64;
             if self.vertex_buffer.capacity < required_vertex_buffer_size {
                 // Resize vertex buffer if needed.
+                self.vertex_buffer.underused_updates = 0;
                 self.vertex_buffer.capacity =
                     (self.vertex_buffer.capacity * 2).at_least(required_vertex_buffer_size);
                 self.vertex_buffer.buffer =
                     create_vertex_buffer(device, self.vertex_buffer.capacity);
+            } else if let Some(capacity) = capacity_after_sustained_underuse(
+                self.vertex_buffer.capacity,
+                required_vertex_buffer_size,
+                &mut self.vertex_buffer.underused_updates,
+                VERTEX_BUFFER_START_CAPACITY,
+            ) {
+                self.vertex_buffer.capacity = capacity;
+                self.vertex_buffer.buffer = create_vertex_buffer(device, capacity);
             }
 
             let vertex_buffer_staging = queue.write_buffer_with(
@@ -1361,6 +1425,17 @@ impl Renderer {
                     }
                     Primitive::Callback(_) => {}
                 }
+            }
+        } else {
+            self.vertex_buffer.slices.clear();
+            if let Some(capacity) = capacity_after_sustained_underuse(
+                self.vertex_buffer.capacity,
+                0,
+                &mut self.vertex_buffer.underused_updates,
+                VERTEX_BUFFER_START_CAPACITY,
+            ) {
+                self.vertex_buffer.capacity = capacity;
+                self.vertex_buffer.buffer = create_vertex_buffer(device, capacity);
             }
         }
 
@@ -1493,8 +1568,9 @@ fn renderer_impl_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::{
-        UniformBuffer, enhanced_lcd_coverage, font_subpixel_after, lcd_shader_source,
-        normalized_contrast, subpixel_order_code, supports_subpixel_features,
+        BUFFER_SHRINK_AFTER_UPDATES, BUFFER_SHRINK_MIN_CAPACITY, UniformBuffer,
+        capacity_after_sustained_underuse, enhanced_lcd_coverage, font_subpixel_after,
+        lcd_shader_source, normalized_contrast, subpixel_order_code, supports_subpixel_features,
         texel_mapping_is_one_to_one, use_lcd_pipeline, validate_lcd_shader_source,
     };
     use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
@@ -1663,6 +1739,70 @@ mod tests {
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_contrast), 20);
         assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
         assert!(std::mem::size_of::<UniformBuffer>().is_multiple_of(16));
+    }
+
+    #[test]
+    fn buffers_shrink_only_after_sustained_low_use() {
+        let initial = 1024 * 1024;
+        let capacity = 16 * initial;
+        let required = initial;
+        let mut underused_updates = BUFFER_SHRINK_AFTER_UPDATES - 2;
+
+        assert_eq!(
+            capacity_after_sustained_underuse(
+                capacity,
+                required,
+                &mut underused_updates,
+                initial
+            ),
+            None,
+            "a buffer must not shrink on a single small frame"
+        );
+        assert_eq!(underused_updates, BUFFER_SHRINK_AFTER_UPDATES - 1);
+
+        assert_eq!(
+            capacity_after_sustained_underuse(
+                capacity,
+                required,
+                &mut underused_updates,
+                initial
+            ),
+            Some(2 * required)
+        );
+        assert_eq!(underused_updates, 0);
+
+        underused_updates = BUFFER_SHRINK_AFTER_UPDATES;
+        assert_eq!(
+            capacity_after_sustained_underuse(
+                capacity,
+                capacity / 4 + 1,
+                &mut underused_updates,
+                initial
+            ),
+            None,
+            "a temporarily larger frame must reset the hysteresis"
+        );
+        assert_eq!(underused_updates, 0);
+
+        underused_updates = BUFFER_SHRINK_AFTER_UPDATES;
+        assert_eq!(
+            capacity_after_sustained_underuse(
+                BUFFER_SHRINK_MIN_CAPACITY / 2,
+                0,
+                &mut underused_updates,
+                64 * 1024
+            ),
+            None,
+            "small renderer buffers are not worth reallocating"
+        );
+
+        let mut underused_updates = BUFFER_SHRINK_AFTER_UPDATES - 1;
+        assert_eq!(
+            capacity_after_sustained_underuse(capacity, 0, &mut underused_updates, initial),
+            Some(initial),
+            "a sustained empty or callback-only update must return to the initial capacity"
+        );
+        assert_eq!(underused_updates, 0);
     }
 
     #[test]

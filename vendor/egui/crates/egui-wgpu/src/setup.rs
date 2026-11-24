@@ -1,5 +1,38 @@
 use std::sync::Arc;
 
+/// Keep enough width/height for 8K displays and full-surface depth textures.
+const GUI_MAX_TEXTURE_DIMENSION_2D: u32 = 8192;
+
+/// D3D12 allocates its visible CBV/SRV/UAV heap from this limit at device creation.
+///
+/// TaskMan's bounded 512-entry icon cache needs far fewer descriptors than wgpu's
+/// one-million-binding default. Leaving substantial headroom keeps ordinary textures and
+/// custom UI bind groups working without reserving an oversized descriptor heap up front.
+const GUI_MAX_NON_SAMPLER_BINDINGS: u32 = 8192;
+
+/// The GUI performs small, infrequent uploads rather than large GPU workloads. wgpu's
+/// performance default starts device/host allocation blocks at 128/64 MiB; memory usage
+/// starts them at 8/4 MiB.
+fn gui_device_memory_hints() -> wgpu::MemoryHints {
+    wgpu::MemoryHints::MemoryUsage
+}
+
+fn gui_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
+    let base_limits = if backend == wgpu::Backend::Gl {
+        wgpu::Limits::downlevel_webgl2_defaults()
+    } else {
+        wgpu::Limits::default()
+    };
+
+    // The other portable limits are validation ceilings and custom callback compatibility,
+    // not allocations. Keep them at wgpu's defaults while bounding the two fields above.
+    wgpu::Limits {
+        max_texture_dimension_2d: GUI_MAX_TEXTURE_DIMENSION_2D,
+        max_non_sampler_bindings: GUI_MAX_NON_SAMPLER_BINDINGS,
+        ..base_limits
+    }
+}
+
 /// Request dual-source blending only when the selected adapter advertises it.
 ///
 /// Unknown adapters must keep the ordinary grayscale path: requesting a feature they do
@@ -264,21 +297,11 @@ impl WgpuSetupCreateNew {
             native_adapter_selector: None,
 
             device_descriptor: Arc::new(|adapter| {
-                let base_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::default()
-                };
-
                 wgpu::DeviceDescriptor {
                     label: Some("egui wgpu device"),
                     required_features: requested_dual_source_blending(adapter.features()),
-                    required_limits: wgpu::Limits {
-                        // When using a depth buffer, we have to be able to create a texture
-                        // large enough for the entire surface, and we want to support 4k+ displays.
-                        max_texture_dimension_2d: 8192,
-                        ..base_limits
-                    },
+                    required_limits: gui_device_limits(adapter.get_info().backend),
+                    memory_hints: gui_device_memory_hints(),
                     ..Default::default()
                 }
             }),
@@ -288,7 +311,37 @@ impl WgpuSetupCreateNew {
 
 #[cfg(test)]
 mod tests {
-    use super::requested_dual_source_blending;
+    use super::{
+        GUI_MAX_NON_SAMPLER_BINDINGS, GUI_MAX_TEXTURE_DIMENSION_2D, gui_device_limits,
+        gui_device_memory_hints, requested_dual_source_blending,
+    };
+
+    #[test]
+    fn gui_device_request_uses_bounded_memory_defaults() {
+        assert!(matches!(
+            gui_device_memory_hints(),
+            wgpu::MemoryHints::MemoryUsage
+        ));
+
+        for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
+            let limits = gui_device_limits(backend);
+            assert_eq!(limits.max_texture_dimension_2d, GUI_MAX_TEXTURE_DIMENSION_2D);
+            assert_eq!(
+                limits.max_non_sampler_bindings,
+                GUI_MAX_NON_SAMPLER_BINDINGS
+            );
+        }
+
+        let gl_limits = gui_device_limits(wgpu::Backend::Gl);
+        assert_eq!(
+            gl_limits.max_texture_dimension_2d,
+            GUI_MAX_TEXTURE_DIMENSION_2D
+        );
+        assert_eq!(
+            gl_limits.max_non_sampler_bindings,
+            GUI_MAX_NON_SAMPLER_BINDINGS
+        );
+    }
 
     #[test]
     fn dual_source_is_requested_only_when_the_adapter_has_it() {

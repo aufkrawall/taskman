@@ -162,6 +162,14 @@ pub struct WindowState {
     frame: Option<WinitFrame>,
 }
 
+fn is_suspended_state(state: XdgWindowState) -> bool {
+    state.contains(XdgWindowState::SUSPENDED)
+}
+
+fn suspended_state_changed(old: Option<XdgWindowState>, new: XdgWindowState) -> bool {
+    old.is_some_and(|old| is_suspended_state(old) != is_suspended_state(new))
+}
+
 impl WindowState {
     /// Create new window state.
     pub fn new(
@@ -380,6 +388,7 @@ impl WindowState {
 
         let new_state = configure.state;
         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
+        let suspended_changed = suspended_state_changed(old_state, new_state);
 
         let state_change_requires_resize = old_state
             .map(|old_state| {
@@ -393,6 +402,12 @@ impl WindowState {
 
         // NOTE: Set the configure before doing a resize, since we query it during it.
         self.last_configure = Some(configure);
+        if suspended_changed {
+            // A suspended surface does not necessarily receive the frame callback that
+            // normally throttles redraws. Let the compositor-triggered configure redraw
+            // through on both suspend and resume transitions.
+            self.frame_callback_reset();
+        }
 
         if state_change_requires_resize || new_size != self.inner_size() {
             self.resize(new_size);
@@ -582,6 +597,17 @@ impl WindowState {
     #[inline]
     pub fn is_configured(&self) -> bool {
         self.last_configure.is_some()
+    }
+
+    /// Whether the compositor marked this toplevel as suspended.
+    ///
+    /// xdg-shell's suspended state is the standardized repaint hint available when a
+    /// Wayland toplevel is hidden or minimized; clients have no direct visibility query.
+    #[inline]
+    pub fn is_suspended(&self) -> bool {
+        self.last_configure
+            .as_ref()
+            .is_some_and(|configure| is_suspended_state(configure.state))
     }
 
     #[inline]
@@ -1216,5 +1242,36 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
         Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
         Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
         None => sctk_adwaita::FrameConfig::auto(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspended_state_detection_tracks_xdg_window_state() {
+        assert!(!is_suspended_state(XdgWindowState::empty()));
+        assert!(is_suspended_state(XdgWindowState::SUSPENDED));
+        assert!(is_suspended_state(XdgWindowState::SUSPENDED | XdgWindowState::ACTIVATED));
+        assert!(!is_suspended_state(XdgWindowState::ACTIVATED | XdgWindowState::MAXIMIZED));
+    }
+
+    #[test]
+    fn suspended_state_changes_reset_redraw_throttle() {
+        assert!(!suspended_state_changed(None, XdgWindowState::SUSPENDED));
+        assert!(suspended_state_changed(Some(XdgWindowState::empty()), XdgWindowState::SUSPENDED));
+        assert!(suspended_state_changed(
+            Some(XdgWindowState::SUSPENDED),
+            XdgWindowState::ACTIVATED
+        ));
+        assert!(!suspended_state_changed(
+            Some(XdgWindowState::ACTIVATED),
+            XdgWindowState::MAXIMIZED
+        ));
+        assert!(!suspended_state_changed(
+            Some(XdgWindowState::SUSPENDED | XdgWindowState::ACTIVATED),
+            XdgWindowState::SUSPENDED
+        ));
     }
 }
