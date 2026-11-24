@@ -47,6 +47,7 @@ $ErrorActionPreference = "Stop"
 
 $script:InstancePattern = '^pid_(?<Pid>[0-9]+)_luid_(?<LuidHigh>0x[0-9A-Fa-f]+)_(?<LuidLow>0x[0-9A-Fa-f]+)_phys_(?<Phys>[0-9]+)(?:#[0-9]+)?$'
 $script:StartupTimeoutSeconds = 20
+$script:BaselineSettleMilliseconds = 1000
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
 
 function Limit-Text {
@@ -164,7 +165,6 @@ function Get-CounterPathParts {
     $markerIndex = $Path.IndexOf($marker, [StringComparison]::Ordinal)
     if ($markerIndex -lt 0) { return $null }
     return [pscustomobject]@{
-        ObjectPrefix = $Path.Substring(0, $markerIndex + 3)
         CounterName = $Path.Substring($markerIndex + $marker.Length)
     }
 }
@@ -232,7 +232,6 @@ function Find-GpuProcessCounterSet {
             $candidates += [pscustomobject]@{
                 CounterSetName = [string]$set.CounterSetName
                 ObjectName = $objectName
-                ObservedInstance = $observedInstance
                 DedicatedLabel = $dedicated.Label
                 SharedLabel = $shared.Label
                 DedicatedTemplate = $dedicated.Template
@@ -313,13 +312,24 @@ function Wait-ForTaskManReady {
         }
 
         $logText = Get-TaskManLogText -DataDirectory $DataDirectory
-        $match = [regex]::Match($logText, "(?im)^.*engine started.*$")
-        if ($match.Success) {
+        $engineMatch = [regex]::Match($logText, "(?im)^.*engine started.*$")
+        $subpixelMatch = [regex]::Match(
+            $logText,
+            '(?im)^.*phase="subpixel_capability_resolved".*$'
+        )
+        if ($engineMatch.Success -or $subpixelMatch.Success) {
+            $readinessMatch = if ($engineMatch.Success) { $engineMatch } else { $subpixelMatch }
+            $readinessMarker = if ($engineMatch.Success) {
+                "engine started"
+            } else {
+                "subpixel_capability_resolved"
+            }
             $rendererMatch = [regex]::Match($logText, "(?im)^.*trying renderer.*$")
             return [pscustomobject]@{
                 Ready = $true
-                Reason = "Engine started after the first submitted frame."
-                Evidence = $match.Value.Trim()
+                Reason = "Renderer readiness was confirmed by '$readinessMarker'."
+                Marker = $readinessMarker
+                Evidence = $readinessMatch.Value.Trim()
                 RendererEvidence = $rendererMatch.Value.Trim()
             }
         }
@@ -328,7 +338,7 @@ function Wait-ForTaskManReady {
 
     return [pscustomobject]@{
         Ready = $false
-        Reason = "Timed out waiting for the isolated TaskMan log to report 'engine started'."
+        Reason = "Timed out waiting for the isolated TaskMan log to report 'engine started' or phase=`"subpixel_capability_resolved`"."
         Evidence = ""
     }
 }
@@ -351,9 +361,24 @@ function Start-IsolatedTaskMan {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.EnvironmentVariables["TASKMAN_DATA_DIR"] = $DataDirectory
-    $startInfo.EnvironmentVariables["TASKMAN_CONFIG_DIR"] = $ConfigDirectory
-    $startInfo.EnvironmentVariables["TASKMAN_RENDERER"] = $RendererName
+    $childEnvironment = $startInfo.EnvironmentVariables
+    $inheritedKeysToRemove = @()
+    foreach ($key in @($childEnvironment.Keys)) {
+        if ($key -like "TASKMAN_*" -or
+            $key -like "WGPU_*" -or
+            [string]::Equals($key, "RUST_LOG", [StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($key, "RUST_BACKTRACE", [StringComparison]::OrdinalIgnoreCase)) {
+            $inheritedKeysToRemove += $key
+        }
+    }
+    foreach ($key in $inheritedKeysToRemove) {
+        [void]$childEnvironment.Remove($key)
+    }
+    $childEnvironment["TASKMAN_DATA_DIR"] = $DataDirectory
+    $childEnvironment["TASKMAN_CONFIG_DIR"] = $ConfigDirectory
+    $childEnvironment["TASKMAN_RENDERER"] = $RendererName
+    # Performance demand avoids per-process network/disk ETW sessions.
+    $childEnvironment["TASKMAN_TAB"] = "performance"
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
@@ -391,6 +416,111 @@ function Assert-SpawnedTaskManAlive {
     }
 }
 
+function Stop-IsolatedTaskMan {
+    param(
+        $Process,
+        [bool]$TrayMode
+    )
+
+    $warnings = @()
+    $Process.Refresh()
+    if ($Process.HasExited) {
+        return [pscustomobject]@{
+            StopReason = "ProcessExitedBeforeProbeStop"
+            Warnings = @()
+        }
+    }
+
+    if (-not $TrayMode) {
+        $closeRequested = $false
+        try {
+            $closeRequested = $Process.CloseMainWindow()
+        } catch {
+            $warnings += "CloseMainWindow() failed; falling back to exact-PID Kill(): $($_.Exception.Message)"
+        }
+
+        if ($closeRequested -and $Process.WaitForExit(5000)) {
+            $Process.WaitForExit()
+            return [pscustomobject]@{
+                StopReason = "VisibleWindowClosedGracefully"
+                Warnings = $warnings
+            }
+        }
+        if ($closeRequested) {
+            $warnings += "Visible TaskMan did not exit within 5 seconds after CloseMainWindow(); falling back to exact-PID Kill()."
+        } elseif (-not $Process.HasExited) {
+            $warnings += "Visible TaskMan had no main window to close; falling back to exact-PID Kill()."
+        }
+
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            return [pscustomobject]@{
+                StopReason = "ProcessExitedBeforeProbeStop"
+                Warnings = $warnings
+            }
+        }
+    }
+
+    try {
+        $Process.Kill()
+    } catch {
+        $Process.Refresh()
+        if (-not $Process.HasExited) { throw }
+        return [pscustomobject]@{
+            StopReason = "ProcessExitedBeforeProbeStop"
+            Warnings = $warnings
+        }
+    }
+
+    if (-not $Process.WaitForExit(5000)) {
+        $warnings += "The exact child process did not exit within 5 seconds after Kill()."
+        $stopReason = "ProbeKillTimedOut"
+    } else {
+        $Process.WaitForExit()
+        $stopReason = if ($TrayMode) {
+            "TrayStoppedExactChild"
+        } else {
+            "VisibleCloseFallbackKilledExactChild"
+        }
+    }
+
+    return [pscustomobject]@{
+        StopReason = $stopReason
+        Warnings = $warnings
+    }
+}
+
+function New-GpuCounterSampleResult {
+    param(
+        [int]$Sequence,
+        [long]$ElapsedMilliseconds,
+        [long]$QueryMilliseconds,
+        [ValidateSet("Observed", "Absent", "Incomplete", "Unavailable")]
+        [string]$Outcome,
+        [AllowNull()]$DedicatedBytes = $null,
+        [AllowNull()]$SharedBytes = $null,
+        [int]$InstanceCount = 0,
+        [int]$CompleteInstanceCount = 0,
+        [int]$RawSampleCount = 0,
+        [AllowNull()][string]$ErrorMessage = "",
+        [object[]]$Instances = @()
+    )
+
+    return [pscustomobject]@{
+        Sequence = $Sequence
+        ElapsedMilliseconds = $ElapsedMilliseconds
+        QueryMilliseconds = $QueryMilliseconds
+        Outcome = $Outcome
+        DedicatedBytes = $DedicatedBytes
+        SharedBytes = $SharedBytes
+        InstanceCount = $InstanceCount
+        CompleteInstanceCount = $CompleteInstanceCount
+        RawSampleCount = $RawSampleCount
+        Error = $ErrorMessage
+        Instances = @($Instances)
+    }
+}
+
 function Measure-GpuCounterSample {
     param(
         $CounterSet,
@@ -409,54 +539,31 @@ function Measure-GpuCounterSample {
         $counterData = Get-Counter -Counter $queryPaths -MaxSamples 1 -ErrorAction Stop
     } catch {
         $queryTimer.Stop()
-        return [pscustomobject]@{
-            Sequence = $Sequence
-            ElapsedMilliseconds = $ElapsedMilliseconds
-            QueryMilliseconds = $queryTimer.ElapsedMilliseconds
-            Outcome = "Unavailable"
-            DedicatedBytes = $null
-            SharedBytes = $null
-            InstanceCount = 0
-            CompleteInstanceCount = 0
-            RawSampleCount = 0
-            Error = Limit-Text -Text $_.Exception.Message -MaximumLength 2048
-            Instances = @()
-        }
+        return New-GpuCounterSampleResult `
+            -Sequence $Sequence `
+            -ElapsedMilliseconds $ElapsedMilliseconds `
+            -QueryMilliseconds $queryTimer.ElapsedMilliseconds `
+            -Outcome "Unavailable" `
+            -ErrorMessage (Limit-Text -Text $_.Exception.Message -MaximumLength 2048)
     }
 
     if ($null -eq $counterData) {
         $queryTimer.Stop()
-        return [pscustomobject]@{
-            Sequence = $Sequence
-            ElapsedMilliseconds = $ElapsedMilliseconds
-            QueryMilliseconds = $queryTimer.ElapsedMilliseconds
-            Outcome = "Absent"
-            DedicatedBytes = $null
-            SharedBytes = $null
-            InstanceCount = 0
-            CompleteInstanceCount = 0
-            RawSampleCount = 0
-            Error = ""
-            Instances = @()
-        }
+        return New-GpuCounterSampleResult `
+            -Sequence $Sequence `
+            -ElapsedMilliseconds $ElapsedMilliseconds `
+            -QueryMilliseconds $queryTimer.ElapsedMilliseconds `
+            -Outcome "Absent"
     }
 
     $rawSamples = @($counterData.CounterSamples | Where-Object { $null -ne $_ })
     if ($rawSamples.Count -eq 0) {
         $queryTimer.Stop()
-        return [pscustomobject]@{
-            Sequence = $Sequence
-            ElapsedMilliseconds = $ElapsedMilliseconds
-            QueryMilliseconds = $queryTimer.ElapsedMilliseconds
-            Outcome = "Absent"
-            DedicatedBytes = $null
-            SharedBytes = $null
-            InstanceCount = 0
-            CompleteInstanceCount = 0
-            RawSampleCount = 0
-            Error = ""
-            Instances = @()
-        }
+        return New-GpuCounterSampleResult `
+            -Sequence $Sequence `
+            -ElapsedMilliseconds $ElapsedMilliseconds `
+            -QueryMilliseconds $queryTimer.ElapsedMilliseconds `
+            -Outcome "Absent"
     }
 
     $rows = @{}
@@ -503,38 +610,29 @@ function Measure-GpuCounterSample {
     $instances = @($rows.Values | ForEach-Object { [pscustomobject]$_ })
     if ($instances.Count -eq 0) {
         $reason = "Get-Counter returned $($rawSamples.Count) sample(s), but none matched pid_$ProcessId with the expected LUID/phys instance shape."
-        return [pscustomobject]@{
-            Sequence = $Sequence
-            ElapsedMilliseconds = $ElapsedMilliseconds
-            QueryMilliseconds = $queryTimer.ElapsedMilliseconds
-            Outcome = "Incomplete"
-            DedicatedBytes = $null
-            SharedBytes = $null
-            InstanceCount = 0
-            CompleteInstanceCount = 0
-            RawSampleCount = $rawSamples.Count
-            Error = $reason
-            Instances = @()
-        }
+        return New-GpuCounterSampleResult `
+            -Sequence $Sequence `
+            -ElapsedMilliseconds $ElapsedMilliseconds `
+            -QueryMilliseconds $queryTimer.ElapsedMilliseconds `
+            -Outcome "Incomplete" `
+            -RawSampleCount $rawSamples.Count `
+            -ErrorMessage $reason
     }
 
     $completeInstances = @($instances | Where-Object {
         $null -ne $_.DedicatedBytes -and $null -ne $_.SharedBytes
     })
     if ($completeInstances.Count -ne $instances.Count) {
-        return [pscustomobject]@{
-            Sequence = $Sequence
-            ElapsedMilliseconds = $ElapsedMilliseconds
-            QueryMilliseconds = $queryTimer.ElapsedMilliseconds
-            Outcome = "Incomplete"
-            DedicatedBytes = $null
-            SharedBytes = $null
-            InstanceCount = $instances.Count
-            CompleteInstanceCount = $completeInstances.Count
-            RawSampleCount = $rawSamples.Count
-            Error = "At least one target LUID instance lacked a valid dedicated or shared counter value."
-            Instances = $instances
-        }
+        return New-GpuCounterSampleResult `
+            -Sequence $Sequence `
+            -ElapsedMilliseconds $ElapsedMilliseconds `
+            -QueryMilliseconds $queryTimer.ElapsedMilliseconds `
+            -Outcome "Incomplete" `
+            -InstanceCount $instances.Count `
+            -CompleteInstanceCount $completeInstances.Count `
+            -RawSampleCount $rawSamples.Count `
+            -ErrorMessage "At least one target LUID instance lacked a valid dedicated or shared counter value." `
+            -Instances $instances
     }
 
     [long]$dedicatedTotal = 0
@@ -549,19 +647,18 @@ function Measure-GpuCounterSample {
     } else {
         ""
     }
-    return [pscustomobject]@{
-        Sequence = $Sequence
-        ElapsedMilliseconds = $ElapsedMilliseconds
-        QueryMilliseconds = $queryTimer.ElapsedMilliseconds
-        Outcome = "Observed"
-        DedicatedBytes = $dedicatedTotal
-        SharedBytes = $sharedTotal
-        InstanceCount = $instances.Count
-        CompleteInstanceCount = $instances.Count
-        RawSampleCount = $rawSamples.Count
-        Error = $note
-        Instances = $instances
-    }
+    return New-GpuCounterSampleResult `
+        -Sequence $Sequence `
+        -ElapsedMilliseconds $ElapsedMilliseconds `
+        -QueryMilliseconds $queryTimer.ElapsedMilliseconds `
+        -Outcome "Observed" `
+        -DedicatedBytes $dedicatedTotal `
+        -SharedBytes $sharedTotal `
+        -InstanceCount $instances.Count `
+        -CompleteInstanceCount $instances.Count `
+        -RawSampleCount $rawSamples.Count `
+        -ErrorMessage $note `
+        -Instances $instances
 }
 
 function Get-InterpretedMetric {
@@ -669,6 +766,9 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 if ($Tray -and $Visible) {
     throw "Use either -Tray or -Visible, not both."
 }
+if ($TaskbarMonitor -and $Visible) {
+    throw "-TaskbarMonitor requires -Tray; visible mode does not model the tray-overlay scenario."
+}
 
 $trayMode = -not $Visible.IsPresent
 $modeName = if ($trayMode) { "Tray" } else { "Visible" }
@@ -687,6 +787,7 @@ $result = [ordered]@{
     Mode = $modeName
     Renderer = $rendererName
     TaskbarMonitor = $TaskbarMonitor.IsPresent
+    ForcedTab = "performance"
     Executable = $executablePath
     ProcessId = $null
     CounterSetName = $null
@@ -696,7 +797,9 @@ $result = [ordered]@{
     DedicatedCounterPath = $null
     SharedCounterPath = $null
     StartupEvidence = $null
+    ReadinessMarker = $null
     RendererEvidence = $null
+    BaselineSettleMilliseconds = $script:BaselineSettleMilliseconds
     BaselineState = $null
     BaselineDedicatedBytes = $null
     BaselineSharedBytes = $null
@@ -791,7 +894,11 @@ try {
     }
     Assert-SpawnedTaskManAlive -Process $process -Phase "after reporting renderer startup"
     $result["StartupEvidence"] = $ready.Evidence
+    $result["ReadinessMarker"] = $ready.Marker
     $result["RendererEvidence"] = $ready.RendererEvidence
+
+    Start-Sleep -Milliseconds $script:BaselineSettleMilliseconds
+    Assert-SpawnedTaskManAlive -Process $process -Phase "after the baseline settle window"
 
     $measureTimer = [Diagnostics.Stopwatch]::StartNew()
     $baseline = Measure-GpuCounterSample `
@@ -894,25 +1001,9 @@ try {
     if ($null -ne $started) {
         $process = $started.Process
         try {
-            $process.Refresh()
-            if (-not $process.HasExited) {
-                $stopReason = "ProbeStoppedExactChild"
-                try {
-                    $process.Kill()
-                } catch {
-                    $process.Refresh()
-                    if (-not $process.HasExited) { throw }
-                    $stopReason = "ProcessExitedBeforeProbeStop"
-                }
-                if (-not $process.WaitForExit(5000)) {
-                    $warnings += "The exact child process did not exit within 5 seconds after Kill()."
-                    $stopReason = "ProbeKillTimedOut"
-                } else {
-                    $process.WaitForExit()
-                }
-            } else {
-                $stopReason = "ProcessExitedBeforeProbeStop"
-            }
+            $stop = Stop-IsolatedTaskMan -Process $process -TrayMode $trayMode
+            $stopReason = $stop.StopReason
+            $warnings += @($stop.Warnings)
 
             if ($process.HasExited) {
                 $result["ExitCode"] = $process.ExitCode
@@ -1002,7 +1093,12 @@ if ($Json) {
     Write-Output ("Counter set: {0}" -f $result["CounterSetName"])
     Write-Output ("Counters: {0} / {1}" -f
         $result["DedicatedCounterLabel"], $result["SharedCounterLabel"])
-    Write-Output ("Startup: {0}" -f $result["StartupEvidence"])
+    Write-Output ("Forced tab: {0}; taskbar overlay config: {1}" -f
+        $result["ForcedTab"], $result["TaskbarMonitor"])
+    Write-Output ("Startup: {0} (marker: {1}; settle: {2} ms)" -f
+        $result["StartupEvidence"],
+        $result["ReadinessMarker"],
+        $result["BaselineSettleMilliseconds"])
 
     $summary = [pscustomobject][ordered]@{
         Baseline = "{0} dedicated, {1} shared ({2})" -f

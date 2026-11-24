@@ -113,32 +113,45 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\gpu-memory-probe.ps1
 
 The probe discovers the localized counter object and counter labels through
 `Get-Counter`, then queries only `pid_<child-PID>_luid_*_phys_*` instances and
-sums every matching LUID. It waits for the isolated log's `engine started`
-marker before taking the baseline, and reports baseline, peak, final, LUID
-details, exit/error text, or explicit unavailable values. Tray mode treats a
-valid counter query with no child GPU-process instance as 0 B; visible mode
-reports that absence as `Unknown` rather than inventing zero. Every launch uses
+sums every matching LUID. Readiness comes from either the isolated log's
+`engine started` marker or its renderer-ready
+`phase="subpixel_capability_resolved"` startup record; the probe then requires
+the child to stay alive through a one-second settle window before taking the
+baseline. It reports baseline, peak, final, LUID details, exit/error text, or
+explicit unavailable values. Tray mode treats a valid counter query with no
+child GPU-process instance as 0 B; visible mode reports that absence as
+`Unknown` rather than inventing zero. Every launch uses
 `--instance-unresponsive`, so an installed hidden instance cannot absorb it by
-single-instance handoff; the spawned PID must stay alive through startup and
-sampling. `-TaskbarMonitor` seeds only the isolated `config.ini` with
-`taskbar_monitor_enabled=true` and `close_to_tray=true`;
+single-instance handoff. Inherited `TASKMAN_*`, `WGPU_*`, `RUST_LOG`, and
+`RUST_BACKTRACE` variables are removed from the child environment before the
+probe sets its own values.
+
+`-TaskbarMonitor` is valid only with tray mode and seeds the isolated
+`config.ini` with `taskbar_monitor_enabled=true` and `close_to_tray=true`;
 `-Tray -TaskbarMonitor -Renderer d3d12` is the closest reproduction of a hidden
 main window plus the software taskbar stats overlay. Omit it for a pure hidden
 baseline. Fresh
 `TASKMAN_DATA_DIR`/`TASKMAN_CONFIG_DIR` directories are used, and only the
-spawned `Process` object and its own temporary directory are stopped/removed.
+spawned process is stopped and only its own temporary directory is removed.
 The normal user token is sufficient; no elevation is requested. `vulkan` is
 accepted by the interface, but Windows builds currently expose only D3D12 and
 will report the renderer startup error.
 
-The baseline is post-renderer-start steady state, so it excludes startup
-transients before the first submitted frame. Dedicated/shared values describe
-this process only: driver, compositor, or desktop allocations can remain even
-when TaskMan reports 0 B, and a released allocation can persist in driver
-bookkeeping. For a same-process close-to-tray comparison, launch a visible
-instance, note its PID's GPU dedicated/shared columns in Task Manager Details,
-close the window to the tray, let Task Manager refresh, and compare the same
-PID; use a separate tray launch as the control.
+The probe deliberately forces `TASKMAN_TAB=performance`, whose hidden demand
+starts no per-process network/disk ETW sessions. Tray mode therefore uses
+exact-PID termination and cannot strand those machine-wide traces. Visible mode
+first calls `Process.CloseMainWindow()` and allows five seconds for graceful
+shutdown; if no window can be closed or shutdown times out, it warns and falls
+back to killing only the exact child.
+
+The baseline is a settled post-start sample, not by itself a steady-state
+proof, and it excludes transients before readiness. Dedicated/shared values
+describe this process only: driver, compositor, or desktop allocations can
+remain even when TaskMan reports 0 B, and a released allocation can persist in
+driver bookkeeping. For a same-process close-to-tray comparison, launch a
+visible instance, note its PID's GPU dedicated/shared columns in Task Manager
+Details, close the window to the tray, let Task Manager refresh, and compare the
+same PID; use a separate tray launch as the control.
 
 ## UI/capture diagnostics
 
