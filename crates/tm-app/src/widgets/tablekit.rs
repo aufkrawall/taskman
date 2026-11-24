@@ -750,6 +750,11 @@ pub struct TmTable {
     /// real machine, where a process list repeats one image across many rows.
     icon_calls: std::cell::Cell<u64>,
     icon_lookups: std::cell::Cell<u64>,
+    /// Clipped-text measurements [`TmTable::text_cell`] performed this frame.
+    /// A dense list that measures every cell pays a text layout per visible
+    /// cell on every repaint; the tally makes that visible in the
+    /// `TASKMAN_INPUT_STATS=1` summary.
+    text_measures: std::cell::Cell<u64>,
 }
 
 impl TmTable {
@@ -765,6 +770,7 @@ impl TmTable {
             icon_memo: std::cell::RefCell::new(IconMemo::new()),
             icon_calls: std::cell::Cell::new(0),
             icon_lookups: std::cell::Cell::new(0),
+            text_measures: std::cell::Cell::new(0),
             id,
             auto_widths: vec![None; cols.len()],
             cols,
@@ -1468,9 +1474,43 @@ impl TmTable {
         pal: &Palette,
         dim: bool,
     ) -> bool {
-        self.describe_cell(ui, i, text);
         let cell = self.col_rect(i, row);
+        self.text_measures.set(self.text_measures.get() + 1);
         let truncated = text_width(ui, text, FONT_ROW) + 10.0 > cell.width();
+        self.paint_text_cell(ui, cell, i, text, pal, dim);
+        truncated
+    }
+
+    /// [`Self::text_cell`] for callers that only consume the clipped-text
+    /// answer under the pointer.
+    ///
+    /// The answer is a hover tooltip, so a table that checks it per cell pays
+    /// for one text layout per visible cell per repaint — on a dense Details
+    /// list that is hundreds of layouts per frame for at most one answer it
+    /// uses. Both variants paint exactly the same thing; only the measurement
+    /// is skipped.
+    pub fn text_cell_unmeasured(
+        &self,
+        ui: &egui::Ui,
+        row: Rect,
+        i: usize,
+        text: &str,
+        pal: &Palette,
+        dim: bool,
+    ) {
+        self.paint_text_cell(ui, self.col_rect(i, row), i, text, pal, dim);
+    }
+
+    fn paint_text_cell(
+        &self,
+        ui: &egui::Ui,
+        cell: Rect,
+        i: usize,
+        text: &str,
+        pal: &Palette,
+        dim: bool,
+    ) {
+        self.describe_cell(ui, i, text);
         ui.painter_at(cell).text(
             Pos2::new(cell.left() + 10.0, cell.center().y),
             Align2::LEFT_CENTER,
@@ -1478,7 +1518,6 @@ impl TmTable {
             FontId::proportional(FONT_ROW),
             if dim { pal.text_dim } else { pal.text },
         );
-        truncated
     }
 
     /// Paint the blue value band for the numeric columns starting at `from`.
@@ -1587,6 +1626,13 @@ impl TmTable {
     pub fn icon_memo_counts(&self) -> (u64, u64) {
         let lookups = self.icon_lookups.get();
         (self.icon_calls.get().saturating_sub(lookups), lookups)
+    }
+
+    /// Clipped-text measurements this frame's table performed; the same
+    /// summary reports it. Callers that only consume the answer under the
+    /// pointer use [`Self::text_cell_unmeasured`] and keep it near zero.
+    pub fn text_measure_count(&self) -> u64 {
+        self.text_measures.get()
     }
 
     /// Paint a row's icon from `tex`.
@@ -2036,6 +2082,51 @@ mod tests {
         // A remembered "no icon for this image" is an answer too, never a miss.
         assert_eq!(memoize(&memo, Some("a.exe".to_string()), || Some(1)), None);
         assert_eq!(memo.borrow().len(), 3);
+    }
+
+    /// The unmeasured variant must paint EXACTLY what the measured one paints.
+    ///
+    /// It exists to skip the text layout that only answers "is this cell
+    /// clipped?", so any difference in what lands on screen would be a bug —
+    /// a table that opted out would show its cells shifted or missing.
+    #[test]
+    fn unmeasured_text_cell_paints_the_same_text_as_the_measured_one() {
+        let painted = |measured: bool| {
+            let ctx = egui::Context::default();
+            let table = table();
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 160.0))),
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        let (rect, _) = table.row(ui, &crate::theme::DARK, false, "t");
+                        if measured {
+                            table.text_cell(ui, rect, 0, "Row", &crate::theme::DARK, false);
+                        } else {
+                            table.text_cell_unmeasured(
+                                ui,
+                                rect,
+                                0,
+                                "Row",
+                                &crate::theme::DARK,
+                                false,
+                            );
+                        }
+                    });
+                },
+            );
+            out.shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some((text.galley.job.text.clone(), text.pos)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(painted(true), painted(false));
+        assert_eq!(painted(true).len(), 1, "the cell paints exactly one text");
     }
 
     /// The disk headers must never invent a zero.

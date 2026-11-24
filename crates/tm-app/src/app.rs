@@ -521,6 +521,9 @@ struct InputStatsRecorder {
     /// and the icon cache lookups the row loops actually made.
     icon_memo_hits: u64,
     icon_lookups: u64,
+    /// Clipped-text measurements the dense list pages performed, i.e. text
+    /// layouts spent only to answer "is this cell clipped?".
+    text_measures: u64,
 }
 
 impl InputStatsRecorder {
@@ -535,6 +538,7 @@ impl InputStatsRecorder {
             model_rebuilds: 0,
             icon_memo_hits: 0,
             icon_lookups: 0,
+            text_measures: 0,
         }
     }
 }
@@ -3002,6 +3006,13 @@ impl TaskManApp {
         self.input_stats.icon_lookups += lookups;
     }
 
+    /// Count one painted table's clipped-text measurements for the
+    /// `TASKMAN_INPUT_STATS=1` summary: each one is a text layout spent on a
+    /// hover answer.
+    pub fn note_text_measures(&mut self, measures: u64) {
+        self.input_stats.text_measures += measures;
+    }
+
     /// Input/render diagnostics (`TASKMAN_INPUT_STATS=1`): logs `CursorMoved`
     /// and `MouseWheel` decisions, software-renderer pass/paint/present timings,
     /// tile-damage skip ratio, AccessKit activation, and top repaint causes
@@ -3062,6 +3073,7 @@ impl TaskManApp {
             model_rebuilds = self.input_stats.model_rebuilds,
             icon_lookups = self.input_stats.icon_lookups,
             icon_memo_hits = self.input_stats.icon_memo_hits,
+            text_measures = self.input_stats.text_measures,
             accesskit = ctx.is_accesskit_enabled(),
             causes = %causes_summary.join(","),
             "input stats"
@@ -3070,6 +3082,7 @@ impl TaskManApp {
         self.input_stats.model_rebuilds = 0;
         self.input_stats.icon_memo_hits = 0;
         self.input_stats.icon_lookups = 0;
+        self.input_stats.text_measures = 0;
     }
 }
 

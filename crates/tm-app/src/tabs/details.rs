@@ -1326,13 +1326,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             egui::FontId::proportional(tablekit::FONT_ROW),
                             pal.text,
                         );
-                    } else {
-                        if table.text_cell(ui, rect, pos, text, &pal, false)
-                            && pointer
-                                .is_some_and(|pointer| table.col_rect(pos, rect).contains(pointer))
-                        {
+                    } else if pointer
+                        .is_some_and(|pointer| table.col_rect(pos, rect).contains(pointer))
+                    {
+                        // The clipped-text answer is only consumed for the cell
+                        // under the pointer, so only that one is measured; the
+                        // rest are painted without a text layout each.
+                        if table.text_cell(ui, rect, pos, text, &pal, false) {
                             truncated_tip = Some(text.to_string());
                         }
+                    } else {
+                        table.text_cell_unmeasured(ui, rect, pos, text, &pal, false);
                     }
                 }
 
@@ -1401,6 +1405,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     );
     let (icon_memo_hits, icon_lookups) = table.icon_memo_counts();
     app.note_icon_work(icon_memo_hits, icon_lookups);
+    app.note_text_measures(table.text_measure_count());
 
     let header_secondary = ui.ctx().input(|i| {
         i.pointer.button_clicked(egui::PointerButton::Secondary)
