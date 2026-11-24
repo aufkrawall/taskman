@@ -161,21 +161,32 @@ impl IconCache {
         Lookup::Pending
     }
 
+    /// Hand `path` to the worker, or forget it again.
+    ///
+    /// `queued` is the dedup guard, so a request that never reached the worker
+    /// must not stay in it: every row asked for in that frame would then wait
+    /// for an answer nobody is working on and paint nothing for the rest of the
+    /// process's life (a transient thread-spawn failure, or a worker that died
+    /// between two frames).
     fn send_request(&self, path: &str) {
         let tx = sync::lock(&self.tx).clone();
-        if let Some(tx) = tx {
+        let sent = tx.is_some_and(|tx| {
             self.in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tx.send(path.to_string()).is_err() {
-                self.in_flight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                sync::lock(&self.inner).queued.remove(path);
-                // The worker thread is gone (panicked or the channel closed):
-                // allow ensure_worker to spawn a fresh one on the next get().
-                *sync::lock(&self.tx) = None;
-                self.worker_started
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            if tx.send(path.to_string()).is_ok() {
+                return true;
             }
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // The worker thread is gone (panicked or the channel closed):
+            // allow ensure_worker to spawn a fresh one on the next get().
+            *sync::lock(&self.tx) = None;
+            self.worker_started
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            false
+        });
+        if !sent {
+            sync::lock(&self.inner).queued.remove(path);
         }
     }
 
@@ -651,6 +662,45 @@ mod tests {
             Some(r"C:\x\a.exe".to_string())
         );
         assert_eq!(row_icon_key(None), None);
+    }
+
+    /// A request that never reached the worker must not stay in the dedup set:
+    /// the stuck key would never be asked for again, so that row kept an empty
+    /// icon cell for the rest of the process's life instead of retrying.
+    #[test]
+    fn unsent_request_is_not_left_queued() {
+        let cache = IconCache::default();
+        let path = r"C:\apps\never-sent.exe";
+        sync::lock(&cache.inner).queued.insert(path.to_string());
+        // No worker channel at all: the request cannot be delivered.
+        cache.send_request(path);
+        let inner = sync::lock(&cache.inner);
+        assert!(
+            !inner.queued.contains(path),
+            "the dead request must be forgotten"
+        );
+        assert_eq!(
+            cache.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a request that was never handed over is not in flight"
+        );
+    }
+
+    /// The control case: a delivered request stays queued (so no duplicate is
+    /// sent) and counts as in flight until its result is uploaded.
+    #[test]
+    fn delivered_request_stays_queued_until_answered() {
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        cache.ensure_worker(&actions);
+        let path = r"C:\apps\queued.exe";
+        sync::lock(&cache.inner).queued.insert(path.to_string());
+        cache.send_request(path);
+        assert!(sync::lock(&cache.inner).queued.contains(path));
+        assert_eq!(
+            cache.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     /// A blank path and a bare process name are not image paths. Asking the
