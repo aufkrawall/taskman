@@ -1017,6 +1017,9 @@ impl WgpuWinitRunning<'_> {
             }
 
             winit::event::WindowEvent::Resized(physical_size) => {
+                // A zero-sized Resized event is the Windows minimize signal. Request an
+                // immediate pass even when egui does not, so hidden GPU state is released.
+                repaint_asap = true;
                 // Resize with 0 width and height is used by winit to signal a minimize event on Windows.
                 // See: https://github.com/rust-windowing/winit/issues/208
                 // This solves an issue where the app would panic when minimizing on Windows.
@@ -1039,7 +1042,9 @@ impl WgpuWinitRunning<'_> {
                 if let Some(viewport_id) = viewport_id
                     && let Some(viewport) = shared.viewports.get_mut(&viewport_id)
                 {
+                    let changed = viewport.info.occluded != Some(*is_occluded);
                     viewport.info.occluded = Some(*is_occluded);
+                    repaint_asap |= changed;
                 }
             }
 
@@ -1083,7 +1088,7 @@ impl WgpuWinitRunning<'_> {
 
         if integration.should_close() {
             EventResult::CloseRequested
-        } else if event_response.repaint {
+        } else if event_response.repaint || repaint_asap {
             if repaint_asap {
                 EventResult::RepaintNow(window_id)
             } else {
