@@ -512,17 +512,24 @@ struct InputStatsRecorder {
     enabled: bool,
     window_start: std::time::Instant,
     causes: HashMap<(&'static str, u32), u32>,
-    /// Table model rebuilds (`(snapshot, sort, filter, view)` key changed).
-    /// The repaint path must NOT rebuild them: a scroll frame changes neither
-    /// the data nor the ordering, so the per-second count has to sit at the
-    /// sample cadence and never at the frame rate.
+    /// Table model rebuilds (`(snapshot, sort, filter, view)` key changed),
+    /// counted for the Processes and Details pages. The repaint path must NOT
+    /// rebuild them: a scroll frame changes neither the data nor the ordering,
+    /// so the per-second count has to sit at the sample cadence and never at
+    /// the frame rate. Saturating, because it is only reset while the probe is
+    /// enabled and must never wrap.
     model_rebuilds: u32,
-    /// Rows whose icon the frame memo answered without touching the cache,
-    /// and the icon cache lookups the row loops actually made.
+    /// Rows whose icon the frame memo answered without touching the cache, and
+    /// the icon cache lookups the row loops actually made. Processes and
+    /// Details report them; Services, Startup, App History, Users, Modules,
+    /// Threads and Connections still resolve one icon per row uncached, so they
+    /// are not part of these two numbers.
     icon_memo_hits: u64,
     icon_lookups: u64,
-    /// Clipped-text measurements the dense list pages performed, i.e. text
-    /// layouts spent only to answer "is this cell clipped?".
+    /// Clipped-text measurements spent only to answer "is this cell clipped?".
+    /// Details is the only page that reports them: the other list pages still
+    /// measure every cell through `text_cell`, into a table-local counter
+    /// nothing reads.
     text_measures: u64,
 }
 
@@ -2991,16 +2998,19 @@ impl TaskManApp {
     }
 
     /// Count one flattened-model rebuild for the `TASKMAN_INPUT_STATS=1`
-    /// summary. A page rebuilds its rows only when the data, the sort or the
-    /// filter changed — never on a scroll frame.
+    /// summary (Processes and Details are the pages that call this). A page
+    /// rebuilds its rows only when the data, the sort or the filter changed —
+    /// never on a scroll frame.
     pub fn note_table_model_rebuild(&mut self) {
-        self.input_stats.model_rebuilds += 1;
+        self.input_stats.model_rebuilds = self.input_stats.model_rebuilds.saturating_add(1);
     }
 
     /// Count one painted table's icon work for the `TASKMAN_INPUT_STATS=1`
     /// summary: `memo_hits` rows reused an answer the frame memo already had,
     /// `lookups` rows had to ask the icon cache. The two add up to the rows
-    /// painted, so the memo's effect is directly readable.
+    /// painted, so the memo's effect is directly readable. Only Processes and
+    /// Details report here — the pages that still resolve one icon per row do
+    /// not, so this is their work, not the application's.
     pub fn note_icon_work(&mut self, memo_hits: u64, lookups: u64) {
         self.input_stats.icon_memo_hits += memo_hits;
         self.input_stats.icon_lookups += lookups;

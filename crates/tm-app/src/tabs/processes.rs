@@ -225,9 +225,17 @@ struct Cache {
     /// Display indices of the SELECTABLE rows, in display order.
     ///
     /// Selection movement, its Shift range and the scroll request all need
-    /// exactly this sequence, and it is a property of the built model (rows
-    /// plus expansion state, both in `key`). Building it with the model keeps
-    /// the per-repaint path from re-filtering every row of the list.
+    /// exactly this sequence, so it is built with the model instead of being
+    /// re-filtered on every repaint.
+    ///
+    /// INVARIANT: it is only correct for the expansion state that built it, and
+    /// `key` reaches that state INDIRECTLY — through `view_generation`, not
+    /// through the `expanded`/`group_collapsed` sets themselves. Every mutation
+    /// of those sets must bump that generation: `State::toggle_expanded` and
+    /// `State::toggle_group` do it themselves, and the Expand all / Collapse
+    /// all menu items call `State::invalidate` right after editing the set. A
+    /// future writer who inserts into `expanded` directly, without invalidating,
+    /// leaves this index describing a model that no longer exists.
     selectable: Vec<usize>,
 }
 
@@ -439,10 +447,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // table can bring it into view vertically even when it lies outside the
     // currently rendered virtualization window.
     let focus_row = app.processes_state.scroll_to_pid.take().and_then(|pid| {
-        selectable
-            .iter()
-            .copied()
-            .find(|&index| matches!(rows.get(index), Some(DisplayRow::Process(p)) if p.pid == pid))
+        resolve_focus_row(pid, rows, selectable, &app.processes_state.expanded)
     });
 
     // Keep the viewport pinned to the rows the user is looking at when the
@@ -493,13 +498,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         focus_row,
         Some(anchor),
         |ui, table, _avail, content_w, range| {
+            // One heat-cell buffer for the whole visible window: the cells only
+            // BORROW the model's text, so it is refilled per row instead of
+            // being allocated per row.
+            let mut cells = Vec::with_capacity(VALUE_COLS);
             for i in range {
                 match rows.get(i) {
                     Some(DisplayRow::GroupHeader(gi, total)) => {
                         group_header(app, ui, &pal, *gi, *total, content_w, table.row_h);
                     }
                     Some(DisplayRow::Process(row)) => {
-                        row_ui(app, ui, &pal, table, row, rows, i);
+                        row_ui(app, ui, &pal, table, row, rows, i, &mut cells);
                     }
                     None => {}
                 }
@@ -802,6 +811,32 @@ fn selectable_indices(rows: &[DisplayRow], expanded: &HashSet<u32>) -> Vec<usize
         .collect()
 }
 
+/// Resolve a one-shot scroll request to a display-row index.
+///
+/// The cached index is authoritative EXCEPT when this frame's navigation changed
+/// the expansion state after the model was built: arrow-collapsing an aggregate
+/// parent selects that parent, and collapsing is exactly what makes it a
+/// selectable row again (`row_is_selectable`). The request is one-shot (the
+/// caller already `take`s it), so a miss falls back to a scan against the LIVE
+/// expansion state rather than dropping the scroll for that frame.
+fn resolve_focus_row(
+    pid: u32,
+    rows: &[DisplayRow],
+    selectable: &[usize],
+    expanded: &HashSet<u32>,
+) -> Option<usize> {
+    selectable
+        .iter()
+        .copied()
+        .find(|&index| matches!(rows.get(index), Some(DisplayRow::Process(p)) if p.pid == pid))
+        .or_else(|| {
+            rows.iter().position(|row| match row {
+                DisplayRow::Process(p) if p.pid == pid => row_is_selectable(p, expanded),
+                _ => false,
+            })
+        })
+}
+
 /// A selectable row's data, addressed by its SELECTABLE position.
 ///
 /// The model build records which display rows are selectable, so nothing on
@@ -1056,14 +1091,19 @@ fn group_header(
     }
 }
 
-fn row_ui(
+/// One visible process row. `cells` is the caller's heat-cell buffer: it lives
+/// for the whole visible window and is refilled here, because the cell text is
+/// borrowed from the row model rather than formatted on the spot.
+#[allow(clippy::too_many_arguments)]
+fn row_ui<'a>(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
     pal: &theme::Palette,
     table: &tablekit::TmTable,
-    row: &RowData,
+    row: &'a RowData,
     all_rows: &[DisplayRow],
     index: usize,
+    cells: &mut Vec<HeatCell<'a>>,
 ) {
     let expanded = app.processes_state.expanded.contains(&row.pid);
     let selectable = row_is_selectable(row, &app.processes_state.expanded);
@@ -1126,14 +1166,13 @@ fn row_ui(
     // display model during cache build (audit P0.2); here we only paint.
     // Cells follow the user's column order; `values`/`heat` never do. The text
     // is part of the same built model (`RowData::cells`), so a repaint borrows
-    // it instead of formatting every visible cell again.
-    let cells: Vec<HeatCell<'_>> = app
-        .processes_state
-        .value_order
-        .iter()
-        .map(|&li| HeatCell::new(row.heat[li], row.cells[li].as_str()))
-        .collect();
-    table.heat_cells(ui, pal, rect, FIXED_COLS, &cells);
+    // it instead of formatting every visible cell again — and the buffer is the
+    // caller's, so nothing is allocated per row.
+    cells.clear();
+    for &li in &app.processes_state.value_order {
+        cells.push(HeatCell::new(row.heat[li], row.cells[li].as_str()));
+    }
+    table.heat_cells(ui, pal, rect, FIXED_COLS, cells.as_slice());
     let unknown = [
         (NET_VALUE, row.net_available),
         (DISK_ACT_VALUE, row.disk_available),
@@ -3190,6 +3229,39 @@ mod tests {
         }
     }
 
+    /// Every selectable position must address the row the old per-frame filter
+    /// would have handed the same position. `rows` is whatever the model built,
+    /// so this also covers the two orderings a display index can go wrong in:
+    /// a filtered (flat, search-ordered) model and a resource-sorted one, where
+    /// group headers are dropped and whole blocks re-sort.
+    fn assert_selectable_index_is_exact(rows: &[DisplayRow], expanded: &HashSet<u32>) {
+        let selectable = selectable_indices(rows, expanded);
+        let expected: Vec<&RowData> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) if row_is_selectable(row, expanded) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            selectable.len(),
+            expected.len(),
+            "the index must hold every selectable row exactly once"
+        );
+        for (position, row) in expected.iter().enumerate() {
+            let addressed = selectable_row(rows, &selectable, position).expect("in range");
+            assert_eq!(
+                (addressed.pid, addressed.start_epoch_s),
+                (row.pid, row.start_epoch_s),
+                "selectable position {position} addresses the wrong row"
+            );
+        }
+        assert!(
+            selectable_row(rows, &selectable, selectable.len()).is_none(),
+            "past the end there is no row"
+        );
+    }
+
     /// The cached index must be EXACTLY what filtering the model produced:
     /// navigation, Shift ranges and the scroll request all address rows
     /// through it, so a dropped or reordered entry moves the selection onto
@@ -3198,35 +3270,73 @@ mod tests {
     fn the_cached_selectable_index_matches_filtering_the_model() {
         let snap = snap_of(vec![
             proc(1, None, "explorer.exe", ProcCategory::App),
-            proc(2, None, "svchost.exe", ProcCategory::System),
-            pseudo(3, "Terminated Processes", ProcCategory::Background),
-            proc(4, None, "updatehelper.exe", ProcCategory::Background),
+            proc(2, Some(1), "svchost.exe", ProcCategory::App),
+            proc(3, None, "svchost.exe", ProcCategory::System),
+            pseudo(4, "Terminated Processes", ProcCategory::Background),
+            proc(5, None, "updatehelper.exe", ProcCategory::Background),
+            proc(6, None, "svcbroker.exe", ProcCategory::Background),
         ]);
         let expanded = HashSet::new();
+        // The plain name-sorted model...
         let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 4]);
-        let selectable = selectable_indices(&rows, &expanded);
-
-        let expected: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| match row {
-                DisplayRow::Process(row) if row_is_selectable(row, &expanded) => Some(index),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(selectable, expected, "the index must be the same sequence");
-        assert!(!selectable.is_empty(), "a populated model has selectable rows");
-        for (position, &display) in selectable.iter().enumerate() {
-            let addressed = selectable_row(&rows, &selectable, position).expect("in range");
-            let DisplayRow::Process(row) = &rows[display] else {
-                panic!("a selectable index must address a process row");
-            };
-            assert_eq!(addressed.pid, row.pid);
-        }
         assert!(
-            selectable_row(&rows, &selectable, selectable.len()).is_none(),
-            "past the end there is no row"
+            selectable_indices(&rows, &expanded).len() > 1,
+            "the fixture must produce several selectable rows"
         );
+        assert_selectable_index_is_exact(&rows, &expanded);
+
+        // ...a SEARCH model, which is flat and drops the group headers...
+        let searched = build_display_rows(&snap, "svc", 0, true, &expanded, &[false; 4]);
+        assert!(
+            !searched.is_empty(),
+            "the search must match the fixture rows"
+        );
+        assert_selectable_index_is_exact(&searched, &expanded);
+
+        // ...and a resource-sorted model, where `sort_blocks_globally`
+        // re-orders whole blocks and the headers are gone.
+        let by_cpu = build_display_rows(&snap, "", FIXED_COLS, false, &expanded, &[false; 4]);
+        assert_selectable_index_is_exact(&by_cpu, &expanded);
+    }
+
+    /// Arrow-collapsing an aggregate parent selects that parent in the SAME
+    /// frame whose model was built while it was expanded, so the cached index
+    /// does not hold it yet. The request is one-shot, so a miss must fall back
+    /// to the live expansion state — otherwise the row just selected is never
+    /// scrolled into view (regression: the scroll request was silently dropped).
+    #[test]
+    fn a_scroll_request_for_a_row_the_cached_index_misses_still_resolves() {
+        let head = proc(10, None, "brave.exe", ProcCategory::Background);
+        let mut aggregate = make_flat_row(&head);
+        let DisplayRow::Process(row) = &mut aggregate else {
+            unreachable!("make_flat_row builds a process row")
+        };
+        row.aggregate = true;
+        let rows = vec![
+            DisplayRow::GroupHeader(1, 2),
+            aggregate,
+            make_flat_row(&proc(11, Some(10), "brave.exe", ProcCategory::Background)),
+        ];
+
+        // The model was built with the family open: the head is a virtual
+        // parent, so the index holds only its member.
+        let open = HashSet::from([10]);
+        let selectable = selectable_indices(&rows, &open);
+        assert_eq!(selectable, vec![2]);
+        assert_eq!(
+            resolve_focus_row(10, &rows, &selectable, &open),
+            None,
+            "while it is open, the head is genuinely not a selectable row"
+        );
+        // The collapse gesture mutated `expanded` after the model was built.
+        assert_eq!(
+            resolve_focus_row(10, &rows, &selectable, &HashSet::new()),
+            Some(1),
+            "the freshly collapsed head must still be scrolled to"
+        );
+        // Everything the index does hold resolves from it.
+        assert_eq!(resolve_focus_row(11, &rows, &selectable, &open), Some(2));
+        assert_eq!(resolve_focus_row(99, &rows, &selectable, &open), None);
     }
 
     /// The index depends on the expansion state, which is why it lives inside
