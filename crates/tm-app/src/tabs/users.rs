@@ -98,12 +98,6 @@ pub(crate) fn first_search_match_session_id(app: &TaskManApp, q: &search::Query)
     visible_sessions.first().map(|&i| sessions[i].id)
 }
 
-/// CPU, memory and the disk byte rates come straight off every process, so a
-/// session with no processes at all honestly totals zero. The last three come
-/// from traces that may not be running; until one of them delivers, their sum
-/// is "not measured", not "nothing happened".
-const ALWAYS_KNOWN: [bool; VALUE_COLS] = [true, true, true, false, false, false];
-
 /// What a set of processes adds up to, in the shared LOGICAL column order.
 #[derive(Clone)]
 struct Roll {
@@ -121,7 +115,12 @@ impl Roll {
     fn new() -> Self {
         Self {
             values: [0.0; VALUE_COLS],
-            known: ALWAYS_KNOWN,
+            // Memory and the disk byte rates come straight off every process,
+            // so a session with no processes at all honestly totals zero. CPU
+            // needs a measured window, and the last three come from traces
+            // that may not be running; until one of them delivers, their sum
+            // is "not measured", not "nothing happened".
+            known: [false, true, true, false, false, false],
             count: 0,
             disk: DiskGroupLoad::default(),
             gpu: GpuGroupLoad::default(),
@@ -132,7 +131,10 @@ impl Roll {
     /// fact that it was measured; a process the trace never saw contributes
     /// neither, so it cannot drag a real rate down to a fake zero.
     fn add(&mut self, p: &tm_core::model::ProcessEntry) {
-        self.values[0] += p.cpu_pct as f64;
+        if let Some(pct) = p.cpu_pct {
+            self.values[value_columns::CPU] += f64::from(pct);
+            self.known[value_columns::CPU] = true;
+        }
         self.values[1] += p.mem_bytes as f64;
         self.values[2] += p.disk_read_bps + p.disk_write_bps;
         if p.net_recv_bps.is_some() || p.net_sent_bps.is_some() {
@@ -1073,7 +1075,7 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
 mod tests {
     use super::*;
     use tm_core::model::ProcessEntry;
-    use value_columns::{DISK_ACT, GPU, NET};
+    use value_columns::{CPU, DISK_ACT, GPU, NET};
 
     fn empty_agg() -> Agg {
         Agg {
@@ -1144,12 +1146,12 @@ mod tests {
     fn unmeasured_columns_stay_unknown() {
         let mut a = empty_agg();
         accumulate(&mut a, &with_net("a.exe", None, None));
-        for li in [NET, DISK_ACT, GPU] {
+        for li in [CPU, NET, DISK_ACT, GPU] {
             assert!(!a.roll.known[li]);
             assert_eq!(a.roll.texts()[li], "—");
         }
         // ...while the columns every process reports stay real numbers.
-        assert!(a.roll.known[0] && a.roll.known[1] && a.roll.known[2]);
+        assert!(a.roll.known[1] && a.roll.known[2]);
 
         let mut loud = Roll::new();
         loud.values[NET] = 9_000.0;
@@ -1165,8 +1167,10 @@ mod tests {
         let mut a = empty_agg();
         let mut p = with_net("a.exe", Some(0.0), Some(0.0));
         p.gpu_util_pct = Some(0.0);
+        p.cpu_pct = Some(0.0);
         accumulate(&mut a, &p);
-        assert!(a.roll.known[NET] && a.roll.known[GPU]);
+        assert!(a.roll.known[CPU] && a.roll.known[NET] && a.roll.known[GPU]);
+        assert_ne!(a.roll.texts()[CPU], "—");
         assert_ne!(a.roll.texts()[NET], "—");
         assert_ne!(a.roll.texts()[GPU], "—");
     }

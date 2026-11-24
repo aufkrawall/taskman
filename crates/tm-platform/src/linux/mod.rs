@@ -11,6 +11,7 @@ mod launch;
 mod net_meta;
 pub mod polkit;
 mod process_connections;
+mod process_cpu;
 mod process_io;
 mod process_modules;
 mod process_threads;
@@ -41,6 +42,7 @@ pub struct LinuxCollector {
     networks: Networks,
     users: sysinfo::Users,
     cpu_stats: cpu_stat::CpuStatSampler,
+    process_cpu: process_cpu::ProcessCpuSampler,
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
@@ -81,11 +83,14 @@ impl SystemCollector for LinuxCollector {
                 linux_proc_start_ticks(pid).map(|ticks| (pid, ticks))
             })
             .collect();
+        // No `.with_cpu()`: every CPU number comes from `/proc` above
+        // (`cpu_stat` for the machine, `process_cpu` for each process). Asking
+        // sysinfo for CPU as well would keep a second, differently-windowed
+        // accumulator whose gate skips refreshes closer than 200 ms.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
-                .with_cpu()
                 .with_memory()
                 .with_disk_usage()
                 .with_user(UpdateKind::OnlyIfNotSet)
@@ -97,12 +102,15 @@ impl SystemCollector for LinuxCollector {
         let cpus = self.sys.cpus();
         let logical = cpus.len().max(1);
         let freq = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32;
-        let nb_cpus = logical as f32;
         let (physical_cores, sockets) = cpu_topology();
         let proc_stat = std::fs::read_to_string("/proc/stat").ok();
         let cpu_sample = proc_stat
             .as_deref()
             .and_then(|text| self.cpu_stats.sample(text));
+        // The per-process window is the same two `/proc/stat` reads, so a
+        // process' share and the machine's utilization cannot drift apart.
+        self.process_cpu
+            .start(cpu_sample.as_ref().map(|sample| sample.window_total_ticks));
 
         // EWMH makes the X11 client inventory available when DISPLAY is
         // usable. Native Wayland has no portable whole-window inventory, so a
@@ -139,10 +147,17 @@ impl SystemCollector for LinuxCollector {
             live_pids.insert(pid_u);
             let name = p.name().to_string_lossy().into_owned();
 
-            let boot_start_ticks = before_refresh
-                .get(&pid_u)
-                .copied()
-                .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
+            // One `/proc/<pid>/stat` read feeds both the identity bracket and
+            // the CPU accountant, so the counters can only describe the record
+            // the bracket just validated.
+            let stat_bytes = std::fs::read(format!("/proc/{pid_u}/stat")).ok();
+            let boot_start_ticks = before_refresh.get(&pid_u).copied().filter(|&before| {
+                stat_bytes.as_deref().and_then(parse_proc_stat_starttime) == Some(before)
+            });
+            let proc_cpu = stat_bytes
+                .as_deref()
+                .and_then(process_cpu::parse_pid_cpu_stat)
+                .map(|stat| self.process_cpu.observe(pid_u, stat));
             let desktop_evidence = boot_start_ticks
                 .map_or_else(desktop_session::DesktopEvidence::default, |ticks| {
                     self.desktop_evidence.evidence(pid_u, ticks, started)
@@ -160,7 +175,7 @@ impl SystemCollector for LinuxCollector {
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
             entry.desktop_role = Some(desktop_evidence.role_marker());
-            entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
+            entry.cpu_pct = proc_cpu.and_then(|cpu| cpu.pct);
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
@@ -173,7 +188,7 @@ impl SystemCollector for LinuxCollector {
                     .and_then(|(ticks, (btime_s, clk_tck))| {
                         linux_start_timestamp(btime_s, ticks, clk_tck)
                     });
-            entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
+            entry.cpu_time_s = proc_cpu.and_then(|cpu| cpu.cpu_time_s);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
             entry.disk_read_total = du.total_read_bytes;
@@ -205,6 +220,7 @@ impl SystemCollector for LinuxCollector {
             processes.push(entry);
         }
         self.desktop_evidence.retain_live(&live_pids);
+        self.process_cpu.retain_live(&live_pids);
         mark_desktop_app_roots(&mut processes);
 
         let diskstats = diskstats::read();
@@ -1325,6 +1341,7 @@ pub fn create_collector() -> LinuxCollector {
         networks: Networks::new_with_refreshed_list(),
         users: sysinfo::Users::new_with_refreshed_list(),
         cpu_stats: cpu_stat::CpuStatSampler::default(),
+        process_cpu: process_cpu::ProcessCpuSampler::new(linux_clk_tck()),
         prev_net_totals: HashMap::new(),
         last_tick: None,
         first_tick_done: false,

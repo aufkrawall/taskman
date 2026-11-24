@@ -37,13 +37,17 @@ fn print_tick(last: &Snapshot, t0: &Instant) {
         last.cpu.utilization_pct
     );
 
-    let mut top: Vec<_> = last.processes.iter().filter(|p| p.cpu_pct > 0.05).collect();
+    let mut top: Vec<_> = last
+        .processes
+        .iter()
+        .filter(|p| p.cpu_pct.is_some_and(|pct| pct > 0.05))
+        .collect();
     top.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap());
     for p in top.iter().take(5) {
         println!(
             "    pid {:>6}  {:>5.1}%  cpu_time {:>8.1}s  {}",
             p.pid,
-            p.cpu_pct,
+            p.cpu_pct.unwrap_or(0.0),
             p.cpu_time_s.unwrap_or(0.0),
             &p.name[..p.name.len().min(32)]
         );
