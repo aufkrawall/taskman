@@ -37,7 +37,10 @@ const DEFAULT_APP_ICON_KEY: &str = "\u{0}os-default-app-icon";
 /// Monotonic milliseconds since the first icon request (no wall-clock jumps).
 fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Whether a worker spawn may be attempted at `now_ms`, given the deadline
@@ -258,8 +261,10 @@ impl IconCache {
             .name("tm-icons".into())
             .spawn(move || icon_worker(rx, actions.clone(), results, has_results));
         if spawned.is_err() {
-            self.spawn_deadline_ms
-                .store(spawn_retry_deadline(now), std::sync::atomic::Ordering::Relaxed);
+            self.spawn_deadline_ms.store(
+                spawn_retry_deadline(now),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             tracing::warn!("failed to spawn the icon worker; retrying after backoff");
             *sync::lock(&self.tx) = None;
             self.worker_started

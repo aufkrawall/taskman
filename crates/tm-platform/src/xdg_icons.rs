@@ -687,8 +687,8 @@ fn exec_first_binary(exec: &str) -> Option<String> {
     let mut tokens = exec.split_whitespace();
     let mut first = tokens.next()?;
     loop {
-        let is_prefix = binary_basename(first)
-            .is_some_and(|base| EXEC_PREFIXES.contains(&base.as_str()));
+        let is_prefix =
+            binary_basename(first).is_some_and(|base| EXEC_PREFIXES.contains(&base.as_str()));
         if is_prefix {
             first = tokens.next()?;
             // `env -i FOO=1 app`, `sudo -E app`: flags are not the binary, and
@@ -830,7 +830,11 @@ fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBu
         a_pixel
             .abs_diff(TARGET_SIZE)
             .cmp(&b_pixel.abs_diff(TARGET_SIZE))
-            .then_with(|| a_size.abs_diff(TARGET_SIZE).cmp(&b_size.abs_diff(TARGET_SIZE)))
+            .then_with(|| {
+                a_size
+                    .abs_diff(TARGET_SIZE)
+                    .cmp(&b_size.abs_diff(TARGET_SIZE))
+            })
             .then_with(|| a_dir.cmp(b_dir))
     });
     for (_, _, dir) in candidates {
@@ -1610,7 +1614,13 @@ mod tests {
         ] {
             assert!(is_wrapper_binary(wrapper), "{wrapper} is a wrapper");
         }
-        for app in ["shotcut", "python-tool", "code", "firefox", "gnome-terminal"] {
+        for app in [
+            "shotcut",
+            "python-tool",
+            "code",
+            "firefox",
+            "gnome-terminal",
+        ] {
             assert!(!is_wrapper_binary(app), "{app} is an app");
         }
     }
@@ -1621,7 +1631,8 @@ mod tests {
     fn flatpak_command_names_the_sandboxed_executable() {
         let sb = Sandbox::new("flatpak");
         write_desktop(
-            &sb.root.join("share/applications/org.gnome.Calculator.desktop"),
+            &sb.root
+                .join("share/applications/org.gnome.Calculator.desktop"),
             "[Desktop Entry]\nName=Calculator\n\
              Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 \
              --command=gnome-calculator --file-forwarding org.gnome.Calculator %U\n\
@@ -1663,12 +1674,14 @@ mod tests {
     fn try_exec_names_an_entry_without_a_usable_exec() {
         let sb = Sandbox::new("try-exec-no-exec");
         write_desktop(
-            &sb.root.join("share/applications/net.example.Service.desktop"),
+            &sb.root
+                .join("share/applications/net.example.Service.desktop"),
             "[Desktop Entry]\nName=Service\nDBusActivatable=true\n\
              TryExec=/usr/bin/service\nIcon=service-icon\n",
         );
         write_desktop(
-            &sb.root.join("share/applications/net.example.Prefixed.desktop"),
+            &sb.root
+                .join("share/applications/net.example.Prefixed.desktop"),
             "[Desktop Entry]\nName=Prefixed\nExec=env\nTryExec=/usr/bin/prefixed\n\
              Icon=prefixed-icon\n",
         );
@@ -1695,12 +1708,14 @@ mod tests {
              Icon=niced-icon\n",
         );
         write_desktop(
-            &sb.root.join("share/applications/net.example.Rooted.desktop"),
+            &sb.root
+                .join("share/applications/net.example.Rooted.desktop"),
             "[Desktop Entry]\nName=Rooted\nExec=/usr/bin/sudo -u root /opt/rooted/bin/rooted\n\
              Icon=rooted-icon\n",
         );
         write_desktop(
-            &sb.root.join("share/applications/net.example.Envved.desktop"),
+            &sb.root
+                .join("share/applications/net.example.Envved.desktop"),
             "[Desktop Entry]\nName=Envved\nExec=env -u FOO /opt/envved/bin/envved\n\
              Icon=envved-icon\n",
         );
@@ -1719,7 +1734,8 @@ mod tests {
     fn absolute_env_prefix_is_skipped_not_indexed() {
         let sb = Sandbox::new("env-prefix");
         write_desktop(
-            &sb.root.join("share/applications/net.example.Wrapped.desktop"),
+            &sb.root
+                .join("share/applications/net.example.Wrapped.desktop"),
             "[Desktop Entry]\nName=Wrapped\nExec=/usr/bin/env FOO=1 /opt/wrapped/bin/wrapped %U\n\
              Icon=wrapped-icon\n",
         );
@@ -1777,7 +1793,8 @@ mod tests {
     fn try_exec_names_the_entry_when_exec_hides_the_binary() {
         let sb = Sandbox::new("try-exec");
         write_desktop(
-            &sb.root.join("share/applications/net.example.Bundled.desktop"),
+            &sb.root
+                .join("share/applications/net.example.Bundled.desktop"),
             "[Desktop Entry]\nName=Bundled\nExec=sh -c \"/opt/bundled/bin/bundled %f\"\n\
              TryExec=/opt/bundled/bin/bundled\nIcon=bundled-icon\n",
         );
@@ -1786,7 +1803,8 @@ mod tests {
             HICOLOR_INDEX,
         );
         write_png(
-            &sb.root.join("share/icons/hicolor/48x48/apps/bundled-icon.png"),
+            &sb.root
+                .join("share/icons/hicolor/48x48/apps/bundled-icon.png"),
             48,
             48,
             [3, 3, 3, 255],

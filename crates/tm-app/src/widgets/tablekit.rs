@@ -719,7 +719,8 @@ fn memoize<V: Clone>(
     }
     let value = resolve();
     // Only a miss materializes the key, and only once per distinct image.
-    memo.borrow_mut().push((key.map(str::to_owned), value.clone()));
+    memo.borrow_mut()
+        .push((key.map(str::to_owned), value.clone()));
     value
 }
 
@@ -2151,8 +2152,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let measured = painted(true);
-        assert_eq!(measured, painted(false), "the two variants must paint alike");
-        assert!(!measured.is_empty(), "the cell must paint text, and both variants must match");
+        assert_eq!(
+            measured,
+            painted(false),
+            "the two variants must paint alike"
+        );
+        assert!(
+            !measured.is_empty(),
+            "the cell must paint text, and both variants must match"
+        );
         let (clip, text, _, galley) = &measured[0];
         assert_eq!(text, &overflowing, "the full string reaches the painter");
         assert!(

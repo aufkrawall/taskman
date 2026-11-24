@@ -467,9 +467,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // Consume any pending scroll request as a flat display-row index so the
     // table can bring it into view vertically even when it lies outside the
     // currently rendered virtualization window.
-    let focus_row = app.processes_state.scroll_to_pid.take().and_then(|pid| {
-        resolve_focus_row(pid, rows, selectable, &app.processes_state.expanded)
-    });
+    let focus_row =
+        app.processes_state.scroll_to_pid.take().and_then(|pid| {
+            resolve_focus_row(pid, rows, selectable, &app.processes_state.expanded)
+        });
 
     // Keep the viewport pinned to the rows the user is looking at when the
     // model is rebuilt: the list re-sorts every sample and processes spawn or
@@ -2119,7 +2120,9 @@ fn known_columns(members: &[&ProcessEntry]) -> [bool; VALUE_COLS] {
         members
             .iter()
             .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some()),
-        members.iter().any(|member| member.disk_active_pct.is_some()),
+        members
+            .iter()
+            .any(|member| member.disk_active_pct.is_some()),
         members.iter().any(|member| member.gpu_util_pct.is_some()),
     ]
 }
@@ -3152,12 +3155,7 @@ fn subtree_rollups<'a>(
     }
 }
 
-fn sort_entries(
-    v: &mut [&ProcessEntry],
-    col: usize,
-    asc: bool,
-    cells: &HashMap<u32, CellValues>,
-) {
+fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, cells: &HashMap<u32, CellValues>) {
     // `None` where the row measured nothing, so an unmeasured cell ranks
     // strictly below a measured zero instead of tying with it — the same rule
     // the Users tab rollups apply to these columns.
@@ -4661,10 +4659,7 @@ mod tests {
 
         // Highest first: the measured 0.0 % outranks the dash even though the
         // dash owns the lower pid here.
-        let cells = HashMap::from([
-            (idle.pid, own_cells(&idle)),
-            (fresh.pid, own_cells(&fresh)),
-        ]);
+        let cells = HashMap::from([(idle.pid, own_cells(&idle)), (fresh.pid, own_cells(&fresh))]);
         let mut rows = vec![&fresh, &idle];
         sort_entries(&mut rows, FIXED_COLS + CPU_VALUE, false, &cells);
         assert_eq!(
