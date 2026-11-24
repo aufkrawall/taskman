@@ -535,7 +535,19 @@ def package_tar(name: str, files: list[tuple[Path, str]]) -> Path:
     dest = DIST / f"{name}.tar.gz"
     with tarfile.open(dest, "w:gz") as tf:
         for src, arc in files:
-            tf.add(src, arcname=arc)
+            info = tf.gettarinfo(src, arcname=arc)
+            # Windows has no POSIX mode bits, so `add()` records 0o644/0o666
+            # and the extracted Linux binary is not executable — the artifact
+            # was unusable until the user ran `chmod +x`. Stamp the
+            # conventional release modes instead, and the release ownership
+            # so the archive does not carry the build host's identity.
+            info.mode = 0o644 if arc.endswith(".desktop") else 0o755
+            info.uid = 0
+            info.gid = 0
+            info.uname = "root"
+            info.gname = "root"
+            with src.open("rb") as fh:
+                tf.addfile(info, fh)
     return dest
 
 
