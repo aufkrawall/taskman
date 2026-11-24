@@ -128,9 +128,10 @@ pub struct RowData {
     /// Command line for a concrete process, when available.
     pub command_line: Option<String>,
     /// Localized row-level explanation for a "—" in the CPU column, if any;
-    /// pseudo-rows put their aggregate description here instead. It outranks
-    /// the name/command-line tooltip, so the reason for the dash is never
-    /// hidden behind it.
+    /// pseudo-rows put their aggregate description here instead. The
+    /// name/command-line tooltip outranks it while the pointer is over the
+    /// name, so a row can still say what the process runs; the CPU cell always
+    /// explains its own dash, and the rest of the row explains it too.
     pub tooltip: Option<String>,
 }
 
@@ -1159,10 +1160,13 @@ fn row_ui(
         app.tab = crate::app::Tab::Details;
     }
     // on_hover_text/context_menu consume the response (builder style). A
-    // status glyph under the cursor explains itself first; otherwise the
-    // row's own explanation (e.g. unattributable CPU) applies.
+    // status glyph under the cursor explains itself first, then the "—" of the
+    // column under the pointer. Over the name the command line wins, because a
+    // row-level reason (an unmeasured CPU share, a pseudo-row's description)
+    // must not push out what the process actually runs; it still applies
+    // everywhere else in the row.
     let fallback_tip = name_tip;
-    let resp = match (status_tip, unknown_tip, row.tooltip.clone(), fallback_tip) {
+    let resp = match (status_tip, unknown_tip, fallback_tip, row.tooltip.clone()) {
         (Some(tip), _, _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
         (None, Some(tip), _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
         (None, None, Some(tip), _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
@@ -2160,7 +2164,10 @@ fn emit_flat_with_family_groups(
 
     for p in display {
         if let Some(fam) = family_heads.get(&p.pid) {
-            let cells = repr.get(&p.pid).copied().unwrap_or_default();
+            // Never `CellValues::default()` here: its `known` is all false,
+            // but `value_known` answers true for Memory and Disk I/O, so a
+            // default row would paint a measured-looking 0 B / 0 B/s.
+            let cells = repr.get(&p.pid).copied().unwrap_or_else(|| own_cells(p));
             out.push(DisplayRow::Process(RowData {
                 pid: p.pid,
                 start_epoch_s: p.creation_identity(),
@@ -4325,33 +4332,48 @@ mod tests {
     /// A dash is not a zero: an unmeasured cell ranks strictly below a
     /// measured 0.0, and equal cells keep the deterministic pid order — the
     /// rule the Users tab rollups already apply to these columns.
+    ///
+    /// Each half pairs a dash with a measured zero whose pid orders the other
+    /// way, and seeds the rows in the order the assertion has to reverse. A
+    /// comparator that merely tied (falling through to the pid tie-break)
+    /// therefore cannot pass either half.
     #[test]
     fn unmeasured_cells_sort_below_a_measured_zero() {
-        let mut idle = ProcessEntry::new(1, "idle.exe");
+        let mut idle = ProcessEntry::new(4, "idle.exe");
         idle.cpu_pct = Some(0.0);
-        let mut fresh = ProcessEntry::new(2, "fresh.exe");
+        let mut fresh = ProcessEntry::new(1, "fresh.exe");
         fresh.cpu_pct = None;
+        assert_eq!(own_cells(&idle).key(CPU_VALUE), Some(0.0));
+        assert_eq!(own_cells(&fresh).key(CPU_VALUE), None);
+
+        // Highest first: the measured 0.0 % outranks the dash even though the
+        // dash owns the lower pid here.
         let cells = HashMap::from([
             (idle.pid, own_cells(&idle)),
             (fresh.pid, own_cells(&fresh)),
         ]);
-        assert_eq!(own_cells(&idle).key(CPU_VALUE), Some(0.0));
-        assert_eq!(own_cells(&fresh).key(CPU_VALUE), None);
-
-        // Highest first: the measured 0.0 % outranks the dash.
         let mut rows = vec![&fresh, &idle];
         sort_entries(&mut rows, FIXED_COLS + CPU_VALUE, false, &cells);
         assert_eq!(
             rows.iter().map(|p| p.pid).collect::<Vec<_>>(),
             vec![idle.pid, fresh.pid]
         );
-        // Lowest first: the dash falls to the bottom, not into a tie with the
-        // real zero.
-        let mut rows = vec![&fresh, &idle];
+
+        // Lowest first puts the dash FIRST: the rank is what is pinned, not a
+        // screen position. This time the dash owns the higher pid.
+        let mut dashed_high = ProcessEntry::new(9, "dashed-high.exe");
+        dashed_high.cpu_pct = None;
+        let mut idle_low = ProcessEntry::new(4, "idle-low.exe");
+        idle_low.cpu_pct = Some(0.0);
+        let cells = HashMap::from([
+            (dashed_high.pid, own_cells(&dashed_high)),
+            (idle_low.pid, own_cells(&idle_low)),
+        ]);
+        let mut rows = vec![&idle_low, &dashed_high];
         sort_entries(&mut rows, FIXED_COLS + CPU_VALUE, true, &cells);
         assert_eq!(
             rows.iter().map(|p| p.pid).collect::<Vec<_>>(),
-            vec![fresh.pid, idle.pid]
+            vec![dashed_high.pid, idle_low.pid]
         );
 
         // Two measured zeros are ordered by pid whatever the emission order
