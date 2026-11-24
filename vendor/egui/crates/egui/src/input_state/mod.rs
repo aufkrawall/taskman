@@ -3,7 +3,7 @@ mod wheel_state;
 
 use crate::{
     SafeAreaInsets,
-    emath::{NumExt as _, Pos2, Rect, Vec2, vec2},
+    emath::{Pos2, Rect, Vec2, vec2},
     util::History,
 };
 use crate::{
@@ -362,6 +362,51 @@ impl Default for InputState {
     }
 }
 
+/// Upper bound for the delta-time handed to the wheel smoothing kernel.
+///
+/// Same bound as the upstream `stable_dt.at_most(0.1)`, so a stall can never
+/// land a whole scroll impulse in one giant step.
+const WHEEL_SMOOTHING_DT_MAX: f32 = 0.1;
+
+/// Lower bound for the delta-time handed to the wheel smoothing kernel.
+///
+/// A non-positive `dt` would land nothing and stall the tail forever.
+const WHEEL_SMOOTHING_DT_MIN: f32 = 0.001;
+
+/// Residual (`px`) below which we stop asking for wheel smoothing frames.
+const WHEEL_SMOOTHING_RESIDUAL_PX: f32 = 0.01;
+
+/// Delta-time to hand to [`WheelState::after_events`] for the wheel smoothing kernel.
+///
+/// TASKMAN-FORK (#14): the follow-up smoothing frames are scheduled with a
+/// duration (`wants_repaint_after`), so `stable_dt` is `predicted_dt` for them
+/// and under-reports every frame that really arrived late (frame hitch, timer
+/// slip, coalesced wheel repaint). The exponential would then advance as if
+/// less time had passed, stretching the tail into visible late mini-steps, so
+/// prefer the honestly measured `unstable_dt`.
+///
+/// `unstable_dt` is only trusted when it is plausible for one frame; it is a
+/// whole second on the first pass of a default `InputState` and can be minutes
+/// after a suspend, which would jump the scroll. Anything implausible falls
+/// back to the nominal cadence, and both paths are clamped.
+fn wheel_smoothing_dt(unstable_dt: f32, predicted_dt: f32) -> f32 {
+    let predicted_dt = if predicted_dt.is_finite() && predicted_dt > 0.0 {
+        predicted_dt
+    } else {
+        1.0 / 60.0
+    };
+
+    let max_dt = WHEEL_SMOOTHING_DT_MAX;
+    let measurable = unstable_dt.is_finite() && unstable_dt > 0.0 && unstable_dt <= max_dt;
+    let dt = if measurable {
+        unstable_dt
+    } else {
+        predicted_dt
+    };
+
+    dt.clamp(WHEEL_SMOOTHING_DT_MIN, max_dt)
+}
+
 fn wheel_smoothing_repaint_delay(predicted_dt: f32) -> Duration {
     let seconds = if predicted_dt.is_finite() && predicted_dt > 0.0 {
         predicted_dt.clamp(0.001, 0.1)
@@ -463,7 +508,9 @@ impl InputState {
         }
 
         let smooth_scroll_delta = {
-            let dt = stable_dt.at_most(0.1);
+            // TASKMAN-FORK (#14): the smoothing kernel gets the measured frame
+            // time, not `stable_dt` (== `predicted_dt` on these follow-up frames).
+            let dt = wheel_smoothing_dt(unstable_dt, new.predicted_dt);
             self.wheel.after_events(time, dt);
 
             zoom_factor_delta *= (options.scroll_zoom_speed
@@ -681,11 +728,17 @@ impl InputState {
             .abs()
             .max_elem()
             .max(self.wheel.unprocessed_zoom_delta.abs().max_elem())
-            > 0.2
+            > WHEEL_SMOOTHING_RESIDUAL_PX
         {
             // Mouse-wheel smoothing is discrete follow-up input rather than an
             // animation. Let the backend deliver it at the display cadence
             // instead of asking for back-to-back frames.
+            //
+            // TASKMAN-FORK (#14): keep those frames coming until the impulse is
+            // actually spent. Upstream stopped at 0.2 px and so deferred the
+            // last sliver to some unrelated later frame, which read as a lone
+            // late mini-scroll. The epsilon stays positive, so float dust
+            // cannot spin an endless repaint loop.
             return Some(wheel_smoothing_repaint_delay(self.predicted_dt));
         }
 
@@ -1916,6 +1969,134 @@ mod tests {
 
         assert!(state.smooth_scroll_delta().y > 0.0);
         assert!(state.zoom_delta() > 1.0);
+    }
+
+    #[test]
+    fn wheel_smoothing_dt_is_clamped() {
+        let predicted_dt = 1.0 / 240.0;
+
+        // Implausible measurements fall back to the nominal cadence: 0 ms would
+        // land nothing, and the 1 s first pass of a default `InputState` (or a
+        // resume from suspend) would jump the scroll.
+        for unstable_dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0e9] {
+            assert_eq!(wheel_smoothing_dt(unstable_dt, predicted_dt), predicted_dt);
+        }
+
+        // A plausible measurement is used as measured.
+        assert_eq!(wheel_smoothing_dt(0.05, predicted_dt), 0.05);
+
+        // Whatever the fallback is, the result stays inside the kernel's band.
+        assert_eq!(wheel_smoothing_dt(f32::NAN, 0.0), 1.0 / 60.0);
+        assert_eq!(wheel_smoothing_dt(f32::NAN, -1.0), 1.0 / 60.0);
+        assert_eq!(wheel_smoothing_dt(f32::NAN, 1.0e9), WHEEL_SMOOTHING_DT_MAX);
+        assert_eq!(wheel_smoothing_dt(f32::NAN, 1.0e-9), WHEEL_SMOOTHING_DT_MIN);
+    }
+
+    /// Deliver one line notch, then run the next smoothing pass `elapsed`s later.
+    fn scroll_after_follow_up_gap(elapsed: f64) -> f32 {
+        let predicted_dt = 1.0 / 240.0;
+        let start = f64::from(predicted_dt);
+
+        let seed = InputState::default().begin_pass(
+            RawInput {
+                time: Some(start),
+                predicted_dt,
+                events: vec![line_wheel()],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+        let follow_up = seed.begin_pass(
+            RawInput {
+                time: Some(start + elapsed),
+                predicted_dt,
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+        follow_up.smooth_scroll_delta().y
+    }
+
+    #[test]
+    fn wheel_smoothing_uses_real_elapsed_time() {
+        // A follow-up frame that really took 50 ms must land more of the impulse
+        // than one that took 5 ms. With `stable_dt` both landed the same amount
+        // (it is `predicted_dt` on every frame scheduled with a duration, which
+        // is what the smoothing frames are), so a late frame decayed too little
+        // and stretched the tail.
+        let slow_frame = scroll_after_follow_up_gap(0.05);
+        let fast_frame = scroll_after_follow_up_gap(0.005);
+
+        assert!(fast_frame > 0.0);
+        assert!(
+            slow_frame > fast_frame,
+            "50 ms pass landed {slow_frame} px, 5 ms pass landed {fast_frame} px"
+        );
+    }
+
+    #[test]
+    fn residual_tail_keeps_requesting_frames_until_exhausted() {
+        let predicted_dt = 1.0 / 240.0;
+        let cadence = Duration::from_secs_f32(predicted_dt);
+        let mut time = f64::from(predicted_dt);
+
+        // One notch, nothing else in the input, so only the wheel residual can
+        // ask for a frame.
+        let mut state = InputState::default().begin_pass(
+            RawInput {
+                time: Some(time),
+                predicted_dt,
+                events: vec![line_wheel()],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+
+        let mut frames = 0;
+        loop {
+            let Some(delay) = state.wants_repaint_after() else {
+                break;
+            };
+            assert_eq!(
+                delay, cadence,
+                "frame {frames} must wait for the display cadence, not repaint back-to-back"
+            );
+
+            frames += 1;
+            assert!(frames < 1_000, "wheel residual never got exhausted");
+
+            time += f64::from(predicted_dt);
+            state = state.begin_pass(
+                RawInput {
+                    time: Some(time),
+                    predicted_dt,
+                    ..Default::default()
+                },
+                false,
+                1.0,
+                InputOptions::default(),
+            );
+        }
+
+        // Exhausted: nothing pending, and a converged state asks for no frame at
+        // all. Only sub-epsilon dust may be left, which no frame will ever
+        // deliver as a lone late mini-scroll.
+        let residual = state
+            .wheel
+            .unprocessed_wheel_delta
+            .abs()
+            .max_elem()
+            .max(state.wheel.unprocessed_zoom_delta.abs().max_elem());
+        assert!(
+            residual <= WHEEL_SMOOTHING_RESIDUAL_PX,
+            "residual {residual} px still pending after {frames} frames"
+        );
     }
 
     #[test]
