@@ -1309,10 +1309,9 @@ impl Renderer {
             })
         };
 
+        self.index_buffer.slices.clear();
         if index_count > 0 {
             profiling::scope!("indices", index_count.to_string().as_str());
-
-            self.index_buffer.slices.clear();
 
             let required_index_buffer_size = (std::mem::size_of::<u32>() * index_count) as u64;
             if self.index_buffer.capacity < required_index_buffer_size {
@@ -1362,7 +1361,6 @@ impl Renderer {
                 }
             }
         } else {
-            self.index_buffer.slices.clear();
             if let Some(capacity) = capacity_after_sustained_underuse(
                 self.index_buffer.capacity,
                 0,
@@ -1373,10 +1371,9 @@ impl Renderer {
                 self.index_buffer.buffer = create_index_buffer(device, capacity);
             }
         }
+        self.vertex_buffer.slices.clear();
         if vertex_count > 0 {
             profiling::scope!("vertices", vertex_count.to_string().as_str());
-
-            self.vertex_buffer.slices.clear();
 
             let required_vertex_buffer_size = (std::mem::size_of::<Vertex>() * vertex_count) as u64;
             if self.vertex_buffer.capacity < required_vertex_buffer_size {
@@ -1427,7 +1424,6 @@ impl Renderer {
                 }
             }
         } else {
-            self.vertex_buffer.slices.clear();
             if let Some(capacity) = capacity_after_sustained_underuse(
                 self.vertex_buffer.capacity,
                 0,

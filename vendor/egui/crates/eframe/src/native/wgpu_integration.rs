@@ -1126,7 +1126,7 @@ impl Viewport {
         event_loop: &ActiveEventLoop,
         egui_ctx: &egui::Context,
         windows_id: &mut HashMap<WindowId, ViewportId>,
-        painter: &mut egui_wgpu::winit::Painter,
+        painter: &egui_wgpu::winit::Painter,
     ) {
         if self.window.is_some() {
             return; // we already have one

@@ -5,7 +5,7 @@ const GUI_MAX_TEXTURE_DIMENSION_2D: u32 = 8192;
 
 /// D3D12 allocates its visible CBV/SRV/UAV heap from this limit at device creation.
 ///
-/// TaskMan's bounded 512-entry icon cache needs far fewer descriptors than wgpu's
+/// `TaskMan`'s bounded 512-entry icon cache needs far fewer descriptors than wgpu's
 /// one-million-binding default. Leaving substantial headroom keeps ordinary textures and
 /// custom UI bind groups working without reserving an oversized descriptor heap up front.
 const GUI_MAX_NON_SAMPLER_BINDINGS: u32 = 8192;
