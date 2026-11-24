@@ -106,6 +106,11 @@ items across Phases 2–6. The following concrete gaps remain:
   clone, and installs no WGPU paint callbacks. Automatic recovery after a hard device-loss
   event and capability drift on a replacement device are also not implemented; normal
   suspend/recreate selects the same surface-compatible adapter.
+  - **Generic eframe viewport residuals:** TaskMan uses only the root viewport. A hidden
+    immediate viewport currently skips its callback even though egui's immediate-viewport
+    contract expects it to run, and the first X11 map can still tear down/recreate the
+    renderer once between `Visibility::YesWait`, `Occlusion(false)` and `VisibilityNotify`.
+    Neither path is reachable in TaskMan's current single-root UI.
 - **Wayland hidden-state signal depends on xdg-shell v6.** The winit fork maps the
   `SUSPENDED` xdg-toplevel configure state to `Window::is_minimized()`, requests a redraw on
   every configure, and clears a pending frame-callback throttle when the suspended bit

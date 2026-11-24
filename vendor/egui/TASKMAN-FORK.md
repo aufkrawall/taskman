@@ -356,6 +356,11 @@ command precedence, partial/full texture snapshot composition, texture free, all
 policy, and buffer-shrink hysteresis. The release gate exercises the renderer under the
 platform backend; the GPU-memory probe is the live end-to-end measurement.
 
+**Scope:** TaskMan uses the root viewport and no WGPU paint callbacks. Retained custom
+`RenderState` clones, `WgpuSetup::Existing`, hidden immediate-viewport callbacks, hard
+device-loss recovery and adapter-capability drift remain generic eframe residuals documented in
+`llm-wiki/known-debt.md`.
+
 ## Rebase runbook
 
 ```
