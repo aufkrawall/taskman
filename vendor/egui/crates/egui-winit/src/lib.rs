@@ -230,7 +230,10 @@ enum WheelRepaint {
     /// Coalesce into an already armed repaint.
     Coalesced,
     /// The event did not change the scroll delta (for example a zero-delta
-    /// `Move`), so keep it for the next frame but do not create one.
+    /// `Move`), so keep it for the next frame but do not create one. An
+    /// expired trailing token that still holds a *nonzero* line delta is
+    /// resolved before this, so a dropped token cannot strand that delta; a
+    /// report with nothing to rescue stays here.
     Skip,
 }
 
@@ -257,18 +260,41 @@ impl WheelRepaintThrottle {
         min_interval: web_time::Duration,
         wants_repaint: bool,
     ) -> WheelRepaint {
-        if !wants_repaint {
+        // TASKMAN-FORK (#14): an expired trailing token means the frame that
+        // was going to deliver the queued delta never ran. Resolve it even
+        // for an event that needs no repaint of its own, otherwise a
+        // zero-delta report would leave the queued delta to be delivered by
+        // some unrelated later frame — as a bare scroll with nothing before
+        // it.
+        //
+        // Only when a *nonzero* delta is actually queued. `push` runs before
+        // `plan` and a zero-delta Line/Move report opens a pending entry of its
+        // own, so `pending_line.is_some()` would be true for the very report
+        // this guard is about: taking the repaint then would advance
+        // `last_repaint` and push the next real notch out by up to one display
+        // interval, with no delta rescued in return.
+        let trailing_lost = self
+            .trailing_at
+            .is_some_and(|trailing_at| now >= trailing_at)
+            && self
+                .events
+                .pending_line
+                .is_some_and(|pending| pending.delta != Vec2::ZERO);
+        if !wants_repaint && !trailing_lost {
             return WheelRepaint::Skip;
         }
         if let Some(trailing_at) = self.trailing_at {
             // A repaint is already pending and will take the input queued so
-            // far. This also covers an event arriving between the deadline
-            // and the event-loop turn that delivers the trailing frame.
+            // far.
             if now < trailing_at {
                 return WheelRepaint::Coalesced;
             }
-            // The callback can be dropped as outdated by eframe. Do not let
-            // that lost token wedge every later wheel event in Coalesced.
+            // The callback can be dropped as outdated by eframe, and an event
+            // can arrive between the deadline and the event-loop turn that
+            // delivers that frame. Do not let the lost token wedge every
+            // later wheel event in Coalesced: request the frame ourselves.
+            // eframe's `RepaintNext` replaces the armed deadline, so the stale
+            // token cannot fire a second time.
             self.trailing_at = None;
         }
         if let Some(last) = self.last_repaint
@@ -3178,6 +3204,91 @@ mod wheel_repaint_tests {
         assert!(repaint(&ctx, &mut throttle, &stats, at(t0, 20), true));
         assert_eq!(throttle.last_repaint, Some(at(t0, 20)));
         assert!(throttle.trailing_at.is_none());
+    }
+
+    #[test]
+    fn zero_delta_report_after_a_lost_trailing_token_delivers_the_queued_notch() {
+        let ctx = egui::Context::default();
+        let delays = capture_repaint_delays(&ctx);
+        let mut throttle = WheelRepaintThrottle::default();
+        let stats = AtomicWheelRepaintStats::default();
+        let mut events = Vec::new();
+        let modifiers = egui::Modifiers::default();
+        let t0 = web_time::Instant::now();
+
+        let (unit, delta) = line(egui::vec2(0.0, 1.0));
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
+        assert!(repaint(&ctx, &mut throttle, &stats, t0, true));
+        throttle.flush(&mut events);
+        throttle.note_frame(t0, true);
+
+        let (unit, delta) = line(egui::vec2(0.0, 1.0));
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
+        assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 4), true));
+        assert_eq!(throttle.trailing_at, Some(at(t0, 16)));
+        assert_eq!(events.len(), 1, "the second notch waits for its frame");
+
+        // The trailing callback produced no frame, so the notch is still
+        // queued. A report that needs no repaint of its own must resolve the
+        // lost token instead of leaving the notch to an unrelated frame.
+        let (unit, delta) = line(Vec2::ZERO);
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
+        assert!(repaint(&ctx, &mut throttle, &stats, at(t0, 20), false));
+        assert!(throttle.trailing_at.is_none());
+        assert_eq!(throttle.last_repaint, Some(at(t0, 20)));
+
+        // The immediate repaint takes the queued notch exactly once.
+        throttle.flush(&mut events);
+        assert_eq!(
+            events[1],
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers,
+            }
+        );
+        throttle.flush(&mut events);
+        assert_eq!(events.len(), 2, "no double delivery");
+        assert_eq!(
+            delays.lock().as_slice(),
+            [web_time::Duration::from_millis(12)],
+            "resolving a lost token repaints immediately and arms nothing"
+        );
+    }
+
+    #[test]
+    fn zero_delta_report_with_nothing_queued_keeps_its_repaint_budget() {
+        let ctx = egui::Context::default();
+        let mut throttle = WheelRepaintThrottle::default();
+        let stats = AtomicWheelRepaintStats::default();
+        let mut events = Vec::new();
+        let modifiers = egui::Modifiers::default();
+        let t0 = web_time::Instant::now();
+
+        let (unit, delta) = line(egui::vec2(0.0, 1.0));
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
+        assert!(repaint(&ctx, &mut throttle, &stats, t0, true));
+        throttle.flush(&mut events);
+        throttle.note_frame(t0, true);
+
+        // Arm a trailing repaint, then take the delta: the buffer is empty while
+        // the token is still pending.
+        let (unit, delta) = line(egui::vec2(0.0, 1.0));
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
+        assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 4), true));
+        throttle.flush(&mut events);
+        assert_eq!(throttle.trailing_at, Some(at(t0, 16)));
+
+        // A zero-delta report after the deadline, exactly as production delivers
+        // it: `push` first — which opens a pending entry of its own with a zero
+        // delta — then the decision. Nothing is queued to rescue, so stay `Skip`
+        // rather than spending the interval and pushing the next real notch out.
+        let (unit, delta) = line(Vec2::ZERO);
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
+        assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 20), false));
+        assert_eq!(throttle.last_repaint, Some(t0));
+        assert_eq!(throttle.trailing_at, Some(at(t0, 16)));
     }
 
     #[test]
