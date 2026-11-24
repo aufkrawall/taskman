@@ -274,10 +274,7 @@ impl IconCache {
     fn drain_results(&self, ctx: &egui::Context) {
         // Fast path: `lookup` calls this once per visible row, and a row would
         // otherwise pay three mutex acquisitions with nothing to drain.
-        if !self
-            .has_results
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.has_results.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let pass = ctx.cumulative_pass_nr();

@@ -84,6 +84,10 @@ const WRAPPER_BINARIES: &[&str] = &[
 /// token is skipped instead of becoming the executable name.
 const EXEC_PREFIXES: &[&str] = &["env", "sudo", "setsid", "nohup", "nice"];
 
+/// Prefix flags that take a separate value (`nice -n 10`, `sudo -u root`), so
+/// the value is not mistaken for the binary the prefix runs.
+const PREFIX_FLAG_VALUES: &[&str] = &["-n", "-u", "-g", "-p", "-c", "-C", "-t", "-U"];
+
 /// The Flatpak launcher. Its entries run `<launcher> run … --command=<app>`;
 /// inside the sandbox the process is the command, not the launcher.
 const FLATPAK_LAUNCHER: &str = "flatpak";
@@ -571,7 +575,10 @@ impl DesktopEntry {
                 push_try_exec(&mut names, self.try_exec.as_deref());
             }
             Some(base) => names.push(base.to_string()),
-            None => {}
+            // No usable `Exec=` at all (DBus-activated entries declare it
+            // anyway, but an empty or prefix-only one collapses here): the
+            // entry's own `TryExec=` is still the program it announces.
+            None => push_try_exec(&mut names, self.try_exec.as_deref()),
         }
         names
     }
@@ -684,8 +691,13 @@ fn exec_first_binary(exec: &str) -> Option<String> {
             .is_some_and(|base| EXEC_PREFIXES.contains(&base.as_str()));
         if is_prefix {
             first = tokens.next()?;
-            // `env -i FOO=1 app`, `sudo -E app`: flags are not the binary.
+            // `env -i FOO=1 app`, `sudo -E app`: flags are not the binary, and
+            // a flag that takes a value (`nice -n 10`, `sudo -u root`) carries
+            // that value in the next token.
             while first.starts_with('-') {
+                if PREFIX_FLAG_VALUES.contains(&first) {
+                    tokens.next()?;
+                }
                 first = tokens.next()?;
             }
             continue;
@@ -779,11 +791,17 @@ fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBu
     if !theme_dir.is_dir() {
         return None;
     }
-    // Candidate subdirs with their pixel size, best (closest to 32) first.
-    let mut candidates: Vec<(u32, PathBuf)> = Vec::new();
+    // Candidate subdirs with their pixel size and nominal size, best first.
+    // The nominal size is what breaks a pixel-size tie: `16x16@2` and `32x32`
+    // both hold 32 px files, but only `32x32` is native at that size.
+    let mut candidates: Vec<(u32, u32, PathBuf)> = Vec::new();
     if let Some(dirs) = theme_directories(&theme_dir) {
-        for (size, sub) in dirs {
-            candidates.push((size, theme_dir.join(sub)));
+        for declared in dirs {
+            candidates.push((
+                declared.pixel_size,
+                declared.size,
+                theme_dir.join(declared.subdir),
+            ));
         }
     } else {
         // No index.theme: scan one level of `<size>` dirs, then `<context>`.
@@ -798,19 +816,24 @@ fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBu
                 let Some(size_name) = size_entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                candidates.push((dir_size_from_name(&size_name), size_entry.path()));
+                candidates.push((
+                    dir_size_from_name(&size_name),
+                    nominal_size_from_name(&size_name),
+                    size_entry.path(),
+                ));
             }
         }
     }
-    // Pixel size first (closest to the target), then the path: a `read_dir`
-    // order must never decide between two same-size directories.
-    candidates.sort_by(|(a_size, a_dir), (b_size, b_dir)| {
-        a_size
+    // Pixel size closest to the target, then the size closest to it, then the
+    // path: a `read_dir` order must never decide between equal candidates.
+    candidates.sort_by(|(a_pixel, a_size, a_dir), (b_pixel, b_size, b_dir)| {
+        a_pixel
             .abs_diff(TARGET_SIZE)
-            .cmp(&b_size.abs_diff(TARGET_SIZE))
+            .cmp(&b_pixel.abs_diff(TARGET_SIZE))
+            .then_with(|| a_size.abs_diff(TARGET_SIZE).cmp(&b_size.abs_diff(TARGET_SIZE)))
             .then_with(|| a_dir.cmp(b_dir))
     });
-    for (_, dir) in candidates {
+    for (_, _, dir) in candidates {
         // The icon may sit directly in the size dir (rare) or one context
         // level deeper (the standard layout).
         let direct = dir.join(file_name);
@@ -829,20 +852,33 @@ fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBu
     None
 }
 
+/// One directory declared by a theme's `index.theme`.
+struct ThemeDir {
+    /// `Size × Scale`: the number of pixels its files hold.
+    pixel_size: u32,
+    /// The declared `Size=` itself, i.e. the size the directory is native at.
+    size: u32,
+    subdir: String,
+}
+
 /// Pixel size encoded in a size-directory name: `16x16` → 16, `48x48/apps` →
 /// 48, `16x16@2` → 32 (an `@N` directory holds `N ×` the pixels), and anything
 /// unparseable → 0, i.e. ranked last.
 fn dir_size_from_name(size_name: &str) -> u32 {
+    nominal_size_from_name(size_name).saturating_mul(name_scale(size_name))
+}
+
+/// Nominal size encoded in a size-directory name (`16x16@2/apps` → 16), i.e. the
+/// size the directory is native at.
+fn nominal_size_from_name(size_name: &str) -> u32 {
     let base = match size_name.split_once('@') {
         Some((base, _)) => base,
         None => size_name,
     };
-    let size = base
-        .split('x')
+    base.split('x')
         .next()
         .and_then(|n| n.parse::<u32>().ok())
-        .unwrap_or(0);
-    size.saturating_mul(name_scale(size_name))
+        .unwrap_or(0)
 }
 
 /// Pixel multiplier encoded in a theme directory name (`16x16@2/apps` → 2), for
@@ -865,16 +901,17 @@ fn index_theme_list(value: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_string)
 }
 
-/// `(pixel size, subdir)` pairs from a theme's `index.theme`: the
-/// `Directories=` and `ScaledDirectories=` lists of `[Icon Theme]`, each with
-/// the `Size=` and `Scale=` of its own section.
+/// The directories a theme's `index.theme` declares: the `Directories=` and
+/// `ScaledDirectories=` lists of `[Icon Theme]`, each with the `Size=` and
+/// `Scale=` of its own section.
 ///
 /// The pixel size is `Size × Scale`: a `16x16@2` directory holds 32 px files
 /// (`Size=16 Scale=2`), and ranking on `Size` alone preferred a 16 px asset over
 /// that sharper one. `ScaledDirectories=` is where Adwaita/Breeze-style themes
 /// declare their hidpi dirs, and a missing `Scale=` is taken from the `@N` in
-/// the directory name.
-fn theme_directories(theme_dir: &Path) -> Option<Vec<(u32, String)>> {
+/// the directory name. `Size` is kept next to the pixel size so a same-pixel
+/// tie can prefer the directory that is native at that size.
+fn theme_directories(theme_dir: &Path) -> Option<Vec<ThemeDir>> {
     let text = std::fs::read_to_string(theme_dir.join("index.theme")).ok()?;
     let mut dirs: Vec<String> = Vec::new();
     let mut scaled_dirs: Vec<String> = Vec::new();
@@ -920,7 +957,11 @@ fn theme_directories(theme_dir: &Path) -> Option<Vec<(u32, String)>> {
             .map(|d| {
                 let size = sizes.get(&d).copied().unwrap_or(0);
                 let scale = scales.get(&d).copied().unwrap_or_else(|| name_scale(&d));
-                (size.saturating_mul(scale), d)
+                ThemeDir {
+                    pixel_size: size.saturating_mul(scale),
+                    size,
+                    subdir: d,
+                }
             })
             .collect(),
     )
@@ -1615,6 +1656,63 @@ mod tests {
         );
     }
 
+    /// An entry whose `Exec=` names nothing at all — DBus-activated service
+    /// entries, an empty value, a command line of prefixes only — still
+    /// announces its program through `TryExec=`.
+    #[test]
+    fn try_exec_names_an_entry_without_a_usable_exec() {
+        let sb = Sandbox::new("try-exec-no-exec");
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Service.desktop"),
+            "[Desktop Entry]\nName=Service\nDBusActivatable=true\n\
+             TryExec=/usr/bin/service\nIcon=service-icon\n",
+        );
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Prefixed.desktop"),
+            "[Desktop Entry]\nName=Prefixed\nExec=env\nTryExec=/usr/bin/prefixed\n\
+             Icon=prefixed-icon\n",
+        );
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        assert_eq!(
+            index.get("service").map(String::as_str),
+            Some("service-icon")
+        );
+        assert_eq!(
+            index.get("prefixed").map(String::as_str),
+            Some("prefixed-icon")
+        );
+        assert!(!index.contains_key("env"));
+    }
+
+    /// Prefix flags that take a value must not leave the value behind as a
+    /// binary name: `nice -n 10 app` and `sudo -u root app` run `app`.
+    #[test]
+    fn prefix_flag_values_are_not_executable_names() {
+        let sb = Sandbox::new("prefix-flags");
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Niced.desktop"),
+            "[Desktop Entry]\nName=Niced\nExec=nice -n 10 /opt/niced/bin/niced %U\n\
+             Icon=niced-icon\n",
+        );
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Rooted.desktop"),
+            "[Desktop Entry]\nName=Rooted\nExec=/usr/bin/sudo -u root /opt/rooted/bin/rooted\n\
+             Icon=rooted-icon\n",
+        );
+        write_desktop(
+            &sb.root.join("share/applications/net.example.Envved.desktop"),
+            "[Desktop Entry]\nName=Envved\nExec=env -u FOO /opt/envved/bin/envved\n\
+             Icon=envved-icon\n",
+        );
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        assert_eq!(index.get("niced").map(String::as_str), Some("niced-icon"));
+        assert_eq!(index.get("rooted").map(String::as_str), Some("rooted-icon"));
+        assert_eq!(index.get("envved").map(String::as_str), Some("envved-icon"));
+        assert!(!index.contains_key("10"), "nice level is not a binary");
+        assert!(!index.contains_key("root"), "sudo user is not a binary");
+        assert!(!index.contains_key("foo"), "env var is not a binary");
+    }
+
     /// An absolute `/usr/bin/env` prefix is the same execution prefix as a bare
     /// `env`: it must be skipped, not indexed as the shared `env` binary.
     #[test]
@@ -1765,6 +1863,30 @@ mod tests {
             .find_icon_file("handmade")
             .expect("theme below $HOME/.icons");
         assert!(f.ends_with(".icons/custom/32x32/apps/handmade.png"));
+    }
+
+    /// `$HOME/.icons` ranks with the per-user data home: it is inserted right
+    /// after `<data home>/icons`, never appended behind the system dirs, or a
+    /// hand-installed theme would lose to the system's copy of the same name.
+    #[test]
+    fn legacy_home_icons_outranks_the_system_icon_dirs() {
+        let lookup = IconLookup {
+            data_dirs: vec![
+                PathBuf::from("/home/u/.local/share"),
+                PathBuf::from("/usr/share"),
+            ],
+            pixmaps: Vec::new(),
+            theme: None,
+            home_icons: Some(PathBuf::from("/home/u/.icons")),
+        };
+        assert_eq!(
+            lookup.icon_dirs(),
+            [
+                PathBuf::from("/home/u/.local/share/icons"),
+                PathBuf::from("/home/u/.icons"),
+                PathBuf::from("/usr/share/icons"),
+            ]
+        );
     }
 
     /// Without a configured theme the spec's `default` theme supplies the real
@@ -1922,6 +2044,39 @@ mod tests {
         assert_eq!(name_scale("16x16/apps"), 1);
         assert_eq!(name_scale("scalable/apps"), 1);
         assert_eq!(name_scale("16x16@0/apps"), 1);
+        assert_eq!(nominal_size_from_name("16x16@2/apps"), 16);
+        assert_eq!(nominal_size_from_name("32x32/apps"), 32);
+        assert_eq!(nominal_size_from_name("scalable/apps"), 0);
+    }
+
+    /// A hidpi directory and a native one can hold the same number of pixels
+    /// (`16x16@2` and `32x32` are both 32 px): the native one must win, or a
+    /// 16 px asset gets upscaled where a real 32 px file exists.
+    #[test]
+    fn native_size_directory_wins_a_pixel_size_tie() {
+        let sb = Sandbox::new("scale-tie");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=32x32/apps\n\
+             ScaledDirectories=16x16@2/apps\n\n\
+             [32x32/apps]\nSize=32\nType=Fixed\n\n\
+             [16x16@2/apps]\nSize=16\nScale=2\nType=Fixed\n",
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/32x32/apps/native.png"),
+            32,
+            32,
+            [9, 9, 9, 255],
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/16x16@2/apps/native.png"),
+            32,
+            32,
+            [1, 1, 1, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let f = r.find_icon_file("native").expect("found");
+        assert!(f.ends_with("32x32/apps/native.png"), "{f:?}");
     }
 
     /// End to end through the no-index.theme branch: the sharper `@2` directory
