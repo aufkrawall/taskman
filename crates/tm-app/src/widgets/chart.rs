@@ -40,8 +40,9 @@ pub fn fmt_percent(v: f64) -> String {
 /// unavailable ("—"), never a fabricated number.
 ///
 /// That is the project's missing-telemetry invariant, and here it is also
-/// concrete rendering: a NaN travels on into the marker dot's y, i.e. into a
-/// shape position.
+/// concrete rendering: the same non-finite value would otherwise reach a shape
+/// position (the marker dot) and be formatted by `num_fixed`, which maps a
+/// non-finite to 0.0 — a gap reported as "0,0 %".
 fn readout_text(value: Option<f64>, fmt: ValueFmt) -> String {
     value
         .filter(|value| value.is_finite())
@@ -402,12 +403,33 @@ fn paint_marker(
 /// the edge, because pinning it is what drew a straight stroke from frac 0.447
 /// (value >= 100 %) down to frac 0.952 (10 %) across a per-core tile, with no
 /// area fill under it.
+///
+/// A sample further back than that bound is not drawn at all: see
+/// [`placeable_on_axis`].
 fn x_on_axis(rect: Rect, bounds: (u64, u64), stamp: u64) -> f32 {
     let (t0, span) = bounds;
     // f64 throughout: these are epoch milliseconds (~1.8e12), where f32 cannot
     // represent whole minutes (see `nearest_sample`).
     let frac = (stamp as f64 - t0 as f64) / span.max(1) as f64;
     rect.left() + rect.width() * frac.clamp(-1.0, 1.0) as f32
+}
+
+/// Whether the axis can honestly place `stamp`, i.e. whether it lies within one
+/// window width of the axis opening.
+///
+/// The plotted window carries exactly one sample from before the axis
+/// (`performance::visible_slice`), and it sits there so the polyline can enter
+/// at its true slope. That lead-in is normally one sampling interval old. It
+/// does NOT stay one interval old across a suspend: history `[… 60 s, 360 s]`
+/// with a 60 s window is an ordinary post-resume buffer, and its lead-in is
+/// four windows old. Clamping that sample to `left - width` and joining it to
+/// the first in-window sample draws a slope across four minutes nobody
+/// measured — the "stroke that starts at its own left edge" from the report.
+/// Such a sample is dropped and breaks the run instead, which is what
+/// [`ChartGeometry::runs`] does with `None`.
+fn placeable_on_axis(bounds: (u64, u64), stamp: u64) -> bool {
+    let (t0, span) = bounds;
+    (stamp as f64 - t0 as f64) / span.max(1) as f64 >= -1.0
 }
 
 /// x of series index `i` at even spacing across `rect`: the fallback for a
@@ -613,19 +635,31 @@ impl<'a> ChartGeometry<'a> {
     }
 
     /// Where series index `i` is drawn, and in which coordinate system.
-    fn place(&self, i: usize) -> (XSource, f32) {
+    ///
+    /// `None` when the axis has a timestamp for this sample but cannot place it
+    /// honestly (see [`placeable_on_axis`]): more than one window before the
+    /// axis opens. Callers must treat that as a break, never as a position.
+    fn place(&self, i: usize) -> Option<(XSource, f32)> {
         match (self.stamp(i), self.bounds) {
-            (Some(stamp), Some(bounds)) => {
-                (XSource::Axis(stamp), x_on_axis(self.rect, bounds, stamp))
+            (Some(stamp), Some(bounds)) if placeable_on_axis(bounds, stamp) => {
+                Some((XSource::Axis(stamp), x_on_axis(self.rect, bounds, stamp)))
             }
-            _ => (XSource::Even, even_x(self.rect, i, self.len)),
+            (Some(_), Some(_)) => None,
+            _ => Some((XSource::Even, even_x(self.rect, i, self.len))),
         }
     }
 
     /// Screen x of series index `i` — for the hover marker, which marks a single
     /// sample rather than a run.
+    ///
+    /// Deliberately the clamped position rather than [`place`](Self::place): the
+    /// readout never points at a sample outside the axis (`first_on_axis`), and a
+    /// marker asking for an x must not have to answer "no".
     fn x(&self, i: usize) -> f32 {
-        self.place(i).1
+        match (self.stamp(i), self.bounds) {
+            (Some(stamp), Some(bounds)) => x_on_axis(self.rect, bounds, stamp),
+            _ => even_x(self.rect, i, self.len),
+        }
     }
 
     /// Screen y of a sample value that is known to be finite: 0 sits on the
@@ -633,8 +667,15 @@ impl<'a> ChartGeometry<'a> {
     ///
     /// The clamp is where the old path took a NaN and kept it — `f64::clamp`
     /// returns NaN for NaN — so callers hand over a value the run splitter has
-    /// already proven finite.
+    /// already proven finite. The assertion is local on purpose: the run
+    /// splitter covers the series, but the hover marker and the kernel dots call
+    /// this with a single value.
     fn y(&self, value: f64) -> f32 {
+        debug_assert!(
+            value.is_finite(),
+            "non-finite chart value {value}: a NaN y is the garbage stroke this \
+             geometry exists to prevent"
+        );
         let frac = (value.clamp(0.0, self.y_max) / self.y_max) as f32;
         self.rect.bottom() - frac * self.rect.height()
     }
@@ -650,7 +691,18 @@ impl<'a> ChartGeometry<'a> {
             let mut run: Vec<Pos2> = Vec::new();
             let mut previous: Option<(XSource, f32)> = None;
             for (index, value) in measured {
-                let (source, x) = self.place(index);
+                let Some((source, x)) = self.place(index) else {
+                    // The axis cannot place this sample: it is more than a
+                    // window older than the axis opening, so any segment to the
+                    // next sample would describe time nobody measured. Drop it
+                    // and let the run break — the lead-in this exists for is
+                    // one sampling interval old, not one suspend old.
+                    if !run.is_empty() {
+                        runs.push(std::mem::take(&mut run));
+                    }
+                    previous = None;
+                    continue;
+                };
                 if let Some((prev_source, prev_x)) = previous
                     && !(prev_source.joins(source) && x > prev_x)
                 {
@@ -670,9 +722,9 @@ impl<'a> ChartGeometry<'a> {
                 run.push(point);
                 previous = Some((source, x));
             }
-            // `measured_runs` never yields an empty run, so this is never a
-            // stray empty path.
-            runs.push(run);
+            if !run.is_empty() {
+                runs.push(run);
+            }
         }
         runs
     }
@@ -719,13 +771,15 @@ fn paint_runs_fill(painter: &egui::Painter, runs: &[Vec<Pos2>], baseline_y: f32,
 
 /// The polyline of every run of one series, at `width`.
 ///
-/// A run with a single sample is painted as the 1.25 px dot it always was,
-/// never as a line to nowhere: `Shape::line` through one point draws nothing at
-/// all, which would silently drop the only measurement there is.
+/// A run with a single sample is painted as the dot it always was, never as a
+/// line to nowhere: `Shape::line` through one point draws nothing at all, which
+/// would silently drop the only measurement there is. Its radius follows the
+/// stroke width so a tile's dot matches its own 1.4 px line instead of looking
+/// like a bead glued onto it.
 fn paint_runs_line(painter: &egui::Painter, runs: &[Vec<Pos2>], width: f32, color: Color32) {
     for run in runs {
         match run.as_slice() {
-            [dot] => painter.circle_filled(*dot, 1.25, color),
+            [dot] => painter.circle_filled(*dot, width.max(1.25), color),
             points => painter.add(Shape::line(points.to_vec(), Stroke::new(width, color))),
         }
     }
@@ -1109,9 +1163,12 @@ fn core_chart_impl(
             dots.push((geometry.y(value), color));
         }
         // The band is painted only when its slice matches the value series (see
-        // [`kernel_runs`]); the readout says the same thing.
+        // [`kernel_runs`]) and only where the value sample itself exists — the
+        // dot has to obey the same rule, or a tile whose readout says "—" for
+        // its usage would carry a kernel dot over a region with no band.
         if let Some((kernel_values, kernel_color)) = kernels
             && kernel_values.len() == n
+            && samples.get(idx).copied().is_some_and(f64::is_finite)
             && let Some(kernel) = kernel_values
                 .get(idx)
                 .copied()
@@ -2197,10 +2254,15 @@ mod tests {
     #[test]
     fn a_pathological_stamp_stays_within_one_chart_width() {
         let rect = Rect::from_min_size(Pos2::new(100.0, 0.0), Vec2::new(600.0, 100.0));
-        // Epoch zero followed by two samples from 2027.
+        // Epoch zero followed by two samples from 2027: the lead-in is ~19
+        // years older than the window it is carried into, which is the post-
+        // suspend buffer (history `[… 60 s, 360 s]` with a 60 s window) taken to
+        // its extreme.
         let stamps = [1_000u64, 1_800_000_000_000, 1_800_000_060_000];
         let axis = TimeAxis::new(&stamps, 60);
         let geometry = ChartGeometry::new(rect, 100.0, Some(axis), stamps.len());
+        // The marker position is still a bounded, finite x -- it is a marker,
+        // not a segment.
         for x in (0..stamps.len()).map(|i| geometry.x(i)) {
             assert!(x.is_finite(), "{x}");
             assert!(
@@ -2212,8 +2274,30 @@ mod tests {
         // The stale stamp is the lead-in: left of the chart, inside the bound.
         assert!(geometry.x(0) < rect.left());
         assert!(geometry.x(0) >= rect.left() - rect.width());
+        // But it is NOT painted: the axis cannot place a sample four windows
+        // old, so the run starts at the first sample it can place. Drawing it
+        // anyway is the "stroke from its own left edge" of the report.
+        let samples = [10.0, 40.0, 70.0];
+        let runs = geometry.runs_of(&samples);
+        assert_eq!(
+            runs.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2],
+            "a sample the axis cannot place must break the run, not join it"
+        );
         // Not a gap, though: the axis can still place the other two, in order.
         assert!(geometry.x(1) < geometry.x(2));
+        // ...and no painted edge spans more than one sampling interval, which is
+        // what a bridged 19-year jump would.
+        let interval = rect.width() / 60.0;
+        for run in &runs {
+            for pair in run.windows(2) {
+                let dx = (pair[1].x - pair[0].x).abs();
+                assert!(
+                    dx <= interval + 0.5,
+                    "a painted edge spans {dx} px, more than one sample interval"
+                );
+            }
+        }
     }
 
     /// A series longer than the timestamp slice never stitches the time axis to
