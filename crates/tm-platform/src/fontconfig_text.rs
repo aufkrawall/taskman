@@ -5,8 +5,10 @@
 //! racy. The command is resolved from a small set of root-owned absolute system paths
 //! rather than `PATH`, but it inherits the user's environment so `FONTCONFIG_FILE`,
 //! `XDG_CONFIG_HOME`, `HOME` and desktop-specific overrides continue to select the user's
-//! real configuration. Every invocation has one absolute deadline, capped stdout and
-//! kill/reap cleanup on timeout.
+//! real configuration. Resolution is memoized for the process lifetime because it only
+//! reads root-owned system state. Every invocation has one absolute deadline, capped
+//! stdout and kill/reap cleanup on timeout, and waits for the child by parking on it
+//! (pidfd on Linux, a capped backoff elsewhere) instead of spinning.
 
 use super::text_rendering::{HintStyleChoice, LcdFilterChoice, Params};
 
@@ -21,6 +23,10 @@ const TRUSTED_FC_MATCH_PATHS: &[&str] = &[
 const FC_MATCH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
 #[cfg(target_os = "linux")]
 const FC_MATCH_OUTPUT_LIMIT: usize = 64 * 1024;
+/// First pause between child-status polls, cheap enough for a child that exits at once.
+const POLL_BACKOFF_START: std::time::Duration = std::time::Duration::from_micros(100);
+/// Longest pause between child-status polls; caps the wakeup rate of a slow child.
+const POLL_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug)]
 struct ProgramMetadata {
@@ -161,8 +167,19 @@ fn params_from_output(text: &str) -> Params {
     params
 }
 
+/// The trusted `fc-match` path, resolved once per process.
+///
+/// The candidate list and every ancestor directory are root-owned system state that
+/// cannot change behind a running process, so the canonicalize-plus-stat chain runs once
+/// and no trust check is relaxed.
 #[cfg(target_os = "linux")]
 fn resolve_fc_match() -> Option<std::path::PathBuf> {
+    static RESOLVED: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(resolve_fc_match_uncached).clone()
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_fc_match_uncached() -> Option<std::path::PathBuf> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     for candidate in TRUSTED_FC_MATCH_PATHS {
@@ -303,7 +320,8 @@ fn run_command_bounded(
         terminate_and_reap(&mut child);
         return None;
     };
-    let Some(status) = wait_for_exit(&mut child, deadline) else {
+    let (status, _) = wait_with_deadline(&mut child, deadline);
+    let Some(status) = status else {
         terminate_and_reap(&mut child);
         return None;
     };
@@ -370,20 +388,112 @@ fn capture_to_deadline<R: std::os::fd::AsRawFd>(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn wait_for_exit(
+/// Poll `child` until it exits or `deadline` passes.
+///
+/// Returns the child's own exit status (or `None` when the deadline passed first) plus the
+/// number of status polls it took, which pins the wait as a park rather than a spin. One
+/// absolute deadline bounds the whole wait.
+fn wait_with_deadline(
     child: &mut std::process::Child,
     deadline: std::time::Instant,
-) -> Option<std::process::ExitStatus> {
+) -> (Option<std::process::ExitStatus>, u32) {
+    let waiter = ChildWaiter::new(child);
+    let mut backoff = PollBackoff::new();
+    let mut polls = 0u32;
     loop {
-        if let Some(status) = child.try_wait().ok()? {
-            return Some(status);
+        polls = polls.saturating_add(1);
+        match child.try_wait() {
+            Ok(Some(status)) => return (Some(status), polls),
+            Ok(None) => {}
+            Err(_) => return (None, polls),
         }
         if std::time::Instant::now() >= deadline {
-            return None;
+            return (None, polls);
         }
-        std::thread::yield_now();
+        waiter.park(&mut backoff, deadline);
     }
+}
+
+/// Pause between child-status polls: 100 us, doubling, capped at 5 ms.
+#[derive(Clone, Copy, Debug)]
+struct PollBackoff {
+    next: std::time::Duration,
+}
+
+impl PollBackoff {
+    fn new() -> Self {
+        Self {
+            next: POLL_BACKOFF_START,
+        }
+    }
+
+    /// The pause to take now, then the next (doubled, capped) one.
+    fn step(&mut self) -> std::time::Duration {
+        let pause = self.next;
+        self.next = (self.next * 2).min(POLL_BACKOFF_CAP);
+        pause
+    }
+}
+
+/// Parks the polling thread until the child may have exited.
+///
+/// Linux pins the child with a pidfd and polls that, so a slow child costs no CPU;
+/// kernels or seccomp profiles without `pidfd_open` fall back to the caller's backoff.
+struct ChildWaiter {
+    #[cfg(target_os = "linux")]
+    pidfd: Option<libc::c_int>,
+}
+
+impl ChildWaiter {
+    #[cfg(target_os = "linux")]
+    fn new(child: &std::process::Child) -> Self {
+        // SAFETY: `pidfd_open` only reads the pid; a negative result means the kernel or a
+        // seccomp profile refused it, which is not an error for this caller.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        Self {
+            pidfd: (fd >= 0).then_some(fd as libc::c_int),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(_child: &std::process::Child) -> Self {
+        Self {}
+    }
+
+    /// Block until the child may have exited, never past `deadline`.
+    fn park(&self, backoff: &mut PollBackoff, deadline: std::time::Instant) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = self.pidfd {
+            poll_child_exit(fd, remaining);
+            return;
+        }
+        std::thread::sleep(backoff.step().min(remaining));
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ChildWaiter {
+    fn drop(&mut self) {
+        if let Some(fd) = self.pidfd {
+            // SAFETY: `fd` is the descriptor `new` opened and nothing else owns it.
+            let _ = unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Block until the child behind `fd` exits or `remaining` passes.
+#[cfg(target_os = "linux")]
+fn poll_child_exit(fd: libc::c_int, remaining: std::time::Duration) {
+    let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` describes one live descriptor for the duration of the call and the
+    // timeout is bounded; a timeout or an interrupted call just re-polls.
+    let _ = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
 }
 
 #[cfg(target_os = "linux")]
@@ -596,6 +706,124 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "a hung fc-match helper must be killed at its deadline"
+        );
+    }
+
+    /// A child that exits with `code` immediately.
+    fn exit_command(code: i32) -> std::process::Command {
+        let script = format!("exit {code}");
+        #[cfg(target_os = "windows")]
+        let mut command = std::process::Command::new("cmd");
+        #[cfg(not(target_os = "windows"))]
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(target_os = "windows")]
+        command.args(["/C", script.as_str()]);
+        #[cfg(not(target_os = "windows"))]
+        command.args(["-c", script.as_str()]);
+        command
+    }
+
+    /// A child that lives about a second.
+    fn slow_command() -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        let mut command = std::process::Command::new("cmd");
+        #[cfg(not(target_os = "windows"))]
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(target_os = "windows")]
+        command.args(["/C", "ping -n 2 127.0.0.1 >nul"]);
+        #[cfg(not(target_os = "windows"))]
+        command.args(["-c", "sleep 1"]);
+        command
+    }
+
+    #[test]
+    fn poll_backoff_grows_monotonically_to_a_hard_cap() {
+        // The fc-match deadline is 750 ms; the schedule must cover it in few polls.
+        let deadline = std::time::Duration::from_millis(750);
+        let mut backoff = PollBackoff::new();
+        let mut pause = backoff.step();
+        assert_eq!(pause, POLL_BACKOFF_START);
+
+        let mut covered = pause;
+        let mut steps = 1u32;
+        while covered < deadline {
+            let next = backoff.step();
+            assert!(next >= pause, "the backoff must never shrink");
+            assert!(next <= POLL_BACKOFF_CAP, "the backoff must stay capped");
+            pause = next;
+            covered += pause;
+            steps += 1;
+            assert!(steps < 400, "the schedule must reach the deadline in few steps");
+        }
+        assert_eq!(pause, POLL_BACKOFF_CAP, "growth must stop at the cap");
+        assert!(steps <= 200, "750 ms must need at most 200 polls: {steps}");
+        assert_eq!(backoff.step(), POLL_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn wait_with_deadline_reports_the_childs_real_exit_status() {
+        for (code, success) in [(0, true), (3, false)] {
+            let mut child = exit_command(code)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a short-lived child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let (status, polls) = wait_with_deadline(&mut child, deadline);
+            let status = status.expect("an exiting child must report its own status");
+            assert_eq!(status.success(), success, "exit {code}: {status:?}");
+            if code != 0 {
+                assert_eq!(
+                    status.code(),
+                    Some(code),
+                    "the wait must pass the real exit code through"
+                );
+            }
+            assert!(polls > 0);
+        }
+    }
+
+    #[test]
+    fn wait_with_deadline_parks_instead_of_spinning_on_a_living_child() {
+        let mut child = slow_command()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child that lives about a second");
+        let started = std::time::Instant::now();
+        let (status, polls) =
+            wait_with_deadline(&mut child, started + std::time::Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        assert!(status.is_some_and(|status| status.success()), "{status:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "the child must really live: {elapsed:?}"
+        );
+        // One poll per capped backoff step (one park when pidfd is available); a yield spin
+        // over the same second reports tens of thousands.
+        assert!(polls < 500, "waiting {elapsed:?} polled {polls} times");
+    }
+
+    #[test]
+    fn wait_with_deadline_reports_timeout_and_leaves_the_child_reapable() {
+        let mut child = slow_command()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child that outlives the deadline");
+        let started = std::time::Instant::now();
+        let (status, _) =
+            wait_with_deadline(&mut child, started + std::time::Duration::from_millis(50));
+        assert!(status.is_none(), "a child outliving the deadline reports no status");
+        let _ = child.kill();
+        let reaped = child.wait().expect("the killed child must still be reapable");
+        assert!(!reaped.success(), "a killed child must not report success: {reaped:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the deadline must bound the wait: {:?}",
+            started.elapsed()
         );
     }
 }
