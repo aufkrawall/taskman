@@ -179,7 +179,7 @@ pub(super) const SYSTEM_TOOL_DIRS: [&str; 4] = [
     "/nix/var/nix/profiles/default/bin",
 ];
 
-/// Resolve a systemd client tool from [`SYSTEM_TOOL_DIRS`].
+/// Resolve a systemd client tool from `SYSTEM_TOOL_DIRS`.
 ///
 /// Every candidate still has to pass the rule in `launch::trusted_system_program`:
 /// an executable regular file whose own path and every ancestor are root-owned

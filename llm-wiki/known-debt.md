@@ -522,6 +522,17 @@ remain follow-up rather than being simulated in headless tests:
   writable, and final publication is no-replace/atomic. Symlinked ancestors and
   a same-user swap between validation and path-based rename/unlink are not
   eliminated with directory-FD `openat`/`renameat`/`unlinkat` operations.
+- **A Startup-page entry that is a symlink is still written through it.**
+  `startup.rs::write_replacing` writes an entry whose `symlink_metadata` reports
+  a symlink with a truncating `fs::write` instead of publishing a sibling file,
+  deliberately: replacing the link would silently turn a shared entry into a
+  private copy. That one path therefore bypasses the atomic publish and
+  re-checks nothing between the check and the write, so a same-user process can
+  make TaskMan truncate another file that user can already write. The accepted
+  direction is "a file the same user could rewrite without TaskMan anyway", the
+  content written is a desktop entry, and the damage is bounded to that one
+  file. Closing it needs a directory-FD `O_NOFOLLOW` + `renameat` publish, which
+  `autostart.rs` already performs for its own entry and `startup.rs` does not.
 
 ### 2026-11-23 remaining Linux parity contracts
 
@@ -674,6 +685,19 @@ remain follow-up rather than being simulated in headless tests:
 - The one wiring hop that does have host coverage is the engine's: a demand
   change sent to a running engine must reach the collector
   (`engine::tests::demand_sent_to_a_running_engine_reaches_the_collector`).
+- **The Linux privilege/ownership policies added on 2026-11-25 share that gap.**
+  The hidden helper's relaunch refusal
+  (`polkit::execute_privileged_action`), the activation listener's accept
+  classification (`activation::accept_outcome`) and the autostart
+  entry-ownership rule (`autostart::is_replaceable_entry`) each carry a focused
+  unit test next to the policy, and no gate executes any of them: the Linux
+  cross check omits `--all-targets`, so even type-checking them takes a manual
+  form. The request side and the root side of the elevation policy at least
+  cannot disagree silently, because both build their refusal through one pair of
+  constructors in `polkit.rs`; a rule that needs to *run* under a gate has to
+  move into a platform-neutral module (`linux_action_support.rs`, compiled under
+  `cfg(any(target_os = "linux", test))`, is the existing home for the parser
+  half). Do not add another unrunnable Linux test and call the rule covered.
 
 ## Row/total audit leftovers (2026-10-21)
 
