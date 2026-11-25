@@ -371,6 +371,24 @@ fn measured_total(read: Option<u64>, written: Option<u64>) -> Option<u64> {
     }
 }
 
+/// One per-file counter summed over every listed file, or `None` when ANY of
+/// them is unmeasured.
+///
+/// Adding up only the rows that happen to report a counter prints a smaller
+/// number than the process actually moved, and the page then states it as THE
+/// total. The rows already say "—" for what they never measured, so the total
+/// has to say the same instead of quietly understating it. A sum that does not
+/// fit in `u64` is unknown rather than saturated for the same reason.
+fn measured_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let mut total = 0u64;
+    let mut measured = false;
+    for value in values {
+        total = total.checked_add(value?)?;
+        measured = true;
+    }
+    measured.then_some(total)
+}
+
 fn cmp_known_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) if ascending => a.cmp(&b),
@@ -719,16 +737,16 @@ pub fn show(
         ui.strong(title)
             .on_hover_text(i18n::tr(K::PropIoFilesTooltip));
 
-        let total_read: u64 = state.files.iter().filter_map(|f| f.read_bytes).sum();
-        let total_written: u64 = state.files.iter().filter_map(|f| f.write_bytes).sum();
-        if total_read > 0 || total_written > 0 {
+        let total_read = measured_sum(state.files.iter().map(|f| f.read_bytes));
+        let total_written = measured_sum(state.files.iter().map(|f| f.write_bytes));
+        if total_read.is_some() || total_written.is_some() {
             ui.add_space(8.0);
             let summary = format!(
                 "({}: {}, {}: {})",
                 i18n::tr(K::PropIoColRead),
-                format::format_bytes_loc(total_read),
+                fmt_optional_bytes(total_read),
                 i18n::tr(K::PropIoColWritten),
-                format::format_bytes_loc(total_written),
+                fmt_optional_bytes(total_written),
             );
             ui.label(egui::RichText::new(summary).color(pal.text_dim).size(12.0));
         }
@@ -1250,6 +1268,30 @@ mod tests {
         assert_eq!(extract_file_name(r"/usr/bin/bash"), "bash");
         assert_eq!(extract_file_name(r"C:\dir\sub\"), "sub");
         assert_eq!(extract_file_name("single_name"), "single_name");
+    }
+
+    /// The header total covers the whole list or states "—".
+    ///
+    /// Regression: it summed `filter_map(read_bytes)`, so a list in which one
+    /// file reported its counters and the next did not printed the first
+    /// file's traffic as the page total — a smaller number than the process
+    /// moved, presented as the measured one. A measured zero is still a number.
+    #[test]
+    fn the_file_totals_are_unavailable_rather_than_partial() {
+        use std::iter;
+        assert_eq!(measured_sum(iter::empty()), None);
+        assert_eq!(measured_sum([Some(0), Some(0)].into_iter()), Some(0));
+        assert_eq!(measured_sum([Some(1000), Some(24)].into_iter()), Some(1024));
+        assert_eq!(
+            measured_sum([Some(1000), None, Some(24)].into_iter()),
+            None,
+            "one unknown counter makes the whole total unknown"
+        );
+        assert_eq!(
+            measured_sum([Some(u64::MAX), Some(1)].into_iter()),
+            None,
+            "an overflowing sum is unknown, never saturated"
+        );
     }
 
     #[test]
