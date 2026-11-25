@@ -1020,6 +1020,22 @@ fn restore_needs_present_gate(was_hidden: bool, minimized: bool) -> bool {
     was_hidden || minimized
 }
 
+/// Has a restored window's first frame really reached the screen?
+///
+/// `armed` is whether a restore is still waiting for its acknowledgement,
+/// `marked` whether this restore already logged, `painted` the app's
+/// painted-frame counter and `armed_at` the value `restore_window` recorded.
+/// `ui` bumps that counter before eframe tessellates and paints the frame it
+/// just laid out, so a frame counted there has no paint behind it yet; the pass
+/// that begins after it is the first one with a presented frame — the same
+/// one-frame boundary `REVEAL_MIN_TICKS` exists for. A restore the
+/// acknowledgement deadline gives up on clears the wait, so it never produces a
+/// painted claim.
+#[cfg(target_os = "windows")]
+fn restore_paint_seen(armed: bool, marked: bool, painted: u32, armed_at: u32) -> bool {
+    armed && !marked && painted > armed_at
+}
+
 /// Platform-neutral holder for a native instance-activation channel.
 #[derive(Clone, Default)]
 struct NativeActivation {
@@ -1412,6 +1428,21 @@ impl eframe::App for NativeApp {
         }
         #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
+        // The first frame of a restore. It is marked HERE and not in `ui` for
+        // the reason `frames_painted` documents: this pass begins after the
+        // frame `ui` laid out was painted and presented. `restore_window` arms
+        // the wait and only a new restore re-arms it, so this fires once per
+        // restore. Before `finish_reveal`, which clears the wait it reads.
+        #[cfg(target_os = "windows")]
+        if restore_paint_seen(
+            self.show_ack_pending,
+            self.restore_paint_marked,
+            self.frames_painted,
+            self.show_ack_at_frame,
+        ) {
+            self.restore_paint_marked = true;
+            StartupTrace::mark("restored_window_painted");
+        }
         // Before the tray actions, so a transition drained here cannot spend
         // one of the frames it is owed on the frame that requested it.
         #[cfg(target_os = "windows")]
@@ -1545,16 +1576,6 @@ impl eframe::App for NativeApp {
             // Every wait below is over once this counter has moved past the
             // value it started at.
             self.frames_painted = self.frames_painted.saturating_add(1);
-            // First painted frame of a restore. `restore_window` arms the wait
-            // and only a new restore re-arms it, so this mark fires once per
-            // restore rather than per frame.
-            if self.show_ack_pending
-                && !self.restore_paint_marked
-                && self.frames_painted > self.show_ack_at_frame
-            {
-                self.restore_paint_marked = true;
-                StartupTrace::mark("restored_window_painted");
-            }
             // A changed monitor size means the display layout changed under
             // the window (resolution switch by a game, monitor unplugged or
             // re-docked): pull the window back inside the visible desktop.
@@ -2459,6 +2480,25 @@ mod tests {
         assert!(restore_needs_present_gate(true, true));
         // Already showing its last frame: a cloak here would only blink.
         assert!(!restore_needs_present_gate(false, false));
+    }
+
+    /// `restored_window_painted` claims a frame is on screen, so it may not be
+    /// logged on the pass that armed the restore: `ui` bumps the painted-frame
+    /// counter before that frame is painted, and only the pass after it has a
+    /// presented frame behind it.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_restore_paint_is_marked_only_after_a_frame_really_painted() {
+        // Nothing armed: a taskbar un-minimize the app never asked for.
+        assert!(!restore_paint_seen(false, false, 3, 2));
+        // Armed this pass: `ui` has not bumped the counter since.
+        assert!(!restore_paint_seen(true, false, 2, 2));
+        // The pass after that frame ran: it has been presented by now.
+        assert!(restore_paint_seen(true, false, 3, 2));
+        // Once per restore, however many frames follow.
+        assert!(!restore_paint_seen(true, true, 4, 2));
+        // A deadline that gave up clears the wait, so it claims nothing later.
+        assert!(!restore_paint_seen(false, false, 9, 2));
     }
 
     #[cfg(feature = "wgpu")]
