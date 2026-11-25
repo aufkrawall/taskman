@@ -415,7 +415,7 @@ fn x_on_axis(rect: Rect, bounds: (u64, u64), stamp: u64) -> f32 {
 }
 
 /// Whether the axis can honestly place `stamp`, i.e. whether it lies within one
-/// window width of the axis opening.
+/// window width of either end of the axis.
 ///
 /// The plotted window carries exactly one sample from before the axis
 /// (`performance::visible_slice`), and it sits there so the polyline can enter
@@ -427,9 +427,19 @@ fn x_on_axis(rect: Rect, bounds: (u64, u64), stamp: u64) -> f32 {
 /// measured — the "stroke that starts at its own left edge" from the report.
 /// Such a sample is dropped and breaks the run instead, which is what
 /// [`ChartGeometry::runs`] does with `None`.
+///
+/// The RIGHT bound is not symmetric decoration. The axis' right edge is the
+/// newest ARRIVAL, not the largest stamp (see [`TimeAxis::bounds`]), so a
+/// wall-clock step FORWARD that is later corrected leaves samples already in
+/// the buffer stamped past the axis end. Clamping those onto the edge draws
+/// stale values where the newest measurement belongs — a dot beside the live
+/// curve with nothing to explain it — and the run builder will happily JOIN one
+/// of them to the in-window sample before it, which is the same "stroke across
+/// time nobody measured" as the left-hand case. They are dropped instead.
 fn placeable_on_axis(bounds: (u64, u64), stamp: u64) -> bool {
     let (t0, span) = bounds;
-    (stamp as f64 - t0 as f64) / span.max(1) as f64 >= -1.0
+    let frac = (stamp as f64 - t0 as f64) / span.max(1) as f64;
+    (-1.0..=1.0).contains(&frac)
 }
 
 /// x of series index `i` at even spacing across `rect`: the fallback for a
@@ -2250,6 +2260,48 @@ mod tests {
         let axis = TimeAxis::new(&stamps, 60);
         let runs = ChartGeometry::new(rect, 100.0, Some(axis), 3).runs_of(&[10.0, 20.0, 30.0]);
         assert_eq!(runs.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// A stamp PAST the axis end is dropped, not pinned onto the right edge.
+    ///
+    /// The axis' right edge is the newest ARRIVAL, not the largest stamp, so a
+    /// wall clock that jumps forward and is later corrected leaves samples
+    /// already in the buffer stamped beyond the window. `placeable_on_axis`
+    /// only bounded the axis on the LEFT, so `x_on_axis` clamped each of those
+    /// onto the right edge: stale values painted where the newest measurement
+    /// belongs, and — when one followed an in-window sample — a segment
+    /// bridging time nobody measured, exactly the stroke class the run builder
+    /// exists to prevent.
+    #[test]
+    fn a_stamp_past_the_axis_end_is_dropped_instead_of_pinned_to_the_right_edge() {
+        const NEWEST: u64 = 1_797_000_000_000;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 50.0));
+        // Arrival order with the newest arrival SMALLER than the three samples
+        // already buffered, i.e. an NTP correction back onto the true clock.
+        let stamps = [NEWEST + 5_000, NEWEST + 6_000, NEWEST + 7_000, NEWEST];
+        let samples = [10.0, 20.0, 30.0, 40.0];
+        let axis = TimeAxis::new(&stamps, 10);
+        let geometry = ChartGeometry::new(rect, 100.0, Some(axis), samples.len());
+        let runs = geometry.runs_of(&samples);
+        let points: Vec<Pos2> = runs.into_iter().flatten().collect();
+        assert_eq!(
+            points.len(),
+            1,
+            "only the newest sample is on the axis, but the stale ones were painted too: \
+             {points:?}"
+        );
+        assert!(
+            (points[0].x - rect.right()).abs() < 0.5,
+            "the newest sample is not on the right edge: {:?}",
+            points[0]
+        );
+        // 40 % of a 50 pt tall chart: the NEWEST value, not one of the stale
+        // ones the clamp used to draw in its place.
+        assert!(
+            (points[0].y - 30.0).abs() < 0.5,
+            "the right edge carries a stale value: {:?}",
+            points[0]
+        );
     }
 
     /// However stale a stamp is, the lead-in overhang stays within one chart
