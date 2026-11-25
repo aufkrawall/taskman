@@ -145,7 +145,16 @@ impl DibSurface {
                 let _ = DeleteDC(hdc);
                 return None;
             }
+            // A refused select answers null or HGDI_ERROR, and on either the
+            // bitmap is still free of the device context, so `Drop` could never
+            // delete it. That is a construction failure, not a surface with no
+            // pixels: release the bitmap and the context, then report it.
             let old_obj = SelectObject(hdc, HGDIOBJ(bitmap.0));
+            if old_obj.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(hdc);
+                return None;
+            }
             Some(Self {
                 hdc,
                 bitmap,
