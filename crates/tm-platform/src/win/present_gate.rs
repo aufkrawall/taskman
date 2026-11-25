@@ -445,10 +445,6 @@ fn teardown(window_live: bool) {
 /// Cloak `hwnd` and mark the gate as holding it.
 ///
 /// For a reveal the app drives itself: call this before asking the window to
-/// appear, then [`present_gate_release`] once a frame has been presented.
-/// Cloak the window and mark the gate as holding it.
-///
-/// For a reveal the app drives itself: call this before asking the window to
 /// appear, then [`present_gate_release`] once a frame has been presented. A
 /// zero `hwnd` falls back to the handle the gate was installed on, mirroring
 /// [`present_gate_release`], so a hold taken without a cached handle is still
