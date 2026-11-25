@@ -31,10 +31,10 @@ const MAX_MESSAGE_BYTES: usize = 128;
 const HANDOFF_DEADLINE: Duration = Duration::from_secs(5);
 const PER_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-/// Pause after a transient `accept` failure. Long enough that a persistent fd or
-/// memory shortage does not spin, short enough that a freed descriptor is picked
-/// up within one launch's handoff deadline.
-const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// Pause after a transient `poll`/`accept` failure. Long enough that a
+/// persistent fd or memory shortage does not spin, short enough that a freed
+/// descriptor is picked up within one launch's handoff deadline.
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The process that owns activation coordination for this user session.
 ///
@@ -335,11 +335,11 @@ fn establish_primary(
 
 /// What the listener loop does with one `accept` result.
 ///
-/// There is deliberately no outcome that ends the loop: the advisory lock keeps
-/// this process the session's coordinator until it exits, so a listener that
-/// gave up would leave the socket gone (or unanswered) while the lock still
-/// blocked every successor. Only a dead descriptor, which `poll` reports as
-/// `POLLNVAL`, tears the listener down.
+/// No accept outcome ends the loop: the advisory lock keeps this process the
+/// session's coordinator until it exits, so a listener that gave up would leave
+/// the socket gone (or unanswered) while the lock still blocked every successor.
+/// Teardown belongs to `poll_failure`, which reserves it for a descriptor that
+/// `poll` proves unusable.
 enum AcceptOutcome {
     Serve(UnixStream),
     NextPoll,
@@ -358,6 +358,30 @@ fn accept_outcome(result: io::Result<UnixStream>) -> AcceptOutcome {
     }
 }
 
+/// What the listener loop does with a failed `poll`.
+///
+/// `poll(2)` documents `ENOMEM`, which is transient for a two-descriptor table
+/// and must not cost the session its endpoint: this process would keep the flock
+/// and unlink the socket, so every later launch would burn the whole handoff
+/// deadline and open a duplicate window. Only an error that names an unusable
+/// descriptor (`EBADF`, `EINVAL`, `EFAULT`) ends the listener.
+#[derive(Debug, PartialEq, Eq)]
+enum PollFailure {
+    RetryImmediately,
+    RetryAfterBackoff,
+    TearDown,
+}
+
+fn poll_failure(error: &io::Error) -> PollFailure {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return PollFailure::RetryImmediately;
+    }
+    match error.raw_os_error() {
+        Some(libc::ENOMEM) => PollFailure::RetryAfterBackoff,
+        _ => PollFailure::TearDown,
+    }
+}
+
 fn serve_activation(
     listener: UnixListener,
     inbox: ActivationInbox,
@@ -366,9 +390,9 @@ fn serve_activation(
     socket_path: &Path,
     socket_identity: SocketIdentity,
 ) {
-    // One line per failure episode: a persistent fd shortage would otherwise
-    // repeat the same warning every backoff period for the rest of the session.
-    let mut accept_failure_reported = false;
+    // One line per failure episode: a persistent fd or memory shortage would
+    // otherwise repeat the same warning every backoff period for the session.
+    let mut transient_failure_reported = false;
     loop {
         let mut poll_fds = [
             libc::pollfd {
@@ -387,11 +411,28 @@ fn serve_activation(
         let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
         if result < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
+            match poll_failure(&error) {
+                PollFailure::RetryImmediately => continue,
+                // A transient failure keeps the live endpoint: this process holds
+                // the advisory lock, so tearing the listener down would make
+                // every later launch retry the whole handoff deadline and open a
+                // duplicate window. Back off interruptibly and poll again.
+                PollFailure::RetryAfterBackoff => {
+                    if !transient_failure_reported {
+                        tracing::warn!(
+                            %error,
+                            "Linux activation listener poll failed; keeping the endpoint"
+                        );
+                        transient_failure_reported = true;
+                    }
+                    wait_for_stop(wake, RETRY_BACKOFF);
+                    continue;
+                }
+                PollFailure::TearDown => {
+                    tracing::warn!(%error, "Linux activation listener poll failed");
+                    break;
+                }
             }
-            tracing::warn!(%error, "Linux activation listener poll failed");
-            break;
         }
         if stop.load(Ordering::Acquire) {
             break;
@@ -410,7 +451,7 @@ fn serve_activation(
                 }
                 match accept_outcome(listener.accept()) {
                     AcceptOutcome::Serve(stream) => {
-                        accept_failure_reported = false;
+                        transient_failure_reported = false;
                         serve_activation_connection(stream, &inbox, stop)
                     }
                     AcceptOutcome::NextPoll => break,
@@ -420,20 +461,20 @@ fn serve_activation(
                     // this process keeps the advisory lock for its whole
                     // lifetime, so a listener that unlinked its own socket
                     // would make every later launch retry the full handoff
-                    // deadline and open a duplicate window. A genuinely dead
-                    // listener is reported by `poll` as POLLNVAL above, which is
-                    // where the loop tears down. Back off so a persistent
-                    // shortage cannot spin, and let the stop wake-up end the
-                    // wait immediately.
+                    // deadline and open a duplicate window. Teardown belongs to
+                    // the poll result above, which is what proves a descriptor
+                    // unusable (`POLLNVAL`, or a poll error naming it). Back off
+                    // so a persistent shortage cannot spin, and let the stop
+                    // wake-up end the wait immediately.
                     AcceptOutcome::RetryAfterBackoff(error) => {
-                        if !accept_failure_reported {
+                        if !transient_failure_reported {
                             tracing::warn!(
                                 %error,
                                 "Linux activation listener accept failed; keeping the endpoint"
                             );
-                            accept_failure_reported = true;
+                            transient_failure_reported = true;
                         }
-                        wait_for_stop(wake, ACCEPT_RETRY_BACKOFF);
+                        wait_for_stop(wake, RETRY_BACKOFF);
                         break;
                     }
                 }
@@ -1169,8 +1210,8 @@ mod tests {
     fn transient_accept_failures_keep_the_listener_alive() {
         // The lock outlives the listener, so a torn-down endpoint would block
         // every later launch for the whole handoff deadline and then open a
-        // duplicate window. Only a dead descriptor may end the loop, and `poll`
-        // reports that as POLLNVAL before `accept` is ever reached.
+        // duplicate window. No accept error ends the loop; only the poll result
+        // may, because that is what proves a descriptor unusable.
         for errno in [
             libc::EMFILE,
             libc::ENFILE,
@@ -1194,6 +1235,29 @@ mod tests {
             accept_outcome(Err(io::Error::from(io::ErrorKind::WouldBlock))),
             AcceptOutcome::NextPoll
         ));
+    }
+
+    #[test]
+    fn transient_poll_failures_keep_the_listener_alive() {
+        // poll(2) documents ENOMEM, and the flock is held for the process
+        // lifetime, so ending the listener would strand every later launch the
+        // same way a torn-down accept path does. Only an error that names an
+        // unusable descriptor may tear down.
+        assert_eq!(
+            poll_failure(&io::Error::from_raw_os_error(libc::ENOMEM)),
+            PollFailure::RetryAfterBackoff
+        );
+        assert_eq!(
+            poll_failure(&io::Error::from(io::ErrorKind::Interrupted)),
+            PollFailure::RetryImmediately
+        );
+        for errno in [libc::EBADF, libc::EINVAL, libc::EFAULT] {
+            assert_eq!(
+                poll_failure(&io::Error::from_raw_os_error(errno)),
+                PollFailure::TearDown,
+                "errno {errno} names an unusable descriptor"
+            );
+        }
     }
 
     #[test]
