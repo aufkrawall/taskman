@@ -289,7 +289,14 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
         });
     }
 
-    let header = unsafe { &*buf.as_ptr().cast::<ProcessHandleSnapshotInformation>() };
+    // The snapshot arrives in a byte buffer, so its records are only
+    // byte-aligned: they are read out unaligned instead of by reference, which
+    // would require an alignment `Vec<u8>` does not guarantee.
+    let header = unsafe {
+        buf.as_ptr()
+            .cast::<ProcessHandleSnapshotInformation>()
+            .read_unaligned()
+    };
     let max_entries = (buf.len() - header_size) / entry_size;
     let count = header.number_of_handles.min(max_entries);
 
@@ -311,7 +318,7 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
     let mut complete = count == header.number_of_handles;
 
     for i in 0..count {
-        let entry = unsafe { *entries_ptr.add(i) };
+        let entry = unsafe { entries_ptr.add(i).read_unaligned() };
         if entry.handle_value == 0 || entry.handle_attributes & OBJ_KERNEL_HANDLE != 0 {
             continue;
         }
