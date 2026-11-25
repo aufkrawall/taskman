@@ -400,6 +400,21 @@ pub enum FileIoAccountingState {
     /// The target issued file requests but none of the records could be
     /// decoded: the payload layout is not what this build expects.
     Undecodable,
+    /// No trace could be started because the single global kernel session — the
+    /// only one that delivers the classic `FileIo` class, which is what per-file
+    /// bytes need — is owned by ANOTHER application right now
+    /// (`ERROR_ALREADY_EXISTS` from `StartTraceW`, plus the fallback session
+    /// refusing).
+    ///
+    /// Distinct from [`Self::Unavailable`] because it is not a privilege
+    /// problem and the user can act on it: some other tracing tool (a
+    /// Process Hacker-style monitor, an installer's logger, `wpr`, a
+    /// performance-recording app) holds the kernel logger, and closing it
+    /// releases the session. Distinct from [`Self::Undelivered`] because
+    /// nothing was started at all — there is no silent window to wait out, and
+    /// reporting it as one would suggest the subscription is broken. The rows
+    /// carry no byte counts.
+    KernelLoggerInUse,
     /// Counts are measured. Absence of a file means it saw no I/O.
     Measured,
 }

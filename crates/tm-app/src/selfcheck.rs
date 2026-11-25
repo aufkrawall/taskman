@@ -40,6 +40,7 @@ fn file_io_state_name(state: FileIoAccountingState) -> &'static str {
         FileIoAccountingState::Unavailable => "unavailable",
         FileIoAccountingState::Undelivered => "undelivered",
         FileIoAccountingState::Undecodable => "undecodable",
+        FileIoAccountingState::KernelLoggerInUse => "kernel_logger_in_use",
         FileIoAccountingState::Measured => "measured",
     }
 }
@@ -455,6 +456,10 @@ mod tests {
             (FileIoAccountingState::Unavailable, "unavailable"),
             (FileIoAccountingState::Undelivered, "undelivered"),
             (FileIoAccountingState::Undecodable, "undecodable"),
+            (
+                FileIoAccountingState::KernelLoggerInUse,
+                "kernel_logger_in_use",
+            ),
             (FileIoAccountingState::Measured, "measured"),
         ] {
             let accounting = FileIoAccounting {
