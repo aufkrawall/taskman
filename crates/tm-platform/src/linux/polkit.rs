@@ -215,8 +215,8 @@ fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<(
         ));
     };
     let (stdout, stderr) = match (
-        drain_pipe("tm-linux-pkexec-stdout", stdout),
-        drain_pipe("tm-linux-pkexec-stderr", stderr),
+        drain_pipe("tm-pkexec-out", stdout),
+        drain_pipe("tm-pkexec-err", stderr),
     ) {
         (Ok(stdout), Ok(stderr)) => (stdout, stderr),
         // A refused thread must fail this action. `std::thread::spawn` panics
@@ -274,6 +274,8 @@ fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<(
 /// returned to the caller, which kills and reaps the child and fails the action:
 /// the handle is deliberately dropped, never joined, on the timeout path,
 /// because a descendant that inherited the pipe would make the join unbounded.
+/// `name` becomes the kernel's `comm`, which Linux truncates to 15 bytes, so keep
+/// it short enough for two concurrent readers to stay distinguishable.
 fn drain_pipe(
     name: &'static str,
     pipe: impl Read + Send + 'static,
