@@ -556,8 +556,18 @@ impl Renderer {
     /// [`crate::RenderState`]'s renderer slot is first-call-wins, so a second caller cannot
     /// tell from the outside whether its own options are the ones in use. A `false` answer
     /// means its options never reached a pipeline and never will.
+    ///
+    /// `msaa_samples` is compared normalized, because that is how the pipelines were built:
+    /// `0` and `1` both mean "no multisampling" and produce identical pipelines, so treating
+    /// them as different options would reject a caller whose options are in use.
     pub fn was_created_with(&self, options: RendererOptions) -> bool {
-        self.options == options
+        fn normalized(options: RendererOptions) -> RendererOptions {
+            RendererOptions {
+                msaa_samples: options.msaa_samples.max(1),
+                ..options
+            }
+        }
+        normalized(self.options) == normalized(options)
     }
 
     /// Creates a renderer for a egui UI.
@@ -1744,7 +1754,13 @@ mod tests {
             "an out-of-range blend source must fail"
         );
 
-        // End to end: the same device, with this source's validation outcome, is not capable.
+        // End to end: the feature alone is not the answer, the shipped shader plus the feature
+        // is, and a shader that failed validation removes it. Without the positive control the
+        // negative one below would hold even if the predicate ignored its arguments.
+        assert!(subpixel_text_supported(
+            wgpu::Features::DUAL_SOURCE_BLENDING,
+            validate_lcd_shader_source(&lcd_shader_source()).is_ok()
+        ));
         assert!(!subpixel_text_supported(
             wgpu::Features::DUAL_SOURCE_BLENDING,
             validation.is_ok()
