@@ -131,14 +131,6 @@ impl MemoryInfo {
         let pct = self.used_bytes as f32 / self.total_bytes as f32 * 100.0;
         pct.is_finite().then_some(pct)
     }
-
-    pub fn commit_pct(&self) -> f32 {
-        if self.commit_total_bytes == 0 {
-            0.0
-        } else {
-            self.commit_used_bytes as f32 / self.commit_total_bytes as f32 * 100.0
-        }
-    }
 }
 
 // ---------------------------------------------------------------- disks
@@ -198,16 +190,6 @@ pub struct DiskInfo {
     pub avg_resp_ms: f32,
     pub total_read_bytes: u64,
     pub total_written_bytes: u64,
-}
-
-impl DiskInfo {
-    pub fn used_pct(&self) -> f32 {
-        if self.total_bytes == 0 {
-            0.0
-        } else {
-            (self.total_bytes - self.free_bytes) as f32 / self.total_bytes as f32 * 100.0
-        }
-    }
 }
 
 /// One physical disk's active time spent on one process.
