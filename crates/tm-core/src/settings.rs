@@ -31,7 +31,7 @@
 //!   toggling the autosave switch itself persists immediately so the choice
 //!   survives restart (implement.md §17.2).
 //! * A legacy `settings.json` from older builds is migrated once when no
-//!   config.ini exists yet.
+//!   usable config.ini exists yet.
 //! * Column preferences are keyed by **stable column id** (`[columns.<table>]`
 //!   sections); positional `[columns]` entries of old builds are migrated
 //!   once through each table's historical hard-coded column order.
@@ -784,9 +784,16 @@ impl Settings {
     }
 
     /// Read `path` and report whether its contents could be used. A file that
-    /// is present but unreadable (oversized, corrupt, locked) is kept aside
-    /// and reported unusable, so [`Settings::load`] can still fall back to the
-    /// legacy JSON settings instead of letting defaults shadow them.
+    /// is present but unreadable (oversized, corrupt, locked), or readable but
+    /// holding no settings at all (empty, zero-filled, garbage after a failed
+    /// save) is kept aside and reported unusable, so [`Settings::load`] can
+    /// still fall back to the legacy JSON settings instead of letting defaults
+    /// shadow them.
+    ///
+    /// One `key=value` pair is enough to be usable: a hand-edited INI
+    /// legitimately sets a subset of the keys, and every key it omits keeps
+    /// its default. Only a file that says nothing is indistinguishable from
+    /// one whose write lost its data.
     fn load_from_checked(path: &Path) -> (Self, bool) {
         let bytes = read_capped(path, MAX_SETTINGS_BYTES);
         match bytes {
@@ -794,9 +801,22 @@ impl Settings {
                 // Tolerate a UTF-8 BOM (e.g. files edited with PowerShell).
                 let text = String::from_utf8_lossy(&bytes);
                 let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-                let s = Self::from_ini_text(text);
-                tracing::debug!(path = %path.display(), "settings loaded");
-                (s, true)
+                if parse_ini(text).is_empty() {
+                    // Nothing to restore. Reporting this as usable would skip
+                    // the JSON migration and let the first autosave of
+                    // defaults overwrite what the user actually chose.
+                    tracing::warn!(
+                        path = %path.display(),
+                        bytes = bytes.len(),
+                        "settings file holds no settings"
+                    );
+                    crate::persist::set_aside(path, "settings file");
+                    (Self::default(), false)
+                } else {
+                    let s = Self::from_ini_text(text);
+                    tracing::debug!(path = %path.display(), "settings loaded");
+                    (s, true)
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(path = %path.display(), "no settings file; using defaults");
@@ -1075,10 +1095,11 @@ impl Settings {
     }
 
     /// Read the settings files in `dir`: `config.ini`, else the legacy
-    /// `settings.json` of older builds. An INI that exists but cannot be read
-    /// is unusable rather than empty, so the JSON migration still runs and the
-    /// first autosave cannot replace JSON-era settings with defaults. When
-    /// neither source is usable the INI result (defaults) is returned.
+    /// `settings.json` of older builds. An INI that exists but cannot be read,
+    /// or that holds no settings at all, is unusable rather than empty, so the
+    /// JSON migration still runs and the first autosave cannot replace
+    /// JSON-era settings with defaults. When neither source is usable the INI
+    /// result (defaults) is returned.
     fn load_from_dir(dir: &Path) -> Self {
         let ini = dir.join("config.ini");
         let (from_ini, ini_usable) = Self::load_from_checked(&ini);
@@ -1631,6 +1652,58 @@ text_smoothing=banana
                 .len(),
             (MAX_SETTINGS_BYTES + 1) as u64
         );
+    }
+
+    /// An empty config.ini is readable, which used to be mistaken for usable:
+    /// the JSON migration was skipped and the next autosave wrote defaults
+    /// over the user's JSON-era settings. It holds nothing, so it is unusable
+    /// like any other failed write — and kept, not deleted.
+    #[test]
+    fn empty_ini_still_migrates_the_legacy_json_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"theme":"Dark","update_speed":"High","graph_seconds":90}"#,
+        )
+        .unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, b"").unwrap();
+
+        let loaded = Settings::load_from_dir(dir.path());
+
+        // The JSON values, not the defaults (System/Normal/60).
+        assert_eq!(loaded.theme, ThemeMode::Dark);
+        assert_eq!(loaded.update_speed, UpdateSpeed::High);
+        assert_eq!(loaded.graph_seconds, 90);
+        // Kept aside instead of being left for the first autosave to overwrite.
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("config.ini.bad"))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// The other half of the rule: an INI with one key is a normal file, not a
+    /// lost one, so the current format wins and the stale JSON is ignored.
+    #[test]
+    fn a_usable_ini_wins_over_the_legacy_json_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"theme":"Dark","update_speed":"High","graph_seconds":90}"#,
+        )
+        .unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[general]\nupdate_speed=low\n").unwrap();
+
+        let loaded = Settings::load_from_dir(dir.path());
+
+        assert_eq!(loaded.update_speed, UpdateSpeed::Low);
+        assert_eq!(loaded.theme, ThemeMode::System);
+        assert_eq!(loaded.graph_seconds, 60);
+        assert!(path.exists(), "a usable INI must not be moved aside");
     }
 
     #[test]
