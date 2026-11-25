@@ -1022,11 +1022,16 @@ mod tests {
     /// it.
     ///
     /// This restates the axis's documented contract rather than borrowing the
-    /// widget's own arithmetic: the window opens at `newest - window`, a sample
-    /// outside it is pinned to the axis edge, and a timestamp slice shorter
-    /// than the series falls back to even spacing. The gates need it to know
-    /// what ONE sample interval is in points, which is the width a stroke edge
-    /// is allowed to span.
+    /// widget's own arithmetic: the window opens at `newest - window`, and a
+    /// timestamp slice shorter than the series falls back to even spacing. The
+    /// gates need it to know what ONE sample interval is in points, which is the
+    /// width a stroke edge is allowed to span.
+    ///
+    /// It is only ever asked about IN-WINDOW stamps (the fixtures' regular
+    /// series), because the widget drops a sample older than one window rather
+    /// than pinning it: the clamp below is stated for completeness, not
+    /// exercised. Do not make this helper match a widget that pins out-of-window
+    /// samples onto the edge — pinning them is the bug the gate exists for.
     fn axis_x(rect: Rect, stamps: &[u64], window_ms: u64, i: usize, n: usize) -> f32 {
         let even = rect.left() + rect.width() * i as f32 / (n - 1) as f32;
         let (Some(&last), Some(&stamp)) = (stamps.last(), stamps.get(i)) else {
@@ -1306,8 +1311,10 @@ mod tests {
     /// vertex off the tile or poison the geometry.
     ///
     /// Coverage rather than detection: the sample is real data at a real
-    /// instant, so a chart may legitimately draw the little Z the ordering
-    /// implies. What it may not do is leave the tile while handling it.
+    /// instant, and the widget answers it by starting a new run right there (a
+    /// segment may not go back in time), so this gate asserts only that whatever
+    /// the chart draws stays inside the tile — not which of the two honest
+    /// renderings it picked.
     #[test]
     fn a_backwards_stamp_stays_inside_its_tile() {
         let stamps: &[u64] = &[0, 1_000, 2_000, 1_500, 3_000];
@@ -1451,7 +1458,7 @@ mod tests {
         // pixel that is clearly blue-dominant. The chrome around it -- card
         // fill, grid, border -- is neutral grey and cannot be mistaken for one.
         let tinted = |px: u32| {
-            let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+            let (r, _, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
             b > 70 && b > r + 30
         };
         let at_px = |x: u32, y: u32| buf[(y * PW + x) as usize];

@@ -335,13 +335,14 @@ Everything below is headless; none of it opens a window.
   code and asserts structural properties of the output, plus the end-to-end sub-pixel
   check: enabling the mode must add channel spread to glyph edges and leave solid fills
   bit-identical. The same test binary carries the chart-geometry gate: adversarial series
-  (NaN, ±inf, a stamp an hour outside the axis, fewer timestamps than samples, a kernel
-  slice of the wrong length) are tessellated through a windowless `Context`, and every
-  vertex must be finite and inside the tile's bounded lead-in overhang, each measured run
-  must be its own stroke that never spans more than one sample interval, and the fill must
-  not close over a gap. It pins the artifact where a missing sample used to be drawn as a
-  straight stroke across the plot; `widgets::chart::ChartGeometry` is the single place that
-  builds those positions.
+  (NaN, ±inf, a stamp an hour outside the axis, fewer timestamps than samples) are
+  tessellated through a windowless `Context`, and every vertex must be finite and inside
+  the tile's bounded lead-in overhang, each measured run must be its own stroke that never
+  spans more than one sample interval (one tile width where a fixture's spacing is
+  irregular), and the fill must not close over a gap. The mismatched kernel slice has its
+  own case in `widgets::chart`'s unit tests, which is also where the geometry rules
+  (`ChartGeometry`) are pinned. The gate exists for the artifact where a missing sample was
+  drawn as a straight stroke across the plot.
 - `(cd vendor/egui && cargo test -p egui-wgpu)` - pure coverage for feature detection/request policy, atlas
   full/partial state transitions, managed-texture-only pipeline selection, transform
   fallback policy, all-white untextured exclusion, RGB/BGR/contrast uniform fields, the

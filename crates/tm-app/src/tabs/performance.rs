@@ -406,8 +406,13 @@ mod tests {
             }
         });
         // Same ticks, tile by tile: 1 and 2 are gaps in every tile, so no tile
-        // charts a kernel band the aggregate band would not.
-        assert!(kern.iter().all(|tile| tile[0] == Some(1.0)));
+        // charts a kernel band the aggregate band would not. Tile `i` carries
+        // its OWN core's kernel share (the vectors are zipped in order, not
+        // broadcast), so the first tick is 1, 2, 3, 4.
+        assert_eq!(
+            kern.iter().map(|tile| tile[0]).collect::<Vec<_>>(),
+            vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)]
+        );
         assert!(
             kern.iter()
                 .all(|tile| tile[1].is_none() && tile[2].is_none()),

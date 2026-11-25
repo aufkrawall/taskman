@@ -882,8 +882,8 @@ fn hover_pos(ui: &egui::Ui, response: &Response, rect: Rect) -> Option<Pos2> {
     pos
 }
 
-/// Age caption for sample `idx` of `timestamps_ms`, relative to the newest
-/// sample in the window. Empty when the caller charted without timestamps.
+/// Age caption for sample `idx` of the axis, relative to the newest sample in
+/// the window. Empty when the caller charted without timestamps.
 pub(crate) fn sample_age(axis: Option<TimeAxis>, idx: usize) -> String {
     let Some(ts) = axis.map(|a| a.stamps) else {
         return String::new();
@@ -1052,8 +1052,8 @@ pub fn paint_sparkline_with_gaps(
 /// only meaningful when they are there, and because a tile and the aggregate
 /// CPU chart have to paint kernel time in the same colour.
 ///
-/// `label` names the tile in the hover readout ("CPU 0"); `timestamps_ms`
-/// gives that readout the sample's age, exactly as on the big charts.
+/// `label` names the tile in the hover readout ("CPU 0"); `axis` gives that
+/// readout the sample's age, exactly as on the big charts.
 #[allow(clippy::too_many_arguments)]
 fn core_chart_impl(
     ui: &mut egui::Ui,
@@ -1250,7 +1250,7 @@ impl MultiSeries {
 }
 
 /// Bordered chart with several filled series sharing one y scale
-/// (disk read+write, memory+commit, ...). When `timestamps_ms` is given the
+/// (disk read+write, memory+commit, ...). When an `axis` is given the
 /// x positions follow real sample times, so delayed/irregular samples plot
 /// at their true elapsed offset instead of compressing evenly (§14.3).
 ///
@@ -1422,7 +1422,7 @@ pub fn chart_multi_with_bg(
                 rows.push(ReadoutRow {
                     color: s.color,
                     label: s.label.clone(),
-                    value: readout_text(Some(value), fmt),
+                    value: readout_text(value, fmt),
                 });
                 if let Some(value) = value.filter(|value| value.is_finite()) {
                     dots.push((geometry.y(value), s.color));
@@ -2254,11 +2254,11 @@ mod tests {
     #[test]
     fn a_pathological_stamp_stays_within_one_chart_width() {
         let rect = Rect::from_min_size(Pos2::new(100.0, 0.0), Vec2::new(600.0, 100.0));
-        // Epoch zero followed by two samples from 2027: the lead-in is ~19
-        // years older than the window it is carried into, which is the post-
-        // suspend buffer (history `[… 60 s, 360 s]` with a 60 s window) taken to
-        // its extreme.
-        let stamps = [1_000u64, 1_800_000_000_000, 1_800_000_060_000];
+        // Epoch zero followed by two samples from 2027, one sampling interval
+        // apart: the lead-in is ~19 years older than the window it is carried
+        // into, which is the post-suspend buffer (history `[… 60 s, 360 s]`
+        // with a 60 s window) taken to its extreme.
+        let stamps = [1_000u64, 1_800_000_000_000, 1_800_000_001_000];
         let axis = TimeAxis::new(&stamps, 60);
         let geometry = ChartGeometry::new(rect, 100.0, Some(axis), stamps.len());
         // The marker position is still a bounded, finite x -- it is a marker,
@@ -2287,7 +2287,8 @@ mod tests {
         // Not a gap, though: the axis can still place the other two, in order.
         assert!(geometry.x(1) < geometry.x(2));
         // ...and no painted edge spans more than one sampling interval, which is
-        // what a bridged 19-year jump would.
+        // what a bridged 19-year jump would (the two placeable samples are one
+        // second apart on a sixty-second axis, so one interval is width/60).
         let interval = rect.width() / 60.0;
         for run in &runs {
             for pair in run.windows(2) {
