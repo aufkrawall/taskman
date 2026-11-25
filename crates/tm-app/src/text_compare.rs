@@ -161,7 +161,10 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
             o.subpixel_binning = smoothing == TextSmoothing::Smooth;
             o.font_hinting = true;
             if !subpixel.is_off() {
-                o.max_texture_side = o.max_texture_side.max(4096);
+                // The atlas ceiling is not settable from a style:
+                // `Context::update_fonts_mut` overwrites `max_texture_side` with
+                // `RawInput`'s value on every pass, so a write here would be
+                // discarded. The harness only renders a short sample anyway.
                 // Either an explicit sweep value, or exactly what the app would pick
                 // for this profile -- so the profile rows show real behaviour.
                 let (gamma, contrast) = blend.unwrap_or_else(|| {
