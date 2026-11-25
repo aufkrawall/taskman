@@ -982,18 +982,46 @@ rebase runbook.
   `WinActions::list_process_file_io` path whenever a request does not get a
   served answer — no service installed, the broker unavailable, or the broker
   rejecting the request — which still requires elevation, and attaches its
-  sample through the one shared `file_etw::attach_file_io`. The session is a
-  system logger that enables the SystemIo provider with `SYSTEM_IO_KW_FILE`
-  (`file_etw::PROVIDERS`) — one of the eight slots the SystemTraceProvider
-  multiplexes, never the single NT Kernel Logger and never the disk session, so
-  the disk graphs keep their own flags and lifetime. That enable is a PROVIDER
-  call, not an `EnableFlags` flag: both the manifest `EnableTraceEx2` for
-  `Microsoft-Windows-Kernel-File` and the legacy `EVENT_TRACE_FLAG_FILE_IO` are
-  accepted and deliver no record — the live elevated selfcheck that reported
-  `undelivered` with `events_lost` 0 came from them, not from an idle machine.
+  sample through the one shared `file_etw::attach_file_io`. Which session
+  carries the class is decided in three ordered attempts
+  (`file_etw::sources`, best first, re-tried best-first on every restart):
+  1. the single global NT Kernel Logger (`etw::KERNEL_LOGGER`,
+     `LoggerKind::KernelFile`) with `EnableFlags = EVENT_TRACE_FLAG_FILE_IO`
+     and `Wnode.Guid = SystemTraceControlGuid`, real-time only, on the disk
+     session's buffers. This is the session the classic `FileIo` class has
+     always been delivered by and the flag IS its subscription, so the attempt
+     enables no provider at all (`file_etw::KERNEL_PROVIDERS`);
+  2. a private system logger (`LoggerKind::SystemFile`) enabling the SystemIo
+     provider with `SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME`
+     (`file_etw::PROVIDERS`) — one of the eight slots the SystemTraceProvider
+     multiplexes, never the disk session, so the disk graphs keep their own
+     flags and lifetime. That enable is a PROVIDER call, not an `EnableFlags`
+     flag: both the manifest `EnableTraceEx2` for
+     `Microsoft-Windows-Kernel-File` and the legacy `EVENT_TRACE_FLAG_FILE_IO`
+     are accepted and deliver no record — the live elevated selfcheck that
+     reported `undelivered` with `events_lost` 0 came from them, not from an
+     idle machine. The two mechanisms are not interchangeable: the flag works
+     on the kernel logger and nowhere else;
+  3. a refusal, which becomes a state and never a number.
+  The kernel logger is EXCLUSIVE: there is exactly one on the machine, its name
+  is not ours, and an `ERROR_ALREADY_EXISTS` from `StartTraceW` must NOT be
+  answered the way every per-role session is (`LoggerKind::
+  reclaims_a_stale_session`) — stopping it would end another application's
+  trace. That is why Process Hacker-style tools coordinate on this one session
+  and why the code reports it instead of retrying. When another tool owns it
+  (a monitor, `wpr`, an installer's logger), attempt 2 may still carry the
+  class; when that is refused too, `FileTraceRefusal::KernelLoggerInUse`
+  reaches the snapshot as `FileIoAccountingState::KernelLoggerInUse` through
+  `file_etw::attach_refusal`, and the line reads "another application is using
+  the NT Kernel Logger, so per-file I/O cannot be traced" — a machine owner the
+  user can close, not a privilege problem and not a silent window. Should this
+  program ever own the kernel logger and crash, `SESSION_NAMES` includes it so
+  the panic teardown releases it.
   The delivered records are still classic `FileIo` ones (class GUID in
   `ProviderId`, operation in the opcode: 12–16 for Create/Cleanup/Close/Read/
-  Write), the same enable-then-class split `disk_etw` uses for `DiskIo`. An
+  Write), the same enable-then-class split `disk_etw` uses for `DiskIo`, and
+  BOTH attempts decode through that one callback, so a byte means the same
+  thing whichever session measured it. An
   app-side start
   that fails (the ordinary unelevated GUI) is throttled for
   `APP_FILE_TRACE_RETRY` so the once-per-second poll does not spin on a kernel
@@ -1005,9 +1033,10 @@ rebase runbook.
   gets a line of its own: `Unavailable` says no trace is running and names
   elevation or the installed service, `Undelivered` says a trace is running but
   has not delivered a file event yet, `Undecodable` says events arrived and
-  could not be decoded. Only `Unavailable` is Windows-only gated (the Linux
+  could not be decoded, `KernelLoggerInUse` says another application holds the
+  kernel logger. Only `Unavailable` is Windows-only gated (the Linux
   backend reports `Unavailable` for every snapshot and has no elevated host);
-  the other two describe what the trace did, not what it needs. Non-zero
+  the other three describe what the trace could not do, not what it needs. Non-zero
   `events_lost`, `dropped_paths` and `cleared_file_objects` are appended in that
   order as one parenthesized phrase, so a lossy or capped session reads as such
   instead of as complete numbers. The line is suppressed while a displayed row

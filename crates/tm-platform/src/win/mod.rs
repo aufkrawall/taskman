@@ -36,6 +36,22 @@ pub fn disk_etw_test_start() -> Option<disk_etw::DiskUsage> {
     disk_etw::DiskUsage::start(etw::TraceRole::App)
 }
 
+/// Test-only handle into the ETW per-file trace: which of its ordered attempts
+/// actually started, or why none did.
+///
+/// The order is the design (the global NT Kernel Logger first, a private
+/// system-logger subscription second, a refusal third), and only a live range
+/// can say which of the three a given machine lands in. Returning the refusal
+/// is what lets an elevated diagnostic report the third case instead of
+/// silently passing.
+#[doc(hidden)]
+pub fn file_etw_test_start()
+-> std::result::Result<(file_etw::FileEtw, &'static str), file_etw::FileTraceRefusal> {
+    let trace = file_etw::FileEtw::try_start(etw::TraceRole::App)?;
+    let session = trace.source().name;
+    Ok((trace, session))
+}
+
 #[doc(hidden)]
 pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
     core_service::live_pids_for_test()
