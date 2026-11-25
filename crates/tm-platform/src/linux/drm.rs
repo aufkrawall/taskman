@@ -38,6 +38,11 @@ struct CardFacts {
 #[derive(Debug, Clone)]
 struct CardIdentity {
     path: PathBuf,
+    /// The PCI device this card number pointed at when the identity was read.
+    /// `/sys/class/drm/cardN` is per-driver probe order and is reused, so the
+    /// number alone would pair card A's cached name and VRAM total with card
+    /// B's live counters after a removal.
+    device: Option<PathBuf>,
     facts: CardFacts,
 }
 
@@ -45,6 +50,39 @@ struct CardCache {
     cards: Vec<CardIdentity>,
     nvidia_names: HashMap<String, String>,
     read_at: Instant,
+}
+
+impl CardCache {
+    /// Whether these identities still describe the cards sysfs lists right now.
+    ///
+    /// One directory listing plus one symlink read per card per tick catches a
+    /// removed card, a newly probed one, a reused card number and a card that
+    /// now names another device, so a real change is picked up immediately
+    /// instead of at the next TTL expiry. The expensive identity reads stay
+    /// behind the TTL. A listing that fails cannot prove the cache wrong, so it
+    /// keeps what it has rather than publishing an empty adapter list.
+    fn still_accurate(&self) -> bool {
+        let Some(current) = drm_cards() else {
+            return true;
+        };
+        let current: Vec<(PathBuf, Option<PathBuf>)> = current
+            .into_iter()
+            .map(|(_, path)| {
+                let device = card_device(&path);
+                (path, device)
+            })
+            .collect();
+        let cached: Vec<(PathBuf, Option<PathBuf>)> = self
+            .cards
+            .iter()
+            .map(|card| (card.path.clone(), card.device.clone()))
+            .collect();
+        crate::linux_telemetry::card_identities_hold(&cached, &current)
+    }
+}
+
+fn card_device(path: &Path) -> Option<PathBuf> {
+    std::fs::read_link(path.join("device")).ok()
 }
 
 fn card_cache() -> &'static Mutex<Option<CardCache>> {
@@ -62,9 +100,13 @@ pub fn gpus(measure: bool) -> Vec<GpuInfo> {
     let mut guard = tm_core::sync::lock(card_cache());
     let stale = guard
         .as_ref()
-        .is_none_or(|cache| cache.read_at.elapsed() >= IDENTITY_TTL);
+        .is_none_or(|cache| cache.read_at.elapsed() >= IDENTITY_TTL || !cache.still_accurate());
     if stale {
-        *guard = Some(scan_cards());
+        // A listing that failed is not "no cards": keep the adapters we already
+        // described instead of blanking the GPU page for a whole cache window.
+        if let Some(fresh) = scan_cards() {
+            *guard = Some(fresh);
+        }
     }
     let Some(cache) = guard.as_ref() else {
         return Vec::new();
@@ -78,20 +120,23 @@ pub fn gpus(measure: bool) -> Vec<GpuInfo> {
 }
 
 /// Enumerate the adapters, once per [`IDENTITY_TTL`] window.
-fn scan_cards() -> CardCache {
-    let mut cards = drm_cards();
+///
+/// `None` when `/sys/class/drm` cannot be listed: that is "unknown", not "no GPU".
+fn scan_cards() -> Option<CardCache> {
+    let mut cards = drm_cards()?;
     cards.sort_by_key(|(name, _)| card_number(name));
-    CardCache {
+    Some(CardCache {
         cards: cards
             .into_iter()
             .map(|(_, path)| CardIdentity {
+                device: card_device(&path),
                 facts: read_identity(&path),
                 path,
             })
             .collect(),
         nvidia_names: nvidia_models(),
         read_at: Instant::now(),
-    }
+    })
 }
 
 /// One adapter row: cached identity plus, when measured, this tick's counters.
@@ -104,21 +149,23 @@ fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> 
     gpu_from_card(id, facts, &cache.nvidia_names)
 }
 
-fn drm_cards() -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let number = name.strip_prefix("card")?;
-            if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-            Some((name, entry.path()))
-        })
-        .collect()
+/// The cards sysfs lists, lowest name order. `None` when the directory cannot be
+/// read, which the caller must not confuse with "this host has no DRM".
+fn drm_cards() -> Option<Vec<(String, PathBuf)>> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let number = name.strip_prefix("card")?;
+                if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
+                    return None;
+                }
+                Some((name, entry.path()))
+            })
+            .collect(),
+    )
 }
 
 fn card_number(name: &str) -> u32 {

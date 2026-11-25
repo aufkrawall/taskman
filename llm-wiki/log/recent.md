@@ -1,3 +1,54 @@
+## 2026-11-25 - What the Linux sampling tick actually cost
+
+- Reported as "after starting TaskMan on Linux, CPU usage stays elevated for at least several
+  seconds, maybe racy". The suspicion was right about the cost and wrong about the shape: no
+  single loop burned a core for seconds, and the one loop that really spun (the `fc-match`
+  wait) only spans stdout-EOF-to-reap, i.e. microseconds. What the code did confirm is a tick
+  that re-derived static facts and re-read the same files, on Linux only, where Windows reads
+  one kernel snapshot.
+- Removed per tick: a third `/proc/<pid>/stat` read purely for the priority (the sample loop's
+  bytes now feed it, and the byte parser also survives a non-UTF-8 `comm` that used to blank
+  the whole priority), three of four `/proc/meminfo` reads, the `/sys` walks for CPU topology
+  and base frequency, the DRM adapter identity including the NVIDIA model probe, and every
+  network adapter's `device`/`kind` description. Command lines are remembered per
+  `(pid, start ticks)`; a failed read is not remembered.
+- The largest single item is the current-frequency probe: `CpuRefreshKind::with_frequency()`
+  is a `scaling_cur_freq` read per CPU, and on a host without `cpufreq` (VM, container)
+  sysinfo falls back to re-reading the whole `/proc/cpuinfo` **per CPU** — its own source
+  calls that "very slow". `LinuxCollector` now implements `SystemCollector::set_demand`, so
+  that probe follows `CPU_SPEED` (Performance CPU card only), `/proc/diskstats` follows
+  `DISK_RATE` with a `forget()` so the resumed window reads "—" instead of a rate across the
+  gap, and GPU counters follow `any_gpu` while the adapters stay listed.
+- Deliberate non-parity, recorded rather than hidden: Windows never gates its sysinfo
+  frequency refresh (it gates only the PDH counter and uses sysinfo when that counter cannot
+  be opened), so with the same `CPU_SPEED` off Windows still publishes a sysinfo number while
+  Linux publishes "—". Linux has no measured counter to fall back on, so gating the reading
+  is the only way to skip it.
+- Also fixed on the way: the DRM identity cache was keyed only by a wall clock, so a reused
+  `/sys/class/drm/cardN` could pair card A's cached name and VRAM total with card B's live
+  counters; it is now revalidated each tick against the card listing and the `device` symlink,
+  and a failed listing keeps the previous adapters instead of caching "no GPU".
+- Icons: `find_in_theme` re-parsed `index.theme` and re-listed its size dirs per lookup, and
+  the same PNG was decoded once per executable path. Theme layouts, name-to-file answers and
+  decoded pixels are cached (64/1024/128, FIFO), and **only successes are cached** — the GUI
+  retries a failed key on `FAILURE_RETRY_TTL`, so a remembered miss would silently cancel that
+  recovery. The same rule applies to the `fc-match` path memo and to an empty theme layout
+  (what a failed `read_dir` or a half-written `index.theme` looks like).
+- `fc-match` waits now park (pidfd + `poll`, capped backoff elsewhere) under one absolute
+  deadline; a `poll` that fails or reports `POLLNVAL` falls back to the sleep instead of
+  re-polling at full speed.
+- Coverage: the wiring is pinned where the Windows gate can see it — a new
+  `engine::tests::demand_sent_to_a_running_engine_reaches_the_collector` (the mid-run
+  `SetDemand` hop had no test at all, on any platform), plus `linux_telemetry`'s
+  `cpu_count`/`card_identities_hold`/`providers`, which live in a platform-neutral module on
+  purpose. What cannot be pinned here: the Linux-only call sites themselves. CI runs only on
+  `windows-latest`, `tests/integration.rs` is `#![cfg(target_os = "windows")]`, and the cross
+  check is `cargo check` without `--all-targets`, so a `#[cfg(target_os = "linux")]` test is
+  never executed; see `known-debt.md`.
+- Verification: `cargo check -p tm-platform --all-targets --target x86_64-unknown-linux-gnu`,
+  `cargo test -p tm-core -p tm-platform` (Windows, includes every new pin) and
+  `python build.py --check`.
+
 ## 2026-11-25 - The white window flash: a presentation gate
 
 - Reported as "occasionally" brief white flashing when the window opens, "not always", on cold

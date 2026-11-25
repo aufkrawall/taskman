@@ -118,19 +118,34 @@ impl SystemCollector for LinuxCollector {
         self.networks.refresh(true);
 
         let cpus = self.sys.cpus();
-        let logical = cpus.len().max(1);
-        // Zero when the current speed is not demanded, which the UI renders as
-        // unavailable instead of reusing a stale or nominal clock.
-        let freq = if providers.cpu_speed {
-            cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32
-        } else {
-            0.0
-        };
-        let (physical_cores, sockets) = cpu_topology();
         let proc_stat = std::fs::read_to_string("/proc/stat").ok();
         let cpu_sample = proc_stat
             .as_deref()
             .and_then(|text| self.cpu_stats.sample(text));
+        // `/proc/stat` carries one `cpuN` line per logical processor, so its line count is the
+        // live count. sysinfo's CPU list is a snapshot from construction that never shrinks and
+        // only grows through `refresh_cpu_list`, so it is the fallback, not the source: a CPU
+        // removed at runtime would otherwise be counted for the rest of the run, and a count
+        // published as 1 would scale CPU time by the core count in App History and the threads
+        // view.
+        let logical = proc_stat
+            .as_deref()
+            .map(linux_telemetry::cpu_count)
+            .filter(|count| *count > 0)
+            .or_else(|| (!cpus.is_empty()).then_some(cpus.len()))
+            .unwrap_or(1);
+        // Zero when the current speed is not demanded, which the UI renders as
+        // unavailable instead of reusing a stale or nominal clock.
+        //
+        // Averaged over the CPUs actually summed: a CPU hot-added at runtime raises `logical`
+        // while sysinfo's list stays as it was.
+        let freq = if providers.cpu_speed {
+            let summed = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>();
+            summed / cpus.len().max(1) as f32
+        } else {
+            0.0
+        };
+        let (physical_cores, sockets) = cpu_topology();
         // The per-process window is the same two `/proc/stat` reads, so a
         // process' share and the machine's utilization cannot drift apart.
         self.process_cpu
@@ -479,9 +494,16 @@ fn proc_cmdline(pid: u32) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Command line of one process generation. `argv` is fixed while the process
-/// it names lives, so it is read once per (pid, start ticks) instead of on
-/// every tick; an unverified generation is re-read rather than trusted.
+/// Command line of one process generation.
+///
+/// Read once per (pid, start ticks) instead of on every tick. Two honest limits: `execve`
+/// keeps the creation ticks, so a process that re-execs itself keeps the command line it was
+/// first seen with, and a `setproctitle`/`PR_SET_MM_ARG_START` rewrite is not observed until
+/// it exits — Windows makes the same trade. A failed read is deliberately not remembered:
+/// `hidepid` and a fork that has not filled `argv` yet both clear, so the next tick retries
+/// instead of blanking that row for the rest of the session. A kernel thread has no command
+/// line at all, so it stays uncached and is re-read each tick — which is what the pre-cache
+/// code did for every process.
 fn cached_cmdline(
     cache: &mut HashMap<u32, (i64, Option<String>)>,
     pid: u32,
@@ -497,7 +519,9 @@ fn cached_cmdline(
         return cache.get(&pid).and_then(|(_, cmdline)| cmdline.clone());
     }
     let cmdline = proc_cmdline(pid);
-    cache.insert(pid, (ticks, cmdline.clone()));
+    if cmdline.is_some() {
+        cache.insert(pid, (ticks, cmdline.clone()));
+    }
     cmdline
 }
 

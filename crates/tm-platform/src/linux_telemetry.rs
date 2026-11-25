@@ -8,8 +8,36 @@
 //! a fake sysfs layout instead of the machine's own.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tm_core::demand::TelemetryDemand;
+
+/// Number of logical processors `/proc/stat` lists.
+///
+/// The aggregate line is `cpu` followed by a space; every per-CPU line is `cpuN`. Counting
+/// the suffixed lines gives the live count without a delta window — the per-core percentages
+/// are unavailable on a first tick and whenever the core set changes, which is exactly when a
+/// count is still wanted.
+pub fn cpu_count(stat: &str) -> usize {
+    stat.lines()
+        .filter(|line| {
+            line.strip_prefix("cpu")
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .count()
+}
+
+/// Whether a cached DRM card list still describes the cards sysfs lists now.
+///
+/// Entries are a card's sysfs path and the `device` symlink target read from it. Equal length
+/// plus a matching pair for every card means no card was added, removed, renumbered, or
+/// replaced by another PCI device under a reused number — the four ways a cached `cardN`
+/// identity can silently go wrong.
+pub fn card_identities_hold(
+    cached: &[(PathBuf, Option<PathBuf>)],
+    current: &[(PathBuf, Option<PathBuf>)],
+) -> bool {
+    cached.len() == current.len() && current.iter().all(|entry| cached.contains(entry))
+}
 
 /// Selected `/proc/meminfo` counters, in bytes.
 ///
@@ -125,15 +153,23 @@ fn read_u32(path: impl AsRef<Path>) -> Option<u32> {
 
 /// Which optional providers the current [`TelemetryDemand`] keeps switched on.
 ///
-/// This mirrors the Windows sampler bit for bit, for the providers Linux
+/// The mapping follows the Windows sampler's *intent* for the providers Linux
 /// actually has: the process table and adapter metadata are always sampled
 /// (Windows samples them at every demand too), GPU utilization and VRAM are
-/// only *measured* while a GPU bit is set, `/proc/diskstats` is only read while
-/// `DISK_RATE` is set, and the per-CPU current frequency — a `scaling_cur_freq`
-/// read per CPU, falling back to the whole `/proc/cpuinfo` per CPU — is only
-/// probed while `CPU_SPEED` is set. Bits whose provider Linux does not have
-/// (per-process network/disk tracing, WLAN details, token security) select
-/// nothing, and the columns they would fill stay unavailable.
+/// only *measured* while a GPU bit is set, and `/proc/diskstats` is only read
+/// while `DISK_RATE` is set. One honest difference, and one absent provider:
+///
+/// The per-CPU current frequency follows `CPU_SPEED`. Windows never gates its
+/// sysinfo frequency refresh and falls back to it only when its measured counter
+/// cannot be opened at all; Linux has no measured counter, so the gate covers the
+/// whole reading and the CPU card shows "—" instead of a clock nobody asked for.
+/// That is deliberate: the probe is a `scaling_cur_freq` read per CPU, and where
+/// cpufreq is absent (VMs, containers) sysinfo re-reads the whole `/proc/cpuinfo`
+/// once per CPU — its own comment calls that "very slow".
+///
+/// Bits whose provider Linux does not have (per-process network or disk tracing,
+/// WLAN details, token security) select nothing, and the columns they would fill
+/// stay unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Providers {
     /// Measure GPU utilization, VRAM use and temperature.
@@ -336,5 +372,55 @@ Committed_AS:   12345 kB
         ] {
             assert_eq!(providers(bit), Providers::default());
         }
+    }
+
+    /// The logical-processor count comes from the `/proc/stat` line count, not
+    /// from a delta window: a first tick and a core-set change both leave the
+    /// percentages unavailable while the machine still has N processors.
+    #[test]
+    fn cpu_count_counts_the_per_cpu_lines_only() {
+        let stat = "cpu  1 2 3 4\ncpu0 1 2 3 4\ncpu1 1 2 3 4\nintr 5\nctxt 6\n";
+        assert_eq!(cpu_count(stat), 2);
+        assert_eq!(
+            cpu_count("cpu  1 2 3\n"),
+            0,
+            "the aggregate line is not a CPU"
+        );
+        assert_eq!(cpu_count("cpu 1 2\ncpufreq 9\n"), 0);
+        assert_eq!(cpu_count(""), 0);
+        assert_eq!(cpu_count("cpu12 0 0\ncpu2 0 0\ncpu30 0 0\n"), 3);
+    }
+
+    /// A cached DRM identity survives exactly as long as sysfs still lists the
+    /// same cards at the same paths with the same device behind them.
+    #[test]
+    fn card_identities_drop_on_add_remove_renumber_or_device_change() {
+        let card = |name: &str, device: &str| {
+            (
+                PathBuf::from(name),
+                Some(PathBuf::from(format!("../../../{device}"))),
+            )
+        };
+        let cached = [card("/sys/class/drm/card0", "0000:01:00.0")];
+        assert!(card_identities_hold(&cached, &cached));
+        // A card was probed: the cached list no longer describes sysfs.
+        assert!(!card_identities_hold(
+            &cached,
+            &[
+                card("/sys/class/drm/card0", "0000:01:00.0"),
+                card("/sys/class/drm/card1", "0000:02:00.0"),
+            ]
+        ));
+        // The card is gone.
+        assert!(!card_identities_hold(&cached, &[]));
+        // The number was reused by another device.
+        assert!(!card_identities_hold(
+            &cached,
+            &[card("/sys/class/drm/card0", "0000:02:00.0")]
+        ));
+        // A card without a device link matches only another card without one.
+        let bare = [(PathBuf::from("/sys/class/drm/card0"), None)];
+        assert!(card_identities_hold(&bare, &bare));
+        assert!(!card_identities_hold(&cached, &bare));
     }
 }

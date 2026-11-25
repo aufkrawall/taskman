@@ -1,7 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-11-24 (Linux desktop classification and
-GPU/Linux LCD text)
+Last cross-checked: 2026-11-25 (Linux sampling cost and telemetry demand)
 
 ## Summary
 
@@ -330,6 +329,17 @@ cost while it is there. Treat every line as a rule, not a description.
   `THREAD_MODE_BACKGROUND_BEGIN` (priority 4, very low I/O and memory
   priority). The process priority CLASS stays `ABOVE_NORMAL` on purpose: the
   one moment this program has to work is when the machine is saturated.
+- **Linux honours the same mask** (2026-11-25). `LinuxCollector::set_demand` →
+  `linux_telemetry::providers` selects GPU counters (`any_gpu`), the
+  `/proc/diskstats` read (`DISK_RATE`, with a `forget()` so the resumed window
+  reads "—" instead of a rate across the gap) and the per-CPU current-frequency
+  probe (`CPU_SPEED`). The adapters, the disk list and the process table are
+  always filled, as Windows fills them at every demand. One deliberate
+  difference: with `CPU_SPEED` off Windows still publishes a sysinfo frequency
+  (it gates only its PDH counter and falls back to sysinfo when that counter
+  cannot be opened), while Linux publishes "—" — it has no measured counter to
+  gate, and the probe it would run is a `scaling_cur_freq` read per CPU, or on a
+  cpufreq-less host the whole `/proc/cpuinfo` per CPU.
 - **System-wide hooks exist only while the feature that needs them does.**
   - `WH_KEYBOARD_LL` is installed only while TaskMan is the registered Task
     Manager replacement, and removed when it is not. A `RegNotifyChangeKeyValue`
