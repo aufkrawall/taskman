@@ -97,8 +97,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     GCLP_HBRBACKGROUND, IsIconic, IsWindow, SC_MAXIMIZE, SC_RESTORE, SET_WINDOW_POS_FLAGS,
-    SIZE_MAXIMIZED, SIZE_RESTORED, SWP_SHOWWINDOW, SetClassLongPtrW, WINDOWPOS, WM_ERASEBKGND,
-    WM_NCDESTROY, WM_SHOWWINDOW, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED,
+    SIZE_MAXIMIZED, SIZE_MINIMIZED, SIZE_RESTORED, SWP_SHOWWINDOW, SetClassLongPtrW, WINDOWPOS,
+    WM_ERASEBKGND, WM_NCDESTROY, WM_SHOWWINDOW, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED,
 };
 
 /// The subclass id. One gate per process, on one window, so any stable value
