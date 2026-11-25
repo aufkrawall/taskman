@@ -31,16 +31,27 @@ struct SessionProperties {
     timestamp_monotonic_us: Option<u64>,
 }
 
+/// Whether this host can enumerate logind sessions at all.
+///
+/// This is a capability answer, so it must not fold in the retry cooldown: a
+/// single failed `loginctl` run would otherwise claim the platform cannot do
+/// sessions and blank the unrelated per-process Session column that the
+/// collector derives from systemd cgroups.
 pub fn available() -> bool {
     Path::new("/run/systemd/system").is_dir()
         && Path::new("/run/dbus/system_bus_socket").exists()
         && loginctl_path().is_some()
-        && listing_available(Instant::now())
 }
 
 pub fn list_sessions() -> Result<Vec<UserSession>> {
     if !available() {
         return Err(TmError::Unsupported("user sessions (systemd/loginctl)"));
+    }
+    if !listing_available(Instant::now()) {
+        return Err(TmError::platform(
+            "loginctl list-sessions",
+            "a recent loginctl failure is still cooling down",
+        ));
     }
     let loginctl =
         loginctl_path().ok_or_else(|| TmError::Unsupported("user sessions (loginctl path)"))?;

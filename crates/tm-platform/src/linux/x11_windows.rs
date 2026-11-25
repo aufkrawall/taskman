@@ -143,9 +143,14 @@ impl WindowObserver {
             .spawn(move || {
                 let mut observer = BlockingObserver::default();
                 while let Ok(sequence) = request_rx.recv() {
+                    // Stamp when the observation *started*: a query that
+                    // outlives the observation TTL (a stalled or very busy
+                    // server) must not arrive looking fresh, or a stale client
+                    // list would publish negative window evidence as Complete.
+                    let observed_at = Instant::now();
                     let observation = observer.observe();
                     if response_tx
-                        .send((sequence, Instant::now(), observation))
+                        .send((sequence, observed_at, observation))
                         .is_err()
                     {
                         break;

@@ -84,11 +84,10 @@ pub fn run_new_task(command_line: &str, elevate: bool) -> Result<()> {
         .ok_or_else(|| TmError::platform("run new task", "empty command"))?;
 
     if elevate && !is_elevated() {
-        return Err(TmError::platform(
-            "run new task",
-            "elevated arbitrary task launch is disabled; run the program unelevated or use \
-             the matching desktop service",
-        ));
+        // The capability is false on this backend, so the Run dialog never
+        // offers the toggle. A programmatic request fails closed with the same
+        // typed error macOS uses instead of degrading to an unelevated launch.
+        return Err(TmError::Unsupported("elevated arbitrary task launch"));
     }
 
     let arguments: Vec<OsString> = argv[1..].iter().map(OsString::from).collect();
