@@ -160,6 +160,14 @@ pub struct EpiIntegration {
     pub(crate) is_first_frame: bool,
     pub egui_ctx: egui::Context,
 
+    /// When the native event loop started, for the first-reveal latency log.
+    ///
+    /// Defaults to the creation of this integration. A backend that builds its rendering stack
+    /// before it gets here (the wgpu integration does) corrects it with
+    /// [`Self::note_event_loop_start`], so the logged latency covers the whole startup instead
+    /// of only the part after the rendering stack came up.
+    event_loop_started: Instant,
+
     /// Input that we have received, but not yet given to egui,
     /// because we haven't run any pass since (see [`Self::update_logic_only`]).
     pending_raw_input: egui::RawInput,
@@ -235,6 +243,7 @@ impl EpiIntegration {
                 .unwrap_or_else(Instant::now),
             is_first_frame: true,
             egui_ctx,
+            event_loop_started: Instant::now(),
         }
     }
 
@@ -380,6 +389,12 @@ impl EpiIntegration {
         self.frame.info.cpu_usage = Some(seconds);
     }
 
+    /// Record when the native event loop started, so the reveal log reports the latency the
+    /// user actually sees instead of the time since this integration was constructed.
+    pub fn note_event_loop_start(&mut self, started: Instant) {
+        self.event_loop_started = started;
+    }
+
     /// Reveal the window after its first painted frame.
     ///
     /// `reveal_first_frame` is `false` when the app itself asked for the window
@@ -390,9 +405,18 @@ impl EpiIntegration {
     /// overridden by this reveal — and since the viewport command was already
     /// consumed, nothing would hide the window again. `is_first_frame` is
     /// consumed either way.
+    ///
+    /// The wgpu backend calls this a second time in the same frame: once after
+    /// presenting a cleared primer frame, so the window can appear before the
+    /// pipelines are built, and once after the real paint. Whichever call comes
+    /// first consumes `is_first_frame`, so the other one is a no-op.
     pub fn post_rendering(&mut self, window: &winit::window::Window, reveal_first_frame: bool) {
         profiling::function_scope!();
         if std::mem::take(&mut self.is_first_frame) && reveal_first_frame {
+            log::info!(
+                "Revealing the window {} ms after the event loop started",
+                self.event_loop_started.elapsed().as_millis()
+            );
             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
             window.set_visible(true);
         }

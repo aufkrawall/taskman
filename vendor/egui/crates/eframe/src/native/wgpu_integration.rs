@@ -30,7 +30,9 @@ use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{
         epi_integration::EpiIntegration,
-        winit_integration::{EventResult, sleep_if_invisible_or_minimized},
+        winit_integration::{
+            EventResult, ResidencyAction, ResidencyTimer, sleep_if_invisible_or_minimized,
+        },
     },
 };
 
@@ -43,6 +45,9 @@ pub struct WgpuWinitApp<'app> {
     repaint_proxy: Arc<Mutex<EventLoopProxy<UserEvent>>>,
     app_name: String,
     native_options: NativeOptions,
+
+    /// When the event loop was created, for the first-reveal latency log.
+    event_loop_started: Instant,
 
     /// Set at initialization, then taken and set to `None` in `init_run_state`.
     app_creator: Option<AppCreator<'app>>,
@@ -89,6 +94,9 @@ pub struct SharedState {
     viewport_from_window: HashMap<WindowId, ViewportId>,
     focused_viewport: Option<ViewportId>,
     resized_viewport: Option<ViewportId>,
+
+    /// Keeps the hidden-window grace window for the painter's resident GPU state.
+    residency: ResidencyTimer,
 }
 
 pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
@@ -148,6 +156,7 @@ impl<'app> WgpuWinitApp<'app> {
             repaint_proxy: Arc::new(Mutex::new(event_loop.create_proxy())),
             app_name: app_name.to_owned(),
             native_options,
+            event_loop_started: Instant::now(),
             running: None,
             app_creator: Some(app_creator),
             egui_ctx,
@@ -265,7 +274,7 @@ impl<'app> WgpuWinitApp<'app> {
 
         let wgpu_render_state = painter.render_state();
 
-        let integration = EpiIntegration::new(
+        let mut integration = EpiIntegration::new(
             egui_ctx.clone(),
             &window,
             &self.app_name,
@@ -277,6 +286,10 @@ impl<'app> WgpuWinitApp<'app> {
             None,
             wgpu_render_state.clone(),
         );
+
+        // The device was created above, so report the reveal latency from the event loop
+        // instead of from here.
+        integration.note_event_loop_start(self.event_loop_started);
 
         {
             let event_loop_proxy = Arc::clone(&self.repaint_proxy);
@@ -364,6 +377,7 @@ impl<'app> WgpuWinitApp<'app> {
             painter,
             focused_viewport: Some(ViewportId::ROOT),
             resized_viewport: None,
+            residency: ResidencyTimer::default(),
         }));
 
         {
@@ -633,9 +647,7 @@ impl WgpuWinitRunning<'_> {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
-            let SharedState {
-                viewports, painter, ..
-            } = &mut *shared_lock;
+            let SharedState { egui_ctx, viewports, painter, residency, .. } = &mut *shared_lock;
 
             if viewport_id != ViewportId::ROOT {
                 let Some(viewport) = viewports.get(&viewport_id) else {
@@ -707,12 +719,14 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            if show_ui || any_viewport_visible(viewports) {
-                integration.frame.wgpu_render_state = painter.render_state();
-            } else {
-                integration.frame.wgpu_render_state = None;
-                painter.suspend();
-            }
+            apply_residency(
+                &mut integration.frame.wgpu_render_state,
+                painter,
+                egui_ctx,
+                residency,
+                viewport_id,
+                show_ui || any_viewport_visible(viewports),
+            );
 
             integration.pre_update();
 
@@ -785,9 +799,17 @@ impl WgpuWinitRunning<'_> {
                 )
             };
 
-            if !any_visible_after {
-                integration.frame.wgpu_render_state = None;
-                shared.borrow_mut().painter.suspend();
+            {
+                let mut shared_mut = shared.borrow_mut();
+                let SharedState { egui_ctx, painter, residency, .. } = &mut *shared_mut;
+                apply_residency(
+                    &mut integration.frame.wgpu_render_state,
+                    painter,
+                    egui_ctx,
+                    residency,
+                    viewport_id,
+                    any_visible_after,
+                );
             }
 
             return Ok(if integration.should_close() {
@@ -814,6 +836,7 @@ impl WgpuWinitRunning<'_> {
             viewports,
             painter,
             viewport_from_window,
+            residency,
             ..
         } = &mut *shared_mut;
 
@@ -850,8 +873,36 @@ impl WgpuWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
+        // The app's final root `Visible(..)` decides eframe's first-frame reveal. It is read
+        // before painting so the cleared primer frame below reveals through the same decision.
+        let reveal_first_frame = match viewport_output.get(&ViewportId::ROOT) {
+            Some(output) => first_frame_reveal_from_commands(&output.commands),
+            None => true,
+        };
+        let is_first_reveal = integration.is_first_frame && reveal_first_frame;
+
         let mut first_frame_reveal_in_progress = false;
         let vsync_secs = if is_visible {
+            // Building the pipelines is most of the time between "the window exists" and "the
+            // window shows something". Present one cleared frame in the app's own background
+            // colour and reveal the window through it, so that wait happens with the themed
+            // background on screen instead of a white or stale window.
+            //
+            // This never replaces a paint - the real frame is presented right after it - so a
+            // restore from a pause keeps its single paint of the ui, and only a renderer that
+            // tore its device down adds a cleared frame ahead of it. A failed primer only costs
+            // this frame's head start.
+            if reveal_first_frame && painter.needs_primer() {
+                profiling::scope!("reveal_primer");
+                let clear_color = app.clear_color(&egui_ctx.global_style().visuals);
+                if let Err(err) = painter.present_clear(viewport_id, clear_color, window) {
+                    // No cleared frame on screen, so the paint below reveals with content.
+                    log::debug!("Presenting the cleared primer frame failed: {err}");
+                } else {
+                    integration.post_rendering(window, reveal_first_frame);
+                }
+            }
+
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
             let mut screenshot_commands = vec![];
@@ -898,11 +949,7 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            let reveal_first_frame = match viewport_output.get(&ViewportId::ROOT) {
-                Some(output) => first_frame_reveal_from_commands(&output.commands),
-                None => true,
-            };
-            first_frame_reveal_in_progress = integration.is_first_frame && reveal_first_frame;
+            first_frame_reveal_in_progress = is_first_reveal;
             integration.post_rendering(window, reveal_first_frame);
 
             vsync_secs
@@ -925,12 +972,14 @@ impl WgpuWinitRunning<'_> {
         viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
         painter.gc_viewports(&active_viewports_ids);
 
-        if any_viewport_visible(viewports) || first_frame_reveal_in_progress {
-            integration.frame.wgpu_render_state = painter.render_state();
-        } else {
-            integration.frame.wgpu_render_state = None;
-            painter.suspend();
-        }
+        apply_residency(
+            &mut integration.frame.wgpu_render_state,
+            painter,
+            egui_ctx,
+            residency,
+            viewport_id,
+            any_viewport_visible(viewports) || first_frame_reveal_in_progress,
+        );
 
         let window = viewport_from_window
             .get(&window_id)
@@ -1276,6 +1325,43 @@ fn initial_app_visibility(viewport_id: ViewportId, builder_visible: Option<bool>
         None
     } else {
         builder_visible
+    }
+}
+
+/// Keep, pause or release the painter's resident GPU objects, and mirror the decision in the
+/// frame's render state.
+///
+/// `frame_render_state` must not keep the device alive while nothing paints (see
+/// `TASKMAN-FORK.md` #16), so it follows the decision. While the grace runs, the event that
+/// ends it is a repaint request, so a hidden window sleeps until then instead of polling.
+fn apply_residency(
+    frame_render_state: &mut Option<egui_wgpu::RenderState>,
+    painter: &mut egui_wgpu::winit::Painter,
+    egui_ctx: &egui::Context,
+    residency: &mut ResidencyTimer,
+    viewport_id: ViewportId,
+    visible: bool,
+) {
+    let now = Instant::now();
+    let action = residency.observe(now, visible);
+
+    match action {
+        ResidencyAction::Keep => *frame_render_state = painter.render_state(),
+        ResidencyAction::Pause => {
+            log::debug!("Released the {viewport_id:?} surfaces, keeping the device resident");
+            *frame_render_state = None;
+            painter.pause();
+            egui_ctx.request_repaint_after_for(residency.remaining_grace(now), viewport_id);
+        }
+        ResidencyAction::KeepResident => {
+            *frame_render_state = None;
+            egui_ctx.request_repaint_after_for(residency.remaining_grace(now), viewport_id);
+        }
+        ResidencyAction::Suspend => {
+            log::debug!("Released the resident GPU state of {viewport_id:?} after the grace");
+            *frame_render_state = None;
+            painter.suspend();
+        }
     }
 }
 

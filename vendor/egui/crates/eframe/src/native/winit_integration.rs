@@ -29,6 +29,114 @@ pub fn sleep_if_invisible_or_minimized(window: Option<&Window>) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Resident GPU state while hidden:
+
+/// How long a hidden window keeps its device and its pipelines resident.
+///
+/// A hide is usually the start of a short detour - a minimize, a tray toggle, another window
+/// covering ours - and the restore is what the user waits for. Inside this window the renderer
+/// keeps the objects that are expensive to rebuild, so the restore paints on its very next
+/// frame. Past it they are released again, so a long-idle app returns to the footprint it had
+/// before. The size-dependent targets (swapchain back buffers, depth and MSAA textures) and the
+/// CPU-side atlas copies do not wait: they go on the first hidden frame either way, and what
+/// the grace window buys is only the device plus the pipelines, at the cost of those staying
+/// resident - the wgpu device's own memory blocks and its descriptor heaps included - while
+/// the window is hidden.
+pub const HIDDEN_RESIDENCY_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a renderer should do with the GPU objects that are resident for a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidencyAction {
+    /// A viewport can paint: keep every object, surfaces included.
+    Keep,
+
+    /// Hidden, still inside [`HIDDEN_RESIDENCY_GRACE`]: release the surfaces and the
+    /// size-dependent targets, but keep the device and its pipelines.
+    Pause,
+
+    /// Hidden and already paused: there is nothing left to release yet.
+    KeepResident,
+
+    /// Hidden for at least [`HIDDEN_RESIDENCY_GRACE`]: release the device and the pipelines too.
+    Suspend,
+}
+
+/// Decide what happens to the resident GPU objects of a window.
+///
+/// `visible` is whether a viewport can paint; a minimized or occluded window already counts as
+/// hidden there, because [`egui::ViewportInfo::visible`] reports those as not visible.
+/// `hidden_for` is how long the window has been hidden and is `None` while it can paint, and
+/// `paused` says the pause that [`ResidencyAction::Pause`] asked for is still in effect.
+///
+/// Pure on purpose: the caller owns the clock, so the policy - and not a timer or a sleep - is
+/// what the tests pin.
+#[must_use]
+pub fn residency_action(
+    visible: bool,
+    hidden_for: Option<std::time::Duration>,
+    paused: bool,
+    grace: std::time::Duration,
+) -> ResidencyAction {
+    if visible {
+        ResidencyAction::Keep
+    } else if hidden_for.is_some_and(|hidden_for| hidden_for >= grace) {
+        ResidencyAction::Suspend
+    } else if paused {
+        ResidencyAction::KeepResident
+    } else {
+        ResidencyAction::Pause
+    }
+}
+
+/// Remembers when a window stopped painting, so [`residency_action`] can be asked without the
+/// caller keeping its own timestamps.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResidencyTimer {
+    /// `None` while a viewport can paint, otherwise when the first hidden frame was seen.
+    hidden_since: Option<Instant>,
+
+    /// The renderer already released its surfaces but kept the device.
+    paused: bool,
+}
+
+impl ResidencyTimer {
+    /// Note this frame's visibility and return what the renderer should do with its resident
+    /// GPU objects.
+    ///
+    /// This is the only place the clock enters the decision. Turn the remaining grace into a
+    /// repaint with [`Self::remaining_grace`], so a hidden window leaves this loop and comes
+    /// back once, when the device can go.
+    pub fn observe(&mut self, now: Instant, visible: bool) -> ResidencyAction {
+        let hidden_for = self.hidden_since.map(|since| now.saturating_duration_since(since));
+        let action = residency_action(visible, hidden_for, self.paused, HIDDEN_RESIDENCY_GRACE);
+
+        match action {
+            ResidencyAction::Keep => {
+                self.hidden_since = None;
+                self.paused = false;
+            }
+            ResidencyAction::Pause => {
+                self.hidden_since.get_or_insert(now);
+                self.paused = true;
+            }
+            ResidencyAction::KeepResident => {}
+            ResidencyAction::Suspend => self.paused = false,
+        }
+
+        action
+    }
+
+    /// The part of [`HIDDEN_RESIDENCY_GRACE`] that is still left.
+    pub fn remaining_grace(&self, now: Instant) -> std::time::Duration {
+        let hidden_for = match self.hidden_since {
+            Some(hidden_since) => now.saturating_duration_since(hidden_since),
+            None => std::time::Duration::ZERO,
+        };
+        HIDDEN_RESIDENCY_GRACE.saturating_sub(hidden_for)
+    }
+}
+
 /// Create an egui context, restoring it from storage if possible.
 pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Context {
     profiling::function_scope!();
@@ -199,5 +307,90 @@ pub(crate) fn on_accesskit_window_event(
             // so there's no need to repaint.
             EventResult::Wait
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn action(visible: bool, hidden_for: Option<Duration>, paused: bool) -> ResidencyAction {
+        residency_action(visible, hidden_for, paused, HIDDEN_RESIDENCY_GRACE)
+    }
+
+    #[test]
+    fn a_paintable_viewport_keeps_every_resident_gpu_object() {
+        assert_eq!(action(true, None, false), ResidencyAction::Keep);
+        // Coming back from a pause leaves nothing of the pause behind.
+        let hidden_for = Some(Duration::from_secs(1));
+        assert_eq!(action(true, hidden_for, true), ResidencyAction::Keep);
+    }
+
+    #[test]
+    fn the_first_hidden_frame_pauses_instead_of_suspending() {
+        assert_eq!(action(false, None, false), ResidencyAction::Pause);
+        let just_hidden = Some(Duration::from_millis(1));
+        assert_eq!(action(false, just_hidden, false), ResidencyAction::Pause);
+    }
+
+    #[test]
+    fn a_paused_window_stays_resident_until_the_grace_expires() {
+        let inside = Some(HIDDEN_RESIDENCY_GRACE - Duration::from_millis(1));
+        assert_eq!(action(false, inside, true), ResidencyAction::KeepResident);
+
+        let expired = Some(HIDDEN_RESIDENCY_GRACE);
+        assert_eq!(action(false, expired, true), ResidencyAction::Suspend);
+        // A hide that never got to pause still ends in a suspend once the grace is over.
+        assert_eq!(action(false, expired, false), ResidencyAction::Suspend);
+    }
+
+    #[test]
+    fn the_timer_restarts_the_grace_every_time_the_window_hides() {
+        let mut timer = ResidencyTimer::default();
+        let t0 = Instant::now();
+
+        assert_eq!(timer.observe(t0, false), ResidencyAction::Pause);
+        assert_eq!(timer.remaining_grace(t0), HIDDEN_RESIDENCY_GRACE);
+
+        let inside = t0 + Duration::from_secs(1);
+        assert_eq!(timer.observe(inside, false), ResidencyAction::KeepResident);
+        let left = HIDDEN_RESIDENCY_GRACE - Duration::from_secs(1);
+        assert_eq!(timer.remaining_grace(inside), left);
+
+        // Restored: the pause is over, and the next hide gets a full grace again.
+        assert_eq!(timer.observe(inside, true), ResidencyAction::Keep);
+        assert_eq!(timer.remaining_grace(inside), HIDDEN_RESIDENCY_GRACE);
+        assert_eq!(timer.observe(inside, false), ResidencyAction::Pause);
+    }
+
+    #[test]
+    fn the_grace_expiring_suspends_and_arms_nothing_more() {
+        let mut timer = ResidencyTimer::default();
+        let t0 = Instant::now();
+        assert_eq!(timer.observe(t0, false), ResidencyAction::Pause);
+
+        let after_grace = t0 + HIDDEN_RESIDENCY_GRACE;
+        assert_eq!(timer.observe(after_grace, false), ResidencyAction::Suspend);
+        assert_eq!(timer.remaining_grace(after_grace), Duration::ZERO);
+        // Still hidden and still past the grace: nothing more to release.
+        assert_eq!(timer.observe(after_grace, false), ResidencyAction::Suspend);
+    }
+
+    #[test]
+    fn minimized_and_occluded_windows_are_not_paintable() {
+        // The residency decision takes a single `visible` flag, so the fold that turns a
+        // minimized or occluded window into "cannot paint" must stay upstream of it.
+        let minimized = egui::ViewportInfo {
+            minimized: Some(true),
+            ..Default::default()
+        };
+        let occluded = egui::ViewportInfo {
+            occluded: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(minimized.visible(), Some(false));
+        assert_eq!(occluded.visible(), Some(false));
     }
 }
