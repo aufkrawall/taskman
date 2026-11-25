@@ -242,8 +242,10 @@ impl EnsuredRenderer {
         self.subpixel_text = Some(subpixel_text);
     }
 
-    /// Forget everything, because a new render state — and with it a new renderer — was
-    /// installed.
+    /// Forget everything, because the render state — and with it its renderer — is gone.
+    ///
+    /// `Painter::add_surface` calls this for the render state it installs, and `Painter::suspend`
+    /// for the one it destroys: the answer describes a device neither path keeps.
     fn forget(&mut self) {
         *self = Self::default();
     }
@@ -626,8 +628,8 @@ impl Painter {
     ///
     /// The capability answer, the missing-pipeline report and that replay run once per
     /// renderer, including for a renderer this painter did not create (see `EnsuredRenderer`),
-    /// and again after [`Self::set_window`] installs a new render state. Idempotent; the second
-    /// and later calls cost a dead check.
+    /// and again after [`Self::set_window`] installs a new render state or [`Self::suspend`]
+    /// destroys the current one. Idempotent; the second and later calls cost a dead check.
     pub fn ensure_renderer(&mut self) {
         profiling::function_scope!();
 
@@ -745,10 +747,10 @@ impl Painter {
     ///
     /// `None` means no device has been initialized yet, or the renderer's pipelines have not
     /// been compiled yet ([`Self::ensure_renderer`]). The value remains available while paused
-    /// and reports the actual feature of that device, not just what the selected adapter
-    /// advertised. Installing a new render state ([`Self::suspend`] followed by
-    /// [`Self::set_window`]) clears it: the old answer says nothing about the next device, and
-    /// the next paint answers for it.
+    /// ([`Self::pause`] keeps the device) and reports the actual feature of that device, not just
+    /// what the selected adapter advertised. [`Self::suspend`] clears it with the device it
+    /// describes: the old answer says nothing about the next device, and the next paint answers
+    /// for it.
     pub fn subpixel_text(&self) -> Option<bool> {
         self.ensured.subpixel_text
     }
@@ -843,6 +845,10 @@ impl Painter {
         }
 
         drop(render_state);
+        // The device, its pipelines and any renderer built from them are gone, so the
+        // capability answer describes nothing the next paint will use. `set_window` installs the
+        // next render state, and `ensure_renderer` answers for it.
+        self.ensured.forget();
     }
 
     /// Present one cleared frame, without the renderer.
@@ -1645,8 +1651,9 @@ mod tests {
         assert!(!ensured.is_due(), "the same renderer is not replayed twice");
         assert_eq!(ensured.subpixel_text, Some(true));
 
-        // Pausing (minimize) keeps the device and its renderer, so nothing calls `forget` and
-        // the answer stays valid; only a new render state invalidates it.
+        // Pausing (minimize) keeps the device and its renderer, so `pause` does not call
+        // `forget` and the answer stays valid. Losing that render state does: `suspend` before it
+        // drops the device, and `add_surface` for the render state that replaces it.
         ensured.forget();
         assert!(
             ensured.is_due(),
