@@ -358,13 +358,21 @@ pub fn install_present_gate(hwnd: isize, background: [u8; 3], wake: Arc<dyn Fn()
     }
     // Cloak outside the lock: this is a DWM call, and holding the gate's mutex
     // across it buys nothing.
-    super::window_chrome::set_cloaked_raw(hwnd, true);
-    tracing::debug!(
-        hwnd,
-        ?background,
-        subclassed,
-        "presentation gate installed and holding the window cloaked"
-    );
+    if cloak_window(hwnd) {
+        tracing::debug!(
+            hwnd,
+            ?background,
+            subclassed,
+            "presentation gate installed and holding the window cloaked"
+        );
+    } else {
+        tracing::debug!(
+            hwnd,
+            ?background,
+            subclassed,
+            "presentation gate installed; gate held, cloak refused"
+        );
+    }
 }
 
 /// Take the gate down: uncloak if it was holding, remove the subclass, hand the
@@ -451,13 +459,22 @@ pub fn present_gate_hold(hwnd: isize) {
         gate.hwnd
     };
     let target = if hwnd != 0 { hwnd } else { held_hwnd };
-    if target != 0 {
-        super::window_chrome::set_cloaked_raw(target, true);
+    // The hold is recorded before the cloak and stands even when DWM refuses
+    // the write, so this reports what the window carries rather than what the
+    // gate asked for.
+    if target == 0 {
+        tracing::debug!(
+            hwnd = target,
+            "presentation gate holding the window; no handle to cloak"
+        );
+    } else if cloak_window(target) {
+        tracing::debug!(hwnd = target, "presentation gate holding the window cloaked");
+    } else {
+        tracing::debug!(
+            hwnd = target,
+            "presentation gate holding the window; cloak refused"
+        );
     }
-    tracing::debug!(
-        hwnd = target,
-        "presentation gate holding the window cloaked"
-    );
 }
 
 /// Uncloak `hwnd`, clear the hold and report whether a hold was released.
@@ -562,6 +579,19 @@ fn decide(hwnd: HWND, message: u32, wparam: usize, lparam: LPARAM) -> Option<Dec
     })
 }
 
+/// Cloak `hwnd` through the shared helper and report whether the window now
+/// carries the cloak.
+///
+/// `window_chrome::set_cloaked_raw` can only warn about a refused attribute
+/// write, so a gate log that repeated its own intent would sit next to that
+/// warning contradicting it. Reading the state back costs one
+/// `DwmGetWindowAttribute` per reveal and reports what the compositor holds,
+/// not what the gate asked for.
+fn cloak_window(hwnd: isize) -> bool {
+    super::window_chrome::set_cloaked_raw(hwnd, true);
+    super::window_chrome::is_cloaked(hwnd)
+}
+
 /// Re-cloak before Windows can compose the window, then ask for a frame.
 ///
 /// The wake runs with no gate lock held: it is the app's repaint request, and
@@ -571,13 +601,14 @@ fn unmask(hwnd: HWND, message: u32, decision: Decision) {
     // Re-cloaking BEFORE returning from the WndProc is the whole point: the
     // compositor must see a cloaked window at the moment Windows decides it is
     // shown, not one frame later.
-    super::window_chrome::set_cloaked_raw(raw, true);
+    let cloak_applied = cloak_window(raw);
     tracing::debug!(
         hwnd = raw,
         message,
         cause = ?decision.transition,
         held_before = decision.held_before,
         held_after = true,
+        cloak_applied,
         "presentation gate re-cloaked the window"
     );
     wake_app();

@@ -1405,6 +1405,9 @@ fn files_of_a_child_process_survive_handle_type_probing() {
     let expected = path.to_string_lossy().to_ascii_lowercase();
 
     let actions = tm_platform::win::WinActions;
+    // What the last walk said, so a timeout can name what was still missing
+    // instead of blaming only the file.
+    let mut last_walk: Option<(bool, bool)> = None;
     let snapshot = poll_for(
         || {
             let snapshot = actions.list_process_file_io(pid, None).ok()?;
@@ -1412,7 +1415,13 @@ fn files_of_a_child_process_survive_handle_type_probing() {
                 .files
                 .iter()
                 .any(|file| file.path.to_ascii_lowercase() == expected);
-            holds_file.then(|| snapshot.clone())
+            last_walk = Some((holds_file, snapshot.accounting.handles_complete));
+            // A walk can legitimately report itself incomplete: the child opens
+            // and closes handles of its own while it is being read, and a disk
+            // handle whose path, position or access cannot be read leaves the
+            // flag down. Completeness is therefore part of what this waits for,
+            // not something to demand of the first walk that sees the file.
+            (holds_file && snapshot.accounting.handles_complete).then(|| snapshot.clone())
         },
         std::time::Duration::from_secs(10),
     );
@@ -1422,7 +1431,13 @@ fn files_of_a_child_process_survive_handle_type_probing() {
 
     let snapshot = match snapshot {
         Some(snapshot) => snapshot,
-        None => panic!("child {pid} never reported the file it holds open"),
+        None => {
+            let (holds_file, complete) = last_walk.unwrap_or((false, false));
+            panic!(
+                "child {pid} never reported the held file in a complete handle walk \
+                 (holds_file={holds_file}, handles_complete={complete})"
+            );
+        }
     };
     let row = snapshot
         .files
@@ -1430,7 +1445,7 @@ fn files_of_a_child_process_survive_handle_type_probing() {
         .find(|file| file.path.to_ascii_lowercase() == expected)
         .expect("the found file is still there");
     assert!(row.is_read, "`type` opened the file for reading: {row:?}");
-    // The walk read the whole table, so it must not report itself truncated.
+    // The poll waited for a complete walk, so the flag must still say so.
     assert!(
         snapshot.accounting.handles_complete,
         "the child's handle table was fully readable but the flag says otherwise"

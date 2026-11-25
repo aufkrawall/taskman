@@ -786,8 +786,10 @@ pub(super) fn taskbar_thread_main(
             LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
             IN_ELEVATED_BAND.store(false, std::sync::atomic::Ordering::Release);
             REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
-            // Same order as the shutdown below: the state must be unreachable
-            // from the window before it can be freed.
+            // Same order as the shutdown below, and no `IsWindow` guard: this
+            // window was created on this thread and has dispatched no message,
+            // so the clear still writes to the window it belongs to. The state
+            // must be unreachable from the window before it can be freed.
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if let Err(error) = DestroyWindow(hwnd) {
@@ -880,11 +882,14 @@ pub(super) fn taskbar_thread_main(
         // reused the handle). `wnd_proc` handles `WM_DESTROY` before it reads
         // the pointer and sends every other message with a null one to
         // `DefWindowProcW`, so clearing it first is the safe order.
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        }
+        //
+        // Both steps run only while the handle is still this window: on the
+        // ordinary `WM_CLOSE` path it was destroyed before the loop ended, and
+        // a `GWLP_USERDATA` write into a recycled handle would zero the user
+        // data of whatever window took it.
         if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() } {
             unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if let Err(error) = DestroyWindow(hwnd) {
                     tracing::warn!(
                         hwnd = hwnd.0 as isize,
