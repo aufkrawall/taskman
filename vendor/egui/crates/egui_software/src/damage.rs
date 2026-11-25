@@ -99,10 +99,13 @@ impl FrameKey {
             feathering: ctx.options.feathering,
             feathering_size_bits: f32_bits(ctx.options.feathering_size_in_pixels),
             prerasterized_discs: ctx.options.prerasterized_discs,
-            // These two rewrite the tessellated output, after the input shapes were hashed,
-            // so the shape hash cannot see them. Toggling one at runtime has to invalidate
-            // the frame here, or nothing repaints and the new primitives paint outside the
-            // tiles that claim to be up to date.
+            // Both are applied at the end of `tessellate_shapes`, after `plan()` hashed the
+            // input shapes, so the shape hash cannot see them and a runtime toggle has to
+            // invalidate the frame here, or nothing repaints and the new primitives paint
+            // outside the tiles that claim to be up to date. That end of `tessellate_shapes`
+            // runs only under `TextMode::Tessellate`; the default `Blit` mode tessellates
+            // shape by shape through `tessellate_clipped_shape`, so the two toggles are
+            // inert there and only the tessellating mode depends on them being keyed.
             debug_paint_clip_rects: ctx.options.debug_paint_clip_rects,
             debug_ignore_clip_rects: ctx.options.debug_ignore_clip_rects,
             bezier_tolerance_bits: f32_bits(ctx.options.bezier_tolerance),
