@@ -54,6 +54,15 @@ signature of an accountant that stopped reporting while the header stayed correc
 `process_cpu_unknown` equal to the process count is the opposite failure, every row
 blanked.
 
+`ok` is the run's own verdict, not a constant: it comes from the same
+plausibility gate (at least five processes, a logical-processor count, a measured
+CPU share) that decides the exit code, and `error` carries that gate's reason
+when it fails — so the JSON line and the exit status can no longer disagree.
+`--mock` skips the gate, since a mock snapshot describes no real machine.
+`startup_to_snapshot_ms` is measured when the first snapshot arrives; it must not
+be timed at the print, because the per-file probe below waits up to three seconds
+for a trace delivery and that wait is not startup cost.
+
 `file_io` reports the per-file byte accounting of the binary's own process, which
 is the headless equivalent of the I/O page's state line: `state`
 (`unavailable`/`undelivered`/`undecodable`/`kernel_logger_in_use`/`measured`),
