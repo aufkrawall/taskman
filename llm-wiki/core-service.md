@@ -179,6 +179,13 @@ blank. Protocol v7 splits the disk service time by physical disk (`disks` per
 entry, `disk_totals` per window) because Disk active time is now a per-disk
 share; its frame budget is two caps (`DISK_MAX_ENTRIES`,
 `DISK_MAX_DISK_TIMES`), pinned by `a_capped_disk_response_fits_the_frame_limit`.
+A window that exceeds either cap is answered as unknown and held, then measured
+together with the next request's window, because the drain has already reset
+the accumulators and discarding it undercounted the following shares. The same
+rule makes a network sample unknown when its session was just started or
+replaced: the GUI cannot tell a session that measured no traffic from one that
+has delivered nothing yet, so an `active` sample with no rows would render as a
+measured zero for every process.
 Protocol v8 introduced `ProcessThreadDetails`, a read-only request for the
 handle-derived start address and cycle counter of each thread in one exact
 process. It is bounded to 4096 returned records and the normal 512 KiB frame,
