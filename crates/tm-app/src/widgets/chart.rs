@@ -1,8 +1,15 @@
 //! Custom chart widgets: filled rolling line charts like Windows Task
 //! Manager's Performance tab, plus a compact per-core grid variant.
 //!
-//! Two things every chart here shares:
+//! Three things every chart here shares:
 //!
+//! * **One gap-aware geometry builder.** Every sample reaches the screen
+//!   through [`ChartGeometry`], never as a raw value: a missing or non-finite
+//!   sample, a step back in time and a change of x source all END the run
+//!   instead of becoming a segment. epaint cannot help here — it has no gap
+//!   support, and a non-finite point is not even culled by the clip test — so
+//!   a single NaN used to be drawn as a stroke of the series colour across a
+//!   per-core tile, with no area fill anywhere under it.
 //! * **Pixel snapping.** Card frames, gridlines and borders are axis-aligned
 //!   hairlines. Laid out at fractional point coordinates they straddle two
 //!   device-pixel rows and the whole tile reads as blurry — worst on the
@@ -27,6 +34,18 @@ pub type ValueFmt = fn(f64) -> String;
 /// Percentage readout, the default for utilization charts.
 pub fn fmt_percent(v: f64) -> String {
     format!("{} %", tm_core::format::num_fixed(v, 1))
+}
+
+/// Readout text for one sample: a measurement that is not finite is
+/// unavailable ("—"), never a fabricated number.
+///
+/// That is the project's missing-telemetry invariant, and here it is also
+/// concrete rendering: a NaN travels on into the marker dot's y, i.e. into a
+/// shape position.
+fn readout_text(value: Option<f64>, fmt: ValueFmt) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map_or_else(|| "—".to_owned(), fmt)
 }
 
 /// The x axis of a rolling chart: when the samples were taken, and how wide
@@ -362,32 +381,45 @@ fn paint_marker(
     }
 }
 
-/// x of sample `i` on `axis`, falling back to `fallback` (even spacing) when
-/// the chart has no axis, or the axis is short of that sample.
+/// x of `stamp` on the axis `bounds`: the sample's SIGNED offset from the left
+/// edge of the window.
 ///
-/// The offset is SIGNED. The plotted window carries one sample from just
-/// before the axis opens (`performance::visible_slice`), and it only earns
-/// its place if it lands LEFT of the rect: the segment from there to the
-/// first in-window sample is what covers the left edge, at the slope the
+/// The offset is signed because the plotted window carries one sample from
+/// just before the axis opens (`performance::visible_slice`), and that sample
+/// only earns its place if it lands LEFT of the rect: the segment from there to
+/// the first in-window sample is what covers the left edge, at the slope the
 /// data actually has. `saturating_sub` used to pin it onto the edge instead,
 /// which is the same picture as having no lead-in at all — a flat entry, and
 /// before that an unpainted wedge as wide as the first sample's offset. The
-/// painter's clip rect trims the overhang; the low clamp only keeps a
-/// pathological timestamp from tessellating a chart-wide mesh off-screen.
-fn x_on_axis(
-    rect: Rect,
-    axis: Option<TimeAxis>,
-    bounds: Option<(u64, u64)>,
-    i: usize,
-    fallback: f32,
-) -> f32 {
-    let Some(((t0, span), stamp)) = bounds.zip(axis.and_then(|a| a.stamps.get(i).copied())) else {
-        return fallback;
-    };
+/// painter's clip rect trims the overhang; the clamp only keeps a pathological
+/// timestamp from tessellating a mesh across the screen, so the overhang stays
+/// within ONE chart width.
+///
+/// The clamp is a BOUND, not a coordinate: callers must never use a clamped
+/// position to join two samples. A sample older than the previous one — a
+/// wall-clock step back after NTP correction or resume, a duplicated or stale
+/// stamp — starts a new run in [`ChartGeometry`] instead of being pinned onto
+/// the edge, because pinning it is what drew a straight stroke from frac 0.447
+/// (value >= 100 %) down to frac 0.952 (10 %) across a per-core tile, with no
+/// area fill under it.
+fn x_on_axis(rect: Rect, bounds: (u64, u64), stamp: u64) -> f32 {
+    let (t0, span) = bounds;
     // f64 throughout: these are epoch milliseconds (~1.8e12), where f32 cannot
     // represent whole minutes (see `nearest_sample`).
-    let frac = (stamp as f64 - t0 as f64) / span as f64;
+    let frac = (stamp as f64 - t0 as f64) / span.max(1) as f64;
     rect.left() + rect.width() * frac.clamp(-1.0, 1.0) as f32
+}
+
+/// x of series index `i` at even spacing across `rect`: the fallback for a
+/// chart with no axis, and for the samples an axis cannot place.
+///
+/// A one-sample series has nothing to space evenly; it sits on the left edge,
+/// which keeps the position finite where `i / (n - 1)` would be NaN.
+fn even_x(rect: Rect, i: usize, n: usize) -> f32 {
+    if n < 2 {
+        return rect.left();
+    }
+    rect.left() + rect.width() * i as f32 / (n - 1) as f32
 }
 
 /// Index of the first sample that lies ON the axis.
@@ -437,6 +469,265 @@ fn nearest_at(ts: &[u64], query: u64) -> usize {
         lo
     } else {
         hi
+    }
+}
+
+// ------------------------------------------------------------ chart geometry
+
+/// Split a series into its measured runs: index/value pairs of consecutive
+/// samples that actually have a value, so neither the line nor its fill bridges
+/// missing data.
+///
+/// A sample is missing when it is `None` (the caller knows there is nothing) or
+/// non-finite (the sampler reported NaN/inf, which is what `performance` hands
+/// over for a tick it could not measure). Both have to break the run: epaint
+/// has no gap support, so "no data" that reaches a path becomes a drawn
+/// segment — exactly the shape of the garbage diagonal in the per-core tile
+/// report. This is the value-only half of the split; [`ChartGeometry::runs`]
+/// adds the geometry rules (one x source per run, time has to advance) and
+/// builds the positions.
+fn measured_runs(samples: &[Option<f64>]) -> Vec<Vec<(usize, f64)>> {
+    let mut runs = Vec::new();
+    let mut run = Vec::new();
+    for (index, value) in samples.iter().enumerate() {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            run.push((index, value));
+        } else if !run.is_empty() {
+            runs.push(std::mem::take(&mut run));
+        }
+    }
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    runs
+}
+
+/// Where a sample's x comes from.
+///
+/// The two are DIFFERENT coordinate systems: time on the configured window, or
+/// even spacing across the series. A run may only ever use one of them — a path
+/// that swapped sources mid-run would draw a straight line through time that no
+/// sample ever described.
+#[derive(Clone, Copy)]
+enum XSource {
+    /// Position on the time axis, in epoch milliseconds.
+    Axis(u64),
+    /// Even spacing across the series: there is no timestamp to place it on.
+    Even,
+}
+
+impl XSource {
+    /// Whether a segment from `self` to `next` describes measured data.
+    ///
+    /// Consecutive points of one path ARE a segment, so every rule that has to
+    /// survive into the rendered picture is enforced HERE, by ending the run:
+    /// two coordinate systems cannot be joined, and time has to ADVANCE. A
+    /// sample older than or as old as its predecessor — a wall-clock step back
+    /// after NTP correction or resume, a duplicated or stale stamp — is never
+    /// bridged.
+    fn joins(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Axis(previous), Self::Axis(next)) => next > previous,
+            (Self::Even, Self::Even) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The paths of one plotted series: one entry per measured run, in series
+/// order. Naming the nesting keeps the call sites readable — the inner `Vec` is
+/// a polyline, the outer level is "one per run".
+type SeriesPaths = Vec<Vec<Pos2>>;
+
+/// The single geometry builder every chart shape here paints through.
+///
+/// One place owns the mapping from a sample to a screen position, because
+/// anything that reaches epaint as a `Pos2` gets drawn — and epaint cannot help:
+/// `PathShape::line` keeps every point it is handed, `tessellate_path` has no
+/// gap support, and `Rect::extend_with` skips non-finite points, so a poisoned
+/// path is not even culled by the clip test. A NaN sample therefore did not
+/// disappear; it rasterized as a stroke of the series colour across the chart.
+/// That is the reported per-core tile artifact: a straight stroke from frac
+/// 0.447 at a value of 100 % or more down to frac 0.952 at 10 %, uniform width,
+/// no kinks, with no area fill anywhere under it and a normal curve beside it.
+///
+/// So the builder holds the invariants that make that impossible by
+/// construction rather than by luck:
+///
+/// * Every emitted position is finite. A non-finite sample value is a gap (see
+///   [`measured_runs`]), and `y` maps a verified-finite value through a
+///   sanitised scale.
+/// * A run never spans a gap, never spans a step back in time, and never mixes
+///   two x sources — each of the three ends the run.
+/// * x strictly increases along a run, which is also what keeps the lead-in
+///   sample's overhang bounded to one chart width (see [`x_on_axis`]).
+/// * A one-sample run is a dot, never a line to nowhere.
+///
+/// Every chart shape paints from this (the per-core tile, [`chart_multi`], the
+/// card sparkline), so they cannot diverge again: the tile used to map its raw
+/// samples straight into `Pos2` while the others were gap-aware.
+#[derive(Clone, Copy)]
+struct ChartGeometry<'a> {
+    rect: Rect,
+    /// Top of the y scale: 100 for a percentage chart, the series maximum for
+    /// a raw-rate one. Sanitised in [`ChartGeometry::new`].
+    y_max: f64,
+    axis: Option<TimeAxis<'a>>,
+    /// `(left edge instant, axis width)`, i.e. [`TimeAxis::bounds`].
+    bounds: Option<(u64, u64)>,
+    /// Sample count of the series. Even spacing has to describe the whole
+    /// series even where a run only covers part of it.
+    len: usize,
+}
+
+impl<'a> ChartGeometry<'a> {
+    /// Geometry for one series of `len` samples painted into `rect`.
+    ///
+    /// `y_max` is sanitised here rather than at each call site: `f64::clamp`
+    /// PANICS on inverted bounds, so a negative scale would take the whole
+    /// Performance tab down, and a zero or NaN scale would put a non-finite y
+    /// into every shape of the series.
+    fn new(rect: Rect, y_max: f64, axis: Option<TimeAxis<'a>>, len: usize) -> Self {
+        Self {
+            rect,
+            y_max: if y_max.is_finite() && y_max > 0.0 {
+                y_max
+            } else {
+                1.0
+            },
+            bounds: axis.and_then(|axis| axis.bounds()),
+            axis,
+            len,
+        }
+    }
+
+    /// The instant series index `i` was measured at, when the axis can place it
+    /// there.
+    ///
+    /// `None` covers both "this chart has no timestamps" and "the timestamp
+    /// slice is shorter than the series". Those stay one case on purpose: a
+    /// sample past the end of the slice has no instant, so it must not borrow a
+    /// coordinate from the time axis.
+    fn stamp(&self, i: usize) -> Option<u64> {
+        self.axis.and_then(|axis| axis.stamps.get(i).copied())
+    }
+
+    /// Where series index `i` is drawn, and in which coordinate system.
+    fn place(&self, i: usize) -> (XSource, f32) {
+        match (self.stamp(i), self.bounds) {
+            (Some(stamp), Some(bounds)) => {
+                (XSource::Axis(stamp), x_on_axis(self.rect, bounds, stamp))
+            }
+            _ => (XSource::Even, even_x(self.rect, i, self.len)),
+        }
+    }
+
+    /// Screen x of series index `i` — for the hover marker, which marks a single
+    /// sample rather than a run.
+    fn x(&self, i: usize) -> f32 {
+        self.place(i).1
+    }
+
+    /// Screen y of a sample value that is known to be finite: 0 sits on the
+    /// baseline, `y_max` on the top edge.
+    ///
+    /// The clamp is where the old path took a NaN and kept it — `f64::clamp`
+    /// returns NaN for NaN — so callers hand over a value the run splitter has
+    /// already proven finite.
+    fn y(&self, value: f64) -> f32 {
+        let frac = (value.clamp(0.0, self.y_max) / self.y_max) as f32;
+        self.rect.bottom() - frac * self.rect.height()
+    }
+
+    /// The paths one series paints, in series order.
+    ///
+    /// Each inner slice becomes one polyline plus one area strip; between two of
+    /// them the series has no measured data to join, and the painter must not
+    /// draw across the distance.
+    fn runs(&self, samples: &[Option<f64>]) -> SeriesPaths {
+        let mut runs = SeriesPaths::new();
+        for measured in measured_runs(samples) {
+            let mut run: Vec<Pos2> = Vec::new();
+            let mut previous: Option<(XSource, f32)> = None;
+            for (index, value) in measured {
+                let (source, x) = self.place(index);
+                if let Some((prev_source, prev_x)) = previous
+                    && !(prev_source.joins(source) && x > prev_x)
+                {
+                    // Whatever this check rejects becomes a fresh path rather
+                    // than a bridging segment. The x comparison is what keeps
+                    // the lead-in bounded as well: `x_on_axis` pins every stamp
+                    // older than one window width to the same edge, and two
+                    // points on that edge are not a segment worth drawing.
+                    runs.push(std::mem::take(&mut run));
+                }
+                let point = Pos2::new(x, self.y(value));
+                debug_assert!(
+                    point.x.is_finite() && point.y.is_finite(),
+                    "non-finite chart position {point:?} for sample {index}: epaint renders such a \
+                     point as a stroke across the chart instead of a missing sample"
+                );
+                run.push(point);
+                previous = Some((source, x));
+            }
+            // `measured_runs` never yields an empty run, so this is never a
+            // stray empty path.
+            runs.push(run);
+        }
+        runs
+    }
+
+    /// [`runs`](Self::runs) for a raw `&[f64]` series, the form `performance`
+    /// hands over: there a non-finite value already means "no measurement", and
+    /// the run splitter treats it as the gap it is.
+    fn runs_of(&self, samples: &[f64]) -> SeriesPaths {
+        let measured: Vec<Option<f64>> = samples.iter().copied().map(Some).collect();
+        self.runs(&measured)
+    }
+}
+
+/// Kernel-time band geometry for a core tile.
+///
+/// The band is indexed against the value series it sits under: it is painted
+/// only where that sample exists and where the kernel sample itself is a real
+/// measurement, and only when both slices are the same length — otherwise it is
+/// unavailable rather than shifted. The old path indexed the overlay by ITS OWN
+/// slice index while taking x from the value series' axis stamps, so any length
+/// difference slid the band sideways along the axis.
+fn kernel_runs(values: &[f64], kernels: &[f64], geometry: &ChartGeometry<'_>) -> SeriesPaths {
+    if kernels.len() != values.len() {
+        return SeriesPaths::new();
+    }
+    let band: Vec<Option<f64>> = values
+        .iter()
+        .zip(kernels)
+        .map(|(value, kernel)| value.is_finite().then_some(*kernel))
+        .collect();
+    geometry.runs(&band)
+}
+
+/// Area fill for every run of one series: the region between the polyline and
+/// `baseline_y`.
+///
+/// A one-sample run has no area; it is skipped rather than handed to the
+/// tessellator as a degenerate strip.
+fn paint_runs_fill(painter: &egui::Painter, runs: &[Vec<Pos2>], baseline_y: f32, fill: Color32) {
+    for run in runs.iter().filter(|run| run.len() >= 2) {
+        fill_area_to_baseline(painter, run, baseline_y, fill);
+    }
+}
+
+/// The polyline of every run of one series, at `width`.
+///
+/// A run with a single sample is painted as the 1.25 px dot it always was,
+/// never as a line to nowhere: `Shape::line` through one point draws nothing at
+/// all, which would silently drop the only measurement there is.
+fn paint_runs_line(painter: &egui::Painter, runs: &[Vec<Pos2>], width: f32, color: Color32) {
+    for run in runs {
+        match run.as_slice() {
+            [dot] => painter.circle_filled(*dot, 1.25, color),
+            points => painter.add(Shape::line(points.to_vec(), Stroke::new(width, color))),
+        }
     }
 }
 
@@ -689,32 +980,23 @@ pub fn paint_sparkline_with_gaps(
     let n = samples.len();
     let values: Vec<_> = samples.iter().filter_map(|value| *value).collect();
     let y_max = sparkline_y_max(&values);
-    let x = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-    let y = |v: f64| {
-        let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
-        rect.bottom() - (v.min(y_max) / y_max) as f32 * rect.height()
-    };
-
-    for run in measured_runs(samples) {
-        let pts: Vec<_> = run
-            .into_iter()
-            .map(|(i, v)| Pos2::new(x(i), y(v)))
-            .collect();
-        if pts.len() == 1 {
-            painter.circle_filled(pts[0], 1.25, color);
-        } else {
-            fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(color));
-            painter.add(Shape::line(pts, Stroke::new(1.25, color)));
-        }
-    }
+    // The same builder as the big charts and the core tiles, with no axis (a
+    // sparkline has no timestamps), so a missing or non-finite sample breaks
+    // the line here exactly as it does there.
+    let runs = ChartGeometry::new(rect, y_max, None, n).runs(samples);
+    paint_runs_fill(&painter, &runs, rect.bottom(), area_fill(color));
+    paint_runs_line(&painter, &runs, 1.25, color);
 }
 
 /// Per-logical-processor tile: bordered, faint horizontal grid, filled area.
 /// `kernels` carries the kernel-time share (same length) together with the
-/// colour to overlay it in — Task Manager's "Show kernel times" (§14.4). The
-/// colour travels WITH the samples because it is only meaningful when they
-/// are there, and because a tile and the aggregate CPU chart have to paint
-/// kernel time in the same colour.
+/// colour to overlay it in — Task Manager's "Show kernel times" (§14.4). A band
+/// whose slice is not exactly that long is dropped rather than shifted (see
+/// [`kernel_runs`]): the overlay is indexed against the value series it sits
+/// under, so a length difference would paint one sample's kernel time below
+/// another sample's value. The colour travels WITH the samples because it is
+/// only meaningful when they are there, and because a tile and the aggregate
+/// CPU chart have to paint kernel time in the same colour.
 ///
 /// `label` names the tile in the hover readout ("CPU 0"); `timestamps_ms`
 /// gives that readout the sample's age, exactly as on the big charts.
@@ -769,30 +1051,29 @@ fn core_chart_impl(
     let n = samples.len();
     // Window-anchored x, exactly as on the big charts (see [`TimeAxis`]): a
     // tile that spread whatever it had across its full width was compressing
-    // its own history rather than scrolling it.
+    // its own history rather than scrolling it. These bounds are also what the
+    // hover readout maps the pointer through.
     let bounds = axis.and_then(|a| a.bounds());
-    let even = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-    let x = |i: usize| x_on_axis(rect, axis, bounds, i, even(i));
-    let y = |v: f64| rect.bottom() - (v.clamp(0.0, 100.0) / 100.0) as f32 * rect.height();
-    let pts: Vec<Pos2> = samples
-        .iter()
-        .enumerate()
-        .map(|(i, v)| Pos2::new(x(i), y(*v)))
-        .collect();
-    fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(color));
+    // One geometry for the whole tile, from the same builder the big charts
+    // use. The tile used to map its raw samples straight into `Pos2`, so every
+    // gap and every NaN in the series became a point, and epaint drew them:
+    // `f64::clamp` returns NaN for NaN, `PathShape::line` keeps every point it
+    // is handed, and `Rect::extend_with` skips non-finite points, so the
+    // poisoned path was not even culled by the clip test. That is the reported
+    // tile artifact — a stroke of the series colour from frac 0.447 at a value
+    // of 100 % or more down to frac 0.952 at 10 %, with no area fill under it.
+    let geometry = ChartGeometry::new(rect, 100.0, axis, n);
+    let runs = geometry.runs_of(samples);
+    paint_runs_fill(&painter, &runs, rect.bottom(), area_fill(color));
 
     // Kernel overlay: darker band under the user portion. Painted AFTER the
     // user fill but BEFORE the line, so it darkens the lower region without
     // burying the series line (the old order drew the line first).
-    if let Some((k, kernel_color)) = kernels {
-        let kpts: Vec<Pos2> = k
-            .iter()
-            .enumerate()
-            .map(|(i, v)| Pos2::new(x(i), y(*v)))
-            .collect();
-        fill_area_to_baseline(&painter, &kpts, rect.bottom(), kernel_fill(kernel_color));
+    if let Some((kernel_values, kernel_color)) = kernels {
+        let band = kernel_runs(samples, kernel_values, &geometry);
+        paint_runs_fill(&painter, &band, rect.bottom(), kernel_fill(kernel_color));
     }
-    painter.add(Shape::line(pts, Stroke::new(1.4, color)));
+    paint_runs_line(&painter, &runs, 1.4, color);
 
     let hover = if keyboard.is_some() {
         None
@@ -800,7 +1081,7 @@ fn core_chart_impl(
         hover_pos(ui, &response, rect)
     };
     if let Some(pos) =
-        hover.or_else(|| keyboard.map(|(idx, _)| Pos2::new(x(idx), rect.top() + 20.0)))
+        hover.or_else(|| keyboard.map(|(idx, _)| Pos2::new(geometry.x(idx), rect.top() + 20.0)))
     {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         let first = first_on_axis(axis, bounds);
@@ -819,24 +1100,41 @@ fn core_chart_impl(
         let mut rows = vec![ReadoutRow {
             color,
             label: label.to_owned(),
-            value: fmt_percent(samples[idx]),
+            value: readout_text(samples.get(idx).copied(), fmt_percent),
         }];
-        let mut dots = vec![(y(samples[idx]), color)];
-        if let Some((kernel_color, k)) = kernels.and_then(|(k, c)| Some((c, *k.get(idx)?))) {
+        // The marker dot is a plotted position like any other: a sample without
+        // a measurement gets no dot, rather than one at a NaN y.
+        let mut dots = Vec::new();
+        if let Some(value) = samples.get(idx).copied().filter(|value| value.is_finite()) {
+            dots.push((geometry.y(value), color));
+        }
+        // The band is painted only when its slice matches the value series (see
+        // [`kernel_runs`]); the readout says the same thing.
+        if let Some((kernel_values, kernel_color)) = kernels
+            && kernel_values.len() == n
+            && let Some(kernel) = kernel_values
+                .get(idx)
+                .copied()
+                .filter(|value| value.is_finite())
+        {
             rows.push(ReadoutRow {
                 color: kernel_color,
                 label: i18n::tr(K::ShowKernelTimesShort).to_owned(),
-                value: fmt_percent(k),
+                value: fmt_percent(kernel),
             });
-            dots.push((y(k), kernel_color));
+            dots.push((geometry.y(kernel), kernel_color));
         }
-        paint_marker(&painter, &pal, rect, ppp, x(idx), &dots);
+        paint_marker(&painter, &pal, rect, ppp, geometry.x(idx), &dots);
         readout(ui, pos, &sample_age(axis, idx), &rows);
         if let Some((_, changed)) = keyboard.filter(|_| !grouped) {
             chart_accessible_value(
                 ui,
                 &response,
-                format!("{}: {}", sample_age(axis, idx), fmt_percent(samples[idx])),
+                format!(
+                    "{}: {}",
+                    sample_age(axis, idx),
+                    readout_text(samples.get(idx).copied(), fmt_percent)
+                ),
                 changed,
             );
         }
@@ -892,23 +1190,6 @@ impl MultiSeries {
             label: label.into(),
         }
     }
-}
-
-/// Separate measured runs so neither the line nor its fill bridges missing data.
-fn measured_runs(samples: &[Option<f64>]) -> Vec<Vec<(usize, f64)>> {
-    let mut runs = Vec::new();
-    let mut run = Vec::new();
-    for (index, value) in samples.iter().enumerate() {
-        if let Some(value) = value.filter(|value| value.is_finite()) {
-            run.push((index, value));
-        } else if !run.is_empty() {
-            runs.push(std::mem::take(&mut run));
-        }
-    }
-    if !run.is_empty() {
-        runs.push(run);
-    }
-    runs
 }
 
 /// Bordered chart with several filled series sharing one y scale
@@ -1002,51 +1283,42 @@ pub fn chart_multi_with_bg(
         ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
     }
 
-    let y = |v: f64| rect.bottom() - (v.clamp(0.0, y_max) / y_max) as f32 * rect.height();
     // Time-proportional x over the CONFIGURED window — see [`TimeAxis`].
     let bounds = axis.and_then(|a| a.bounds());
     // Callers must hand over one timestamp per sample (every series extractor
     // maps over the same window). Indexing blind would turn a future
     // desynchronization — a bug class this code has already seen once, see
     // `series_extractors_stay_aligned_with_window` — into a panic in the paint
-    // path, i.e. a crashed task manager. A short timestamp slice degrades to
-    // even spacing for the samples it cannot place instead.
-    let even = |i: usize, n: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-    let x_at = |i: usize, n: usize| x_on_axis(rect, axis, bounds, i, even(i, n));
-    for s in series {
-        let n = s.samples.len();
-        if n < 2 {
-            continue;
-        }
-        for run in measured_runs(&s.samples) {
-            if run.len() >= 2 {
-                let pts: Vec<Pos2> = run
-                    .into_iter()
-                    .map(|(i, v)| Pos2::new(x_at(i, n), y(v)))
-                    .collect();
-                fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(s.color));
+    // path, i.e. a crashed task manager. The samples a short timestamp slice
+    // cannot place start a run of their own instead of being stitched onto the
+    // time-based one ([`ChartGeometry`]), which is also the honest picture: they
+    // have no instant, so they borrow no coordinate from the axis.
+    //
+    // Built ONCE per series, for both paint passes: filling and outlining
+    // recomputed the points separately before, which is how a fill and its own
+    // outline drift apart.
+    let plots: Vec<SeriesPaths> = series
+        .iter()
+        .map(|s| {
+            // A one-sample series has no line and no area to paint, and
+            // `even_x` has no spacing to divide (0 / 0) for it. Every series
+            // reaches two samples on the next tick.
+            if s.samples.len() < 2 {
+                return SeriesPaths::new();
             }
-        }
+            ChartGeometry::new(rect, y_max, axis, s.samples.len()).runs(&s.samples)
+        })
+        .collect();
+    // Fills FIRST: an outer series' translucent fill must never dim an inner
+    // series' line (the old single-pass order made overlapping series muddy and
+    // hard to read).
+    for (s, runs) in series.iter().zip(&plots) {
+        paint_runs_fill(&painter, runs, rect.bottom(), area_fill(s.color));
     }
-    // Lines in a SECOND pass: an outer series' translucent fill must never
-    // dim an inner series' line (the old single-pass order made overlapping
-    // series muddy and hard to read).
-    for s in series {
-        let n = s.samples.len();
-        if n < 2 {
-            continue;
-        }
-        for run in measured_runs(&s.samples) {
-            let pts: Vec<Pos2> = run
-                .into_iter()
-                .map(|(i, v)| Pos2::new(x_at(i, n), y(v)))
-                .collect();
-            if pts.len() == 1 {
-                painter.circle_filled(pts[0], 1.25, s.color);
-            } else {
-                painter.add(Shape::line(pts, Stroke::new(1.25, s.color)));
-            }
-        }
+    // Lines in a second pass, over the SAME geometry. A run of one sample is the
+    // dot it always was (see [`paint_runs_line`]).
+    for (s, runs) in series.iter().zip(&plots) {
+        paint_runs_line(&painter, runs, 1.25, s.color);
     }
 
     // Hover: every series' value at the pointer, in a box AT the pointer.
@@ -1055,9 +1327,13 @@ pub fn chart_multi_with_bg(
     } else {
         hover_pos(ui, &response, rect)
     };
-    if let Some(pos) = hover.or_else(|| {
-        keyboard.map(|(idx, _)| Pos2::new(x_at(idx, max_len.max(2)), rect.top() + 20.0))
-    }) {
+    // A keyboard cursor marks one sample rather than a run, so it only needs
+    // that index's x — through the same builder, so it cannot land anywhere but
+    // on the curve it marks.
+    let cursor_x = |idx: usize| ChartGeometry::new(rect, y_max, axis, max_len.max(2)).x(idx);
+    if let Some(pos) =
+        hover.or_else(|| keyboard.map(|(idx, _)| Pos2::new(cursor_x(idx), rect.top() + 20.0)))
+    {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
         // sample — even-spacing math skips across sampling gaps.
@@ -1078,22 +1354,23 @@ pub fn chart_multi_with_bg(
             if n < 2 {
                 continue;
             }
+            let geometry = ChartGeometry::new(rect, y_max, axis, n);
             let idx = time_idx
                 .map_or_else(
                     || (frac * (n - 1) as f32).round() as usize,
                     |i| i.min(n - 1),
                 )
                 .min(n - 1);
-            if let Some(v) = s.samples.get(idx) {
+            if let Some(value) = s.samples.get(idx).copied() {
                 rows.push(ReadoutRow {
                     color: s.color,
                     label: s.label.clone(),
-                    value: v.filter(|v| v.is_finite()).map_or_else(|| "—".into(), fmt),
+                    value: readout_text(Some(value), fmt),
                 });
-                if let Some(v) = v.filter(|v| v.is_finite()) {
-                    dots.push((y(v), s.color));
+                if let Some(value) = value.filter(|value| value.is_finite()) {
+                    dots.push((geometry.y(value), s.color));
                 }
-                marker.get_or_insert((x_at(idx, n), idx));
+                marker.get_or_insert((geometry.x(idx), idx));
             }
         }
         if let Some((x, idx)) = marker {
@@ -1249,7 +1526,8 @@ mod tests {
         let stamps: Vec<u64> = (0..=8).map(|i| i * 1_300).collect();
         let axis = TimeAxis::new(&stamps, 10);
         let bounds = axis.bounds();
-        let at = |i: usize| x_on_axis(rect, Some(axis), bounds, i, f32::NAN);
+        let geometry = ChartGeometry::new(rect, 100.0, Some(axis), stamps.len());
+        let at = |i: usize| geometry.x(i);
 
         assert!(at(0) < rect.left(), "lead-in pinned to the edge: {}", at(0));
         // The lead-in stays ONE sample out, so the entering segment is short
@@ -1787,5 +2065,336 @@ mod tests {
         assert!(sample_age(None, 0).is_empty());
         // An out-of-range index is a caller slip, not a panic.
         assert!(sample_age(Some(axis), 99).is_empty());
+    }
+
+    /// Polyline points of every path a chart frame painted, in shape order.
+    fn painted_paths(output: &mut egui::FullOutput) -> Vec<Vec<Pos2>> {
+        output.textures_delta.clear();
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                Shape::Path(path) => Some(path.points.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every position a shape hands to epaint, including the ones a bounding
+    /// rect would hide.
+    ///
+    /// `Shape::visual_bounding_rect` cannot stand in for this check:
+    /// `Rect::extend_with` ignores non-finite points, so a poisoned path still
+    /// reports a sane bound and passes the clip test — which is exactly how the
+    /// artifact below reached the rasterizer instead of being culled.
+    fn assert_shape_positions_finite(shape: &Shape) {
+        fn finite(label: &str, point: Pos2) {
+            assert!(
+                point.x.is_finite() && point.y.is_finite(),
+                "{label} carries a non-finite position: {point:?}"
+            );
+        }
+        match shape {
+            Shape::Path(path) => path.points.iter().for_each(|point| finite("path", *point)),
+            Shape::Mesh(mesh) => mesh
+                .vertices
+                .iter()
+                .for_each(|vertex| finite("mesh", vertex.pos)),
+            Shape::LineSegment { points, .. } => {
+                points.iter().for_each(|point| finite("segment", *point));
+            }
+            Shape::Circle(circle) => finite("circle", circle.center),
+            Shape::Rect(rect) => {
+                finite("rect min", rect.rect.min);
+                finite("rect max", rect.rect.max);
+            }
+            Shape::Text(text) => finite("text", text.pos),
+            Shape::Vec(shapes) => shapes.iter().for_each(assert_shape_positions_finite),
+            _ => {}
+        }
+    }
+
+    /// A missing or non-finite sample is a GAP: the runs it produces are finite,
+    /// their x strictly increases, and nothing continuous spans the bad sample.
+    ///
+    /// The tile did not split at all before — a NaN went straight into
+    /// `Pos2::new`, and `f64::clamp` returns NaN for NaN, so it stayed NaN
+    /// through the scale and became a path point epaint happily stroked.
+    #[test]
+    fn gaps_and_non_finite_samples_produce_finite_broken_runs() {
+        let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(300.0, 80.0));
+        let samples = [
+            1.0,
+            2.0,
+            f64::NAN,
+            4.0,
+            f64::INFINITY,
+            6.0,
+            f64::NEG_INFINITY,
+            8.0,
+        ];
+        let runs = ChartGeometry::new(rect, 100.0, None, samples.len()).runs_of(&samples);
+        let lengths: Vec<usize> = runs.iter().map(Vec::len).collect();
+        assert_eq!(
+            lengths,
+            vec![2, 1, 1, 1],
+            "a gap must split the line: {runs:?}"
+        );
+        for run in &runs {
+            for point in run {
+                assert!(point.x.is_finite() && point.y.is_finite(), "{point:?}");
+                assert!((rect.top()..=rect.bottom()).contains(&point.y), "{point:?}");
+            }
+            assert!(
+                run.windows(2).all(|pair| pair[0].x < pair[1].x),
+                "x must advance along a run: {run:?}"
+            );
+        }
+        // The run that ends at index 1 and the one that starts at index 3 are
+        // separate paths, so no segment covers the NaN between them.
+        let end_of_first = runs[0].last().expect("a measured run").x;
+        assert!(
+            end_of_first < runs[1][0].x,
+            "the runs are out of order: {runs:?}"
+        );
+    }
+
+    /// A wall-clock step back starts a new run instead of pinning the sample
+    /// onto the plot edge.
+    ///
+    /// `x_on_axis` clamps the fraction to `[-1, 1]`, so an older stamp that
+    /// follows a newer one used to land on the left edge and the two were joined
+    /// by a straight, chart-wide diagonal — the stroke from frac 0.447 at a
+    /// value of 100 % or more down to frac 0.952 at 10 % in the report.
+    #[test]
+    fn a_step_back_in_time_starts_a_new_run() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 100.0));
+        // Samples tick once a second; index 3 comes from BEFORE index 2, the
+        // way a clock correction or a resume leaves the history buffer.
+        let stamps = [10_000u64, 11_000, 12_000, 4_000, 5_000];
+        let samples = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let axis = TimeAxis::new(&stamps, 60);
+        let runs = ChartGeometry::new(rect, 100.0, Some(axis), samples.len()).runs_of(&samples);
+        assert_eq!(runs.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 2]);
+        for run in &runs {
+            assert!(
+                run.windows(2).all(|pair| pair[0].x < pair[1].x),
+                "a run bridges backwards in time: {run:?}"
+            );
+        }
+
+        // A duplicated stamp is not a segment either: two samples on one instant
+        // would be a zero-length line, so the second one starts its own run.
+        let stamps = [10_000u64, 10_000, 11_000];
+        let axis = TimeAxis::new(&stamps, 60);
+        let runs = ChartGeometry::new(rect, 100.0, Some(axis), 3).runs_of(&[10.0, 20.0, 30.0]);
+        assert_eq!(runs.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// However stale a stamp is, the lead-in overhang stays within one chart
+    /// width — the bound that keeps a pathological sample from tessellating a
+    /// mesh across the screen.
+    #[test]
+    fn a_pathological_stamp_stays_within_one_chart_width() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 0.0), Vec2::new(600.0, 100.0));
+        // Epoch zero followed by two samples from 2027.
+        let stamps = [1_000u64, 1_800_000_000_000, 1_800_000_060_000];
+        let axis = TimeAxis::new(&stamps, 60);
+        let geometry = ChartGeometry::new(rect, 100.0, Some(axis), stamps.len());
+        for x in (0..stamps.len()).map(|i| geometry.x(i)) {
+            assert!(x.is_finite(), "{x}");
+            assert!(
+                x >= rect.left() - rect.width(),
+                "overhang past one chart width: {x}"
+            );
+            assert!(x <= rect.right(), "past the right edge: {x}");
+        }
+        // The stale stamp is the lead-in: left of the chart, inside the bound.
+        assert!(geometry.x(0) < rect.left());
+        assert!(geometry.x(0) >= rect.left() - rect.width());
+        // Not a gap, though: the axis can still place the other two, in order.
+        assert!(geometry.x(1) < geometry.x(2));
+    }
+
+    /// A series longer than the timestamp slice never stitches the time axis to
+    /// the even-spacing fallback inside one run: the samples the axis cannot
+    /// place start a run of their own, so every run has exactly one x source.
+    #[test]
+    fn a_short_timestamp_slice_never_mixes_two_coordinate_systems() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 100.0));
+        let stamps = [1_000u64, 2_000, 3_000, 4_000];
+        let samples: Vec<f64> = (0..10u32).map(|i| 20.0 + f64::from(i)).collect();
+        let axis = TimeAxis::new(&stamps, 60);
+        let geometry = ChartGeometry::new(rect, 100.0, Some(axis), samples.len());
+        let runs = geometry.runs_of(&samples);
+        assert_eq!(runs.iter().map(Vec::len).collect::<Vec<_>>(), vec![4, 6]);
+        let bounds = axis.bounds().expect("axis bounds");
+        for (i, point) in runs[0].iter().enumerate() {
+            assert_eq!(point.x, x_on_axis(rect, bounds, stamps[i]), "axis x {i}");
+        }
+        for (k, point) in runs[1].iter().enumerate() {
+            assert_eq!(point.x, even_x(rect, k + 4, samples.len()), "even x {k}");
+        }
+    }
+
+    /// The kernel band is indexed against the value series it sits under.
+    ///
+    /// It used to iterate its own slice while taking x from the value series'
+    /// stamps, so a length mismatch slid the band sideways along the axis, and a
+    /// sample with no measurement still got a band under it — a stroke of the
+    /// kernel colour over a region where the tile paints nothing at all.
+    #[test]
+    fn a_kernel_band_is_indexed_against_its_value_series() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 100.0));
+        let values = [10.0f64; 6];
+        let geometry = ChartGeometry::new(rect, 100.0, None, values.len());
+        // A slice of the wrong length is unavailable, never shifted.
+        assert!(kernel_runs(&values, &[1.0, 2.0, 3.0], &geometry).is_empty());
+
+        let kernels = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let band = kernel_runs(&values, &kernels, &geometry);
+        assert_eq!(band.len(), 1);
+        assert_eq!(
+            band[0].iter().map(|point| point.x).collect::<Vec<_>>(),
+            geometry.runs_of(&values)[0]
+                .iter()
+                .map(|point| point.x)
+                .collect::<Vec<_>>(),
+            "the band must sit on the value series' x"
+        );
+        // Kernel time is a share that rises here, so the band's y falls.
+        assert!(band[0][0].y > band[0][5].y);
+
+        // No value sample, no band: the runs break where the values do.
+        let mut gapped = values;
+        gapped[2] = f64::NAN;
+        let band = kernel_runs(&gapped, &kernels, &geometry);
+        assert_eq!(band.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    /// The per-core tile and the multi-series chart must build the SAME
+    /// geometry from the same samples.
+    ///
+    /// They diverged once: the tile had its own gap-unaware mapping, so one NaN
+    /// series painted a clean curve in the big chart and a garbage diagonal in
+    /// the tile. Both now paint through `ChartGeometry`, and this pins it
+    /// through the public entry points rather than through the builder alone.
+    #[test]
+    fn a_core_tile_and_a_multi_series_chart_build_the_same_geometry() {
+        let stamps: Vec<u64> = (0..40u64).map(|i| 1_000 + i * 500).collect();
+        let samples: Vec<f64> = (0..40u32)
+            .map(|i| {
+                if i % 11 == 7 {
+                    f64::NAN
+                } else {
+                    f64::from(i % 9) * 11.0
+                }
+            })
+            .collect();
+        let paths = |tile: bool| -> Vec<Vec<Pos2>> {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let axis = Some(TimeAxis::new(&stamps, 60));
+                    if tile {
+                        core_chart(
+                            ui,
+                            Vec2::new(180.0, 60.0),
+                            &samples,
+                            None,
+                            Color32::BLUE,
+                            "CPU 0",
+                            axis,
+                        );
+                    } else {
+                        chart_multi(
+                            ui,
+                            Vec2::new(180.0, 60.0),
+                            &[MultiSeries::new("CPU", samples.clone(), Color32::BLUE)],
+                            100.0,
+                            axis,
+                            fmt_percent,
+                        );
+                    }
+                },
+            );
+            painted_paths(&mut output)
+        };
+        let tile = paths(true);
+        let multi = paths(false);
+        assert!(
+            tile.len() > 1,
+            "the fixture has to produce gapped runs: {tile:?}"
+        );
+        assert_eq!(tile, multi, "the tile and the big chart diverge");
+    }
+
+    /// Acceptance criterion, end to end: whatever the data does, no shape a
+    /// chart hands to epaint carries a non-finite position.
+    ///
+    /// The fixture carries all four inputs that used to produce poisoned
+    /// geometry at once: non-finite values (NaN and both infinities), a
+    /// wall-clock step back, a duplicated stamp, and a kernel slice shorter than
+    /// the value series. All three chart shapes paint from it.
+    #[test]
+    fn no_chart_shape_carries_a_non_finite_position() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 400.0));
+        let stamps = [10_000u64, 11_000, 12_000, 3_000, 12_000, 14_000, 15_000];
+        let samples = [
+            10.0,
+            f64::NAN,
+            30.0,
+            f64::INFINITY,
+            50.0,
+            f64::NEG_INFINITY,
+            70.0,
+        ];
+        let kernel = [1.0, 2.0, 3.0];
+        let measured: Vec<Option<f64>> = samples.iter().copied().map(Some).collect();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let axis = Some(TimeAxis::new(&stamps, 60));
+                core_chart(
+                    ui,
+                    Vec2::new(120.0, 60.0),
+                    &samples,
+                    Some((kernel.as_slice(), Color32::RED)),
+                    Color32::BLUE,
+                    "CPU 0",
+                    axis,
+                );
+                chart_multi(
+                    ui,
+                    Vec2::new(240.0, 90.0),
+                    &[MultiSeries::new("CPU", samples.to_vec(), Color32::BLUE)],
+                    100.0,
+                    axis,
+                    fmt_percent,
+                );
+                paint_sparkline_with_gaps(
+                    ui,
+                    Rect::from_min_size(Pos2::new(4.0, 4.0), Vec2::new(64.0, 40.0)),
+                    &measured,
+                    Color32::BLUE,
+                    Color32::BLACK,
+                );
+            },
+        );
+        // Nothing paints this frame to a surface, so the font-atlas delta has to
+        // be dropped explicitly.
+        output.textures_delta.clear();
+        assert!(output.shapes.len() > 8, "the fixtures must paint something");
+        for clipped in &output.shapes {
+            assert_shape_positions_finite(&clipped.shape);
+        }
     }
 }
