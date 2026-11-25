@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 /// Keep enough width/height for 8K displays and full-surface depth textures.
-const GUI_MAX_TEXTURE_DIMENSION_2D: u32 = 8192;
+///
+/// The target applies to both the 1D and the 2D texture dimension: wgpu validates every field of
+/// the request against the adapter, so a 1D request above it fails device creation exactly like a
+/// 2D one, whichever dimension the GUI actually renders into.
+const GUI_MAX_TEXTURE_DIMENSION: u32 = 8192;
 
 /// D3D12 allocates its visible CBV/SRV/UAV heap from this limit at device creation.
 ///
@@ -21,8 +25,10 @@ fn gui_device_memory_hints() -> wgpu::MemoryHints {
 ///
 /// The GUI target is 8K, but wgpu rejects a device request that asks for more than the adapter
 /// offers, and a GL driver may cap the texture dimension well below 8192 — below even the GL-safe
-/// base. Asking for the target there fails `request_device` and the GUI does not start at all,
-/// where asking for what the adapter has gives a smaller but working surface.
+/// base, which asks for 2048 in both dimensions. Asking for the target there fails `request_device`
+/// and the GUI does not start at all, where asking for what the adapter has gives a smaller but
+/// working surface. Both dimensions take the same clamp because wgpu compares the whole request
+/// and the GL backend derives the two from one `max_texture_size`.
 fn gui_device_limits(backend: wgpu::Backend, adapter_limits: &wgpu::Limits) -> wgpu::Limits {
     let base_limits = if backend == wgpu::Backend::Gl {
         wgpu::Limits::downlevel_webgl2_defaults()
@@ -31,9 +37,11 @@ fn gui_device_limits(backend: wgpu::Backend, adapter_limits: &wgpu::Limits) -> w
     };
 
     // The other portable limits are validation ceilings and custom callback compatibility,
-    // not allocations. Keep them at wgpu's defaults while bounding the two fields above.
+    // not allocations. Keep them at wgpu's defaults while bounding the three fields below.
     wgpu::Limits {
-        max_texture_dimension_2d: GUI_MAX_TEXTURE_DIMENSION_2D
+        max_texture_dimension_1d: GUI_MAX_TEXTURE_DIMENSION
+            .min(adapter_limits.max_texture_dimension_1d),
+        max_texture_dimension_2d: GUI_MAX_TEXTURE_DIMENSION
             .min(adapter_limits.max_texture_dimension_2d),
         max_non_sampler_bindings: GUI_MAX_NON_SAMPLER_BINDINGS,
         ..base_limits
@@ -317,44 +325,50 @@ impl WgpuSetupCreateNew {
 #[cfg(test)]
 mod tests {
     use super::{
-        GUI_MAX_NON_SAMPLER_BINDINGS, GUI_MAX_TEXTURE_DIMENSION_2D, gui_device_limits,
+        GUI_MAX_NON_SAMPLER_BINDINGS, GUI_MAX_TEXTURE_DIMENSION, gui_device_limits,
         gui_device_memory_hints, requested_dual_source_blending,
     };
 
     #[test]
-    fn gui_device_request_uses_bounded_memory_defaults() {
+    fn gui_device_request_uses_bounded_memory_and_adapter_clamped_texture_limits() {
         assert!(matches!(
             gui_device_memory_hints(),
             wgpu::MemoryHints::MemoryUsage
         ));
 
-        // The requirement never exceeds the adapter, whatever the backend: wgpu validates it
-        // against the adapter and fails the request instead of giving a smaller device.
+        // Neither texture dimension ever exceeds the adapter, whatever the backend: wgpu
+        // validates the whole request against it and fails the request instead of giving a
+        // smaller device. Below the target the clamp is exact, so the requirement is what the
+        // adapter advertises and nothing more.
         for adapter_max in [1024, 2048, 4096, 8192, 16384] {
             for backend in [wgpu::Backend::Gl, wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
                 let adapter = wgpu::Limits {
+                    max_texture_dimension_1d: adapter_max,
                     max_texture_dimension_2d: adapter_max,
                     ..wgpu::Limits::default()
                 };
-                let requested = gui_device_limits(backend, &adapter).max_texture_dimension_2d;
-                assert!(
-                    requested <= adapter_max,
-                    "{backend:?} asked for {requested} px from an adapter with {adapter_max} px"
-                );
-                assert!(requested <= GUI_MAX_TEXTURE_DIMENSION_2D);
+                let limits = gui_device_limits(backend, &adapter);
+                let expected = adapter_max.min(GUI_MAX_TEXTURE_DIMENSION);
+                assert_eq!(limits.max_texture_dimension_1d, expected);
+                assert_eq!(limits.max_texture_dimension_2d, expected);
             }
         }
 
-        // An adapter that offers the GUI target keeps the full requirement.
+        // An adapter that offers the GUI target keeps the full requirement in both dimensions.
         let large_adapter = wgpu::Limits {
-            max_texture_dimension_2d: GUI_MAX_TEXTURE_DIMENSION_2D * 2,
+            max_texture_dimension_1d: GUI_MAX_TEXTURE_DIMENSION * 2,
+            max_texture_dimension_2d: GUI_MAX_TEXTURE_DIMENSION * 2,
             ..wgpu::Limits::default()
         };
         for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
             let limits = gui_device_limits(backend, &large_adapter);
             assert_eq!(
+                limits.max_texture_dimension_1d,
+                GUI_MAX_TEXTURE_DIMENSION
+            );
+            assert_eq!(
                 limits.max_texture_dimension_2d,
-                GUI_MAX_TEXTURE_DIMENSION_2D
+                GUI_MAX_TEXTURE_DIMENSION
             );
             assert_eq!(
                 limits.max_non_sampler_bindings,
@@ -362,13 +376,19 @@ mod tests {
             );
         }
 
-        // A GL driver below the GUI target is asked only for what it advertises, so the GUI
-        // starts with a smaller working surface instead of no window at all.
+        // A GL driver below the GUI target, and below the GL-safe base, is asked only for what
+        // it advertises, so the GUI starts with a smaller working surface instead of no window
+        // at all.
         let small_gl_adapter = wgpu::Limits {
-            max_texture_dimension_2d: 2048,
+            max_texture_dimension_1d: 1024,
+            max_texture_dimension_2d: 1024,
             ..wgpu::Limits::downlevel_webgl2_defaults()
         };
         let gl_limits = gui_device_limits(wgpu::Backend::Gl, &small_gl_adapter);
+        assert_eq!(
+            gl_limits.max_texture_dimension_1d,
+            small_gl_adapter.max_texture_dimension_1d
+        );
         assert_eq!(
             gl_limits.max_texture_dimension_2d,
             small_gl_adapter.max_texture_dimension_2d
