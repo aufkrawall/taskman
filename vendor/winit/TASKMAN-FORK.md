@@ -44,8 +44,11 @@ value differs from the startup value.
     `create_window_native()` would otherwise leave the call and the imports
     untouched.
 
-Nothing else in `windows/window.rs` is changed. `grep -n TASKMAN_WINDOW_BAND vendor/winit/src` lists
-every window-band line.
+Nothing else in `windows/window.rs` is changed. The reapply grep is
+`grep -n "TaskMan fork:" vendor/winit/src`, not `TASKMAN_WINDOW_BAND`: the
+import comment at the top of the file and the `init()` call site both carry
+the marker, and neither names the variable. `TASKMAN_WINDOW_BAND` is only the
+runtime knob: setting it to `16` asks for band 16 at window creation.
 
 ## 2. Do not poison `EVENT_LOOP_CREATED` when `EventLoopBuilder::build()` fails
 

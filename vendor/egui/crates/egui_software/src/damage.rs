@@ -58,6 +58,7 @@ pub(crate) struct FrameKey {
     pub prerasterized_discs: bool,
     pub debug_paint_clip_rects: bool,
     pub debug_ignore_clip_rects: bool,
+    pub debug_paint_text_rects: bool,
     pub bezier_tolerance_bits: u32,
     pub epsilon_bits: u32,
     pub font_tex_size: [usize; 2],
@@ -99,12 +100,18 @@ impl FrameKey {
             feathering: ctx.options.feathering,
             feathering_size_bits: f32_bits(ctx.options.feathering_size_in_pixels),
             prerasterized_discs: ctx.options.prerasterized_discs,
-            // These two rewrite the tessellated output, after the input shapes were hashed,
-            // so the shape hash cannot see them. Toggling one at runtime has to invalidate
-            // the frame here, or nothing repaints and the new primitives paint outside the
-            // tiles that claim to be up to date.
+            // The three debug toggles are all applied after `plan()` hashed the input shapes,
+            // so the shape hash cannot see them and a runtime toggle has to invalidate the
+            // frame here, or nothing repaints and the new primitives paint outside the tiles
+            // that claim to be up to date. Only `debug_paint_text_rects` changes pixels on the
+            // default path: `tessellate_shape` injects its stroke while tessellating, and
+            // rotated text -- which cannot be blitted -- is tessellated there. The two
+            // clip-rect toggles are applied at the end of `tessellate_shapes` instead, which
+            // the default `Blit` mode never reaches because it tessellates shape by shape
+            // through `tessellate_clipped_shape`.
             debug_paint_clip_rects: ctx.options.debug_paint_clip_rects,
             debug_ignore_clip_rects: ctx.options.debug_ignore_clip_rects,
+            debug_paint_text_rects: ctx.options.debug_paint_text_rects,
             bezier_tolerance_bits: f32_bits(ctx.options.bezier_tolerance),
             epsilon_bits: f32_bits(ctx.options.epsilon),
             font_tex_size: ctx.font_tex_size,
@@ -809,6 +816,23 @@ mod tests {
         let epsilon =
             painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
         assert_eq!(epsilon.dirty_tiles, epsilon.total_tiles, "float epsilon");
+
+        // The debug toggles inject primitives that no input shape hash covers, so a toggle
+        // missing from the key leaves them on tiles the hashes still call clean.
+        ctx.options.debug_paint_clip_rects = true;
+        let clip =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(clip.dirty_tiles, clip.total_tiles, "clip rects");
+
+        ctx.options.debug_ignore_clip_rects = true;
+        let ignore =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(ignore.dirty_tiles, ignore.total_tiles, "ignore clips");
+
+        ctx.options.debug_paint_text_rects = true;
+        let text =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(text.dirty_tiles, text.total_tiles, "text rects");
     }
 
     /// Damage rects are physical pixels and must stay inside the target even when the window
