@@ -232,6 +232,67 @@ mod tests {
         );
     }
 
+    /// Regression: the Committed / Commit limit / Cached / Paged / Non-paged
+    /// rows used to be built from figures only Windows reports. On a macOS
+    /// machine every one of those fields is 0, so the page stated five
+    /// measurements nobody took. Each row is gated on the predicate that
+    /// answers "did the platform report this at all"; without the seam no test
+    /// could see the decision, which is why the rows are pinned here.
+    #[test]
+    fn the_memory_page_drops_unreported_commit_and_pool_rows() {
+        let gib = 1024 * 1024 * 1024;
+        // macOS shape: real total/used/available, nothing for the Windows set.
+        let darwin = tm_core::model::MemoryInfo {
+            total_bytes: 16 * gib,
+            used_bytes: 4 * gib,
+            available_bytes: 12 * gib,
+            ..Default::default()
+        };
+        assert!(!commit_reported(&darwin), "Committed and Commit limit");
+        assert!(
+            !pools_reported(&darwin),
+            "the Cached / Paged / Non-paged group"
+        );
+        assert!(!cached_reported(&darwin), "Cached");
+        assert!(!paged_pool_reported(&darwin), "Paged pool");
+        assert!(!non_paged_pool_reported(&darwin), "Non-paged pool");
+
+        // Windows: the same rows carry readings and are shown again.
+        let windows = tm_core::model::MemoryInfo {
+            commit_total_bytes: 20 * gib,
+            commit_used_bytes: 5 * gib,
+            cached_bytes: 2 * gib,
+            paged_pool_bytes: 300 * 1024 * 1024,
+            non_paged_pool_bytes: 100 * 1024 * 1024,
+            ..darwin.clone()
+        };
+        assert!(commit_reported(&windows), "Committed and Commit limit");
+        assert!(pools_reported(&windows));
+        assert!(cached_reported(&windows), "Cached");
+        assert!(paged_pool_reported(&windows), "Paged pool");
+        assert!(non_paged_pool_reported(&windows), "Non-paged pool");
+
+        // The gating is "0 = unreported" for exactly those five rows, not a
+        // rule that hides every zero: In use keeps stating a measured 0 B
+        // underneath a real total, and Total/Available have no gate at all.
+        let idle = tm_core::model::MemoryInfo {
+            used_bytes: 0,
+            ..darwin.clone()
+        };
+        assert!(!commit_reported(&idle));
+        assert!(!pools_reported(&idle));
+        assert_eq!(
+            memory_usage_text(&idle),
+            format!(
+                "{}/{} ({})",
+                format::format_bytes_loc(0),
+                format::format_bytes_loc(idle.total_bytes),
+                format::format_pct_hdr(0.0)
+            ),
+            "a zero on an ungated row is a number, not a missing reading"
+        );
+    }
+
     /// Regression: the memory card's sparkline plotted a measured-looking 0 %
     /// on a tick that reported no total — the card's text line had already
     /// given up and read "\u{2014}", so the graph below it contradicted it.
@@ -257,6 +318,33 @@ mod tests {
         idle.mem_total_bytes = 16 * gib;
         assert_eq!(pct_of(0, 16 * gib), Some(0.0));
         assert_eq!(memory_share_series(&[idle]), vec![Some(0.0)]);
+    }
+
+    /// Regression: the Committed chart built its series with `series(..)` and
+    /// `MultiSeries::new`, so a platform that reports no commit charge plotted
+    /// a measured-looking flat 0 GiB line with a "0 B" hover readout — under a
+    /// caption that reads "\u{2014}" for the same missing measurement. An
+    /// unreported limit is a gap; a reported one still plots its reading.
+    #[test]
+    fn the_committed_chart_gaps_an_unreported_commit_limit() {
+        let gib = 1024 * 1024 * 1024;
+        let mut measured = pt(1_000);
+        measured.commit_limit_bytes = 20 * gib;
+        measured.commit_used_bytes = 5 * gib;
+        let mut unmeasured = pt(2_000);
+        unmeasured.commit_limit_bytes = 0;
+        unmeasured.commit_used_bytes = 0;
+
+        assert_eq!(
+            commit_series(&[measured.clone(), unmeasured, measured.clone()]),
+            vec![Some(5.0), None, Some(5.0)],
+            "an unreported commit limit is a gap, not an idle 0 GiB charge"
+        );
+
+        // A reported limit with nothing committed stays a real 0 GiB sample.
+        let mut idle = pt(3_000);
+        idle.commit_limit_bytes = 20 * gib;
+        assert_eq!(commit_series(&[idle]), vec![Some(0.0)]);
     }
 
     /// The card series answers `Option` for every resource, so a tick without
@@ -1241,6 +1329,22 @@ fn pct_of(v: u64, total: u64) -> Option<f64> {
 fn memory_share_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
     gap_series(win, |point| {
         pct_of(point.mem_used_bytes, point.mem_total_bytes)
+    })
+}
+
+/// Commit charge history for the Committed chart, in GiB, `None` where that
+/// tick reported no commit limit.
+///
+/// Commit charge is a Windows figure: macOS leaves every commit field at 0 and
+/// a Linux kernel without `CommitLimit` reports none either, so 0 is
+/// "not reported" (see [`commit_reported`]). Plotted as a sample it drew a
+/// measured-looking flat line with a "0 B" hover readout under a caption that
+/// already reads "\u{2014}" for the same missing measurement (see
+/// [`bytes_or_dash`]). A tick without a limit is a gap; a reported limit with
+/// nothing committed stays a real 0 GiB reading.
+fn commit_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
+    gap_series(win, |h| {
+        (h.commit_limit_bytes > 0).then_some(h.commit_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0)
     })
 }
 
@@ -2709,6 +2813,37 @@ fn gpu_graph_dropdown_menu(
 
 // ---------------------------------------------------------------- Memory page
 
+/// Commit charge, cache and the pools are Windows figures: macOS leaves them
+/// all at 0 and a Linux kernel without `CommitLimit` reports no commit charge
+/// either, so 0 means "not reported", not "measured zero". A row gated on one
+/// of these predicates is dropped the way the pagefile row is dropped without
+/// swap, so the page never states a value nobody measured (see
+/// [`commit_series`] for the same rule on the Committed chart).
+///
+/// The other figures stay ungated: In use, Total and Available are readings on
+/// every platform, a measured zero included.
+fn commit_reported(m: &tm_core::model::MemoryInfo) -> bool {
+    m.commit_total_bytes > 0
+}
+
+fn cached_reported(m: &tm_core::model::MemoryInfo) -> bool {
+    m.cached_bytes > 0
+}
+
+fn paged_pool_reported(m: &tm_core::model::MemoryInfo) -> bool {
+    m.paged_pool_bytes > 0
+}
+
+fn non_paged_pool_reported(m: &tm_core::model::MemoryInfo) -> bool {
+    m.non_paged_pool_bytes > 0
+}
+
+/// Whether any pool/cache row exists at all, so the row group is skipped
+/// instead of laying out an empty `horizontal_top` strip.
+fn pools_reported(m: &tm_core::model::MemoryInfo) -> bool {
+    cached_reported(m) || paged_pool_reported(m) || non_paged_pool_reported(m)
+}
+
 fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let Some(snap) = app.latest_snapshot() else {
         return;
@@ -2756,9 +2891,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         &i18n::trf(K::CommittedWindow, &[&window_text]),
         &bytes_or_dash(snap.memory.commit_total_bytes),
     );
-    let commit: Vec<f64> = series(win, |h| {
-        h.commit_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0
-    });
+    let commit = commit_series(win);
     let commit_limit = snap.memory.commit_total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
     let committed_chart = page_chart(
         ui,
@@ -2766,7 +2899,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         i18n::tr(K::StatCommitted),
         width,
         120.0,
-        &[MultiSeries::new(
+        &[MultiSeries::with_gaps(
             i18n::tr(K::StatCommitted),
             commit,
             theme::toned(pal, pal.memory_graph, 0.62),
@@ -2787,13 +2920,6 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         |ui| {
             ui.vertical(|ui| {
                 let w = 170.0;
-                // Commit charge, cache and the pools are Windows figures:
-                // macOS leaves them all at 0, which means "not reported", not
-                // a measured zero. Such a row is dropped the way the pagefile
-                // row below is dropped without swap, so the page never states
-                // a value nobody measured.
-                let pools_reported =
-                    m.cached_bytes > 0 || m.paged_pool_bytes > 0 || m.non_paged_pool_bytes > 0;
                 big_stat(
                     ui,
                     pal,
@@ -2801,7 +2927,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     &format::format_bytes_loc(m.used_bytes),
                     w + 20.0,
                 );
-                if m.commit_total_bytes > 0 {
+                if commit_reported(m) {
                     big_stat(
                         ui,
                         pal,
@@ -2814,9 +2940,9 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                         w + 60.0,
                     );
                 }
-                if pools_reported {
+                if pools_reported(m) {
                     ui.horizontal_top(|ui| {
-                        if m.cached_bytes > 0 {
+                        if cached_reported(m) {
                             med_stat(
                                 ui,
                                 pal,
@@ -2825,7 +2951,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                                 w,
                             );
                         }
-                        if m.paged_pool_bytes > 0 {
+                        if paged_pool_reported(m) {
                             med_stat(
                                 ui,
                                 pal,
@@ -2834,7 +2960,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                                 w,
                             );
                         }
-                        if m.non_paged_pool_bytes > 0 {
+                        if non_paged_pool_reported(m) {
                             med_stat(
                                 ui,
                                 pal,
@@ -2861,7 +2987,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     i18n::tr(K::KvAvailable),
                     &format::format_bytes_loc(m.available_bytes),
                 );
-                if m.commit_total_bytes > 0 {
+                if commit_reported(m) {
                     kv_row(
                         ui,
                         pal,
