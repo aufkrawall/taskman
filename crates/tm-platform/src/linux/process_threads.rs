@@ -203,17 +203,19 @@ pub(super) fn list_process_threads(
             .and_then(|status| status.tgid)
             .is_some_and(|tgid| tgid != pid)
         {
+            // Positive evidence that this TID now names another task group:
+            // nothing read through this path may be attributed to our process.
             continue;
         }
-        let Some(after_status) = read_task_stat(pid, tid)? else {
-            continue;
-        };
-        if after_status.tid != stat.tid || after_status.start_ticks != stat.start_ticks {
-            // The TID was reused between /stat and /status. Neither record can
-            // be safely combined with the other, so omit this now-ambiguous
-            // observation.
-            continue;
-        }
+        // The second read exists only to prove that the status record belongs to
+        // the same generation as the stat. A changed or vanished generation
+        // therefore invalidates the status-derived counter alone: the first stat
+        // is one self-consistent record of this process' thread, so its own facts
+        // still stand instead of dropping the row from a list that has no way to
+        // say it is incomplete.
+        let revalidated = read_task_stat(pid, tid)?
+            .is_some_and(|after| after.tid == stat.tid && after.start_ticks == stat.start_ticks);
+        let status = if revalidated { status } else { None };
         let context_switches = status.and_then(TaskStatus::context_switches);
         let kernel_time_100ns = ticks_to_100ns(stat.kernel_ticks, clk_tck).ok_or_else(|| {
             TmError::platform(
