@@ -461,7 +461,7 @@ fn serve_activation(
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                match accept_outcome(listener.accept()) {
+                match accept_outcome(listener.accept().map(|(stream, _peer)| stream)) {
                     AcceptOutcome::Serve(stream) => {
                         accept_failure_reported = false;
                         serve_activation_connection(stream, &inbox, stop)
