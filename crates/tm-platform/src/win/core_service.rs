@@ -2145,13 +2145,17 @@ fn process_disk_sample() -> ProcessDiskSample {
 /// trace and spawns this while holding it, and this clears it while holding it
 /// — so there is exactly one watchdog per live session and never a second one
 /// racing it.
+///
+/// Returns whether the thread was started. A caller that keeps a session has to
+/// know: nothing else stops it, so a session whose watchdog could not be spawned
+/// would trace every read and write on the machine for the life of the process.
 fn spawn_trace_watchdog<T: Send + 'static>(
     thread_name: &'static str,
     slot: &'static std::sync::Mutex<Option<T>>,
     last_request: fn(&T) -> std::time::Instant,
     stopped_message: &'static str,
-) {
-    let _ = std::thread::Builder::new()
+) -> bool {
+    std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {
             loop {
@@ -2175,13 +2179,14 @@ fn spawn_trace_watchdog<T: Send + 'static>(
                 };
                 std::thread::sleep(wait);
             }
-        });
+        })
+        .is_ok()
 }
 
 /// Stop the disk trace once the GUI stops polling, exactly like the network
 /// one. Its own thread because the two traces idle out independently.
 fn spawn_disk_trace_watchdog() {
-    spawn_trace_watchdog(
+    let _ = spawn_trace_watchdog(
         "tm-disk-idle",
         disk_trace(),
         |trace| trace.last_request,
@@ -2192,7 +2197,7 @@ fn spawn_disk_trace_watchdog() {
 /// Stop the trace once the GUI stops polling. Without this the session would
 /// outlive the last interested window and trace forever.
 fn spawn_net_trace_watchdog() {
-    spawn_trace_watchdog(
+    let _ = spawn_trace_watchdog(
         "tm-net-idle",
         net_trace(),
         |trace| trace.last_request,
@@ -2263,13 +2268,34 @@ impl FileTraceHost {
 }
 
 /// Stop a host's trace once the GUI stops polling it.
-fn spawn_file_trace_watchdog(host: FileTraceHost) {
+fn spawn_file_trace_watchdog(host: FileTraceHost) -> bool {
     spawn_trace_watchdog(
         host.watchdog_thread(),
         host.slot(),
         |trace| trace.last_request,
         host.stopped_message(),
-    );
+    )
+}
+
+/// Put `session` in `slot` and start the watchdog that will stop it, or leave
+/// the slot empty again and report that it was not kept.
+///
+/// The rule exists because the spawn can fail and its result is the difference
+/// between a bounded session and one that traces every read and write on the
+/// machine until the process exits. It is also what makes the replacement path
+/// sound: a slot only ever holds a session whose watchdog is running, so
+/// swapping the session in place cannot leave it unobserved.
+fn keep_watched<T>(
+    slot: &mut Option<T>,
+    session: T,
+    spawn_watchdog: impl FnOnce() -> bool,
+) -> bool {
+    *slot = Some(session);
+    if spawn_watchdog() {
+        return true;
+    }
+    *slot = None;
+    false
 }
 
 /// Start a session for `role`, the one call both hosts make.
@@ -2335,7 +2361,8 @@ fn file_trace_sample(
         // in place so the slot's one watchdog keeps covering it, then report
         // from the replacement below — its state says "nothing delivered yet",
         // and a replacement that cannot be started keeps the dead session's,
-        // which says the source is gone.
+        // which says the source is gone. This is safe because a slot only ever
+        // holds a session whose watchdog is running; see [`keep_watched`].
         match host {
             FileTraceHost::Service => {
                 tracing::warn!("broker file trace ended unexpectedly; restarting it");
@@ -2356,11 +2383,27 @@ fn file_trace_sample(
     if slot.is_none() {
         match start(host.role()) {
             Some(usage) => {
-                *slot = Some(FileTrace {
-                    usage,
-                    last_request: std::time::Instant::now(),
-                });
-                spawn_file_trace_watchdog(host);
+                let kept = keep_watched(
+                    &mut slot,
+                    FileTrace {
+                        usage,
+                        last_request: std::time::Instant::now(),
+                    },
+                    || spawn_file_trace_watchdog(host),
+                );
+                if !kept {
+                    // Nothing would stop this session, and a Kernel-File
+                    // session left running traces the machine for the life of
+                    // the process. Report no source instead of a leak.
+                    tracing::error!(
+                        host = host.watchdog_thread(),
+                        "could not start the per-file I/O idle watchdog; the session was not kept"
+                    );
+                    return FileTraceAnswer {
+                        sample: None,
+                        start_refused: true,
+                    };
+                }
             }
             None => {
                 // LocalSystem should always be able to start a session; if it
@@ -5359,6 +5402,29 @@ mod tests {
             !std::ptr::eq(FileTraceHost::App.slot(), FileTraceHost::Service.slot()),
             "each host has its own slot, so neither can hand its session to the other"
         );
+    }
+
+    /// A session is kept only with the watchdog that will stop it.
+    ///
+    /// A spawn that fails used to be discarded, which left the session running
+    /// with nothing to idle it out — and made the replacement path assume a
+    /// watchdog that was never there. The rule is now part of the decision, and
+    /// a dropped session is reported as no source rather than kept as a leak.
+    #[test]
+    fn a_session_is_kept_only_with_the_watchdog_that_will_stop_it() {
+        let mut slot = None;
+        assert!(
+            keep_watched(&mut slot, 7u32, || true),
+            "a spawned watchdog keeps the session"
+        );
+        assert_eq!(slot, Some(7), "and the session is in the slot");
+
+        let mut slot = None;
+        assert!(
+            !keep_watched(&mut slot, 7u32, || false),
+            "a session no watchdog can stop must not be kept"
+        );
+        assert_eq!(slot, None, "the slot is left as it was found");
     }
 
     /// A failed start must be driven through the production entry: the window
