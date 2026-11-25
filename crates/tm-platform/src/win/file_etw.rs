@@ -19,17 +19,52 @@
 //!
 //! ## What is subscribed, and how it is decoded
 //!
-//! A normal real-time session ([`LoggerKind::ManifestBulk`], not a system
-//! logger: Kernel-File is a manifest provider) enables the provider with only
-//! the operation keywords that matter — `KERNEL_FILE_KEYWORD_CREATE` (0x80),
-//! `READ` (0x100), `WRITE` (0x200) and `FILEIO` (0x20), which is how Create
-//! itself is keyworded. Directory enumeration, flush and information-class
-//! events are therefore never delivered. Payloads are decoded by hand, at
-//! offsets taken from the provider's manifest templates — `wevtutil gp
-//! Microsoft-Windows-Kernel-File /ge:true` lists the ids and tasks, and
-//! PowerShell's `[System.Diagnostics.Eventing.Reader.ProviderMetadata]` prints
-//! each version's fields; there is no TDH decoding path in this crate, and one
-//! event family does not justify adding one.
+//! The events come from the KERNEL's file I/O hooks, which are classic (MOF)
+//! events and are delivered only to a system logger whose `EnableFlags` ask for
+//! `EVENT_TRACE_FLAG_FILE_IO` — [`LoggerKind::SystemFile`], and no provider to
+//! enable. `Microsoft-Windows-Kernel-File` also has a manifest GUID, and
+//! enabling THAT on an ordinary manifest session was what this module used to
+//! do: `EnableTraceEx2` returns success, the session starts, `events_lost`
+//! stays at zero, and not one record ever arrives, because a manifest provider
+//! enable does not turn on the kernel's per-file logging at all. A live
+//! elevated selfcheck reported exactly that (`undelivered`, `events_lost` 0).
+//!
+//! Records therefore arrive the way every classic kernel record does, and are
+//! identified that way: the MOF class GUID in `EventHeader.ProviderId`
+//! ([`FileIoGuid`]) and the operation in `EventHeader.EventDescriptor.Opcode`.
+//! Those opcodes are the numbers the provider's manifest lists as event ids
+//! (`Create` 12, `Cleanup` 13, `Close` 14, `Read` 15, `Write` 16 — the same
+//! kernel hooks, so the id-to-operation mapping is unchanged). Every other
+//! operation is ignored, but the flag cannot select a subset the way keywords
+//! could: directory enumeration, flush, information classes and deletes are
+//! delivered too and discarded in the callback, which is why this session gets
+//! the largest buffer set in [`super::etw`].
+//!
+//! The flag rides its own system logger rather than the single global "NT
+//! Kernel Logger" or the disk session's: Windows multiplexes the
+//! SystemTraceProvider over up to eight logger sessions and reserves only the
+//! first two for the NT Kernel Logger and the Circular Kernel Context Logger
+//! (SystemTraceProvider session documentation), so the disk, loader, profile
+//! and file traces each host one of the remaining slots without taking the
+//! global one from anything else on the machine. One session per feature is
+//! also what lets this trace live exactly as long as the I/O page needs it:
+//! adding the flag to the disk session would trace every file on the machine
+//! for as long as the Performance page samples disks. `EVENT_TRACE_FLAG_FILE_IO`
+//! is the legacy flag of a group the System IO provider also exposes as
+//! `SYSTEM_IO_KW_FILE` (System Providers documentation), so the same events
+//! could be requested through `EnableTraceEx2`; the flag is used because it is
+//! the shape the loader and profile traces already start with, and because it
+//! cannot half-succeed the way a provider enable accepted-then-ignored did.
+//!
+//! Payloads are decoded by hand, at offsets taken from the provider's manifest
+//! templates — `wevtutil gp Microsoft-Windows-Kernel-File /ge:true` lists the
+//! ids and tasks, and PowerShell's
+//! `[System.Diagnostics.Eventing.Reader.ProviderMetadata]` prints each
+//! version's fields; there is no TDH decoding path in this crate, and one event
+//! family does not justify adding one. The classic payload is the same one the
+//! manifest templates describe: `Microsoft-Windows-Kernel-Disk` has no tasks
+//! and lists its events as values 10 and 11, matching the classic `DiskIo`
+//! opcodes `super::disk_etw` decodes.
 //!
 //! | id | event | v1 layout (after `ByteOffset` for the transfers) |
 //! | --- | --- | --- |
@@ -102,14 +137,22 @@
 //! ## What is verified here, and what is not
 //!
 //! The ids, versions and field offsets above were read from the installed
-//! provider manifest, and the decode/accounting path is covered by tests with
-//! synthetic records. What has NOT been exercised is a live elevated session:
-//! whether the provider accepts this keyword mask on a manifest logger, whether
-//! names really arrive as device paths, and whether ETW delivers every record
-//! at machine rates. A run that delivers nothing reports
-//! [`FileIoAccountingState::Undelivered`] and a run that delivers records this
-//! decoder rejects reports [`FileIoAccountingState::Undecodable`], so a broken
-//! subscription shows up as a state rather than as zeros.
+//! provider manifest; the subscription is the one the other kernel traces
+//! already use for classic records ([`super::module_etw`] receives the
+//! `ImageLoad` class through `EnableFlags` on a system logger, decoded live on
+//! 2026-10-26), and the decode/accounting path is covered by tests with
+//! synthetic records, including a record driven through the real callback under
+//! the classic identity.
+//!
+//! What a synthetic record cannot prove is that the kernel accepts this session
+//! shape on a given build, that names really arrive as device paths, and that
+//! ETW delivers every record at machine rates. A run that delivers nothing
+//! reports [`FileIoAccountingState::Undelivered`] and a run that delivers
+//! records this decoder rejects reports
+//! [`FileIoAccountingState::Undecodable`] with the rejected opcode, version and
+//! payload length logged, so a broken subscription shows up as a state rather
+//! than as zeros. `--selfcheck` reports that state headlessly (see
+//! `llm-wiki/debug-tools.md`).
 //!
 //! ## What this module publishes
 //!
@@ -126,30 +169,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
-use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
-use windows::core::{GUID, PCWSTR};
+use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, FileIoGuid};
+use windows::core::PCWSTR;
 
-use super::etw::{self, LoggerKind, Provider, Session, TraceContext, TraceRole};
+use super::etw::{self, LoggerKind, Session, TraceContext, TraceRole};
 use crate::actions::FileIoAccountingState;
 
-/// `Microsoft-Windows-Kernel-File`.
-const KERNEL_FILE_GUID: GUID = GUID::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289);
+/// The session shape this module needs; see the module docs.
+///
+/// Named so a test can pin the wiring: the kind is the subscription, and the
+/// manifest kind this module used before delivers nothing at all.
+pub(super) const LOGGER_KIND: LoggerKind = LoggerKind::SystemFile;
 
-/// Event ids of the five operations this module reads. The ids are the
-/// provider's task ids; every other task (directory enumeration, flush,
-/// information classes, ...) is ignored.
+/// Opcodes of the five operations this module reads, in the classic `FileIo`
+/// class. They are the provider's task values too, which is why the manifest
+/// and classic generations agree on them; every other opcode (name create,
+/// directory enumeration, flush, information classes, deletes, ...) is ignored.
 const EVENT_CREATE: u16 = 12;
 const EVENT_CLEANUP: u16 = 13;
 const EVENT_CLOSE: u16 = 14;
 const EVENT_READ: u16 = 15;
 const EVENT_WRITE: u16 = 16;
-
-/// `KERNEL_FILE_KEYWORD_CREATE | READ | WRITE | FILEIO`.
-///
-/// The Create event is keyworded with CREATE and FILEIO, the transfers with
-/// their own bit plus FILEIO, and both Close events with FILEIO alone, so this
-/// mask delivers exactly the five families above and nothing else.
-const KEYWORDS: u64 = 0x20 | 0x80 | 0x100 | 0x200;
 
 /// A single request bigger than this did not come from this payload layout.
 /// Windows splits I/O long before a gigabyte, so anything above it is a read
@@ -925,13 +965,11 @@ impl FileEtw {
         });
         let session = Session::start(
             session_name(role),
-            // A normal manifest session: Kernel-File is a manifest provider,
-            // not one of the kernel-flag providers a system logger carries.
-            LoggerKind::ManifestBulk,
-            &[Provider {
-                guid: KERNEL_FILE_GUID,
-                match_any_keyword: KEYWORDS,
-            }],
+            // No provider to enable: the kernel's file flag IS the
+            // subscription, and the manifest GUID's enable call is the one
+            // that delivered nothing. See the module docs.
+            LOGGER_KIND,
+            &[],
             shared,
             on_event,
             "tm-file-etw",
@@ -1030,7 +1068,13 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let Some(shared) = (unsafe { etw::context_of::<Shared>(record) }) else {
         return;
     };
-    let event_id = record.EventHeader.EventDescriptor.Id;
+    // Classic (MOF) identity: the class GUID in `ProviderId`, the operation in
+    // the opcode. The kernel fills in no manifest event id for these records,
+    // so matching on one discarded every file event that did arrive.
+    if record.EventHeader.ProviderId != FileIoGuid {
+        return;
+    }
+    let event_id = u16::from(record.EventHeader.EventDescriptor.Opcode);
     if !matches!(
         event_id,
         EVENT_CREATE | EVENT_CLEANUP | EVENT_CLOSE | EVENT_READ | EVENT_WRITE
@@ -1135,6 +1179,41 @@ mod tests {
         handle_payload(shared, pid, event_id, 1, payload);
     }
 
+    /// Drive the REAL callback with a synthetic record of `provider`'s classic
+    /// class, the way the kernel logger hands one over: the class GUID in
+    /// `ProviderId`, the operation in the opcode, and no manifest event id.
+    fn deliver_kernel_record_as(
+        shared: &Shared,
+        provider: windows::core::GUID,
+        opcode: u16,
+        version: u8,
+        pid: u32,
+        payload: &[u8],
+    ) {
+        assert!(u8::try_from(opcode).is_ok(), "opcodes are one byte");
+        // SAFETY: `EVENT_RECORD` is plain data, and a zeroed one is a record
+        // with no payload, no context and an all-zero descriptor — every field
+        // this test cares about is set below.
+        let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventHeader.ProviderId = provider;
+        record.EventHeader.EventDescriptor.Opcode = opcode as u8;
+        record.EventHeader.EventDescriptor.Version = version;
+        // Deliberately zero: the classic identity carries no event id, and
+        // matching on one is what discarded every record that did arrive.
+        record.EventHeader.EventDescriptor.Id = 0;
+        record.EventHeader.ProcessId = pid;
+        record.UserData = payload.as_ptr() as *mut core::ffi::c_void;
+        record.UserDataLength = payload.len() as u16;
+        record.UserContext = shared as *const Shared as *mut core::ffi::c_void;
+        // SAFETY: both pointers stay alive across the call and the callback
+        // copies nothing out of them.
+        unsafe { on_event(&mut record) };
+    }
+
+    fn deliver_kernel_record(shared: &Shared, opcode: u16, version: u8, pid: u32, payload: &[u8]) {
+        deliver_kernel_record_as(shared, FileIoGuid, opcode, version, pid, payload);
+    }
+
     fn sample_of(shared: &Shared, pid: u32) -> FileIoSample {
         let state = shared.state.lock().unwrap();
         let files = state.pids.get(&pid);
@@ -1169,6 +1248,132 @@ mod tests {
             .iter()
             .find(|(candidate, _)| candidate == path)
             .map(|(_, bytes)| *bytes)
+    }
+
+    /// The kernel delivers per-file events under the classic `FileIo` class, so
+    /// that is what the callback has to accept: the class GUID plus one of the
+    /// five opcodes, decoded with the manifest's fields.
+    #[test]
+    fn a_kernel_file_io_record_decodes_from_the_classic_identity() {
+        let shared = shared();
+        deliver_kernel_record(
+            &shared,
+            EVENT_CREATE,
+            1,
+            20,
+            &create_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, r"\??\C:\data\a.bin"),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_READ,
+            1,
+            20,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 4_096),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_WRITE,
+            1,
+            20,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 512),
+        );
+        let sample = sample_of(&shared, 20);
+        assert_eq!(sample.events_seen, 3);
+        assert_eq!(sample.events_decoded, 3);
+        assert_eq!(
+            bytes(&sample, r"C:\data\a.bin"),
+            Some(FileBytes {
+                read_bytes: 4_096,
+                write_bytes: 512,
+            })
+        );
+        // Close forgets the object, so a later transfer through it is unnamed
+        // rather than charged to the file that had the address.
+        deliver_kernel_record(
+            &shared,
+            EVENT_CLOSE,
+            1,
+            20,
+            &close_payload(KERNEL_FILE_POINTER_BYTES, 0x1000),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_READ,
+            1,
+            20,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 128),
+        );
+        let sample = sample_of(&shared, 20);
+        assert_eq!(
+            bytes(&sample, r"C:\data\a.bin"),
+            Some(FileBytes {
+                read_bytes: 4_096,
+                write_bytes: 512,
+            })
+        );
+        assert_eq!(
+            sample.unnamed,
+            Remainder {
+                read_bytes: 128,
+                write_bytes: 0,
+            }
+        );
+    }
+
+    /// The defect this replaces: a live elevated session reported `undelivered`
+    /// with `events_lost` at zero because no record ever arrived. Once one does,
+    /// the state must move on — and only a decoded read or write may make it
+    /// `measured`, never a Create.
+    #[test]
+    fn a_delivered_kernel_record_is_no_longer_undelivered() {
+        let shared = shared();
+        assert_eq!(
+            sample_of(&shared, 20).state(),
+            FileIoAccountingState::Undelivered
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_CREATE,
+            1,
+            20,
+            &create_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, r"\??\C:\data\a.bin"),
+        );
+        assert_eq!(
+            sample_of(&shared, 20).state(),
+            FileIoAccountingState::Undelivered,
+            "a Create names the file but carries no bytes"
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_READ,
+            1,
+            20,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 4_096),
+        );
+        let sample = sample_of(&shared, 20);
+        assert_eq!(sample.state(), FileIoAccountingState::Measured);
+        assert_eq!(sample.pid_read_transfers, 1);
+
+        // A record from another class sharing the session is not a file event:
+        // it must leave every counter alone instead of making the state
+        // `undecodable` or inflating the byte counts.
+        deliver_kernel_record_as(
+            &shared,
+            windows::Win32::System::Diagnostics::Etw::ThreadGuid,
+            EVENT_READ,
+            1,
+            20,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 8_192),
+        );
+        assert_eq!(sample_of(&shared, 20), sample);
+    }
+
+    /// The session kind is the subscription: a manifest session delivers no
+    /// `FileIo` record however it is enabled, which is how the trace ran for a
+    /// day and reported nothing.
+    #[test]
+    fn the_file_session_uses_the_kernel_file_io_logger() {
+        assert_eq!(LOGGER_KIND, LoggerKind::SystemFile);
     }
 
     /// A read-only handle reports bytes in Read and none in Write, and the

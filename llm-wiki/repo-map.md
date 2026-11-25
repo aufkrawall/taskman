@@ -119,8 +119,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     through a thread map seeded from ToolHelp and maintained by the
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
-    `file_etw.rs` (per-file read/written bytes from
-    `Microsoft-Windows-Kernel-File`: Create correlates a `FileObject` with its
+    `file_etw.rs` (per-file read/written bytes from the kernel's file I/O
+    hooks: the session is a system logger carrying
+    `EVENT_TRACE_FLAG_FILE_IO`, and the records are classic `FileIo` ones —
+    class GUID in `ProviderId`, operation in the opcode 12–16 — because a
+    manifest `EnableTraceEx2` for `Microsoft-Windows-Kernel-File` is accepted
+    and delivers nothing; Create correlates a `FileObject` with its
     name, Read/Write add `IOSize` to that (pid, path) pair, both template
     versions are decoded at native pointer width, device paths are translated
     to the DOS paths the handle walk reports, the open-file map and both the

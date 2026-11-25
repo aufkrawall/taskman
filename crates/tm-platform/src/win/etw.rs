@@ -29,11 +29,11 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG,
-    EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD,
-    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-    EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
-    WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_FLAG_PROFILE,
+    EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -154,12 +154,6 @@ pub(crate) struct Provider {
 pub(crate) enum LoggerKind {
     /// An ordinary session for manifest providers.
     Manifest,
-    /// An ordinary session for a manifest provider with a much higher event
-    /// rate than the rest. `Microsoft-Windows-Kernel-File` reports every read
-    /// and write on the machine, which fills the 64 KiB default buffer set in
-    /// tens of milliseconds under a build and loses events by the thousand, so
-    /// this kind asks for larger buffers (and more of them) instead.
-    ManifestBulk,
     /// A system logger, the only kind that can carry the kernel's own
     /// providers (`SystemIoProviderGuid` and friends). Their events arrive as
     /// classic MOF records — identified by the MOF class GUID in
@@ -174,6 +168,18 @@ pub(crate) enum LoggerKind {
     /// can emit around one sample per logical processor per millisecond, so
     /// it gets larger buffers than the sparse disk/thread session.
     SystemProfile,
+    /// A system logger carrying the kernel's file I/O flag: the only way the
+    /// per-file provider (`FileIoGuid`) is delivered.
+    ///
+    /// `Microsoft-Windows-Kernel-File` also has a manifest GUID of its own,
+    /// and enabling THAT on an ordinary manifest session — which is what the
+    /// file trace used to do — is accepted by `EnableTraceEx2` and then
+    /// delivers not one record: the kernel's per-file hooks are classic (MOF)
+    /// events, and a logger only emits them when its `EnableFlags` request
+    /// `EVENT_TRACE_FLAG_FILE_IO`. The flag, not a provider call, is the
+    /// subscription. Like the loader and profile kinds this is the highest-rate
+    /// stream in the program, so it asks for the larger buffer set.
+    SystemFile,
 }
 
 /// State shared between an ETW callback thread and the sampler.
@@ -461,23 +467,27 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         (*properties).Wnode.ClientContext = 1;
         (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE
             | match kind {
-                LoggerKind::Manifest | LoggerKind::ManifestBulk => 0,
+                LoggerKind::Manifest => 0,
                 // The only way to subscribe to the kernel's own providers
                 // without taking over the single global "NT Kernel Logger".
-                LoggerKind::System | LoggerKind::SystemLoader | LoggerKind::SystemProfile => {
-                    EVENT_TRACE_SYSTEM_LOGGER_MODE
-                }
+                // Windows allows several such sessions, which is why the disk,
+                // loader, profile and file traces can each host their own.
+                LoggerKind::System
+                | LoggerKind::SystemLoader
+                | LoggerKind::SystemProfile
+                | LoggerKind::SystemFile => EVENT_TRACE_SYSTEM_LOGGER_MODE,
             };
         // EnableTraceEx2 can enable these providers after the session starts,
         // but the initial DCStart rundown is emitted while StartTrace creates
         // the logger. Request the corresponding legacy flags up front so a
         // loader/sample session reliably receives that initial state.
+        // `SystemFile` has no EnableTraceEx2 equivalent at all: the kernel's
+        // per-file hooks are classic events selected by this flag.
         (*properties).EnableFlags = match kind {
-            LoggerKind::Manifest | LoggerKind::ManifestBulk | LoggerKind::System => {
-                EVENT_TRACE_FLAG::default()
-            }
+            LoggerKind::Manifest | LoggerKind::System => EVENT_TRACE_FLAG::default(),
             LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
             LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
+            LoggerKind::SystemFile => EVENT_TRACE_FLAG_FILE_IO,
         };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
@@ -486,7 +496,7 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         // higher event rates, so they ask for a larger set.
         let (buffer_kb, minimum, maximum) = match kind {
             LoggerKind::Manifest | LoggerKind::System => (64, 4, 16),
-            LoggerKind::ManifestBulk | LoggerKind::SystemLoader | LoggerKind::SystemProfile => {
+            LoggerKind::SystemLoader | LoggerKind::SystemProfile | LoggerKind::SystemFile => {
                 (256, 8, 32)
             }
         };
@@ -644,20 +654,52 @@ mod tests {
         }
     }
 
-    /// The file trace is the highest-rate provider this program subscribes
-    /// to, but it is still an ordinary manifest session: taking the system
-    /// logger mode for it would be wrong, and the small default buffer set
-    /// loses events.
+    /// The kernel's per-file provider is delivered by this flag and by nothing
+    /// else: an `EnableTraceEx2` for its manifest GUID returns success on any
+    /// other session shape and then delivers no record at all, which is exactly
+    /// how the file trace reported `undelivered` with `events_lost` at zero on
+    /// a live elevated run.
     #[test]
-    fn a_bulk_manifest_logger_stays_a_manifest_logger_with_bigger_buffers() {
+    fn the_file_logger_carries_the_kernel_file_io_flag() {
         let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
-        let buffer = properties_buffer(&name, LoggerKind::ManifestBulk);
+        let buffer = properties_buffer(&name, LoggerKind::SystemFile);
         let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
         unsafe {
-            assert_eq!((*properties).LogFileMode, EVENT_TRACE_REAL_TIME_MODE);
-            assert_eq!((*properties).EnableFlags, EVENT_TRACE_FLAG::default());
+            assert_eq!(
+                (*properties).LogFileMode,
+                EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
+            );
+            assert_eq!((*properties).EnableFlags, EVENT_TRACE_FLAG_FILE_IO);
+            assert!(
+                (*properties).EnableFlags.contains(EVENT_TRACE_FLAG_FILE_IO),
+                "the flag is the subscription"
+            );
+            // Every read and write on the machine, and the family is wider
+            // than the five ids the decoder keeps.
             assert_eq!((*properties).BufferSize, 256);
             assert!((*properties).MaximumBuffers >= 32);
+        }
+    }
+
+    /// The disk session must keep exactly the flags it had: adding the file
+    /// flag to it would multiply its event rate and change what its windows
+    /// measure. The file trace is a session of its own.
+    #[test]
+    fn the_other_system_loggers_do_not_ask_for_file_io() {
+        for kind in [
+            LoggerKind::System,
+            LoggerKind::SystemLoader,
+            LoggerKind::SystemProfile,
+        ] {
+            let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
+            let buffer = properties_buffer(&name, kind);
+            let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+            unsafe {
+                assert!(
+                    !(*properties).EnableFlags.contains(EVENT_TRACE_FLAG_FILE_IO),
+                    "{kind:?} must not subscribe to per-file events"
+                );
+            }
         }
     }
 

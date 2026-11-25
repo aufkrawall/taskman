@@ -769,3 +769,14 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   issuing thread. The events come from `SystemIoProviderGuid` on a
   system-logger session instead (Windows 10 2004+). On older builds the
   session cannot start and the column reports "—".
+- The per-file trace's shape (a system logger carrying
+  `EVENT_TRACE_FLAG_FILE_IO`, decoding classic `FileIo` records) is what the
+  documentation and the sibling kernel traces support, but it has not been
+  proven on live kernel events in this tree: the elevated `--selfcheck` only
+  showed the *previous* manifest session delivering nothing. `file_etw::tests`
+  pins the decode and the flag, and `--selfcheck`'s `file_io.state` is the
+  proof — `measured` after a run that touched files means the flag delivered
+  records. If a live run still reports `undelivered` with the session running,
+  the equivalent subscription to try next is `SystemIoProviderGuid` with
+  `SYSTEM_IO_KW_FILE` (the documented keyword for the same legacy group), which
+  needs no other change to the decode path.

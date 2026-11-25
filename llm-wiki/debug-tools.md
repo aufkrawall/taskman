@@ -61,9 +61,13 @@ session's `events_lost`, `unnamed_creates`, `dropped_paths` and
 `cleared_file_objects`. `unavailable` on an unelevated run is the expected answer
 — a `Microsoft-Windows-Kernel-File` session needs administrator rights or the
 installed service — while `undelivered`/`undecodable` mean a session started and
-delivered nothing usable. `null` means the question could not be asked (no
-verified process identity, or `--mock`), and an unqueried `events_lost` stays
-`null` instead of a zero.
+delivered nothing usable. The two are worth telling apart: the session is a
+system logger carrying `EVENT_TRACE_FLAG_FILE_IO`, so `undelivered` means the
+kernel accepted the session and delivered no `FileIo` record at all, while
+`undecodable` means records arrived and the payload layout did not match (the
+logged opcode, version and payload length say which). `null` means the question
+could not be asked (no verified process identity, or `--mock`), and an unqueried
+`events_lost` stays `null` instead of a zero.
 
 Three ignored ETW diagnostics validate real Windows payloads rather than only
 synthetic records: `disk_trace_attributes_real_requests_to_the_issuing_process`,
