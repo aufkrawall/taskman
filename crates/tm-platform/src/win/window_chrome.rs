@@ -110,11 +110,13 @@ pub fn apply(hwnd: isize, look: TitleBar) {
 static STRICT_TOPMOST_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static STRICT_TOPMOST_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-/// The installed hooks, so they can be taken back down again.
+/// The installed hooks, so they can be taken back down again and so an event
+/// whose install failed is retried without disturbing the one that worked.
 ///
-/// Stored as raw pointer values: `HWINEVENTHOOK` is not `Send`, and these are
-/// only ever touched from the UI thread that installed them.
-static STRICT_TOPMOST_HOOKS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+/// Stored as `(event, raw pointer value)`: `HWINEVENTHOOK` is not `Send`, and
+/// these are only ever touched from the UI thread that installed them.
+static STRICT_TOPMOST_HOOKS: std::sync::Mutex<Vec<(u32, isize)>> =
+    std::sync::Mutex::new(Vec::new());
 
 const OBJID_WINDOW_I32: i32 = 0;
 
@@ -173,7 +175,7 @@ fn remove_strict_topmost_hooks() {
         Ok(hooks) => hooks,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for raw in hooks.drain(..) {
+    for (_, raw) in hooks.drain(..) {
         unsafe {
             let _ = UnhookWinEvent(HWINEVENTHOOK(raw as *mut std::ffi::c_void));
         }
@@ -195,17 +197,20 @@ fn install_strict_topmost_hooks() {
         Ok(hooks) => hooks,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if !hooks.is_empty() {
-        return;
-    }
     let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
     for event in [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_SHOW] {
+        // Each event is installed or retried on its own. Returning early as
+        // soon as one hook existed would turn a first success plus a second
+        // failure into a session that never handles the missing event again.
+        if hooks.iter().any(|(installed, _)| *installed == event) {
+            continue;
+        }
         let hook =
             unsafe { SetWinEventHook(event, event, None, Some(strict_topmost_event), 0, 0, flags) };
         if hook.is_invalid() {
             tracing::warn!(event, "cannot install strict-topmost WinEvent hook");
         } else {
-            hooks.push(hook.0 as isize);
+            hooks.push((event, hook.0 as isize));
         }
     }
 }
