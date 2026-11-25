@@ -219,6 +219,58 @@ mod tests {
         );
     }
 
+    /// Regression: the memory card's sparkline plotted a measured-looking 0 %
+    /// on a tick that reported no total — the card's text line had already
+    /// given up and read "\u{2014}", so the graph below it contradicted it.
+    /// A share is derived from a total; without one there is no sample.
+    #[test]
+    fn the_memory_card_sparkline_gaps_an_unreported_total() {
+        let gib = 1024 * 1024 * 1024;
+        let mut measured = pt(1_000);
+        measured.mem_total_bytes = 16 * gib;
+        measured.mem_used_bytes = 4 * gib;
+        let mut unmeasured = pt(2_000);
+        unmeasured.mem_total_bytes = 0;
+        unmeasured.mem_used_bytes = 0;
+
+        assert_eq!(
+            memory_share_series(&[measured.clone(), unmeasured, measured.clone()]),
+            vec![Some(25.0), None, Some(25.0)],
+            "an unreported total is a gap, not an idle 0 %"
+        );
+
+        // A measured total with nothing used stays a real 0 % reading.
+        let mut idle = pt(3_000);
+        idle.mem_total_bytes = 16 * gib;
+        assert_eq!(pct_of(0, 16 * gib), Some(0.0));
+        assert_eq!(memory_share_series(&[idle]), vec![Some(0.0)]);
+    }
+
+    /// The card series answers `Option` for every resource, so a tick without
+    /// a GPU measurement is a gap here too — not `Some(NaN)` that each painter
+    /// has to remember to filter.
+    #[test]
+    fn the_gpu_card_sparkline_states_a_missing_sample_as_a_gap() {
+        let mut blind = pt(1_000);
+        blind.gpus = vec![crate::app::GpuHistoryPoint {
+            id: 0,
+            util_pct_available: false,
+            ..Default::default()
+        }];
+        let mut measured = pt(2_000);
+        measured.gpus = vec![crate::app::GpuHistoryPoint {
+            id: 0,
+            util_pct_available: true,
+            util_pct: 42.0,
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            gpu_util_series(&[blind, measured, pt(3_000)], "0"),
+            vec![None, Some(42.0), None]
+        );
+    }
+
     /// Regression: the series extractors used to SKIP window points without
     /// the requested device (and net_series even dropped zero-traffic
     /// samples). The shortened series then desynchronized from the shared
@@ -912,18 +964,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         .iter()
                         .map(|e| match e.kind {
                             ResourceKind::Cpu => cpu_total_series(win),
-                            ResourceKind::Memory => {
-                                series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
-                                    .into_iter()
-                                    .map(Some)
-                                    .collect()
-                            }
+                            ResourceKind::Memory => memory_share_series(win),
                             ResourceKind::Disk => disk_activity_series(win, &e.key),
                             ResourceKind::Network => net_series(win, &e.key, 1),
-                            ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util)
-                                .into_iter()
-                                .map(Some)
-                                .collect(),
+                            ResourceKind::Gpu => gpu_util_series(win, &e.key),
                         })
                         .collect();
                     for (index, (e, samples)) in entries.iter().zip(card_series.iter()).enumerate()
@@ -1165,12 +1209,40 @@ fn card_ui(
     );
 }
 
-fn pct_of(v: u64, total: u64) -> f64 {
+/// Share of `total` that `v` is, in percent, or `None` when no total was
+/// reported.
+///
+/// A share is a derived reading: without a total there is no percentage, only
+/// the one a division guard invents. `Some(0.0)` here plotted a calm,
+/// measured-looking 0 % on the card whose text line had already read "\u{2014}".
+fn pct_of(v: u64, total: u64) -> Option<f64> {
     if total == 0 {
-        0.0
+        None
     } else {
-        v as f64 / total as f64 * 100.0
+        Some(v as f64 / total as f64 * 100.0)
     }
+}
+
+/// Memory share history for the card sparkline, `None` where that tick reported
+/// no total (see [`pct_of`]).
+fn memory_share_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
+    gap_series(win, |point| {
+        pct_of(point.mem_used_bytes, point.mem_total_bytes)
+    })
+}
+
+/// Utilization history of one adapter for the card sparkline, `None` where the
+/// tick had no measurement.
+///
+/// [`gpu_series`] answers `NaN` for those ticks because the GPU page's callers
+/// test `is_finite`; the card contract is the `Option` shape every other card
+/// series uses, so a missing sample is stated once rather than as a sentinel
+/// each painter has to remember to filter.
+fn gpu_util_series(win: &[HistoryPoint], key: &str) -> Vec<Option<f64>> {
+    gpu_series(win, key, GpuField::Util)
+        .into_iter()
+        .map(|value| value.is_finite().then_some(value))
+        .collect()
 }
 
 fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
