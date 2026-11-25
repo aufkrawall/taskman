@@ -42,7 +42,7 @@ pub mod capture;
 #[cfg(feature = "winit")]
 pub mod winit;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use epaint::mutex::RwLock;
 
@@ -67,6 +67,12 @@ pub enum WgpuError {
     #[cfg(feature = "winit")]
     #[error(transparent)]
     HandleError(#[from] ::winit::raw_window_handle::HandleError),
+
+    #[error("No render state: call `Painter::set_window` before painting")]
+    NoRenderState,
+
+    #[error("No surface for this viewport: call `Painter::set_window` before painting")]
+    NoSurface,
 }
 
 /// Runtime-mutable subset of [`WgpuConfiguration`].
@@ -130,10 +136,36 @@ pub struct RenderState {
     pub queue: wgpu::Queue,
 
     /// The target texture format used for presenting to the window.
+    ///
+    /// The renderer bakes this into its pipelines when it is created, so it is only meaningful
+    /// while the renderer slot below is still empty: change it before the first
+    /// [`Self::ensure_renderer`] call, as `egui_kittest`'s explicit-format helper does.
+    /// Changing it afterwards makes the pipelines render for a format the surface does not
+    /// present, because the renderer is not rebuilt.
     pub target_format: wgpu::TextureFormat,
 
-    /// Egui renderer responsible for drawing the UI.
-    pub renderer: Arc<RwLock<Renderer>>,
+    /// Egui renderer responsible for drawing the UI, once its pipelines exist.
+    ///
+    /// Empty until [`Self::ensure_renderer`] compiles them (directly, or through
+    /// `Painter::ensure_renderer` on the winit path). Device creation has to happen before a
+    /// window can present anything; pipeline compilation does not, so it is kept out of the
+    /// path that ends in the window becoming visible.
+    ///
+    /// First call wins: the slot holds whichever renderer was created first, with the
+    /// [`RendererOptions`] and `target_format` of that call, and later calls return it
+    /// unchanged. Nothing can rebuild the renderer in place — a different
+    /// [`RendererOptions`] needs a new [`RenderState`], and the same goes for a different
+    /// `target_format`. A mismatch is not silent on the winit path:
+    /// `Painter::ensure_renderer` asserts it in debug builds and
+    /// [`Renderer::was_created_with`] answers it in release builds.
+    ///
+    /// The slot is shared with every clone rather than copied, because eframe hands a clone to
+    /// `CreationContext` (and to `Frame`) before the first paint: a long-lived clone has to see
+    /// the renderer that is built later, or the documented `PaintCallback` /
+    /// `callback_resources` path would silently do nothing. That sharing also means a clone
+    /// held by the application keeps whatever renderer exists alive, exactly as it already
+    /// keeps the device alive.
+    renderer: Arc<OnceLock<Arc<RwLock<Renderer>>>>,
 
     /// Runtime-mutable subset of the wgpu configuration.
     ///
@@ -204,6 +236,11 @@ async fn request_adapter(
 impl RenderState {
     /// Creates a new [`RenderState`], containing everything needed for drawing egui with wgpu.
     ///
+    /// The renderer (and with it the pipelines) is created right away, which is what callers
+    /// that own their own frame loop want. The winit `Painter` uses
+    /// [`Self::create_without_renderer`] instead: a window should appear before the driver
+    /// compiles its pipelines.
+    ///
     /// # Errors
     /// Wgpu initialization may fail due to incompatible hardware or driver for a given config.
     pub async fn create(
@@ -211,6 +248,28 @@ impl RenderState {
         instance: &wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'static>>,
         options: RendererOptions,
+    ) -> Result<Self, WgpuError> {
+        let render_state =
+            Self::create_without_renderer(config, instance, compatible_surface).await?;
+        // Eager by contract: the pipelines exist before this returns, and the lock is not
+        // needed here.
+        let _renderer = render_state.ensure_renderer(options);
+        Ok(render_state)
+    }
+
+    /// Like [`Self::create`], but leaves the renderer unset.
+    ///
+    /// The instance, adapter, device, queue and target format are decided here; the pipelines
+    /// are compiled on demand via [`Self::ensure_renderer`]. Callers that must present
+    /// something before anything has been drawn — a window's first frames — can therefore
+    /// keep pipeline compilation out of that window's reveal path.
+    ///
+    /// # Errors
+    /// Wgpu initialization may fail due to incompatible hardware or driver for a given config.
+    pub async fn create_without_renderer(
+        config: &WgpuConfiguration,
+        instance: &wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'static>>,
     ) -> Result<Self, WgpuError> {
         profiling::scope!("RenderState::create"); // async yield give bad names using `profile_function`
 
@@ -282,8 +341,6 @@ impl RenderState {
         };
         let target_format = crate::preferred_framebuffer_format(&surface_formats)?;
 
-        let renderer = Renderer::new(&device, target_format, options);
-
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.
         #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
@@ -295,9 +352,56 @@ impl RenderState {
             device,
             queue,
             target_format,
-            renderer: Arc::new(RwLock::new(renderer)),
+            renderer: Arc::new(OnceLock::new()),
             surface_config: config.surface,
         })
+    }
+
+    /// The renderer, if its pipelines have been compiled yet.
+    ///
+    /// Read through a clone of the returned lock; the slot behind it is shared by every clone
+    /// of this state, so a value obtained here is the same renderer [`Self::ensure_renderer`]
+    /// builds later.
+    pub fn renderer(&self) -> Option<&Arc<RwLock<Renderer>>> {
+        self.renderer.get()
+    }
+
+    /// Compile the renderer's pipelines, unless that already happened.
+    ///
+    /// Returns the renderer's lock. Cloning the `Arc` is cheap and lets a caller write through
+    /// it while the rest of this state stays borrowed immutably. Idempotent: calling it on
+    /// every frame costs one `Arc` clone, and a clone of this state taken before the first
+    /// call observes the renderer it built.
+    ///
+    /// First call wins: `options` and [`Self::target_format`] are the ones the renderer is
+    /// built with, and a later call with different `options` returns the renderer that exists
+    /// instead of rebuilding it. [`Renderer::was_created_with`] reports which options are in
+    /// use; a new [`RendererOptions`] or `target_format` needs a new [`Self`].
+    #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
+    pub fn ensure_renderer(&self, options: RendererOptions) -> Arc<RwLock<Renderer>> {
+        profiling::function_scope!();
+
+        let renderer = self.renderer.get_or_init(|| {
+            let renderer = Renderer::new(&self.device, self.target_format, options);
+            log::debug!("Created the egui-wgpu renderer");
+            Arc::new(RwLock::new(renderer))
+        });
+        Arc::clone(renderer)
+    }
+
+    /// Whether an LCD text pipeline can be built for this device: the pre-pipeline capability
+    /// answer.
+    ///
+    /// True only when the device advertises dual-source blending *and* the dual-source shader
+    /// passes the deterministic validation that [`Renderer::new`] performs before it asks the
+    /// backend to compile it, so this fails closed instead of promising text that a driver
+    /// cannot blend.
+    ///
+    /// This is not a substitute for [`Renderer::has_subpixel_pipeline`], which reports what the
+    /// backend actually built. Callers that must decide before any renderer exists use this
+    /// one; `Painter::ensure_renderer` logs an error when the two disagree.
+    pub fn supports_subpixel_text(&self) -> bool {
+        Renderer::supports_subpixel_text(&self.device)
     }
 }
 

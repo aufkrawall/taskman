@@ -131,13 +131,19 @@ impl TextureSnapshots {
             return;
         }
 
+        // Callers replay right after creating the renderer, so it is always present here.
+        let Some(renderer) = render_state.renderer() else {
+            log::debug!("No renderer to replay managed textures into");
+            return;
+        };
+
         let font_delta = self.font_atlas_options.and_then(|options| {
             let image = context.fonts(|fonts| fonts.image());
             (image.width() > 0 && image.height() > 0)
                 .then(|| epaint::ImageDelta::full(image, options))
         });
 
-        let mut renderer = render_state.renderer.write();
+        let mut renderer = renderer.write();
         if let Some(font_delta) = font_delta {
             renderer.update_texture(
                 &render_state.device,
@@ -164,6 +170,188 @@ impl TextureSnapshots {
     }
 }
 
+/// Which viewports still owe their surface a first presented frame.
+///
+/// A surface holds whatever the swapchain last contained — nothing, on a fresh window — until
+/// something is presented. Clearing it deliberately (`Painter::present_clear`) is what keeps a
+/// just-shown or just-restored window from showing stale or uninitialised pixels while the
+/// first egui pass is still being prepared, so the painter tracks which surfaces did that.
+#[derive(Clone, Debug, Default)]
+struct PrimerState {
+    unprimed: ViewportIdSet,
+}
+
+impl PrimerState {
+    /// A surface was installed or re-created for `viewport_id`: it needs a primer again.
+    fn mark_new_surface(&mut self, viewport_id: ViewportId) {
+        self.unprimed.insert(viewport_id);
+    }
+
+    /// `viewport_id` presented a frame, so its contents are defined.
+    fn mark_presented(&mut self, viewport_id: ViewportId) {
+        self.unprimed.remove(&viewport_id);
+    }
+
+    /// Every surface was dropped, so there is nothing left to prime.
+    fn clear(&mut self) {
+        self.unprimed.clear();
+    }
+
+    fn retain(&mut self, active_viewports: &ViewportIdSet) {
+        self.unprimed.retain(|id| active_viewports.contains(id));
+    }
+
+    /// Whether `viewport_id`'s surface still owes its first presented frame.
+    ///
+    /// Per viewport, not for the painter as a whole: one window that has presented says
+    /// nothing about another window that has not.
+    fn needs_primer(&self, viewport_id: ViewportId) -> bool {
+        self.unprimed.contains(&viewport_id)
+    }
+}
+
+/// What the painter has already done for the renderer it currently has.
+///
+/// The renderer lives in a slot that every clone of the [`RenderState`] shares, so it can be
+/// compiled without the painter creating it: eframe hands a clone to `CreationContext` (and to
+/// `Frame`), and an application may call [`RenderState::ensure_renderer`] on it. Neither "the
+/// slot is still empty" nor the cached capability answer can tell that apart from a renderer
+/// this painter already replayed into — both outlive the device re-create that is the only way
+/// to get a new renderer — so the work is keyed on the render state instead: a new renderer
+/// needs a new render state, and [`Painter::add_surface`] is where one is installed.
+#[derive(Clone, Copy, Debug, Default)]
+struct EnsuredRenderer {
+    /// Set once the renderer of the current render state has been answered for, reported on
+    /// and replayed into.
+    done: bool,
+
+    /// Whether that renderer built the LCD text pipeline.
+    subpixel_text: Option<bool>,
+}
+
+impl EnsuredRenderer {
+    /// Whether the current render state's renderer still owes this painter its capability
+    /// answer, its LCD report and the managed-texture replay.
+    fn is_due(&self) -> bool {
+        !self.done
+    }
+
+    /// Record the answer for the renderer that just ran, completing this painter's work for it.
+    fn record(&mut self, subpixel_text: bool) {
+        self.done = true;
+        self.subpixel_text = Some(subpixel_text);
+    }
+
+    /// Forget everything, because a new render state — and with it a new renderer — was
+    /// installed.
+    fn forget(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Where the time before the first presented frame went.
+///
+/// Reported as one line on the first present, so a slow start-up can be attributed to device
+/// creation, surface configuration or pipeline compilation instead of guessed at.
+struct StartupTimings {
+    since: web_time::Instant,
+    device_ms: Option<f32>,
+    surface_ms: Option<f32>,
+    renderer_ms: Option<f32>,
+    logged: bool,
+}
+
+impl StartupTimings {
+    fn new(since: web_time::Instant) -> Self {
+        Self {
+            since,
+            device_ms: None,
+            surface_ms: None,
+            renderer_ms: None,
+            logged: false,
+        }
+    }
+
+    fn ms(start: web_time::Instant) -> f32 {
+        start.elapsed().as_secs_f32() * 1000.0
+    }
+
+    /// Only the first device creation is on the start-up path; re-creations after
+    /// `Painter::suspend` are not, so they never overwrite the measurement.
+    fn record_device(&mut self, start: web_time::Instant) {
+        if self.device_ms.is_none() {
+            self.device_ms = Some(Self::ms(start));
+        }
+    }
+
+    fn record_surface(&mut self, start: web_time::Instant) {
+        if self.surface_ms.is_none() {
+            self.surface_ms = Some(Self::ms(start));
+        }
+    }
+
+    fn record_renderer(&mut self, start: web_time::Instant) {
+        if self.renderer_ms.is_none() {
+            self.renderer_ms = Some(Self::ms(start));
+        }
+    }
+
+    fn message(&self, total_ms: f32) -> String {
+        fn phase(ms: Option<f32>) -> String {
+            ms.map_or_else(|| "n/a".to_owned(), |ms| format!("{ms:.1}"))
+        }
+        format!(
+            "wgpu first frame presented {total_ms:.1} ms after painter creation: \
+             device {} ms, surface {} ms, pipelines {} ms",
+            phase(self.device_ms),
+            phase(self.surface_ms),
+            phase(self.renderer_ms),
+        )
+    }
+
+    /// The start-up line, the first time a frame reaches the screen.
+    fn first_present_message(&mut self) -> Option<String> {
+        if self.logged {
+            return None;
+        }
+        self.logged = true;
+        let total_ms = self.since.elapsed().as_secs_f32() * 1000.0;
+        Some(self.message(total_ms))
+    }
+
+    /// The pipeline phase on its own, when it lands after the first presented frame.
+    ///
+    /// The start-up line is emitted at the first present, which on the deferred path happens
+    /// before the pipelines exist; without this the pipeline cost would never be reported, and
+    /// that cost is exactly what this deferral took off the window's reveal path.
+    fn late_renderer_message(&self) -> Option<String> {
+        if !self.logged {
+            return None;
+        }
+        let renderer_ms = self.renderer_ms?;
+        let total_ms = self.since.elapsed().as_secs_f32() * 1000.0;
+        Some(format!(
+            "wgpu pipelines compiled {renderer_ms:.1} ms, {total_ms:.1} ms after painter creation"
+        ))
+    }
+}
+
+/// Report the one case where the capability answer and what was built disagree.
+///
+/// A device that advertises dual-source blending lets a font atlas rasterize LCD coverage; if
+/// no pipeline came out of it, those texels reach the ordinary pipeline as additive
+/// per-channel coverage while their alpha is zero, so text is corrupted instead of degraded.
+/// That must never be silent.
+fn report_missing_lcd_pipeline(render_state: &RenderState, has_lcd_pipeline: bool) {
+    if has_lcd_pipeline || !crate::Renderer::advertises_subpixel_text(&render_state.device) {
+        return;
+    }
+    log::error!(
+        "The device advertises dual-source blending but the LCD text pipeline was not created; \
+         sub-pixel text cannot be drawn (see the warnings above for the shader or pipeline error)"
+    );
+}
+
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
 ///
 /// Alternatively you can use [`crate::Renderer`] directly.
@@ -180,7 +368,10 @@ pub struct Painter {
     render_state: Option<RenderState>,
     texture_snapshots: TextureSnapshots,
     max_texture_side: Option<usize>,
-    subpixel_text: Option<bool>,
+    /// The renderer of the current render state this painter has already answered for.
+    ensured: EnsuredRenderer,
+    primer: PrimerState,
+    startup: StartupTimings,
 
     // Per viewport/window:
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
@@ -209,6 +400,7 @@ impl Painter {
         support_transparent_backbuffer: bool,
         options: RendererOptions,
     ) -> Self {
+        let created_at = web_time::Instant::now();
         let (capture_tx, capture_rx) = capture_channel();
         let instance = config.wgpu_setup.new_instance().await;
 
@@ -223,7 +415,9 @@ impl Painter {
             render_state: None,
             texture_snapshots: Default::default(),
             max_texture_side: None,
-            subpixel_text: None,
+            ensured: EnsuredRenderer::default(),
+            primer: PrimerState::default(),
+            startup: StartupTimings::new(created_at),
 
             depth_texture_view: Default::default(),
             surfaces: Default::default(),
@@ -401,18 +595,72 @@ impl Painter {
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<(), crate::WgpuError> {
         if self.render_state.is_none() {
+            // Pipelines are compiled by `ensure_renderer` on the first drawn frame instead of
+            // here, so this window can present a clear colour before they exist.
+            let device_start = web_time::Instant::now();
             let render_state =
-                RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
+                RenderState::create_without_renderer(&self.config, &self.instance, Some(&surface))
                     .await?;
-            self.texture_snapshots
-                .replay_into(&self.context, &render_state);
+            self.startup.record_device(device_start);
             self.max_texture_side =
                 Some(render_state.device.limits().max_texture_dimension_2d as usize);
-            self.subpixel_text = Some(render_state.renderer.read().has_subpixel_pipeline());
             self.render_state = Some(render_state);
+            // A new render state brings a new renderer, which none of the painter's
+            // once-per-renderer work has run for yet.
+            self.ensured.forget();
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
         Ok(())
+    }
+
+    /// Compile the renderer's pipelines if that has not happened yet.
+    ///
+    /// Renderer creation is deferred off the window's critical path: [`Self::set_window`] only
+    /// decides the device and the surface format, so a window can be shown and cleared before
+    /// any pipeline is built. Every paint path calls this, so an unprimed painter still draws,
+    /// and managed textures captured while the renderer was absent are replayed once it exists.
+    ///
+    /// The capability answer, the missing-pipeline report and that replay run once per
+    /// renderer, including for a renderer this painter did not create (see `EnsuredRenderer`),
+    /// and again after [`Self::set_window`] installs a new render state. Idempotent; the second
+    /// and later calls cost a dead check.
+    pub fn ensure_renderer(&mut self) {
+        profiling::function_scope!();
+
+        let Some(render_state) = self.render_state.as_ref() else {
+            return;
+        };
+        if let Some(renderer) = render_state.renderer() {
+            // First call wins on the slot, so a renderer compiled through another holder of
+            // this state was built with *its* options; nothing rebuilds it to match these, and
+            // a release build keeps drawing with what exists.
+            debug_assert!(
+                renderer.read().was_created_with(self.options),
+                "this render state's renderer was built with different RendererOptions"
+            );
+            // The slot is shared, so an application that compiled the pipelines through a
+            // clone would otherwise leave this painter without a capability answer and
+            // without its snapshots uploaded.
+            if self.ensured.is_due() {
+                let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
+                self.ensured.record(has_lcd_pipeline);
+                report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
+                self.texture_snapshots.replay_into(&self.context, render_state);
+            }
+            return;
+        }
+
+        let renderer_start = web_time::Instant::now();
+        let renderer = render_state.ensure_renderer(self.options);
+        self.startup.record_renderer(renderer_start);
+        if let Some(message) = self.startup.late_renderer_message() {
+            log::info!("{message}");
+        }
+
+        let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
+        self.ensured.record(has_lcd_pipeline);
+        report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
+        self.texture_snapshots.replay_into(&self.context, render_state);
     }
 
     /// Inserts a freshly created surface into [`Self::surfaces`] and configures it.
@@ -464,6 +712,9 @@ impl Painter {
                 needs_recreate: false,
             },
         );
+        // A fresh surface holds whatever the swapchain last contained, so its first frame has
+        // to define every pixel before anything else is drawn into it.
+        self.primer.mark_new_surface(viewport_id);
         let Some(width) = NonZeroU32::new(width) else {
             log::debug!("The window width was zero; skipping generate textures");
             return;
@@ -486,24 +737,83 @@ impl Painter {
 
     /// Whether this painter created the managed-font dual-source pipeline.
     ///
-    /// `None` means no device has been initialized yet. The value remains available while
-    /// suspended and reports the actual feature of that last device, not just what the
-    /// selected adapter advertised.
+    /// `None` means no device has been initialized yet, or the renderer's pipelines have not
+    /// been compiled yet ([`Self::ensure_renderer`]). The value remains available while paused
+    /// and reports the actual feature of that device, not just what the selected adapter
+    /// advertised. Installing a new render state ([`Self::suspend`] followed by
+    /// [`Self::set_window`]) clears it: the old answer says nothing about the next device, and
+    /// the next paint answers for it.
     pub fn subpixel_text(&self) -> Option<bool> {
-        self.subpixel_text
+        self.ensured.subpixel_text
     }
 
-    /// Release all resident GPU objects while keeping the painter reusable.
+    /// Whether `viewport_id`'s surface still owes its first presented frame.
     ///
-    /// The next call to [`Self::set_window()`] recreates the device, renderer and surface
-    /// lazily. Managed textures are replayed from CPU-side snapshots so egui UI state and
-    /// the font atlas survive the interruption. Capabilities needed to create other
-    /// windows, such as [`Self::max_texture_side()`], are retained.
-    pub fn suspend(&mut self) {
+    /// True from the moment [`Self::set_window`] (or a surface re-create) installs that
+    /// viewport's surface until it has presented once — either through
+    /// [`Self::present_clear`] or through [`Self::paint_and_update_textures`]. A caller uses it
+    /// to put the correct background colour on screen while the full first egui pass is still
+    /// being prepared, instead of showing an unpainted backbuffer.
+    ///
+    /// Per viewport: a second window that has not presented yet does not make the first one
+    /// ask for another primer.
+    pub fn needs_primer(&self, viewport_id: ViewportId) -> bool {
+        self.primer.needs_primer(viewport_id)
+    }
+
+    /// Drop every per-surface object, including which surfaces still owe a primer.
+    ///
+    /// The primer requirement belongs to the surface: once the surface is gone there is
+    /// nothing left whose pixels are undefined, and the re-created surface is marked again by
+    /// [`Self::install_surface`]. Keeping both in one place is what stops one teardown path
+    /// from clearing the surfaces and leaving a stale primer request behind.
+    fn drop_all_surfaces(&mut self) {
         self.surfaces.clear();
         self.depth_texture_view.clear();
         self.msaa_texture_view.clear();
         self.screen_capture_state = None;
+        self.primer.clear();
+    }
+
+    /// Release the swapchain while keeping the device and its pipelines resident.
+    ///
+    /// The surfaces, their depth and MSAA views and any capture target are dropped; the
+    /// adapter, device, queue, renderer (pipelines), CPU-side texture snapshots,
+    /// `max_texture_side`, the sub-pixel answer and the fact that this painter already replayed
+    /// into that renderer are kept. Restoring therefore costs a surface re-create and a
+    /// configure instead of a device initialisation plus a pipeline compile plus a full
+    /// font-atlas re-upload, which is what made the window blank for the whole re-init after a
+    /// minimize.
+    ///
+    /// This deliberately does not wait for the GPU. The blocking
+    /// `poll(PollType::Wait { .. })` in [`Self::suspend`] is bounded at 250 ms and would be
+    /// spent on the minimize path, exactly when the window is going away; a non-blocking poll
+    /// lets wgpu retire submissions that already finished and release the surface's
+    /// backbuffers without waiting for a frame that is still in flight.
+    pub fn pause(&mut self) {
+        self.drop_all_surfaces();
+
+        let Some(render_state) = self.render_state.as_ref() else {
+            return;
+        };
+        if let Err(err) = render_state.device.poll(wgpu::PollType::Poll) {
+            log::debug!("WGPU poll while pausing failed: {err}");
+        }
+    }
+
+    /// Release all resident GPU objects while keeping the painter reusable.
+    ///
+    /// This is the full teardown: device, renderer, surfaces and capture state all go away.
+    /// It is correct after [`Self::pause`] (which only dropped the surfaces), and the next call
+    /// to [`Self::set_window()`] recreates the device, renderer and surface lazily. Managed
+    /// textures are replayed from CPU-side snapshots so egui UI state and the font atlas
+    /// survive the interruption. Capabilities needed to create other windows, such as
+    /// [`Self::max_texture_side()`], are retained.
+    ///
+    /// Prefer [`Self::pause`] when the window is coming back: keeping the device and pipelines
+    /// is what makes minimize/restore instant.
+    pub fn suspend(&mut self) {
+        self.drop_all_surfaces();
 
         let Some(render_state) = self.render_state.take() else {
             return;
@@ -519,14 +829,155 @@ impl Painter {
             log::debug!("WGPU did not become idle while suspending: {err}");
         }
 
-        {
-            let mut renderer = render_state.renderer.write();
+        if let Some(renderer) = render_state.renderer() {
+            let mut renderer = renderer.write();
             for id in self.texture_snapshots.ids() {
                 renderer.free_texture(&id);
             }
         }
 
         drop(render_state);
+    }
+
+    /// Present one cleared frame, without the renderer.
+    ///
+    /// [`Self::set_window`] leaves the painter with a usable device and surface but an
+    /// unprimed renderer, so this is the cheapest way to define every pixel of a freshly
+    /// shown or freshly restored window: one load-op clear, one submit, one present, and no
+    /// pipelines, font atlas or app textures involved. The next
+    /// [`Self::paint_and_update_textures`] covers the clear with the real frame.
+    ///
+    /// Marks the viewport as primed (see [`Self::needs_primer`]) and reports the one start-up
+    /// timing line on the first present. Correct on the first frame and after a full surface
+    /// re-create; a zero-sized surface presents nothing and returns `Ok`.
+    ///
+    /// # Errors
+    /// [`crate::WgpuError::NoRenderState`] before [`Self::set_window`] created a device, and
+    /// [`crate::WgpuError::NoSurface`] when the viewport has no surface.
+    pub fn present_clear(
+        &mut self,
+        viewport_id: ViewportId,
+        clear_color: [f32; 4],
+        window: &Arc<winit::window::Window>,
+    ) -> Result<(), crate::WgpuError> {
+        profiling::function_scope!();
+
+        // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action taken in
+        // `paint_and_update_textures` set `needs_recreate`; recreate before re-borrowing the
+        // render state and the surfaces below.
+        if self
+            .surfaces
+            .get(&viewport_id)
+            .is_some_and(|state| state.needs_recreate)
+            && let Err(err) = self.recreate_surface(viewport_id, window)
+        {
+            log::error!("Failed to recreate surface for {viewport_id:?}: {err}");
+            return Err(err);
+        }
+
+        let Some(render_state) = self.render_state.as_ref() else {
+            return Err(crate::WgpuError::NoRenderState);
+        };
+
+        // Apply any runtime changes requested via `RenderState::surface_config`, exactly as
+        // `paint_and_update_textures` does.
+        if render_state.surface_config != self.config.surface {
+            self.config.surface = render_state.surface_config;
+            #[expect(clippy::iter_over_hash_type)]
+            for surface in self.surfaces.values_mut() {
+                surface.needs_reconfigure = true;
+            }
+        }
+        let surface_config = self.config.surface;
+
+        let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
+            return Err(crate::WgpuError::NoSurface);
+        };
+        if surface_state.width == 0 || surface_state.height == 0 {
+            return Ok(());
+        }
+
+        if surface_state.needs_reconfigure {
+            Self::configure_surface(surface_state, render_state, &surface_config);
+            surface_state.needs_reconfigure = false;
+        }
+
+        let output_frame = match surface_state.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                surface_state.needs_reconfigure = true;
+                frame
+            }
+            other => {
+                match (*self.config.on_surface_status)(&other) {
+                    SurfaceErrorAction::Reconfigure => {
+                        Self::configure_surface(surface_state, render_state, &surface_config);
+                        self.context.request_repaint_of(viewport_id);
+                    }
+                    SurfaceErrorAction::RecreateSurface => {
+                        // Ownership keeps the recreation out of this frame; the next paint
+                        // consumes `needs_recreate` at the top.
+                        surface_state.needs_recreate = true;
+                        self.context.request_repaint_of(viewport_id);
+                    }
+                    SurfaceErrorAction::SkipFrame => {}
+                }
+                return Ok(());
+            }
+        };
+
+        let mut encoder =
+            render_state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("egui_clear_encoder"),
+                });
+        let target_view = output_frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        {
+            profiling::scope!("clear_render_pass");
+            // No MSAA and no depth attachment: nothing is drawn, so there is nothing to
+            // resolve or depth-test, and the next paint clears again anyway.
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui_clear_render"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_color[0] as f64,
+                            g: clear_color[1] as f64,
+                            b: clear_color[2] as f64,
+                            a: clear_color[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        {
+            profiling::scope!("Queue::submit");
+            render_state.queue.submit([encoder.finish()]);
+        }
+
+        window.pre_present_notify();
+
+        {
+            profiling::scope!("present");
+            render_state.queue.present(output_frame);
+        }
+
+        self.primer.mark_presented(viewport_id);
+        if let Some(message) = self.startup.first_present_message() {
+            log::info!("{message}");
+        }
+
+        Ok(())
     }
 
     fn resize_and_generate_depth_texture_view_and_msaa_view(
@@ -546,7 +997,9 @@ impl Painter {
         surface_state.width = width;
         surface_state.height = height;
 
+        let configure_start = web_time::Instant::now();
         Self::configure_surface(surface_state, render_state, &self.config.surface);
+        self.startup.record_surface(configure_start);
 
         if let Some(depth_format) = self.options.depth_stencil_format {
             self.depth_texture_view.insert(
@@ -746,6 +1199,11 @@ impl Painter {
             }
         }
 
+        // A painter that presented only the clear colour, or whose renderer was dropped with
+        // its render state, still has to draw: compile the pipelines (and replay the managed
+        // textures recorded so far) before this frame's deltas are recorded and applied.
+        self.ensure_renderer();
+
         // egui emits each texture change once. Record the resulting full images before
         // draining the deltas so a later renderer recreation can restore them.
         self.texture_snapshots.record(textures_delta);
@@ -753,6 +1211,10 @@ impl Painter {
         let Some(render_state) = self.render_state.as_mut() else {
             return vsync_sec;
         };
+
+        // Idempotent: this is the renderer created by `ensure_renderer` above, and the `Arc`
+        // clone keeps it usable while the rest of the state stays borrowed.
+        let renderer = render_state.ensure_renderer(self.options);
 
         let mut render_queue_guard = RendererQueueGuard {
             queue: &render_state.queue,
@@ -785,7 +1247,7 @@ impl Painter {
         });
 
         let user_cmd_bufs = {
-            let mut renderer = render_state.renderer.write();
+            let mut renderer = renderer.write();
             renderer.set_subpixel_text_options(
                 subpixel_text_options.0,
                 subpixel_text_options.1,
@@ -855,7 +1317,7 @@ impl Painter {
 
         let mut capture_buffer = None;
         {
-            let renderer = render_state.renderer.read();
+            let renderer = renderer.read();
 
             let target_texture = if capture {
                 let capture_state = self.screen_capture_state.get_or_insert_with(|| {
@@ -965,7 +1427,7 @@ impl Painter {
         // Calling `wgpu::Texture::destroy` on a texture that is still in use would invalidate the command buffer(s) it is used in.
         // However, once we called `wgpu::Queue::submit`, it is up for wgpu to determine how long the underlying gpu resource has to live.
         {
-            let mut renderer = render_state.renderer.write();
+            let mut renderer = renderer.write();
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for id in textures_delta.free.drain() {
                 renderer.free_texture(&id);
@@ -994,6 +1456,11 @@ impl Painter {
             vsync_sec += start.elapsed().as_secs_f32();
         }
 
+        self.primer.mark_presented(viewport_id);
+        if let Some(message) = self.startup.first_present_message() {
+            log::info!("{message}");
+        }
+
         vsync_sec
     }
 
@@ -1017,6 +1484,7 @@ impl Painter {
             .retain(|id, _| active_viewports.contains(id));
         self.msaa_texture_view
             .retain(|id, _| active_viewports.contains(id));
+        self.primer.retain(active_viewports);
     }
 
     pub fn destroy(&mut self) {
@@ -1149,5 +1617,174 @@ mod tests {
         deltas.clear();
         assert_eq!(snapshots.font_atlas_options, None);
         assert!(!snapshots.ids().any(|id| id == font_id));
+    }
+
+    fn second_viewport() -> ViewportId {
+        ViewportId::from_hash_of("second viewport")
+    }
+
+    #[test]
+    fn the_renderer_is_answered_for_once_and_a_new_state_owes_it_again() {
+        let mut ensured = EnsuredRenderer::default();
+        assert!(
+            ensured.is_due(),
+            "a painter that has not painted yet is due, whether or not a clone already \
+             compiled the pipelines into the shared slot"
+        );
+        assert_eq!(ensured.subpixel_text, None);
+
+        ensured.record(true);
+        assert!(!ensured.is_due(), "the same renderer is not replayed twice");
+        assert_eq!(ensured.subpixel_text, Some(true));
+
+        // Pausing (minimize) keeps the device and its renderer, so nothing calls `forget` and
+        // the answer stays valid; only a new render state invalidates it.
+        ensured.forget();
+        assert!(
+            ensured.is_due(),
+            "a newly installed render state's renderer has not been replayed into"
+        );
+        assert_eq!(
+            ensured.subpixel_text, None,
+            "the previous device's answer must not be reported for a new one"
+        );
+    }
+
+    #[test]
+    fn the_answer_follows_the_renderer_that_built_the_lcd_pipeline() {
+        let mut ensured = EnsuredRenderer::default();
+        ensured.record(false);
+        assert_eq!(
+            ensured.subpixel_text,
+            Some(false),
+            "a device with the blend but no pipeline answers false, not nothing"
+        );
+
+        // A device re-create that does build the pipeline answers for itself.
+        ensured.forget();
+        ensured.record(true);
+        assert_eq!(ensured.subpixel_text, Some(true));
+    }
+
+    #[test]
+    fn primer_state_requires_a_present_after_each_new_surface() {
+        let mut primer = PrimerState::default();
+        assert!(!primer.needs_primer(ViewportId::ROOT));
+
+        primer.mark_new_surface(ViewportId::ROOT);
+        assert!(primer.needs_primer(ViewportId::ROOT));
+
+        primer.mark_presented(ViewportId::ROOT);
+        assert!(!primer.needs_primer(ViewportId::ROOT));
+
+        // A re-created surface holds undefined pixels again.
+        primer.mark_new_surface(ViewportId::ROOT);
+        assert!(primer.needs_primer(ViewportId::ROOT));
+    }
+
+    #[test]
+    fn primer_state_tracks_each_viewport_separately() {
+        let mut primer = PrimerState::default();
+        primer.mark_new_surface(ViewportId::ROOT);
+        primer.mark_new_surface(second_viewport());
+
+        primer.mark_presented(ViewportId::ROOT);
+        assert!(!primer.needs_primer(ViewportId::ROOT), "the root viewport presented");
+        assert!(
+            primer.needs_primer(second_viewport()),
+            "the second viewport has not presented yet, whatever the root did"
+        );
+
+        primer.mark_presented(second_viewport());
+        assert!(!primer.needs_primer(second_viewport()));
+    }
+
+    #[test]
+    fn primer_state_clear_forgets_every_pending_surface() {
+        // `Painter::drop_all_surfaces` is the only caller: both teardown paths drop the
+        // surfaces and their primer requirement together, so nothing is left whose pixels are
+        // undefined.
+        let mut primer = PrimerState::default();
+        primer.mark_new_surface(ViewportId::ROOT);
+        primer.mark_new_surface(second_viewport());
+
+        primer.clear();
+        assert!(!primer.needs_primer(ViewportId::ROOT));
+        assert!(!primer.needs_primer(second_viewport()));
+    }
+
+    #[test]
+    fn primer_state_forgets_closed_viewports() {
+        let mut primer = PrimerState::default();
+        primer.mark_new_surface(ViewportId::ROOT);
+        primer.mark_new_surface(second_viewport());
+
+        let active: ViewportIdSet = [ViewportId::ROOT].into_iter().collect();
+        primer.retain(&active);
+
+        assert!(!primer.needs_primer(second_viewport()));
+        assert!(primer.needs_primer(ViewportId::ROOT));
+        primer.mark_presented(ViewportId::ROOT);
+        assert!(!primer.needs_primer(ViewportId::ROOT));
+    }
+
+    /// Timing values a test can reason about, without a GPU deciding how long anything took.
+    fn startup_timings(
+        device_ms: Option<f32>,
+        surface_ms: Option<f32>,
+        renderer_ms: Option<f32>,
+    ) -> StartupTimings {
+        let mut timings = StartupTimings::new(web_time::Instant::now());
+        timings.device_ms = device_ms;
+        timings.surface_ms = surface_ms;
+        timings.renderer_ms = renderer_ms;
+        timings
+    }
+
+    #[test]
+    fn startup_message_reports_every_phase() {
+        let timings = startup_timings(Some(4.0), Some(2.5), Some(11.75));
+        assert_eq!(
+            timings.message(17.75),
+            "wgpu first frame presented 17.8 ms after painter creation: \
+             device 4.0 ms, surface 2.5 ms, pipelines 11.8 ms"
+        );
+    }
+
+    #[test]
+    fn startup_message_marks_phases_that_never_ran() {
+        let timings = startup_timings(Some(4.0), None, None);
+        assert!(timings.message(9.0).contains("surface n/a ms"));
+        assert!(timings.message(9.0).contains("pipelines n/a ms"));
+    }
+
+    #[test]
+    fn late_pipeline_phase_is_reported_after_the_first_present() {
+        let mut timings = startup_timings(Some(4.0), Some(2.0), None);
+
+        // Nothing is reported before a frame reached the screen.
+        assert!(timings.late_renderer_message().is_none());
+
+        assert!(timings.first_present_message().is_some());
+        assert!(timings.late_renderer_message().is_none());
+
+        timings.renderer_ms = Some(13.5);
+        let message = timings.late_renderer_message().expect("late phase reported");
+        assert!(message.contains("pipelines compiled 13.5 ms"), "{message}");
+    }
+
+    #[test]
+    fn startup_line_is_reported_once_and_keeps_the_first_measurement() {
+        let mut timings = StartupTimings::new(web_time::Instant::now());
+
+        timings.record_device(web_time::Instant::now());
+        let first_device_ms = timings.device_ms.expect("device phase recorded");
+
+        // A second device (after `suspend`) must not overwrite the start-up measurement.
+        timings.record_device(web_time::Instant::now());
+        assert_eq!(timings.device_ms, Some(first_device_ms));
+
+        assert!(timings.first_present_message().is_some());
+        assert!(timings.first_present_message().is_none(), "reported only once");
     }
 }
