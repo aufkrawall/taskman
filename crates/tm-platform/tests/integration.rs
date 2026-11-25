@@ -1457,10 +1457,14 @@ fn files_of_a_child_process_survive_handle_type_probing() {
         .find(|file| file.path.to_ascii_lowercase() == expected)
         .expect("the found file is still there");
     assert!(row.is_read, "`type` opened the file for reading: {row:?}");
-    // No `handles_complete` assertion follows: the flag says whether every
-    // handle in the child's table could be duplicated and read, which a live
-    // child can legitimately prevent (see the poll comment), and the regression
-    // this test pins is that the child's file is reported at all.
+    // A live child always holds handles this process cannot duplicate. That must
+    // not clear the enumeration flag: the I/O page renders the list only when the
+    // flag is set, so treating an un-inspectable handle as a gap blanked the page
+    // for every process.
+    assert!(
+        snapshot.accounting.handles_complete,
+        "an un-inspectable handle must not clear the enumeration flag"
+    );
 }
 
 /// The class procedure for the throwaway window below. The presentation gate's

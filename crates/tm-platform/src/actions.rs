@@ -440,6 +440,13 @@ pub struct FileIoAccounting {
     /// this is non-zero. `None` when it could not be queried.
     pub events_lost: Option<u64>,
     /// Whether the open-handle enumeration (names, sizes, access) completed.
+    ///
+    /// This says the handle TABLE was covered, not that every handle in it could
+    /// be read: a process always holds protected handles that cannot be
+    /// duplicated, and files opened without query rights, so those are skipped
+    /// without clearing the flag (see `win::process_file_io`). It is false when
+    /// the snapshot was truncated, when the process could not be opened, or when
+    /// a caller dropped entries from `files`.
     pub handles_complete: bool,
 }
 

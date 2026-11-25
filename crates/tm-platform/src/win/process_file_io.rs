@@ -315,7 +315,14 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
 
     let mut map: HashMap<String, ProcessFileIo> = HashMap::new();
     let mut path_buf = vec![0u16; 1024];
-    let mut complete = count == header.number_of_handles;
+    // `complete` describes the ENUMERATION, not every handle inside it: it says
+    // the snapshot covered the whole table. Individual handles that cannot be
+    // duplicated or read are counted separately, because every real process
+    // holds protected objects (and files opened without query rights); clearing
+    // the flag for those made the I/O page report itself unavailable for every
+    // process on the machine.
+    let complete = count == header.number_of_handles;
+    let mut unreadable = 0usize;
 
     for i in 0..count {
         let entry = unsafe { entries_ptr.add(i).read_unaligned() };
@@ -332,12 +339,17 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
             Ok(Some(facts)) => facts,
             Ok(None) => continue,
             Err(()) => {
-                complete = false;
+                // A handle this process will not let us duplicate is normal: it
+                // is not a file we can report, and it is not a gap in the
+                // enumeration either.
+                unreadable += 1;
                 continue;
             }
         };
         if !facts.complete {
-            complete = false;
+            // The file was identified; only some of its details could not be
+            // read, and those fields are already `None`.
+            unreadable += 1;
         }
         let (is_read, is_write) = access_flags(facts.granted_access);
 
@@ -373,6 +385,13 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
     // byte/operation source is available in this enumeration, so every row
     // keeps those fields unavailable; the process-wide counters above remain
     // separate facts.
+    if unreadable > 0 {
+        tracing::debug!(
+            unreadable,
+            count,
+            "some handles could not be inspected; the file list is still complete"
+        );
+    }
     Ok(FileEnumeration {
         files: map.into_values().collect(),
         complete,
