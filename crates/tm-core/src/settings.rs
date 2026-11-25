@@ -1287,6 +1287,15 @@ impl SettingsWriter {
         let join = std::thread::Builder::new()
             .name("tm-settings-writer".into())
             .spawn(move || settings_writer_loop(rx))
+            .map_err(|error| {
+                // Without the thread the channel has no receiver: every later
+                // enqueue/flush is dropped and nothing reaches the disk, so
+                // this failure has to be visible in the log.
+                tracing::error!(
+                    %error,
+                    "cannot start the settings writer thread; settings will not persist"
+                );
+            })
             .ok();
         Self { tx, join }
     }
