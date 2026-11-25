@@ -1071,7 +1071,7 @@ fn handle_payload(shared: &Shared, pid: u32, event_id: u16, version: u8, payload
 
 /// Fixed session name per role. See [`super::etw`]: this MUST NOT include the
 /// pid, or an orphaned session can never be reclaimed.
-fn session_name(role: TraceRole) -> &'static str {
+pub(super) fn session_name(role: TraceRole) -> &'static str {
     match role {
         TraceRole::Service => "TaskMan-File-Service",
         TraceRole::App => "TaskMan-File-App",

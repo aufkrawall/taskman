@@ -2272,6 +2272,19 @@ fn spawn_file_trace_watchdog(host: FileTraceHost) {
     );
 }
 
+/// Start a session for `role`, the one call both hosts make.
+///
+/// A seam rather than a direct call: what a FAILED start does to the slot, the
+/// retry window and the snapshot is the part that needs pinning, and a window
+/// set by hand cannot show it. The tests drive the production entry with this
+/// replaced by a stub, so everything but the kernel call is the real path.
+fn start_file_trace(role: super::etw::TraceRole) -> Option<super::file_etw::FileEtw> {
+    super::file_etw::FileEtw::start(role)
+}
+
+/// How a request starts a session; see [`start_file_trace`].
+type FileTraceStarter<'a> = dyn Fn(super::etw::TraceRole) -> Option<super::file_etw::FileEtw> + 'a;
+
 /// Cumulative per-file bytes for `pid` from `host`'s session, starting it on
 /// demand.
 ///
@@ -2286,6 +2299,7 @@ fn file_trace_sample(
     host: FileTraceHost,
     pid: u32,
     start_epoch_s: i64,
+    start: &FileTraceStarter<'_>,
 ) -> Option<super::file_etw::FileIoSample> {
     let mut slot = match host.slot().lock() {
         Ok(slot) => slot,
@@ -2305,14 +2319,14 @@ fn file_trace_sample(
                 tracing::warn!("app file trace ended unexpectedly; restarting it");
             }
         }
-        if let Some(usage) = super::file_etw::FileEtw::start(host.role())
+        if let Some(usage) = start(host.role())
             && let Some(trace) = slot.as_mut()
         {
             trace.usage = usage;
         }
     }
     if slot.is_none() {
-        match super::file_etw::FileEtw::start(host.role()) {
+        match start(host.role()) {
             Some(usage) => {
                 *slot = Some(FileTrace {
                     usage,
@@ -2346,7 +2360,12 @@ fn file_trace_sample(
 
 /// The broker's answer for one request: LocalSystem's own session.
 fn file_io_accounting(pid: u32, start_epoch_s: i64) -> Option<super::file_etw::FileIoSample> {
-    file_trace_sample(FileTraceHost::Service, pid, start_epoch_s)
+    file_trace_sample(
+        FileTraceHost::Service,
+        pid,
+        start_epoch_s,
+        &start_file_trace,
+    )
 }
 
 /// How long an app-side trace start is given up for after it failed.
@@ -2404,12 +2423,16 @@ fn app_trace_start_due(failed_at: Option<std::time::Instant>, now: std::time::In
 ///
 /// The start is throttled by [`APP_FILE_TRACE_RETRY`]; a running session is
 /// sampled on every request and idled out by its watchdog.
-fn app_file_io_accounting(pid: u32, start_epoch_s: i64) -> Option<super::file_etw::FileIoSample> {
+fn app_file_io_accounting(
+    pid: u32,
+    start_epoch_s: i64,
+    start: &FileTraceStarter<'_>,
+) -> Option<super::file_etw::FileIoSample> {
     let now = std::time::Instant::now();
     if !app_trace_start_due(app_trace_last_failure(), now) {
         return None;
     }
-    let sample = file_trace_sample(FileTraceHost::App, pid, start_epoch_s);
+    let sample = file_trace_sample(FileTraceHost::App, pid, start_epoch_s, start);
     remember_app_trace_failure(sample.is_none().then_some(now));
     sample
 }
@@ -2425,7 +2448,17 @@ pub(super) fn attach_app_file_io(
     pid: u32,
     start_epoch_s: i64,
 ) {
-    if let Some(sample) = app_file_io_accounting(pid, start_epoch_s) {
+    attach_app_file_io_with(snapshot, pid, start_epoch_s, &start_file_trace);
+}
+
+/// [`attach_app_file_io`] with the start injectable; see [`start_file_trace`].
+fn attach_app_file_io_with(
+    snapshot: &mut crate::actions::ProcessFileIoSnapshot,
+    pid: u32,
+    start_epoch_s: i64,
+    start: &FileTraceStarter<'_>,
+) {
+    if let Some(sample) = app_file_io_accounting(pid, start_epoch_s, start) {
         super::file_etw::attach_file_io(snapshot, &sample);
     }
 }
@@ -4130,6 +4163,10 @@ fn uninstall() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Tests that flip the process-global app-trace retry window took this lock
+    /// so they cannot interleave and read each other's failure timestamp.
+    static TEST_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn service_required_privileges_include_system_profile_as_multi_sz() {
         let actual = required_service_privileges();
@@ -5234,17 +5271,96 @@ mod tests {
 
     /// The two hosts are separate sessions under separate names: an elevated
     /// GUI must never join, stop, or double-count the service's trace.
+    ///
+    /// Driven through the sampler with a recording start, because a comparison
+    /// of the two accessors cannot catch a call site that stopped using them:
+    /// each host must ASK for its own role, and the fixed names those roles map
+    /// to must differ, or one host reclaims the other's session.
     #[test]
-    fn the_app_and_service_traces_are_different_sessions() {
-        assert_ne!(FileTraceHost::App.role(), FileTraceHost::Service.role());
+    fn each_host_starts_its_own_session() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let record = |role: super::super::etw::TraceRole| {
+            asked.lock().unwrap().push(role);
+            None
+        };
+        assert!(
+            file_trace_sample(FileTraceHost::App, std::process::id(), 1, &record).is_none(),
+            "a refused start reports no sample"
+        );
+        assert!(
+            file_trace_sample(FileTraceHost::Service, std::process::id(), 1, &record).is_none(),
+            "a refused start reports no sample"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![
+                super::super::etw::TraceRole::App,
+                super::super::etw::TraceRole::Service
+            ],
+            "each host must start the session named for itself"
+        );
         assert_ne!(
-            FileTraceHost::App.watchdog_thread(),
-            FileTraceHost::Service.watchdog_thread()
+            super::super::file_etw::session_name(super::super::etw::TraceRole::App),
+            super::super::file_etw::session_name(super::super::etw::TraceRole::Service),
+            "a shared name would let one host join or stop the other's session"
         );
         assert!(
             !std::ptr::eq(FileTraceHost::App.slot(), FileTraceHost::Service.slot()),
             "each host has its own slot, so neither can hand its session to the other"
         );
+    }
+
+    /// A failed start must be driven through the production entry: the window
+    /// has to be set BY the failure, not stood in for, or nothing tests what a
+    /// refusal does to the slot, the window and the snapshot. Exactly one
+    /// attempt is made, the answer is `None`, the accounting says unavailable
+    /// and every row stays unmeasured — a fabricated zero here is the product
+    /// invariant this whole path exists to keep.
+    #[test]
+    fn a_refused_app_trace_start_is_driven_through_the_entry() {
+        let _serial = TEST_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        remember_app_trace_failure(None);
+        let attempts = std::cell::Cell::new(0u32);
+        let refuse = |_: super::super::etw::TraceRole| {
+            attempts.set(attempts.get() + 1);
+            None
+        };
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![file_row(r"C:\data\a.bin"), file_row(r"C:\data\b.bin")],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_app_file_io_with(&mut snapshot, std::process::id(), 1, &refuse);
+        assert_eq!(attempts.get(), 1, "one start per request");
+        for file in &snapshot.files {
+            assert_eq!(file.read_bytes, None);
+            assert_eq!(file.write_bytes, None);
+            assert_eq!(file.read_ops, None);
+            assert_eq!(file.write_ops, None);
+        }
+        let accounting = &snapshot.accounting;
+        assert_eq!(
+            accounting.state,
+            crate::actions::FileIoAccountingState::Unavailable,
+            "the dialog keys its explanation off exactly this state"
+        );
+        assert_eq!(accounting.read_bytes, 0);
+        assert_eq!(accounting.write_bytes, 0);
+        assert_eq!(accounting.since_ms, 0);
+        assert!(
+            app_trace_last_failure().is_some(),
+            "the refusal is on record, so the window starts here"
+        );
+        // The next poll is inside the window: no second attempt reaches the
+        // kernel, and the answer is still unavailable.
+        attach_app_file_io_with(&mut snapshot, std::process::id(), 1, &refuse);
+        assert_eq!(attempts.get(), 1, "the window covers the next poll");
+        assert_eq!(
+            snapshot.accounting.state,
+            crate::actions::FileIoAccountingState::Unavailable
+        );
+        remember_app_trace_failure(None);
     }
 
     /// A failed start is throttled: an unelevated GUI fails it forever, and the
@@ -5275,11 +5391,15 @@ mod tests {
     /// snapshot exactly as the handle walk produced it: every per-file number
     /// unavailable (the dialog then explains why), never a fabricated zero.
     ///
-    /// The retry window stands in for the failed start so no real session is
-    /// attempted: this pins what the dialog receives while a GUI cannot host
-    /// the trace.
+    /// The retry window stands in for the failed start so this pins what the
+    /// THROTTLED branch returns without waiting out the window; the failure
+    /// that sets it is driven through the entry in
+    /// `a_refused_app_trace_start_is_driven_through_the_entry`.
     #[test]
     fn an_unavailable_app_trace_leaves_every_row_unmeasured() {
+        let _serial = TEST_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         remember_app_trace_failure(Some(std::time::Instant::now()));
         let mut snapshot = crate::actions::ProcessFileIoSnapshot {
             files: vec![file_row(r"C:\data\a.bin"), file_row(r"C:\data\b.bin")],
