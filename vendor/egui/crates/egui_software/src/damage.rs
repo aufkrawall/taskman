@@ -892,9 +892,10 @@ mod tests {
             max_y: H as i32,
         };
 
-        // Rounded corners keep the rect off `span::fast_rect`, which clamps its own
-        // arithmetic; this is the general `points_bounds` path. The second case saturates
-        // only the `max` edges, so it catches a clamp that was applied to one side.
+        // Rounded corners keep the rect off `span::fast_rect`, whose casts saturate and add
+        // no margin afterwards; this is the general `points_bounds` path, which adds a
+        // two-pixel margin and therefore clamps in points before the cast. The second case
+        // saturates only the `max` edges, so it catches a clamp applied to one side only.
         for rect in [
             Rect::from_min_max(pos2(-3.0e9, -3.0e9), pos2(3.0e9, 3.0e9)),
             Rect::from_min_max(pos2(0.0, 0.0), pos2(3.0e9, 3.0e9)),
