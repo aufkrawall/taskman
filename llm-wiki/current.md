@@ -985,7 +985,8 @@ rebase runbook.
   thread restarts a session stopped underneath it and prunes exited
   processes. The session also carries `EVENT_TRACE_FLAG_PROCESS`, so it sees
   `Process/Start` (1), the session-start rundown (3) and `Process/End` (2), each
-  with a `UniqueProcessKey` at payload offset 0 and the pid at `P`. A START
+  with a `UniqueProcessKey` at payload offset 0 (assumed from the MOF; only the
+  pid offset at `P` is pinned by a live probe) and the pid at `P`. A START
   whose key differs from the pid's recorded one (`State::process_keys`) is proof
   that the pid changed owner, so that is where the reuse is applied: it drops
   the predecessor's buckets, names, pending requests and waiting bytes at once,
@@ -999,7 +1000,9 @@ rebase runbook.
   snapshot a live start can overtake — and a pid with no recorded key (started
   before the session, or its start record was lost) still drops on any exit.
   Accepted cost: a transfer charged between a reused pid's real start and its
-  start record arriving goes with the predecessor's bucket and is unknown.
+  start record arriving is dropped with whichever bucket the pid owns at that
+  moment — the predecessor's, or the fresh one an epoch binding already created —
+  and is unknown, never attributed to either process.
   Coverage is stated: a process created after the session started (creation
   ticks > session start) has its whole life traced
   (`traced_since_process_start`); for older ones the

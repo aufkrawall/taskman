@@ -143,7 +143,8 @@
 //!   applied.** The session also carries `EVENT_TRACE_FLAG_PROCESS`, so it sees
 //!   a `Process/Start` (opcode 1), the session-start rundown (opcode 3) and a
 //!   `Process/End` (opcode 2), each carrying the process's `UniqueProcessKey` at
-//!   payload offset 0 and its pid at `P`. A start whose key differs from the
+//!   payload offset 0 (assumed from the MOF; only the pid offset at `P` is pinned
+//!   by a live probe) and its pid at `P`. A start whose key differs from the
 //!   pid's recorded one is proof that the pid changed owner, and it drops the
 //!   predecessor's buckets, names, pending requests and waiting bytes — so the
 //!   successor cannot inherit them, and the epoch binding cannot later remove
@@ -154,8 +155,9 @@
 //!   state.
 //!   The rundown only seeds keys, because it is a snapshot that a live start can
 //!   overtake. A transfer charged before the start record that proves a reuse
-//!   arrives is dropped with the predecessor's bucket — unknown, never
-//!   attributed to either process.
+//!   arrives is dropped with whatever bucket the pid owns at that moment — the
+//!   predecessor's, or the fresh one a sample's epoch binding already created —
+//!   unknown, never attributed to either process.
 //! * **Coverage** is stated, not implied: a process created after the session
 //!   started has had its WHOLE life traced; an older one only since the
 //!   session started (Windows keeps no per-file history to recover the rest).
@@ -1147,9 +1149,11 @@ impl State {
     /// predecessor for it, and clearing here would throw away a brand-new
     /// process's own first bytes. The mirror-image cost is that a predecessor the
     /// session never named (no start record and no rundown entry survived) can
-    /// leave its paths in the bucket the successor inherits, until an epoch
-    /// binding or [`State::prune_dead`] removes it — there is no evidence to
-    /// separate the two.
+    /// leave its paths in the bucket the successor inherits: an epoch binding
+    /// ADOPTS that bucket rather than removing it — there is no bound creation
+    /// time to disagree with — so only a later start record (which would prove
+    /// the reuse) or [`State::prune_dead`] closes it. Until then there is no
+    /// evidence to separate the two owners.
     fn process_started(&mut self, pid: u32, key: u64) {
         if self
             .process_keys
@@ -3280,7 +3284,10 @@ mod tests {
         deliver(&shared, 60, EVENT_READ, &request_payload(0x1000, 64));
         // A sample bound the bucket to the predecessor's creation time.
         shared.lock().bind_epoch(60, 1_000);
-        assert_eq!(shared.lock().pids.get(&60).and_then(|f| f.epoch_s), Some(1_000));
+        assert_eq!(
+            shared.lock().pids.get(&60).and_then(|f| f.epoch_s),
+            Some(1_000)
+        );
 
         // The pid is reused, and the successor writes after its start record.
         deliver_process(&shared, PROCESS_START, NEW_KEY, 60);
@@ -3303,7 +3310,10 @@ mod tests {
         assert_eq!(bytes(&sample, r"C:\new\kept.bin"), written(32));
         assert_eq!(bytes(&sample, r"C:\old\gone.bin"), None);
         assert_eq!(sample.pid_transfers(), 1);
-        assert_eq!(shared.lock().pids.get(&60).and_then(|f| f.epoch_s), Some(2_000));
+        assert_eq!(
+            shared.lock().pids.get(&60).and_then(|f| f.epoch_s),
+            Some(2_000)
+        );
     }
 
     /// The session-start rundown only SEEDS a key: it is a snapshot taken while
@@ -3328,7 +3338,10 @@ mod tests {
         // A start with no recorded key still fills it in.
         shared.lock().process_keys.remove(&70);
         deliver_process(&shared, PROCESS_DC_START, STALE_KEY, 70);
-        assert_eq!(shared.lock().process_keys.get(&70).copied(), Some(STALE_KEY));
+        assert_eq!(
+            shared.lock().process_keys.get(&70).copied(),
+            Some(STALE_KEY)
+        );
     }
 
     /// An inherited handle — a parent's redirected output written by its child
