@@ -1362,6 +1362,93 @@ fn list_process_file_io_for_current_process_has_complete_handles() {
     assert!(snapshot.accounting.handles_complete);
 }
 
+/// The direct path attaches its OWN per-file trace sample, and it only does so
+/// when the caller passed a verified creation time — which every other test
+/// here omits. Without this one the attach step never runs end to end, and a
+/// wiring break (wrong state, unmeasured rows reported as zero, a total that
+/// does not add up) would go unnoticed.
+///
+/// This test process is normally unelevated, so `Unavailable` is the expected
+/// answer and nothing is asserted about bytes existing. What IS asserted is the
+/// accounting: either the trace measured and rows plus both remainders are the
+/// process total, or there is no source and every per-file number stayed empty.
+#[cfg(target_os = "windows")]
+#[test]
+fn list_process_file_io_with_a_creation_time_keeps_the_accounting_consistent() {
+    use tm_platform::actions::FileIoAccountingState;
+
+    let mut collector = tm_platform::create_collector();
+    let snapshot = collector
+        .sample(std::time::Instant::now())
+        .expect("live process snapshot");
+    let pid = std::process::id();
+    let start_epoch_s = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.start_epoch_s)
+        .expect("the test process must have a kernel-reported start time");
+
+    let actions = tm_platform::win::WinActions;
+    let file_io = actions
+        .list_process_file_io(pid, Some(start_epoch_s))
+        .expect("own process file io with a verified creation time");
+    assert!(
+        file_io.accounting.handles_complete,
+        "the handle walk must still report this process's files"
+    );
+
+    let rows_read: u64 = file_io
+        .files
+        .iter()
+        .filter_map(|file| file.read_bytes)
+        .sum();
+    let rows_written: u64 = file_io
+        .files
+        .iter()
+        .filter_map(|file| file.write_bytes)
+        .sum();
+    let accounting = &file_io.accounting;
+    if accounting.state == FileIoAccountingState::Measured {
+        assert!(
+            accounting.since_ms > 0 || !file_io.files.is_empty(),
+            "a measured snapshot says how long it has been accounting"
+        );
+        assert_eq!(
+            rows_read + accounting.unnamed_read_bytes + accounting.omitted_read_bytes,
+            accounting.read_bytes,
+            "rows plus the remainders are the whole attribution"
+        );
+        assert_eq!(
+            rows_written + accounting.unnamed_write_bytes + accounting.omitted_write_bytes,
+            accounting.write_bytes,
+            "rows plus the remainders are the whole attribution"
+        );
+        eprintln!(
+            "per-file trace measured {} rows in {} ms",
+            file_io.files.len(),
+            accounting.since_ms
+        );
+    } else {
+        assert_eq!(
+            accounting.state,
+            FileIoAccountingState::Unavailable,
+            "an unelevated host has no source; a live trace reports another state"
+        );
+        assert!(
+            file_io
+                .files
+                .iter()
+                .all(|file| file.read_bytes.is_none() && file.write_bytes.is_none()),
+            "without a source no row may carry a per-file count"
+        );
+        assert_eq!(accounting.read_bytes, 0);
+        assert_eq!(accounting.write_bytes, 0);
+        assert_eq!(accounting.since_ms, 0);
+        eprintln!("per-file trace unavailable here (no elevated session); accounting stayed empty");
+    }
+}
+
 /// Regression: the pre-copy `GetFileType` short-circuit resolved the child's
 /// handle VALUES in this process's handle table, so a foreign process's files
 /// were dropped unless a local handle happened to share the value and be a
