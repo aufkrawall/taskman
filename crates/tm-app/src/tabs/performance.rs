@@ -176,6 +176,49 @@ mod tests {
         assert!(narrow < cols_16);
     }
 
+    /// Regression: the memory header read "13.6 GB/0 B (0.0 %)" when the
+    /// platform reported no total — a byte pair and a share it never
+    /// measured. Unreported is the whole line "\u{2014}"; a measured machine
+    /// still states its used/total and share, zero included.
+    #[test]
+    fn the_memory_header_states_unavailable_until_a_total_is_reported() {
+        assert_eq!(
+            memory_usage_text(&tm_core::model::MemoryInfo::default()),
+            "\u{2014}"
+        );
+
+        let measured = tm_core::model::MemoryInfo {
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            used_bytes: 4 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(
+            memory_usage_text(&measured),
+            format!(
+                "{}/{} ({})",
+                format::format_bytes_loc(measured.used_bytes),
+                format::format_bytes_loc(measured.total_bytes),
+                format::format_pct_hdr(25.0)
+            )
+        );
+
+        let idle = tm_core::model::MemoryInfo {
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            used_bytes: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            memory_usage_text(&idle),
+            format!(
+                "{}/{} ({})",
+                format::format_bytes_loc(0),
+                format::format_bytes_loc(idle.total_bytes),
+                format::format_pct_hdr(0.0)
+            ),
+            "a measured zero is a number, not a missing reading"
+        );
+    }
+
     /// Regression: the series extractors used to SKIP window points without
     /// the requested device (and net_series even dropped zero-traffic
     /// samples). The shortened series then desynchronized from the shared
@@ -1153,12 +1196,7 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         key: "mem".into(),
         title: i18n::tr(K::MemTitle).into(),
         subtitle: String::new(),
-        value_line: format!(
-            "{}/{} ({})",
-            format::format_bytes_loc(snap.memory.used_bytes),
-            format::format_bytes_loc(snap.memory.total_bytes),
-            format::format_pct_hdr(snap.memory.used_pct())
-        ),
+        value_line: memory_usage_text(&snap.memory),
     });
 
     for d in &snap.disks {
@@ -1543,6 +1581,24 @@ fn cpu_util_text(cpu: &tm_core::model::CpuInfo) -> String {
     } else {
         "\u{2014}".to_string()
     }
+}
+
+/// Memory page header: "used/total (share)", or "\u{2014}" while the platform
+/// reports no total.
+///
+/// The whole line goes, not just the share: with `total_bytes == 0` the byte
+/// pair is equally unmeasured, and "13.6 GB/0 B" claims a total the platform
+/// never gave.
+fn memory_usage_text(mem: &tm_core::model::MemoryInfo) -> String {
+    let Some(pct) = mem.used_pct() else {
+        return "\u{2014}".to_string();
+    };
+    format!(
+        "{}/{} ({})",
+        format::format_bytes_loc(mem.used_bytes),
+        format::format_bytes_loc(mem.total_bytes),
+        format::format_pct_hdr(pct)
+    )
 }
 
 /// Page title row: big name left, detail right.
@@ -2563,12 +2619,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui,
         pal,
         i18n::tr(K::MemTitle),
-        &format!(
-            "{}/{} ({})",
-            format::format_bytes_loc(snap.memory.used_bytes),
-            format::format_bytes_loc(snap.memory.total_bytes),
-            format::format_pct_hdr(snap.memory.used_pct())
-        ),
+        &memory_usage_text(&snap.memory),
     );
     let window_text = window_label(app.shared.settings.graph_seconds);
     caption(
