@@ -8,7 +8,7 @@
 
 use super::launch;
 use std::path::Path;
-use std::process::{Child, Command, Output};
+use std::process::{Command, Output};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tm_core::error::{Result, TmError};
@@ -150,70 +150,12 @@ fn run_loginctl(loginctl: &Path, args: &[&str], deadline: Instant) -> std::io::R
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    if let Err(error) = wait_for_exit(&mut child, deadline) {
+    if let Err(error) = launch::wait_for_exit(&mut child, deadline, "loginctl") {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
     child.wait_with_output()
-}
-
-fn wait_for_exit(child: &mut Child, deadline: Instant) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-        if fd >= 0 {
-            let result = wait_pidfd(fd as libc::c_int, deadline);
-            unsafe {
-                libc::close(fd as libc::c_int);
-            }
-            return result;
-        }
-    }
-
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "loginctl exceeded its deadline",
-            ));
-        }
-        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_pidfd(fd: libc::c_int, deadline: Instant) -> std::io::Result<()> {
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "loginctl exceeded its deadline",
-            ));
-        }
-        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut pollfd, 1, remaining_ms) };
-        if result > 0 {
-            return Ok(());
-        }
-        if result == 0 {
-            continue;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
 }
 
 fn lock_listing_state() -> std::sync::MutexGuard<'static, ListingState> {
@@ -234,10 +176,13 @@ fn listing_retry_available(retry_after: Option<Instant>, now: Instant) -> bool {
 /// diagnostic is appended when there is one: the whole point of the window is
 /// to stop respawning a failing `loginctl`, not to hide why it failed.
 fn cooldown_message(last_failure: Option<&str>) -> String {
-    match last_failure.map(str::trim).filter(|detail| !detail.is_empty()) {
-        Some(detail) => format!(
-            "a recent loginctl failure is still cooling down; last failure: {detail}"
-        ),
+    match last_failure
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        Some(detail) => {
+            format!("a recent loginctl failure is still cooling down; last failure: {detail}")
+        }
         None => "a recent loginctl failure is still cooling down".to_string(),
     }
 }

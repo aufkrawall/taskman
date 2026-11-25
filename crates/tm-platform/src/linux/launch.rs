@@ -1,4 +1,5 @@
-//! Detached process-group launches and trust checks for privileged execution.
+//! Detached process-group launches and trust checks for privileged execution,
+//! plus the bounded child wait the `systemctl`/`loginctl` probes share.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -6,6 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tm_core::error::{Result, TmError};
 
@@ -87,6 +89,75 @@ fn reaping_thread(child: Child) -> Result<()> {
             ))
         }
     }
+}
+
+/// Wait for `child` to exit before `deadline`.
+///
+/// The kernel's `pidfd` is preferred: it is readable as soon as the child
+/// exits, so no polling is needed. A kernel or seccomp profile that refuses
+/// `pidfd_open` falls back to a bounded `try_wait` poll. `what` names the
+/// program in the timeout diagnostic. A `TimedOut` return leaves the child
+/// running on purpose: only the caller knows whether the work is still wanted,
+/// so it decides to kill and reap.
+pub(super) fn wait_for_exit(
+    child: &mut Child,
+    deadline: Instant,
+    what: &str,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        if fd >= 0 {
+            let result = wait_pidfd(fd as libc::c_int, deadline, what);
+            unsafe {
+                libc::close(fd as libc::c_int);
+            }
+            return result;
+        }
+    }
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(deadline_error(what));
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pidfd(fd: libc::c_int, deadline: Instant, what: &str) -> std::io::Result<()> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(deadline_error(what));
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut pollfd, 1, remaining_ms) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn deadline_error(what: &str) -> std::io::Error {
+    let detail = format!("{what} exceeded its deadline");
+    std::io::Error::new(std::io::ErrorKind::TimedOut, detail)
 }
 
 /// Require a canonical system-tool path and every parent directory to be
