@@ -1078,6 +1078,13 @@ impl TmTable {
             Some(self.drop_slot(rect, &bounds, pointer.x).unwrap_or(from))
         });
 
+        // The header's guides follow the body dividers' rule: one physical
+        // pixel wide, on a pixel centre. The header sits directly on the
+        // body, so a guide that is a point wide and half a pixel off makes
+        // the same boundary kink at the seam between them.
+        let ppp = ui.ctx().pixels_per_point();
+        let ppp = if ppp > 0.0 { ppp } else { 1.0 };
+
         for (i, col) in self.cols.iter().enumerate() {
             let w = self.col_width(i);
             let cell =
@@ -1129,12 +1136,13 @@ impl TmTable {
             }
 
             if i > 0 {
+                let gx = x.round_to_pixel_center(ppp);
                 painter.line_segment(
                     [
-                        Pos2::new(x, rect.top() + 4.0),
-                        Pos2::new(x, rect.bottom() - 4.0),
+                        Pos2::new(gx, rect.top() + 4.0),
+                        Pos2::new(gx, rect.bottom() - 4.0),
                     ],
-                    Stroke::new(1.0, pal.stroke),
+                    Stroke::new(1.0 / ppp, pal.stroke),
                 );
             }
 
@@ -1792,7 +1800,10 @@ pub fn caret(painter: egui::Painter, c: Pos2, ascending: bool, color: Color32) {
 
 pub struct Aggregates {
     pub cpu_pct: Option<f32>,
-    pub mem_pct: f32,
+    /// Share of RAM in use, or `None` while the platform reports no memory
+    /// total: the memory slot sits beside the CPU slot, so a fabricated zero
+    /// here reads "0 %" next to its "\u{2014}".
+    pub mem_pct: Option<f32>,
     /// Busiest disk's active time, or `None` while the platform's disk-time
     /// counters are not running. Both disk columns hang off this number, so
     /// a fabricated zero here reads as "nothing is touching a disk" on a page
@@ -1869,7 +1880,8 @@ impl Aggregates {
         [
             self.cpu_pct
                 .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
-            format::format_pct_hdr(self.mem_pct),
+            self.mem_pct
+                .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
             disk.clone(),
             self.net_pct
                 .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
@@ -2312,6 +2324,41 @@ mod tests {
             Aggregates::from_snapshot(&snap).strings()[0],
             format::format_pct_hdr(0.0)
         );
+    }
+
+    /// Regression: the memory slot printed "0 %" for an unreported total
+    /// while the CPU slot beside it printed "\u{2014}" from the same header.
+    /// `total_bytes == 0` is the platform's "unreported" signal, and a
+    /// measured zero is still a number the header must state.
+    #[test]
+    fn the_memory_total_reads_unavailable_until_a_total_is_reported() {
+        let unmeasured = tm_core::model::MemoryInfo::default();
+        assert_eq!(unmeasured.used_pct(), None, "no total means no share");
+
+        let mut snap = tm_core::model::Snapshot::default();
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[1],
+            "\u{2014}",
+            "an unreported memory total must not read 0 %"
+        );
+
+        snap.memory.total_bytes = 16 * 1024 * 1024 * 1024;
+        snap.memory.used_bytes = 8 * 1024 * 1024 * 1024;
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[1],
+            format::format_pct_hdr(50.0)
+        );
+
+        let idle = Aggregates::from_snapshot(&tm_core::model::Snapshot {
+            memory: tm_core::model::MemoryInfo {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                used_bytes: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .strings();
+        assert_eq!(idle[1], format::format_pct_hdr(0.0));
     }
 
     /// The network total is the busiest adapter in its busiest direction.

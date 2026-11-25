@@ -121,12 +121,15 @@ pub struct MemoryInfo {
 }
 
 impl MemoryInfo {
-    pub fn used_pct(&self) -> f32 {
+    /// Share of RAM in use, or `None` while the platform reports no total
+    /// (`total_bytes == 0` is its "unreported" signal): an unmeasured machine
+    /// and a full one must never read the same.
+    pub fn used_pct(&self) -> Option<f32> {
         if self.total_bytes == 0 {
-            0.0
-        } else {
-            self.used_bytes as f32 / self.total_bytes as f32 * 100.0
+            return None;
         }
+        let pct = self.used_bytes as f32 / self.total_bytes as f32 * 100.0;
+        pct.is_finite().then_some(pct)
     }
 
     pub fn commit_pct(&self) -> f32 {
