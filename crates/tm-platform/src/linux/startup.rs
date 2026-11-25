@@ -3,7 +3,11 @@
 //! which is the precedence mechanism defined by the XDG autostart spec.
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tm_core::error::{Result, TmError};
 use tm_core::model::{StartupImpact, StartupItem};
 
@@ -182,7 +186,7 @@ pub fn set_enabled(item_id: &str, enabled: bool) -> Result<()> {
         let text = format!(
             "[Desktop Entry]\nType=Application\nName={stem}\nHidden=true\n{TASKMAN_OVERRIDE_KEY}\n"
         );
-        std::fs::write(&user_path, text)
+        write_replacing(&user_path, &text)
             .map_err(|e| TmError::platform("write autostart override", e.to_string()))?;
     } else {
         // No user override means the lower-precedence system file is enabled.
@@ -196,39 +200,112 @@ pub fn set_enabled(item_id: &str, enabled: bool) -> Result<()> {
 fn set_hidden_in_file(path: &Path, hidden: bool) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| TmError::platform("read autostart entry", e.to_string()))?;
+    let value = if hidden { "true" } else { "false" };
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = String::with_capacity(text.len() + 24);
     let mut in_entry = false;
     let mut wrote = false;
-    for raw in text.lines() {
+    // `split_inclusive` keeps every untouched line's own ending, so a CRLF
+    // entry stays CRLF and only the `Hidden` line changes. Rebuilding the text
+    // from `lines()` would normalize the user's whole file.
+    for raw in text.split_inclusive('\n') {
         let line = raw.trim();
         if line.starts_with('[') {
             if in_entry && !wrote {
-                out.push_str(&format!(
-                    "Hidden={}\n",
-                    if hidden { "true" } else { "false" }
-                ));
+                push_hidden(&mut out, value, newline);
                 wrote = true;
             }
             in_entry = line == "[Desktop Entry]";
         }
         if in_entry && line.starts_with("Hidden=") {
-            out.push_str(&format!(
-                "Hidden={}\n",
-                if hidden { "true" } else { "false" }
-            ));
+            out.push_str("Hidden=");
+            out.push_str(value);
+            out.push_str(line_ending(raw));
             wrote = true;
         } else {
             out.push_str(raw);
-            out.push('\n');
         }
     }
     if in_entry && !wrote {
-        out.push_str(&format!(
-            "Hidden={}\n",
-            if hidden { "true" } else { "false" }
-        ));
+        push_hidden(&mut out, value, newline);
     }
-    std::fs::write(path, out).map_err(|e| TmError::platform("write autostart entry", e.to_string()))
+    if out == text {
+        return Ok(());
+    }
+    write_replacing(path, &out)
+        .map_err(|e| TmError::platform("write autostart entry", e.to_string()))
+}
+
+/// The line ending the given source line already carries, empty for a last
+/// line without one.
+fn line_ending(raw: &str) -> &'static str {
+    if raw.ends_with("\r\n") {
+        "\r\n"
+    } else if raw.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    }
+}
+
+/// Append a `Hidden` line that the file did not have, separating it from a
+/// previous line that did not end its own.
+fn push_hidden(out: &mut String, value: &str, newline: &str) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(newline);
+    }
+    out.push_str("Hidden=");
+    out.push_str(value);
+    out.push_str(newline);
+}
+
+/// Publish `contents` at `path` without truncating it in place.
+///
+/// The desktop may read this entry while it is rewritten, and a full disk or a
+/// killed process in the middle of an in-place write leaves the user's file
+/// truncated. A sibling temporary file published by `rename` shows either the
+/// old or the new content, and it keeps the entry's permission bits. An entry
+/// that is a symlink is written through the link instead: replacing the link
+/// itself would silently turn a shared entry into a private copy.
+fn write_replacing(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mode = std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return std::fs::write(path, contents);
+    }
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temp_path)?;
+        // `mode` on creation is masked by the umask; set the entry's exact bits
+        // so a rewrite can never widen or narrow what the user had.
+        temp.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        temp.write_all(contents.as_bytes())?;
+        temp.sync_all()?;
+        std::fs::rename(&temp_path, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,6 +340,50 @@ mod tests {
         assert!(text.contains("Exec=test"));
         assert!(text.contains("Hidden=true"));
         assert!(!is_taskman_override(&path));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hidden_update_keeps_crlf_and_publishes_a_new_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("taskman-xdg-crlf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.desktop");
+        let original = "[Desktop Entry]\r\nName=Test\r\nExec=test\r\nHidden=false\r\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+
+        set_hidden_in_file(&path, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "an already-correct Hidden value must not rewrite the file"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            before,
+            "an unchanged entry must not be replaced"
+        );
+
+        set_hidden_in_file(&path, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replace("Hidden=false", "Hidden=true"),
+            "a CRLF entry keeps its line endings"
+        );
+        let replaced = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            replaced.ino(),
+            before,
+            "a rewrite publishes a sibling file instead of truncating the old one"
+        );
+        assert_eq!(
+            replaced.mode() & 0o777,
+            0o640,
+            "the rewritten entry keeps its permission bits"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
