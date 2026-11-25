@@ -2,14 +2,22 @@
 //! plus the bounded child wait the `systemctl`/`loginctl` probes share.
 
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tm_core::error::{Result, TmError};
+
+/// Largest single stdio stream this module collects from a helper.
+///
+/// `systemctl` and `loginctl` answer in a few hundred bytes; the cap only keeps a
+/// runaway child from allocating without bound inside its deadline.
+const HELPER_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 pub(super) fn spawn_detached(
     program: &OsStr,
@@ -171,6 +179,114 @@ fn wait_pidfd(fd: libc::c_int, deadline: Instant, what: &str) -> std::io::Result
 fn deadline_error(what: &str) -> std::io::Error {
     let detail = format!("{what} exceeded its deadline");
     std::io::Error::new(std::io::ErrorKind::TimedOut, detail)
+}
+
+/// Run `child` to completion and collect its output, all before `deadline`.
+///
+/// `Child::wait_with_output` drains the pipes to EOF with no deadline of its own:
+/// a process that inherited the helper's descriptors keeps them open after the
+/// helper itself exits, so that read outlived the deadline the wait had just
+/// established. Both streams are therefore drained under the same absolute
+/// deadline — `poll` plus `read`, like the `fc-match` runner — and the rest of the
+/// budget then proves the exit. A `TimedOut` return leaves the child, its streams
+/// and its reap to the caller, which owns the kill.
+pub(super) fn wait_with_output(
+    child: &mut Child,
+    deadline: Instant,
+    what: &str,
+) -> std::io::Result<Output> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drain_streams(&mut stdout, &mut stderr, &mut out, &mut err, deadline, what)?;
+    wait_for_exit(child, deadline, what)?;
+    // The exit is proven now, either by a readable pidfd or by the `try_wait`
+    // loop that already reaped it, so this only collects a status the kernel is
+    // holding.
+    let status = child.wait()?;
+    Ok(Output {
+        status,
+        stdout: out,
+        stderr: err,
+    })
+}
+
+/// Read both helper streams until each is closed or `deadline` passes.
+fn drain_streams<O: Read + AsRawFd, E: Read + AsRawFd>(
+    stdout: &mut Option<O>,
+    stderr: &mut Option<E>,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    deadline: Instant,
+    what: &str,
+) -> std::io::Result<()> {
+    while stdout.is_some() || stderr.is_some() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(deadline_error(what));
+        }
+        let remaining_ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut pollfds = [
+            libc::pollfd {
+                fd: stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `pollfds` holds two initialized descriptors for the duration of
+        // the call (a negative entry is the closed stream, which `poll` ignores),
+        // and the timeout is bounded.
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, remaining_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if pollfds[0].revents != 0 {
+            read_ready(stdout, out, what)?;
+        }
+        if pollfds[1].revents != 0 {
+            read_ready(stderr, err, what)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read one stream that `poll` reported ready, or close it at end of file.
+fn read_ready<T: Read>(
+    stream: &mut Option<T>,
+    buffer: &mut Vec<u8>,
+    what: &str,
+) -> std::io::Result<()> {
+    let Some(pipe) = stream.as_mut() else {
+        return Ok(());
+    };
+    if buffer.len() >= HELPER_OUTPUT_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} wrote more than {HELPER_OUTPUT_LIMIT} bytes to one stream"),
+        ));
+    }
+    let mut chunk = [0u8; 4096];
+    let want = (HELPER_OUTPUT_LIMIT - buffer.len()).min(chunk.len());
+    let read = pipe.read(&mut chunk[..want])?;
+    if read == 0 {
+        *stream = None;
+        return Ok(());
+    }
+    buffer.extend_from_slice(&chunk[..read]);
+    Ok(())
 }
 
 /// Require a canonical system-tool path and every parent directory to be

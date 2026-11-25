@@ -150,12 +150,14 @@ fn run_loginctl(loginctl: &Path, args: &[&str], deadline: Instant) -> std::io::R
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    if let Err(error) = launch::wait_for_exit(&mut child, deadline, "loginctl") {
+    // The output is drained under the same deadline as the exit: a process that
+    // inherited these pipes would otherwise block the read past it.
+    let result = launch::wait_with_output(&mut child, deadline, "loginctl");
+    if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(error);
     }
-    child.wait_with_output()
+    result
 }
 
 fn lock_listing_state() -> std::sync::MutexGuard<'static, ListingState> {
@@ -370,6 +372,22 @@ TimestampMonotonic=1234567890
             started + Duration::from_millis(100),
         )
         .expect_err("the busy child must hit the deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The helper's output is bounded by the same deadline as its exit. The
+    /// child here exits at once, but the `sleep` it left behind keeps the
+    /// inherited pipes open, which a plain read-to-EOF would wait out.
+    #[test]
+    fn a_pipe_held_open_by_a_leftover_process_still_hits_the_deadline() {
+        let started = Instant::now();
+        let error = run_loginctl(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 1 & exec sleep 0.05"],
+            started + Duration::from_millis(200),
+        )
+        .expect_err("the held pipe must hit the deadline");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
