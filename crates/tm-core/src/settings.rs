@@ -802,7 +802,10 @@ impl Settings {
                 // Tolerate a UTF-8 BOM (e.g. files edited with PowerShell).
                 let text = String::from_utf8_lossy(&bytes);
                 let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-                if parse_ini(text).is_empty() {
+                // Parsed once: the emptiness check and the field mapping read
+                // the same map, so a large config is not walked twice.
+                let kv = parse_ini(text);
+                if kv.is_empty() {
                     // Nothing to restore. Reporting this as usable would skip
                     // the JSON migration and let the first autosave of
                     // defaults overwrite what the user actually chose.
@@ -814,7 +817,7 @@ impl Settings {
                     crate::persist::set_aside(path, "settings file");
                     (Self::default(), false)
                 } else {
-                    let s = Self::from_ini_text(text);
+                    let s = Self::from_ini_map(&kv);
                     tracing::debug!(path = %path.display(), "settings loaded");
                     (s, true)
                 }
@@ -836,7 +839,12 @@ impl Settings {
     /// Build settings from INI text. Unknown keys/values are ignored and the
     /// corresponding fields keep their defaults.
     pub fn from_ini_text(text: &str) -> Self {
-        let kv = parse_ini(text);
+        Self::from_ini_map(&parse_ini(text))
+    }
+
+    /// Build settings from an already parsed INI map, so the loader can decide
+    /// whether the file holds anything and map its keys from one parse.
+    fn from_ini_map(kv: &BTreeMap<(String, String), String>) -> Self {
         let get = |section: &str, key: &str| kv.get(&(section.to_string(), key.to_string()));
         let b = |section: &str, key: &str, dflt: bool| {
             get(section, key)
@@ -1002,7 +1010,7 @@ impl Settings {
         // column ids are preserved verbatim (harmless) rather than
         // corrupting anything.
         let mut saw_legacy = false;
-        for ((section, key), value) in &kv {
+        for ((section, key), value) in kv {
             if section == "columns" {
                 saw_legacy = true;
             } else if section == "sort" {
