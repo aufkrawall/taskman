@@ -791,10 +791,12 @@ impl Settings {
     /// [`Settings::load`] still fall back to the legacy JSON settings instead
     /// of letting defaults shadow them.
     ///
-    /// One `key=value` pair is enough to be usable: a hand-edited INI
-    /// legitimately sets a subset of the keys, and every key it omits keeps
-    /// its default. Only a file that says nothing is indistinguishable from
-    /// one whose write lost its data.
+    /// One pair under a section header is enough to be usable: a hand-edited
+    /// INI legitimately sets a subset of the keys, and every key it omits
+    /// keeps its default. A pair before the first header belongs to no section
+    /// and is dropped by the parser, so a file with only those still counts as
+    /// nothing. Only a file that says nothing is indistinguishable from one
+    /// whose write lost its data.
     fn load_from_checked(path: &Path) -> (Self, bool) {
         let bytes = read_capped(path, MAX_SETTINGS_BYTES);
         match bytes {
