@@ -2052,15 +2052,66 @@ fn process_network_sample() -> ProcessNetworkSample {
 /// Hard caps on one disk response: entries, and per-disk items across the
 /// entries and the totals. Worst-case JSON stays below the 512 KiB response
 /// frame. Overflow is unavailable rather than a false zero on omitted
-/// processes. Pinned by `a_capped_disk_response_fits_the_frame_limit`.
+/// processes, and the window it refused is held for the next request instead of
+/// being dropped (see [`process_disk_sample`]). Pinned by
+/// `a_capped_disk_response_fits_the_frame_limit`.
 const DISK_MAX_ENTRIES: usize = 1_800;
 const DISK_MAX_DISK_TIMES: usize = 3_600;
+
+/// Whether one drained window encodes within the per-response caps.
+///
+/// The counts are exactly the ones the response carries: a row for every
+/// process that completed at least one request, that row's per-disk split, and
+/// the window's own per-disk totals.
+fn disk_window_fits(window: &super::disk_etw::DiskWindow) -> bool {
+    let mut entries = 0usize;
+    let mut disk_times = window.disk_totals.len();
+    for row in window.procs.values().filter(|row| row.ops != 0) {
+        entries += 1;
+        disk_times += row.per_disk.len();
+    }
+    entries <= DISK_MAX_ENTRIES && disk_times <= DISK_MAX_DISK_TIMES
+}
+
+/// Fold a window a previous response could not carry into the one that follows
+/// it.
+///
+/// The two cover consecutive spans, so the merged window's `since_ms` is their
+/// sum and every counter adds: nothing is charged to a guess and no record is
+/// dropped. A merged window is measured as one longer interval, so the shares
+/// derived from it stay ratios of the same denominator.
+fn merge_disk_windows(into: &mut super::disk_etw::DiskWindow, later: super::disk_etw::DiskWindow) {
+    into.since_ms = into.since_ms.saturating_add(later.since_ms);
+    into.events_seen = into.events_seen.saturating_add(later.events_seen);
+    into.events_decoded = into.events_decoded.saturating_add(later.events_decoded);
+    into.unattributed_service_time = into
+        .unattributed_service_time
+        .saturating_add(later.unattributed_service_time);
+    for total in later.disk_totals {
+        super::disk_etw::add_disk_time(&mut into.disk_totals, total.disk, total.service_time);
+    }
+    for (pid, disk) in later.procs {
+        let row = into.procs.entry(pid).or_default();
+        row.service_time = row.service_time.saturating_add(disk.service_time);
+        row.read_bytes = row.read_bytes.saturating_add(disk.read_bytes);
+        row.write_bytes = row.write_bytes.saturating_add(disk.write_bytes);
+        row.ops = row.ops.saturating_add(disk.ops);
+        for part in disk.per_disk {
+            super::disk_etw::add_disk_time(&mut row.per_disk, part.disk, part.service_time);
+        }
+    }
+}
 
 /// The broker-hosted per-process disk trace, with the same idle watchdog as
 /// the network one.
 struct DiskTrace {
     usage: super::disk_etw::DiskUsage,
     last_request: std::time::Instant,
+    /// A drained window the previous response could not carry because it did
+    /// not fit the caps; measured together with the next one. One slot, not a
+    /// list: the windows a single machine produces over consecutive polls cover
+    /// the same processes, so holding more than one would add span, not rows.
+    pending: Option<super::disk_etw::DiskWindow>,
 }
 
 fn disk_trace() -> &'static std::sync::Mutex<Option<DiskTrace>> {
@@ -2102,6 +2153,7 @@ fn process_disk_sample() -> ProcessDiskSample {
                 *slot = Some(DiskTrace {
                     usage,
                     last_request: std::time::Instant::now(),
+                    pending: None,
                 });
                 if !spawn_disk_trace_watchdog() {
                     // Same rule as the network trace: the watchdog is the only
@@ -2130,7 +2182,28 @@ fn process_disk_sample() -> ProcessDiskSample {
     };
     trace.last_request = std::time::Instant::now();
     let live = live_pids();
-    let window = trace.usage.take_window(&live);
+    let mut window = trace.usage.take_window(&live);
+    if let Some(held) = trace.pending.take() {
+        // A window an earlier response could not carry; see below.
+        merge_disk_windows(&mut window, held);
+    }
+    // The caps bound the RESPONSE, not the measurement, and the drained window
+    // is checked before anything is taken out of it: a window that cannot be
+    // encoded within them is held for the next request, so its records are
+    // measured one request later. This tick answers unknown, which is what a
+    // source that cannot be delivered has to say — publishing the rows that
+    // happen to fit would charge every other process a fabricated zero for the
+    // same window.
+    if !disk_window_fits(&window) {
+        if broker_warning_allowed() {
+            tracing::warn!(
+                entries = window.procs.len(),
+                "disk response exceeds the frame budget; holding the window"
+            );
+        }
+        trace.pending = Some(window);
+        return ProcessDiskSample::default();
+    }
     let total_service_time = window.total_service_time();
     let to_wire = |times: &[super::disk_etw::DiskTime]| -> Vec<ProcessDiskTime> {
         times
@@ -2155,17 +2228,6 @@ fn process_disk_sample() -> ProcessDiskSample {
             ops: disk.ops,
         })
         .collect();
-    let disk_times =
-        disk_totals.len() + entries.iter().map(|entry| entry.disks.len()).sum::<usize>();
-    if entries.len() > DISK_MAX_ENTRIES || disk_times > DISK_MAX_DISK_TIMES {
-        if broker_warning_allowed() {
-            tracing::warn!(
-                count = entries.len(),
-                "disk response exceeds the frame budget"
-            );
-        }
-        return ProcessDiskSample::default();
-    }
     ProcessDiskSample {
         active: true,
         window_ms: window.since_ms,
@@ -4610,6 +4672,161 @@ mod tests {
             "{} > {MAX_RESPONSE_BYTES}",
             encoded.len()
         );
+    }
+
+    /// Regression: `take_window` drains the accumulators, so a drained window
+    /// the caps refused was simply dropped — its service time, bytes and events
+    /// never reached a total and the next window's shares were computed without
+    /// them. A refused window is now held and measured with the next one.
+    #[test]
+    fn a_window_the_caps_refused_is_measured_with_the_next_one() {
+        use super::super::disk_etw::{DiskTime, DiskWindow, PidDisk};
+
+        let window =
+            |since_ms: u64, ops: u64, read: u64, write: u64, service: u64, disks: Vec<DiskTime>| {
+                DiskWindow {
+                    since_ms,
+                    events_seen: ops,
+                    events_decoded: ops,
+                    unattributed_service_time: ops,
+                    disk_totals: disks.clone(),
+                    procs: std::collections::HashMap::from([(
+                        42u32,
+                        PidDisk {
+                            service_time: service,
+                            per_disk: disks,
+                            read_bytes: read,
+                            write_bytes: write,
+                            ops,
+                        },
+                    )]),
+                }
+            };
+        let mut held = window(
+            1_000,
+            3,
+            10,
+            20,
+            400,
+            vec![DiskTime {
+                disk: 1,
+                service_time: 400,
+            }],
+        );
+        let next = window(
+            500,
+            2,
+            5,
+            7,
+            200,
+            vec![
+                DiskTime {
+                    disk: 1,
+                    service_time: 150,
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 50,
+                },
+            ],
+        );
+        merge_disk_windows(&mut held, next);
+        assert_eq!(held.since_ms, 1_500, "the merged window covers both spans");
+        assert_eq!(held.events_seen, 5);
+        assert_eq!(held.events_decoded, 5);
+        assert_eq!(held.unattributed_service_time, 5);
+        assert_eq!(
+            held.disk_totals,
+            vec![
+                DiskTime {
+                    disk: 1,
+                    service_time: 550,
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 50,
+                },
+            ],
+            "the window's own totals add per disk, and a new disk is kept"
+        );
+        let row = &held.procs[&42];
+        assert_eq!(row.ops, 5);
+        assert_eq!(row.read_bytes, 15);
+        assert_eq!(row.write_bytes, 27);
+        assert_eq!(row.service_time, 600);
+        assert_eq!(
+            row.per_disk,
+            vec![
+                DiskTime {
+                    disk: 1,
+                    service_time: 550,
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 50,
+                },
+            ]
+        );
+        assert_eq!(held.total_service_time(), 605);
+    }
+
+    /// The caps count exactly what the response carries: a row per process that
+    /// completed a request, that row's per-disk split, and the window's own
+    /// per-disk totals. The drained window is checked against them before
+    /// anything is taken out of it, so both sides of each boundary are pinned.
+    #[test]
+    fn the_disk_caps_count_what_the_response_carries() {
+        use super::super::disk_etw::{DiskTime, DiskWindow, PidDisk};
+
+        let row = |ops: u64, disks: u32| PidDisk {
+            ops,
+            per_disk: (0..disks)
+                .map(|disk| DiskTime {
+                    disk,
+                    service_time: 1,
+                })
+                .collect(),
+            ..PidDisk::default()
+        };
+        let at_entry_cap = DiskWindow {
+            procs: (0..DISK_MAX_ENTRIES as u32)
+                .map(|pid| (pid, row(1, 0)))
+                .collect(),
+            ..DiskWindow::default()
+        };
+        assert!(disk_window_fits(&at_entry_cap));
+        let mut over_entry_cap = at_entry_cap.clone();
+        over_entry_cap
+            .procs
+            .insert(DISK_MAX_ENTRIES as u32, row(1, 0));
+        assert!(
+            !disk_window_fits(&over_entry_cap),
+            "a row over the entry cap cannot be published"
+        );
+
+        // Two disks per row spends the per-disk budget exactly, so the window's
+        // own totals are what pushes it over.
+        let rows = (DISK_MAX_DISK_TIMES / 2) as u32;
+        let mut at_disk_cap = DiskWindow {
+            procs: (0..rows).map(|pid| (pid, row(1, 2))).collect(),
+            ..DiskWindow::default()
+        };
+        assert!(disk_window_fits(&at_disk_cap));
+        at_disk_cap.disk_totals.push(DiskTime {
+            disk: 9,
+            service_time: 1,
+        });
+        assert!(
+            !disk_window_fits(&at_disk_cap),
+            "the window's totals share the per-disk cap"
+        );
+
+        // A process that completed no request is not a row of the answer.
+        let idle = DiskWindow {
+            procs: std::collections::HashMap::from([(7u32, row(0, 4))]),
+            ..DiskWindow::default()
+        };
+        assert!(disk_window_fits(&idle));
     }
 
     #[test]
