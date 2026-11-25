@@ -291,7 +291,8 @@ impl ProcessModuleTrace {
             shared,
             on_event,
             "tm-profile-etw",
-        )?;
+        )
+        .map_err(String::from)?;
         tracing::info!(pid, "per-process module code-sample trace started");
         Ok(Self {
             session,
