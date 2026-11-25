@@ -371,14 +371,22 @@ struct BrokerResponse {
 
 #[derive(Debug)]
 enum BrokerCallError {
+    /// Nothing was tried, or the service is not there to try.
     Unavailable(String),
+    /// The request or the answer was lost in transport, or the two sides do not
+    /// agree on the frame. The service never said no, so this is an unknown
+    /// rather than a decision: a read-only request may answer from the local
+    /// arm (the same treatment [`Self::Unavailable`] gets), while an action has
+    /// to report that its outcome is unknown.
+    NoAnswer(String),
+    /// The service answered and declined. Never worked around locally.
     Rejected(String),
 }
 
 impl std::fmt::Display for BrokerCallError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(detail) => write!(formatter, "{detail}"),
+            Self::Unavailable(detail) | Self::NoAnswer(detail) => write!(formatter, "{detail}"),
             Self::Rejected(detail) => write!(formatter, "broker rejected request: {detail}"),
         }
     }
@@ -744,22 +752,22 @@ impl BrokerClient {
             ));
         }
         let payload = serde_json::to_vec(&request)
-            .map_err(|error| BrokerCallError::Rejected(error.to_string()))?;
+            .map_err(|error| BrokerCallError::NoAnswer(error.to_string()))?;
         write_frame(&mut pipe, FRAME_REQUEST, &payload, MAX_REQUEST_BYTES).map_err(|error| {
-            BrokerCallError::Rejected(format!(
+            BrokerCallError::NoAnswer(format!(
                 "request delivery failed; action state is unknown: {error}"
             ))
         })?;
         let response =
             read_frame(&mut pipe, FRAME_RESPONSE, MAX_RESPONSE_BYTES).map_err(|error| {
-                BrokerCallError::Rejected(format!(
+                BrokerCallError::NoAnswer(format!(
                     "service response was lost; action state is unknown: {error}"
                 ))
             })?;
         let response: BrokerResponse = serde_json::from_slice(&response)
-            .map_err(|error| BrokerCallError::Rejected(error.to_string()))?;
+            .map_err(|error| BrokerCallError::NoAnswer(error.to_string()))?;
         if response.protocol_version != PROTOCOL_VERSION {
-            return Err(BrokerCallError::Rejected(
+            return Err(BrokerCallError::NoAnswer(
                 "service protocol version changed during request".into(),
             ));
         }
@@ -872,7 +880,9 @@ pub(crate) fn brokered_process_network() -> BrokeredNetwork {
     match telemetry_broker_call(BrokerRequest::ProcessNetworkCounters) {
         Ok(BrokerValue::ProcessNetwork(sample)) => BrokeredNetwork::Sample(sample),
         Ok(_) => BrokeredNetwork::Rejected("unexpected response type".into()),
-        Err(BrokerCallError::Unavailable(_)) => BrokeredNetwork::Unavailable,
+        Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => {
+            BrokeredNetwork::Unavailable
+        }
         Err(BrokerCallError::Rejected(detail)) => BrokeredNetwork::Rejected(detail),
     }
 }
@@ -890,7 +900,9 @@ pub(crate) fn brokered_process_disk() -> BrokeredDisk {
     match telemetry_broker_call(BrokerRequest::ProcessDiskCounters) {
         Ok(BrokerValue::ProcessDisk(sample)) => BrokeredDisk::Sample(sample),
         Ok(_) => BrokeredDisk::Rejected("unexpected response type".into()),
-        Err(BrokerCallError::Unavailable(_)) => BrokeredDisk::Unavailable,
+        Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => {
+            BrokeredDisk::Unavailable
+        }
         Err(BrokerCallError::Rejected(detail)) => BrokeredDisk::Rejected(detail),
     }
 }
@@ -920,7 +932,9 @@ pub(crate) fn brokered_process_identity(
     }) {
         Ok(BrokerValue::ProcessIdentity(identity)) => BrokeredIdentity::Token(identity),
         Ok(_) => BrokeredIdentity::Rejected("unexpected response type".into()),
-        Err(BrokerCallError::Unavailable(_)) => BrokeredIdentity::Unavailable,
+        Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => {
+            BrokeredIdentity::Unavailable
+        }
         Err(BrokerCallError::Rejected(detail)) => BrokeredIdentity::Rejected(detail),
     }
 }
@@ -968,6 +982,13 @@ impl BrokeredActions {
                 "unexpected response type",
             )),
             Err(BrokerCallError::Unavailable(_)) => local(),
+            // A lost answer is not a decision, but an ACTION whose answer was
+            // lost has an unknown outcome: reporting it is the only honest
+            // answer, and retrying it on the local token would repeat its side
+            // effect.
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -984,6 +1005,12 @@ impl BrokeredActions {
             Ok(value) => decode(value)
                 .ok_or_else(|| TmError::platform("core service", "unexpected response type")),
             Err(BrokerCallError::Unavailable(_)) => local(),
+            // One of this helper's callers changes state (a module unload), so a
+            // lost answer cannot fall back: repeating it locally could release a
+            // second reference after the service already released one.
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -1287,7 +1314,7 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected process-security response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             Err(BrokerCallError::Rejected(detail)) => {
                 local().map_err(|_| TmError::platform("core service", detail))
             }
@@ -1315,7 +1342,7 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected process-modules response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             Err(BrokerCallError::Rejected(detail)) => {
                 local().map_err(|_| TmError::platform("core service", detail))
             }
@@ -1346,7 +1373,7 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected module code-sample response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -1391,6 +1418,12 @@ impl PlatformActions for BrokeredActions {
                 tracing::debug!(pid, missing, %detail, "broker thread details unavailable");
                 Ok(threads)
             }
+            // A lost answer is no better evidence than an absent service: the
+            // handle-free list still stands and the privileged columns stay "—".
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                tracing::debug!(pid, missing, %detail, "broker thread details lost");
+                Ok(threads)
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 tracing::debug!(pid, missing, %detail, "broker refused thread details");
                 Ok(threads)
@@ -1426,7 +1459,10 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected process file I/O response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            // Transport loss is a legitimate unavailability: the local arm makes
+            // the same read with our own token. A service that answered and
+            // declined is a decision and still propagates below.
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             // The service declining is a decision, and the local arm is no
             // longer a plain read: it starts a per-file session under this
             // process's own token, machine-wide, whenever that token is
@@ -1530,6 +1566,12 @@ impl PlatformActions for BrokeredActions {
                 "unexpected response type",
             )),
             Err(BrokerCallError::Unavailable(_)) => self.local.repair_task_manager_replacement(),
+            // The broker was asked to write the key and its answer was lost, so
+            // whether it happened is unknown. Repeating the write locally would
+            // claim a repair this process never got an acknowledgement for.
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -3498,9 +3540,13 @@ fn service_state(client: &BrokerClient) -> CoreServiceState {
                 let installed_gui = expected_installed_gui_path().ok();
                 if foreign_client_session(current_exe.as_deref(), installed_gui.as_deref()) {
                     CoreServiceState::ForeignClient
-                } else if matches!(ping, Err(BrokerCallError::Unavailable(_))) {
-                    // The pipe never answered. That is a different fault from
-                    // the broker answering and refusing us, and naming it
+                } else if matches!(
+                    ping,
+                    Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_))
+                ) {
+                    // The pipe never answered — either nothing was there to
+                    // answer, or its answer was lost. That is a different fault
+                    // from the broker answering and refusing us, and naming it
                     // "authentication failed" sent users to a repair that
                     // cannot help. Both stay degraded: a reachable service
                     // whose control pipe is silent is a real problem.
