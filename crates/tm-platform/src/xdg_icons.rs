@@ -1552,6 +1552,13 @@ mod tests {
             read_text_capped(&exact).is_some_and(|text| text.contains("Icon=exact")),
             "exactly the cap is still a text file"
         );
+        // The accepted side must reach the consumer, not just the reader: an
+        // exactly-cap file is still a usable entry with its icon, so a fixture
+        // padded with unusable trailing bytes cannot pass this in its place.
+        assert_eq!(
+            desktop_file_entry(&exact).map(|entry| entry.icon),
+            Some(Some("exact".to_owned()))
+        );
 
         let big = sb.root.join("big.desktop");
         body.push('\n');
