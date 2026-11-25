@@ -850,14 +850,16 @@ mod tests {
                 .map(|candidate| candidate.0)
                 .expect("the probed handle is one of the candidates")
         };
-        // Each probe outlasts the whole budget, so one probe fits per scan.
-        let one_probe_budget = Duration::from_millis(5);
+        // Each probe spends the whole budget in monotonic time before it
+        // answers, so exactly one probe fits per scan whatever the machine does.
+        let budget = Duration::from_millis(2);
         let mut probed_first = Vec::new();
         for scan in 0..candidates.len() {
             let mut probed = Vec::new();
-            let out = resolve_hung_candidates(&candidates, one_probe_budget, scan, |h, _ms| {
+            let out = resolve_hung_candidates(&candidates, budget, scan, |h, _ms| {
                 probed.push(h.0 as usize);
-                std::thread::sleep(Duration::from_millis(40));
+                let until = Instant::now() + budget;
+                while Instant::now() < until {}
                 ProbeOutcome::TimedOut
             });
             assert_eq!(probed.len(), 1, "the budget covers a single probe");
