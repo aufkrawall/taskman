@@ -18,7 +18,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use tm_core::sync;
 
-/// Maximum textures kept alive (32×32 RGBA ≈ 4 KiB each → ~2 MiB at 512).
+/// Maximum textures kept alive. Windows icons are 32×32 RGBA (~4 KiB each,
+/// ~2 MiB at the cap); the Linux resolver caps at 64×64 (`MAX_ICON_EDGE` in
+/// `xdg_icons.rs`), i.e. ~16 KiB each and ~8 MiB at the cap.
 const CACHE_CAP: usize = 512;
 const FAILURE_CACHE_CAP: usize = 512;
 /// Texture uploads allowed per frame (implement.md §10.4).
