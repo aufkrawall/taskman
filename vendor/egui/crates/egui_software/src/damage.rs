@@ -56,6 +56,8 @@ pub(crate) struct FrameKey {
     pub feathering: bool,
     pub feathering_size_bits: u32,
     pub prerasterized_discs: bool,
+    pub debug_paint_clip_rects: bool,
+    pub debug_ignore_clip_rects: bool,
     pub bezier_tolerance_bits: u32,
     pub epsilon_bits: u32,
     pub font_tex_size: [usize; 2],
@@ -88,8 +90,8 @@ impl FrameKey {
             // Every tessellation option that changes pixels for unmodified shapes, not just
             // the ones the app happens to set at startup: a tile hash is only sound if two
             // frames with equal hashes and an equal key really do produce equal pixels.
-            // The `debug_*` toggles are deliberately absent: they change the shapes that are
-            // emitted, which the shape hash already covers.
+            // `parallel_tessellation` is absent because it only reorders work, and
+            // `validate_meshes` because it only affects meshes that are already invalid.
             round_rects_to_pixels: ctx.options.round_rects_to_pixels,
             round_text_to_pixels: ctx.options.round_text_to_pixels,
             round_line_segments_to_pixels: ctx.options.round_line_segments_to_pixels,
@@ -97,6 +99,12 @@ impl FrameKey {
             feathering: ctx.options.feathering,
             feathering_size_bits: f32_bits(ctx.options.feathering_size_in_pixels),
             prerasterized_discs: ctx.options.prerasterized_discs,
+            // These two rewrite the tessellated output, after the input shapes were hashed,
+            // so the shape hash cannot see them. Toggling one at runtime has to invalidate
+            // the frame here, or nothing repaints and the new primitives paint outside the
+            // tiles that claim to be up to date.
+            debug_paint_clip_rects: ctx.options.debug_paint_clip_rects,
+            debug_ignore_clip_rects: ctx.options.debug_ignore_clip_rects,
             bezier_tolerance_bits: f32_bits(ctx.options.bezier_tolerance),
             epsilon_bits: f32_bits(ctx.options.epsilon),
             font_tex_size: ctx.font_tex_size,
@@ -884,9 +892,10 @@ mod tests {
             max_y: H as i32,
         };
 
-        // Rounded corners keep the rect off `span::fast_rect`, which clamps its own
-        // arithmetic; this is the general `points_bounds` path. The second case saturates
-        // only the `max` edges, so it catches a clamp that was applied to one side.
+        // Rounded corners keep the rect off `span::fast_rect`, whose casts saturate and add
+        // no margin afterwards; this is the general `points_bounds` path, which adds a
+        // two-pixel margin and therefore clamps in points before the cast. The second case
+        // saturates only the `max` edges, so it catches a clamp applied to one side only.
         for rect in [
             Rect::from_min_max(pos2(-3.0e9, -3.0e9), pos2(3.0e9, 3.0e9)),
             Rect::from_min_max(pos2(0.0, 0.0), pos2(3.0e9, 3.0e9)),

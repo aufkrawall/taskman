@@ -92,6 +92,10 @@ pub fn fast_rect(
         return None;
     }
 
+    // These casts saturate rather than wrap, and no margin is added after them, so an
+    // edge that overflows `i32` can only end up further off screen: every caller
+    // intersects the result with a clip or target rect. A path that adds a margin cannot
+    // rely on that -- `damage::shape_pixel_bounds` clamps in points before its cast.
     Some(PixelRect {
         min_x: min_x as i32,
         min_y: min_y as i32,
