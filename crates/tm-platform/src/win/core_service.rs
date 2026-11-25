@@ -2184,8 +2184,12 @@ fn process_disk_sample() -> ProcessDiskSample {
     let live = live_pids();
     let mut window = trace.usage.take_window(&live);
     if let Some(held) = trace.pending.take() {
-        // A window an earlier response could not carry; see below.
-        merge_disk_windows(&mut window, held);
+        // A window an earlier response could not carry; see below. It is folded
+        // in FRONT of this one, so the merged window reads in the order it
+        // covered the machine.
+        let mut merged = held;
+        merge_disk_windows(&mut merged, window);
+        window = merged;
     }
     // The caps bound the RESPONSE, not the measurement, and the drained window
     // is checked before anything is taken out of it: a window that cannot be
