@@ -117,14 +117,29 @@ pub(crate) fn request_programmatic_exit() {
 pub struct StartupTrace;
 
 impl StartupTrace {
+    /// Log one startup milestone.
+    ///
+    /// `ms` counts from the first mark (`process_start`, the first statement of
+    /// `main`), and `since_ms` is the gap from the mark before it — the number
+    /// that answers "what delayed this phase". Callers mark one-shot
+    /// milestones only: `info` is the highest level the log file keeps, and a
+    /// per-frame phase would bury the ones that matter.
     pub fn mark(name: &'static str) {
         static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let elapsed = T0.get_or_init(Instant::now).elapsed().as_millis();
-        tracing::info!(ms = elapsed as u64, phase = name, "startup");
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let elapsed = T0.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let previous = LAST_MS.swap(elapsed, std::sync::atomic::Ordering::Relaxed);
+        let gap = elapsed.saturating_sub(previous);
+        tracing::info!(ms = elapsed, since_ms = gap, phase = name, "startup");
     }
 }
 
 fn main() {
+    // First statement: this mark is the origin every later `ms` is measured
+    // from. The record itself is dropped (no subscriber yet in the early-log
+    // configuration), which is the point — the loader and CRT time before it
+    // are not ours to attribute.
+    StartupTrace::mark("process_start");
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Root-only diagnostic/helper entry point retained for a future protected
@@ -433,6 +448,9 @@ fn run_gui(mock: bool, args: &[String]) {
         .then(ui_state::window_position_px)
         .flatten();
     let restore_maximized = restore_position && ui_state::window_maximized();
+    // The last file read before the window exists; everything after this point
+    // is renderer/adapter work and the app's own construction.
+    StartupTrace::mark("window_state_loaded");
 
     let initial_tab_arg = args
         .iter()
@@ -631,15 +649,19 @@ fn run_gui(mock: bool, args: &[String]) {
             StartupTrace::mark("subpixel_capability_resolved");
             theme::apply_startup(&cc.egui_ctx);
             fonts::install_async(cc.egui_ctx.clone());
+            StartupTrace::mark("visuals_installed");
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
-            Ok(Box::new(NativeApp::new(
+            let shell = NativeApp::new(
                 application,
                 &cc.egui_ctx,
                 start_hidden,
                 native_activation,
-            )) as Box<dyn eframe::App>)
+            );
+            StartupTrace::mark("native_shell_ready");
+            Ok(Box::new(shell) as Box<dyn eframe::App>)
         };
         let opts = options(renderer);
+        StartupTrace::mark("window_options_built");
 
         match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
             Ok(()) => return,
@@ -999,6 +1021,11 @@ struct NativeApp {
     tray_init_attempted: bool,
     hidden_to_tray: bool,
     initial_hide_pending: bool,
+    /// Startup diagnostics: `logic` was entered and the first `ui` returned.
+    /// The marks must fire once, so the flags exist only to keep them from
+    /// repeating on every later frame.
+    first_logic_logged: bool,
+    first_ui_logged: bool,
     #[cfg(target_os = "windows")]
     exit_requested: bool,
     /// Native window handle, cached the first time a frame hands it over.
@@ -1076,6 +1103,8 @@ impl NativeApp {
             tray_init_attempted: tray_requested,
             hidden_to_tray: initially_hidden,
             initial_hide_pending: initially_hidden,
+            first_logic_logged: false,
+            first_ui_logged: false,
             #[cfg(target_os = "windows")]
             exit_requested: false,
             #[cfg(target_os = "windows")]
@@ -1189,6 +1218,13 @@ impl NativeApp {
 
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        // The data pass that follows the app's construction: everything
+        // between `native_shell_ready` and this mark is eframe's own window,
+        // adapter and pipeline setup for the renderer in use.
+        if !self.first_logic_logged {
+            self.first_logic_logged = true;
+            StartupTrace::mark("first_logic_enter");
+        }
         #[cfg(target_os = "linux")]
         self.resolve_linux_activations(ctx);
         #[cfg(target_os = "linux")]
@@ -1416,6 +1452,13 @@ impl eframe::App for NativeApp {
                 }
                 ui_state::set_window_maximized(maximized);
             }
+        }
+        // The first UI pass is complete. eframe tessellates, paints and
+        // only then reveals the window, so this mark ends the phase the
+        // renderer pays for before anything is on screen.
+        if !self.first_ui_logged {
+            self.first_ui_logged = true;
+            StartupTrace::mark("first_ui_left");
         }
     }
 

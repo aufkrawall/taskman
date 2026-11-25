@@ -16,7 +16,7 @@ use crate::action_executor::ActionExecutor;
 use crate::app_ui::apply_theme;
 use crate::widgets::tablekit::{TmColumn, TmTable};
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::demand::TelemetryDemand;
@@ -356,7 +356,12 @@ pub struct TaskManApp {
     /// Measured startup cost per image, persisted across restarts. Filled by
     /// [`TaskManApp::startup_impact_tracker`] while the machine is still
     /// inside its startup window; the Startup tab joins it by image path.
-    pub startup_impact: tm_core::ImpactStore,
+    ///
+    /// `None` until [`StartupTask::LoadStartupImpact`] has run, so the frame
+    /// that makes the window visible never waits on that file. Nothing can
+    /// observe the difference: the Startup tab's items come from an
+    /// asynchronous fetch that has not started before then either.
+    pub startup_impact: Option<tm_core::ImpactStore>,
     startup_impact_tracker: Option<tm_core::StartupImpactTracker>,
     pub tab: Tab,
     pub show_settings: bool,
@@ -444,6 +449,15 @@ pub struct TaskManApp {
 
     /// Engine starts after the first presented frame (lazy start).
     engine_started: bool,
+    /// Work [`TaskManApp::new`] left for after the first painted frame, in
+    /// the order it must run; see [`StartupTask`] and [`startup_step`].
+    startup_work: VecDeque<StartupTask>,
+    /// A pass eframe ran `ui` for, i.e. a frame that reached the screen.
+    /// Latched, because the deferred startup work must never be released by
+    /// anything but a frame that really painted.
+    frame_painted: bool,
+    /// `first_frame_painted` was already marked in the startup trace.
+    first_frame_logged: bool,
     /// Last demand bitmask shipped to the engine (send only on change).
     last_demand_bits: u64,
     /// Whether the previous frame actually painted.
@@ -807,12 +821,15 @@ impl TaskManApp {
         } else {
             tm_core::AppHistoryDb::open_deferred(history_path)
         };
-        let startup_impact = if mock {
-            tm_core::ImpactStore::in_memory()
+        // One JSON read that no first frame can show: its only consumer is the
+        // Startup tab, whose items arrive from an asynchronous fetch that has
+        // not even started yet. Deferred behind `StartupTask::LoadStartupImpact`
+        // so it stays off the path to the window becoming visible.
+        let startup_impact_path = if mock {
+            // A mock session must not read (or later write) the real store.
+            None
         } else {
-            tm_core::ImpactStore::open(
-                tm_core::settings::taskman_data_dir().join("startup-impact.json"),
-            )
+            Some(tm_core::settings::taskman_data_dir().join("startup-impact.json"))
         };
 
         // Details tab column visibility/order live in the settings file;
@@ -893,7 +910,7 @@ impl TaskManApp {
             tracing::error!("action workers could not start; blocking controls are disabled");
         }
 
-        Self {
+        let app = Self {
             engine,
             actions,
             is_elevated,
@@ -919,7 +936,7 @@ impl TaskManApp {
             history_cap,
             app_history_db,
             process_history_cache: Default::default(),
-            startup_impact,
+            startup_impact: None,
             startup_impact_tracker: None,
             tab,
             show_settings,
@@ -961,6 +978,9 @@ impl TaskManApp {
             pending_details_focus: None,
             scroll_to_pid: None,
             engine_started: false,
+            startup_work: startup_tasks(startup_impact_path).into(),
+            frame_painted: false,
+            first_frame_logged: false,
             last_demand_bits: 0,
             // Assume visible until a frame proves otherwise: a normal launch
             // paints immediately, and a `--minimized-to-tray` launch settles
@@ -998,7 +1018,12 @@ impl TaskManApp {
             last_viewport_rects: None,
             input_stats,
             accesskit_logged: false,
-        }
+        };
+        // The creator is about to return: everything from here on is the first
+        // pass plus whatever the renderer still needs before the window can be
+        // shown.
+        crate::StartupTrace::mark("app_constructed");
+        app
     }
 
     #[cfg(target_os = "windows")]
@@ -1113,10 +1138,14 @@ impl TaskManApp {
                 tracker.observe(&latest);
                 if !tracker.is_active() {
                     // Window closed: fold the measurements into the store and
-                    // drop the per-tick state.
-                    self.startup_impact.merge(tracker.totals());
-                    if !self.startup_impact.is_empty() {
-                        self.startup_impact.save();
+                    // drop the per-tick state. The store is loaded before the
+                    // engine can publish a first sample, so a measurement can
+                    // never land in a queue that has no store behind it yet.
+                    if let Some(store) = &mut self.startup_impact {
+                        store.merge(tracker.totals());
+                        if !store.is_empty() {
+                            store.save();
+                        }
                     }
                     tracing::info!(
                         images = tracker.totals().len(),
@@ -1415,6 +1444,11 @@ impl TaskManApp {
         self.taskbar_monitor.set_config(cfg);
     }
 
+    /// Start sampling and attach the log file, once.
+    ///
+    /// Runs from [`StartupTask::StartSampling`], i.e. after the first painted
+    /// frame, never while that frame is still being prepared: the log
+    /// appender is directory creation plus a file open plus a writer thread.
     fn ensure_engine_started(&mut self) {
         if !self.engine_started {
             self.engine_started = true;
@@ -1429,6 +1463,53 @@ impl TaskManApp {
             });
             self.engine.start();
             tracing::info!("engine started");
+        }
+    }
+
+    /// Run the deferred startup work once the first frame is on screen.
+    ///
+    /// `logic` runs before `ui` on every tick and also for a surface that
+    /// never paints, so this pass — not `ui` — is where work that must not
+    /// delay the reveal belongs. [`startup_step`] owns the decision; this only
+    /// executes it.
+    fn run_deferred_startup_work(&mut self, ctx: &egui::Context) {
+        let mut ran_task = false;
+        loop {
+            let step = startup_step(
+                self.startup_work.len(),
+                self.frame_painted,
+                self.surface_visible,
+            );
+            match step {
+                StartupStep::RunNext => {
+                    let Some(task) = self.startup_work.pop_front() else {
+                        break;
+                    };
+                    ran_task = true;
+                    match task {
+                        StartupTask::LoadStartupImpact(path) => {
+                            self.startup_impact = Some(match path {
+                                Some(path) => tm_core::ImpactStore::open(path),
+                                None => tm_core::ImpactStore::in_memory(),
+                            });
+                        }
+                        StartupTask::StartSampling => self.ensure_engine_started(),
+                    }
+                }
+                // The frame that will paint is already on its way; the pass
+                // after it runs the work. Ask for it so an idle window cannot
+                // wait for unrelated input to produce one.
+                StartupStep::Wait => {
+                    ctx.request_repaint();
+                    break;
+                }
+                StartupStep::Done => break,
+            }
+        }
+        // Once, on the pass that empties the queue: the mark that closes the
+        // startup phases, after the window they were competing with.
+        if ran_task && self.startup_work.is_empty() {
+            crate::StartupTrace::mark("startup_work_done");
         }
     }
 
@@ -1540,12 +1621,16 @@ impl TaskManApp {
         // Final synchronous flush so history is not lost at shutdown.
         self.app_history_db.save();
         // A session that ends inside the startup window still keeps what it
-        // measured: the tracker's totals are folded in before the save.
-        if let Some(tracker) = &self.startup_impact_tracker {
-            let totals = tracker.totals().clone();
-            self.startup_impact.merge(&totals);
+        // measured: the tracker's totals are folded in before the save. A
+        // session that ends before `StartupTask::LoadStartupImpact` ran has no
+        // store to fold them into, and nothing was measured for it either.
+        if let Some(store) = &mut self.startup_impact {
+            if let Some(tracker) = &self.startup_impact_tracker {
+                let totals = tracker.totals().clone();
+                store.merge(&totals);
+            }
+            store.save();
         }
-        self.startup_impact.save();
         // ETW sessions are kernel objects, and the static trace owners do not
         // run destructors during process teardown. Release every session this
         // GUI owns before the process disappears.
@@ -1963,9 +2048,17 @@ impl eframe::App for TaskManApp {
         // Keep the taskbar monitor config/visibility synchronized even while
         // the main window starts or sits hidden in the tray.
         self.sync_taskbar_monitor(ctx);
-        if !self.surface_visible && self.shared.settings.taskbar_monitor_enabled {
-            self.ensure_engine_started();
+        // The first pass that runs after a painted frame: the window it made
+        // visible is on screen, so what `new` left behind can no longer delay
+        // it. One-shot, which is why the flag guards it rather than a counter.
+        if self.frame_painted && !self.first_frame_logged {
+            self.first_frame_logged = true;
+            crate::StartupTrace::mark("first_frame_painted");
         }
+        // Release what `new` deferred: the impact store and the sampling
+        // thread, on this pass or on the first one where the surface is known
+        // to be hidden — a tray launch never paints a frame to wait for.
+        self.run_deferred_startup_work(ctx);
 
         // Only animations need timed repaints; everything else is woken by
         // events (engine publication, worker completion, input).
@@ -2003,6 +2096,9 @@ impl eframe::App for TaskManApp {
         // Reaching `ui` at all is the proof that this surface is on screen;
         // eframe skips it entirely for a hidden, minimized or occluded one.
         self.painted_last_frame = true;
+        // ...and it is what releases the deferred startup work: this frame is
+        // painted and the window revealed before the next pass runs.
+        self.frame_painted = true;
         if !self.surface_visible {
             // `logic` runs BEFORE `ui`, so this frame's proof arrives too late
             // for the pass that reads it: ask for one more frame rather than
@@ -2188,10 +2284,9 @@ impl eframe::App for TaskManApp {
         {
             self.shared.settings.window_size = [sz.x, sz.y];
         }
-
-        // First frame fully submitted → NOW start sampling. Everything below
-        // this line in the process lifetime happens after the shell painted.
-        self.ensure_engine_started();
+        // Sampling no longer starts here: this pass has not been painted yet,
+        // so the log file and the sampling thread stay behind
+        // `StartupTask::StartSampling` and run on the pass after this one.
     }
 
     #[cfg(feature = "glow")]
@@ -2221,6 +2316,58 @@ pub(crate) fn history_min_interval_s() -> f64 {
 /// series plots at its real position on the axis instead of being stretched
 /// to fill the window — which is what makes stretching the tick safe here.
 pub(crate) const HIDDEN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Work [`TaskManApp::new`] deliberately leaves behind.
+///
+/// Everything here is disk I/O or thread work that no first frame can show,
+/// so none of it may run while that frame is still being prepared: the window
+/// becomes visible only once the first frame has been painted, and anything on
+/// this list would otherwise be paid for by the reveal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupTask {
+    /// `ImpactStore::open` — one JSON read the Startup tab consumes, and that
+    /// tab cannot show a number before its own items have arrived from an
+    /// asynchronous fetch. `None` means a mock session that must not touch the
+    /// real store.
+    LoadStartupImpact(Option<std::path::PathBuf>),
+    /// Attach the log file and release the parked sampling thread. Last, so
+    /// the store above can never miss a measurement.
+    StartSampling,
+}
+
+/// The order [`TaskManApp::new`] hands its deferred work over in.
+pub(crate) fn startup_tasks(impact_path: Option<std::path::PathBuf>) -> Vec<StartupTask> {
+    vec![StartupTask::LoadStartupImpact(impact_path), StartupTask::StartSampling]
+}
+
+/// What the deferred startup work should do in one data pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupStep {
+    /// Run the next pending task now.
+    RunNext,
+    /// Nothing runs yet: the first frame is still on its way to the screen,
+    /// and the caller must ask for the pass that follows it.
+    Wait,
+    /// Every task has run.
+    Done,
+}
+
+/// Whether the deferred startup work may run in this data pass.
+///
+/// `painted` latches once eframe has run `ui`, which happens only for a
+/// surface that is on screen; the pass after it is the first one whose work
+/// cannot delay the reveal. A surface that is known hidden or minimized never
+/// gets a `ui` at all, so the work also runs there — a `--minimized-to-tray`
+/// launch must still load its store and start sampling.
+pub(crate) fn startup_step(pending: usize, painted: bool, visible: bool) -> StartupStep {
+    if pending == 0 {
+        StartupStep::Done
+    } else if painted || !visible {
+        StartupStep::RunNext
+    } else {
+        StartupStep::Wait
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SurfaceVisibilityTransition {
@@ -3551,5 +3698,42 @@ mod tests {
             actions.kill_process(1000, None, false),
             Err(tm_core::TmError::Unsupported(_))
         ));
+    }
+
+    /// The window becomes visible only once the first frame has been painted,
+    /// so nothing deferred may run before that: on the first pass `ui` has not
+    /// run yet, and the pass after it is the one that is already on screen.
+    #[test]
+    fn deferred_startup_work_waits_for_the_first_painted_frame() {
+        let pending = 2;
+        // First pass: nothing painted yet, surface assumed visible.
+        assert_eq!(startup_step(pending, false, true), StartupStep::Wait);
+        // The pass after the painted frame releases the work.
+        assert_eq!(startup_step(pending, true, true), StartupStep::RunNext);
+        // An empty queue is finished whatever the surface says.
+        assert_eq!(startup_step(0, false, true), StartupStep::Done);
+        assert_eq!(startup_step(0, true, false), StartupStep::Done);
+    }
+
+    /// A `--minimized-to-tray` launch never runs `ui`, so a gate that only
+    /// accepted a painted frame would never load the store or start sampling:
+    /// the engine, the app-history store and the log file would all stay dark
+    /// for the whole session.
+    #[test]
+    fn a_hidden_surface_runs_the_deferred_work_without_a_frame() {
+        assert_eq!(startup_step(2, false, false), StartupStep::RunNext);
+    }
+
+    /// The order is not cosmetic: the store is what the sampling thread's
+    /// measurements are folded into, so loading it after `StartSampling` could
+    /// drop the first sample's impact numbers.
+    #[test]
+    fn the_impact_store_loads_before_sampling_starts() {
+        let path = std::path::PathBuf::from("startup-impact.json");
+        let load = StartupTask::LoadStartupImpact(Some(path.clone()));
+        assert_eq!(startup_tasks(Some(path)), vec![load, StartupTask::StartSampling]);
+        // A mock session keeps the store in memory and touches no file.
+        let mock = StartupTask::LoadStartupImpact(None);
+        assert_eq!(startup_tasks(None), vec![mock, StartupTask::StartSampling]);
     }
 }
