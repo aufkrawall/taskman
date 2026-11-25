@@ -122,9 +122,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `file_etw.rs` (per-file read/written bytes from
     `Microsoft-Windows-Kernel-File`: Create correlates a `FileObject` with its
     name, Read/Write add `IOSize` to that (pid, path) pair, both template
-    versions are decoded, device paths are translated to the DOS paths the
-    handle walk reports, and the open-file map and per-process path list are
-    capped with a counted drop),
+    versions are decoded at native pointer width, device paths are translated
+    to the DOS paths the handle walk reports, the open-file map and both the
+    per-process and session-wide path budgets drop with a counter, and buckets
+    are bound to the created time that prevents pid reuse from inheriting),
     `profile_etw.rs` (demand-only system-profile sampling for one exact
     process; MOF sample type 46, profile-privilege enablement, thread
     ownership, page aggregation, module attribution, ETW-loss/lower-bound

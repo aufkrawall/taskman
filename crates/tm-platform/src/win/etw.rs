@@ -559,6 +559,10 @@ fn stop_session(handle: CONTROLTRACE_HANDLE, name: &[u16], properties: &mut [u64
 /// every following field by four bytes and charges whatever number lands
 /// there. Callers validate the fields they read so a misread becomes
 /// "unknown" instead of a confident lie.
+///
+/// This answers for a payload a USER-MODE process wrote. A provider whose
+/// payload is written by the kernel must pin native width instead, whatever
+/// the calling process's flag says — see [`super::file_etw`].
 pub(crate) fn pointer_bytes(record: &EVENT_RECORD) -> usize {
     const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
     if record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER != 0 {

@@ -61,6 +61,10 @@
 //! * [`MAX_TRACKED_FILES_PER_PID`] caps distinct paths per process. Beyond it a
 //!   file's bytes go into the omitted remainder instead of a row: a row whose
 //!   count started mid-stream would look complete and be wrong.
+//! * [`MAX_TRACKED_FILES`] caps distinct (process, path) pairs across the whole
+//!   session, because the per-process cap alone would let a thousand live
+//!   processes hold eight million paths. A file past it also lands in the
+//!   omitted remainder, and the drop is counted.
 //! * Bytes whose `FileObject` was never seen are NOT attributed to anything.
 //!   That is the common case at the start of a session for long-lived handles
 //!   (a database, a log file, a VM image opened hours ago), and the honest
@@ -68,6 +72,11 @@
 //! * A `FileObject` seen under a DIFFERENT process than the Create means either
 //!   a duplicated handle or a reused pointer after a missed Close. Either way
 //!   the old name cannot be trusted for this record, so it stays unnamed.
+//! * **Within one process, pointer reuse is invisible.** The payload carries
+//!   nothing but the address, so if both the Close and the next Create are
+//!   lost, a transfer on the reused address is charged to the name of whatever
+//!   held that address before. The bytes stay in the process's attribution —
+//!   only the name is stale — and no field in the record can detect it.
 //!
 //! ## Things that are easy to get wrong here
 //!
@@ -79,7 +88,8 @@
 //!   `QueryDosDeviceW`, and an unresolvable name stays a remainder.
 //! * **A session in which nothing could be decoded is UNKNOWN, not zero.** See
 //!   [`FileIoSample::state`]: an idle machine is [`FileIoAccountingState::Undelivered`]
-//!   only when literally no file event arrived, and
+//!   when no file event arrived at all or none of them attributed a read or a
+//!   write to the process being asked about, and
 //!   [`FileIoAccountingState::Undecodable`] when records arrived and none of
 //!   them parsed.
 //! * **These are REQUESTED sizes.** The record is written when the file system
@@ -148,16 +158,28 @@ const MAX_PLAUSIBLE_TRANSFER: u32 = 1 << 30;
 
 /// Upper bound on the `FileObject -> name` map.
 ///
-/// A lost Close leaks one entry, and ETW does drop events under load; at 8
-/// bytes of key plus the name, the cap is a few megabytes in the worst case.
-/// On overflow the map is cleared (see [`Shared::create`]) and the discarded
-/// entries are counted, so the map cannot grow without limit.
+/// A lost Close leaks one entry, and ETW does drop events under load; on
+/// overflow the map is cleared (see [`Shared::create`]) and the discarded
+/// entries are counted, so it cannot grow without limit. The cost is not the
+/// entry (a `u64` key and a `{pid, Arc<str>}` value) but the name it points at:
+/// at `MAX_PATH` a name is 260 UTF-16 units, so ~520 bytes plus an allocation
+/// header, and the whole map is roughly 37 MB — not the few megabytes an
+/// ordinary process's short names would suggest.
 const MAX_OPEN_FILES: usize = 65_536;
 
 /// Upper bound on distinct files tracked per process. A build or a package
 /// manager can touch hundreds of thousands of files; past this cap a file's
 /// bytes land in the omitted remainder instead of a row.
 const MAX_TRACKED_FILES_PER_PID: usize = 8_192;
+
+/// Upper bound on distinct (process, path) pairs across all processes.
+///
+/// The per-process cap alone is not a memory bound: a machine with a thousand
+/// live processes could hold eight million paths. At `MAX_PATH` names an entry
+/// is ~570 bytes, so this budget is roughly 37 MB for the whole session. Past
+/// it a file's bytes land in the requesting process's omitted remainder and the
+/// drop is counted in [`State::dropped_paths`].
+const MAX_TRACKED_FILES: usize = 65_536;
 
 /// How long a miss may reuse the drive list before it is rescanned. A miss is
 /// normal (`\Device\Mup\...` is a network share and never maps to a drive), and
@@ -214,7 +236,8 @@ pub struct FileIoSample {
     /// was never seen, one whose name did not resolve to a DOS path, or one
     /// dropped at a cap.
     pub unnamed: Remainder,
-    /// Bytes of files dropped by [`MAX_TRACKED_FILES_PER_PID`].
+    /// Bytes of files dropped by [`MAX_TRACKED_FILES_PER_PID`] or by
+    /// [`MAX_TRACKED_FILES`].
     pub omitted: Remainder,
     /// File events the callback was handed.
     pub events_seen: u64,
@@ -224,6 +247,19 @@ pub struct FileIoSample {
     /// count: they carry no bytes, so they cannot make a byte count measured.
     pub pid_read_transfers: u64,
     pub pid_write_transfers: u64,
+    /// Entries discarded from the `FileObject -> name` map when it reached
+    /// [`MAX_OPEN_FILES`], over the whole session. From that point on their
+    /// transfers are inside [`Self::unnamed`], which is why a row can read
+    /// dashes while the session is still measured.
+    pub cleared_file_objects: u64,
+    /// Creates whose name did not resolve to a DOS path (a network share, a
+    /// `\SystemRoot\` name, a raw device), over the whole session. Their
+    /// transfers are inside [`Self::unnamed`].
+    pub unnamed_creates: u64,
+    /// Paths never tracked because a capacity limit (this process's or the
+    /// session's) was full, over the whole session. Their transfers are inside
+    /// [`Self::omitted`].
+    pub dropped_paths: u64,
     /// Cumulative events ETW reports as lost; counts are lower bounds when
     /// this is non-zero or unknown.
     pub events_lost: Option<u64>,
@@ -299,6 +335,19 @@ enum FileEvent<'a> {
         write: bool,
     },
 }
+
+/// Pointer width of a Kernel-File payload: always this machine's.
+///
+/// [`super::etw::pointer_bytes`] answers a different question — how wide the
+/// pointers are in a payload a USER-MODE process wrote, which is why the
+/// record header flags a WOW64 caller (`EVENT_HEADER_FLAG_32_BIT_HEADER`) and
+/// why the loader and profile providers need it. The records here are written
+/// by the kernel: `FileObject`, `Irp` and `FileKey` are kernel addresses in
+/// every record, whoever issued the request. Taking the header flag at face
+/// value would read a 32-bit process's records four bytes off — either
+/// rejected by the alignment check or charged to the wrong file — leaving that
+/// process with dashes on every row while the session reports Measured.
+const KERNEL_FILE_POINTER_BYTES: usize = std::mem::size_of::<usize>();
 
 /// Offset of `FileObject` and of the trailing `FileName` in a Create payload,
 /// or `None` for a template version this build does not know.
@@ -461,6 +510,10 @@ struct OpenFile {
 /// Per-process accumulators.
 #[derive(Default)]
 struct PidFiles {
+    /// The process creation time this bucket has been bound to, once a sample
+    /// has named it. A pid is reused, and the counters of the process that held
+    /// it before must not be handed to its successor; see [`State::bind_epoch`].
+    epoch_s: Option<i64>,
     /// Cumulative bytes per path, since the session started.
     files: HashMap<Arc<str>, FileBytes>,
     /// Read and Write records decoded for this process, by direction.
@@ -474,16 +527,69 @@ struct PidFiles {
 struct State {
     events_seen: u64,
     events_decoded: u64,
-    /// Payload length of the most recent record the decoder rejected, so a
-    /// layout change is diagnosable from a log line instead of a debugger.
+    /// Id, template version and payload length of the most recent record the
+    /// decoder rejected, so a layout change and a truncated or malformed
+    /// payload can be told apart from a log line instead of a debugger.
+    rejected_event_id: u16,
+    rejected_version: u8,
     rejected_payload_len: u32,
     open: HashMap<u64, OpenFile>,
     pids: HashMap<u32, PidFiles>,
-    /// Creates refused because the open-file map was full, or discarded when it
-    /// was cleared at that cap.
-    dropped_file_objects: u64,
+    /// Distinct paths held across every bucket in `pids`. Kept alongside the
+    /// map rather than recomputed per transfer; [`State::prune_dead`] and
+    /// [`State::bind_epoch`] rebuild it after they drop buckets.
+    tracked_paths: usize,
+    /// Entries discarded when the open-file map was cleared at its cap.
+    cleared_file_objects: u64,
     /// Creates whose name did not resolve to a DOS path.
     unnamed_creates: u64,
+    /// Paths never tracked because a capacity limit was full.
+    dropped_paths: u64,
+}
+
+impl State {
+    /// Drop the accounting of processes that no longer exist.
+    ///
+    /// Both maps are pinned to live processes for the same reason the disk
+    /// trace is: a process that exited can never be asked about again, and its
+    /// entries would otherwise accumulate for the lifetime of the service.
+    /// `tracked_paths` is rebuilt from what survived instead of being
+    /// decremented per bucket, so it cannot drift.
+    fn prune_dead(&mut self, live_pids: &HashSet<u32>) {
+        self.pids.retain(|pid, _| live_pids.contains(pid));
+        self.open.retain(|_, file| live_pids.contains(&file.pid));
+        self.tracked_paths = self.pids.values().map(|files| files.files.len()).sum();
+    }
+
+    /// Bind `pid`'s bucket to the process creation time the caller verified.
+    ///
+    /// The callback cannot know which incarnation of a pid a record belongs to;
+    /// the broker does, because every request carries the creation time it
+    /// sampled. Binding the bucket to it means a pid reused between two samples
+    /// starts empty instead of inheriting the previous process's paths, and the
+    /// `FileObject` names that process had open are dropped for the same reason
+    /// (they belong to a dead object space).
+    fn bind_epoch(&mut self, pid: u32, start_epoch_s: i64) {
+        let reused = self.pids.get(&pid).is_some_and(|files| {
+            files
+                .epoch_s
+                .is_some_and(|epoch_s| epoch_s != start_epoch_s)
+        });
+        if reused {
+            if let Some(files) = self.pids.remove(&pid) {
+                self.tracked_paths = self.tracked_paths.saturating_sub(files.files.len());
+            }
+            self.open.retain(|_, file| file.pid != pid);
+            tracing::debug!(
+                pid,
+                start_epoch_s,
+                "file trace saw a reused pid; its bucket starts fresh"
+            );
+        }
+        if let Some(files) = self.pids.get_mut(&pid) {
+            files.epoch_s = Some(start_epoch_s);
+        }
+    }
 }
 
 /// Device path prefix -> drive letter, resolved on demand and cached.
@@ -508,12 +614,18 @@ impl TraceContext for Shared {
 
 impl Shared {
     /// A file record the decoder could not read. Counted, never guessed at.
-    fn undecodable(&self, payload_len: u32) {
+    ///
+    /// The identity of the rejected record is kept so a log line can say which
+    /// layout is unknown (id and version) and whether the payload was truncated
+    /// (its length) instead of just that something failed.
+    fn undecodable(&self, event_id: u16, version: u8, payload_len: u32) {
         if !self.live.load(Ordering::Relaxed) {
             return;
         }
         if let Ok(mut state) = self.state.lock() {
             state.events_seen = state.events_seen.saturating_add(1);
+            state.rejected_event_id = event_id;
+            state.rejected_version = version;
             state.rejected_payload_len = payload_len;
         }
     }
@@ -530,6 +642,16 @@ impl Shared {
         };
         state.events_seen = state.events_seen.saturating_add(1);
         state.events_decoded = state.events_decoded.saturating_add(1);
+        let Some(path) = resolved else {
+            // A name that is not a resolvable device or DOS path (a network
+            // share, a `\SystemRoot\` name, a raw device) keeps its bytes
+            // unnamed. Nothing is inserted, so it must not cost the map
+            // anything at the cap either: clearing 65 536 live entries for a
+            // Create that is then thrown away would turn every file already
+            // open into a remainder.
+            state.unnamed_creates = state.unnamed_creates.saturating_add(1);
+            return;
+        };
         if state.open.len() >= MAX_OPEN_FILES {
             // A dropped Close leaves an entry behind, so the map can reach the
             // cap with nothing that is safe to evict. Clearing recovers the
@@ -537,8 +659,8 @@ impl Shared {
             // reads and writes fall into the unnamed remainder (counted) until
             // the next Create, instead of being charged to a name this module
             // can no longer trust.
-            state.dropped_file_objects = state
-                .dropped_file_objects
+            state.cleared_file_objects = state
+                .cleared_file_objects
                 .saturating_add(state.open.len() as u64);
             state.open.clear();
             tracing::debug!(
@@ -546,16 +668,7 @@ impl Shared {
                 "file trace dropped its open-file map at the cap"
             );
         }
-        match resolved {
-            Some(path) => {
-                state.open.insert(object, OpenFile { pid, path });
-            }
-            None => {
-                // A name that is not a resolvable device or DOS path (a network
-                // share, a raw device) keeps its bytes unnamed.
-                state.unnamed_creates = state.unnamed_creates.saturating_add(1);
-            }
-        }
+        state.open.insert(object, OpenFile { pid, path });
     }
 
     fn close(&self, object: u64) {
@@ -582,26 +695,41 @@ impl Shared {
             Some(open) if open.pid == pid => Some(Arc::clone(&open.path)),
             _ => None,
         };
-        let files = state.pids.entry(pid).or_default();
-        if write {
-            files.write_transfers = files.write_transfers.saturating_add(1);
-        } else {
-            files.read_transfers = files.read_transfers.saturating_add(1);
-        }
-        let Some(path) = path else {
-            files.unnamed.add(write, size);
-            return;
-        };
-        if !files.files.contains_key(path.as_ref())
-            && files.files.len() >= MAX_TRACKED_FILES_PER_PID
+        // Read before the bucket is borrowed: the bucket reference holds the
+        // whole state, so the session-wide counters cannot be touched while it
+        // is alive.
+        let global_room = state.tracked_paths < MAX_TRACKED_FILES;
+        let mut newly_tracked = false;
+        let mut dropped_path = false;
         {
-            // Out of room for this process. The bytes stay in the accounting
-            // remainder; charging them to a neighbouring file would be a made-up
-            // per-file number.
-            files.omitted.add(write, size);
-            return;
+            let files = state.pids.entry(pid).or_default();
+            if write {
+                files.write_transfers = files.write_transfers.saturating_add(1);
+            } else {
+                files.read_transfers = files.read_transfers.saturating_add(1);
+            }
+            let Some(path) = path else {
+                files.unnamed.add(write, size);
+                return;
+            };
+            let new_path = !files.files.contains_key(path.as_ref());
+            if new_path && (!global_room || files.files.len() >= MAX_TRACKED_FILES_PER_PID) {
+                // Out of room for this process or for the session. The bytes
+                // stay in the accounting remainder; charging them to a
+                // neighbouring file would be a made-up per-file number.
+                files.omitted.add(write, size);
+                dropped_path = true;
+            } else {
+                files.files.entry(path).or_default().add(write, size);
+                newly_tracked = new_path;
+            }
         }
-        files.files.entry(path).or_default().add(write, size);
+        if newly_tracked {
+            state.tracked_paths = state.tracked_paths.saturating_add(1);
+        }
+        if dropped_path {
+            state.dropped_paths = state.dropped_paths.saturating_add(1);
+        }
     }
 
     /// The DOS path for a Create's file name, or `None` when it cannot be
@@ -670,7 +798,12 @@ fn volume_devices() -> Vec<(String, String)> {
         if len == 0 {
             continue;
         }
-        let target = String::from_utf16_lossy(&buffer[..len as usize]);
+        // The API returns the length it wrote, which a hostile or changed
+        // answer could report past the buffer; slicing would then panic.
+        let Some(units) = buffer.get(..len as usize) else {
+            continue;
+        };
+        let target = String::from_utf16_lossy(units);
         let target = target.trim_end_matches('\0');
         if target.is_empty() {
             continue;
@@ -739,21 +872,19 @@ impl FileEtw {
     ///
     /// An EMPTY `live_pids` means "the caller could not enumerate processes",
     /// never "nothing is alive": pruning against it would throw away every
-    /// measurement.
-    pub fn sample(&self, pid: u32, live_pids: &HashSet<u32>) -> FileIoSample {
-        let (mut sample, rejected_payload_len) = {
+    /// measurement. `start_epoch_s` is the creation time the caller verified
+    /// for `pid`, and it is what keeps a reused pid from inheriting the
+    /// previous process's counters (see [`State::bind_epoch`]).
+    pub fn sample(&self, pid: u32, start_epoch_s: i64, live_pids: &HashSet<u32>) -> FileIoSample {
+        let (mut sample, rejected) = {
             let mut state = match self.session.shared().state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
             if !live_pids.is_empty() {
-                // Both maps are pinned to live processes for the same reason the
-                // disk trace is: a process that exited can never be asked about
-                // again, and its entries would otherwise accumulate for the
-                // lifetime of the service.
-                state.pids.retain(|p, _| live_pids.contains(p));
-                state.open.retain(|_, file| live_pids.contains(&file.pid));
+                state.prune_dead(live_pids);
             }
+            state.bind_epoch(pid, start_epoch_s);
             let events_seen = state.events_seen;
             let events_decoded = state.events_decoded;
             let files = state.pids.get(&pid);
@@ -775,17 +906,31 @@ impl FileEtw {
                 events_decoded,
                 pid_read_transfers: files.map_or(0, |files| files.read_transfers),
                 pid_write_transfers: files.map_or(0, |files| files.write_transfers),
+                cleared_file_objects: state.cleared_file_objects,
+                unnamed_creates: state.unnamed_creates,
+                dropped_paths: state.dropped_paths,
                 events_lost: None,
             };
-            (sample, state.rejected_payload_len)
+            let rejected = (
+                state.rejected_event_id,
+                state.rejected_version,
+                state.rejected_payload_len,
+            );
+            (sample, rejected)
         };
         if sample.events_seen > 0 && sample.events_decoded == 0 {
             // Loud on purpose, once per request while it lasts: this is the
-            // failure that silently turns every byte count into a gap.
+            // failure that silently turns every byte count into a gap. The id,
+            // version and length separate the two causes: an id and version
+            // this build has no offsets for is a layout change, while a
+            // rejected id/version we DO know is a truncated or malformed
+            // payload.
             tracing::warn!(
                 events_seen = sample.events_seen,
-                rejected_payload_len,
-                "file trace decoded no records - the Kernel-File payload layout changed"
+                event_id = rejected.0,
+                version = rejected.1,
+                payload_len = rejected.2,
+                "file trace decoded no records - unknown Kernel-File payload layout or rejected payloads"
             );
         }
         // Queried outside the lock: the session properties live in the kernel.
@@ -813,8 +958,23 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     // so it is counted rather than dropped.
     let payload = unsafe { etw::payload_of(record) }.unwrap_or_default();
     let version = record.EventHeader.EventDescriptor.Version;
-    let pid = record.EventHeader.ProcessId;
-    match parse_event(event_id, version, payload, etw::pointer_bytes(record)) {
+    handle_payload(
+        shared,
+        record.EventHeader.ProcessId,
+        event_id,
+        version,
+        payload,
+    );
+}
+
+/// Decode one record's payload and account it.
+///
+/// Split from the callback so a test can drive the decode and the accounting
+/// without a live session. The payload width is pinned to
+/// [`KERNEL_FILE_POINTER_BYTES`] here rather than taken from the record header;
+/// a WOW64 caller's flag says nothing about a kernel-written payload.
+fn handle_payload(shared: &Shared, pid: u32, event_id: u16, version: u8, payload: &[u8]) {
+    match parse_event(event_id, version, payload, KERNEL_FILE_POINTER_BYTES) {
         Some(FileEvent::Create { object, name }) => shared.create(pid, object, name),
         Some(FileEvent::Close { object }) => shared.close(object),
         Some(FileEvent::Transfer {
@@ -822,7 +982,7 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
             size,
             write,
         }) => shared.transfer(pid, object, size, write),
-        None => shared.undecodable(record.UserDataLength.into()),
+        None => shared.undecodable(event_id, version, payload.len() as u32),
     }
 }
 
@@ -889,16 +1049,7 @@ mod tests {
 
     /// The callback's work, minus the ETW plumbing: decode, then account.
     fn deliver(shared: &Shared, pid: u32, event_id: u16, payload: &[u8]) {
-        match parse_event(event_id, 1, payload, 8) {
-            Some(FileEvent::Create { object, name }) => shared.create(pid, object, name),
-            Some(FileEvent::Close { object }) => shared.close(object),
-            Some(FileEvent::Transfer {
-                object,
-                size,
-                write,
-            }) => shared.transfer(pid, object, size, write),
-            None => shared.undecodable(payload.len() as u32),
-        }
+        handle_payload(shared, pid, event_id, 1, payload);
     }
 
     fn sample_of(shared: &Shared, pid: u32) -> FileIoSample {
@@ -922,6 +1073,9 @@ mod tests {
             events_decoded: state.events_decoded,
             pid_read_transfers: files.map_or(0, |files| files.read_transfers),
             pid_write_transfers: files.map_or(0, |files| files.write_transfers),
+            cleared_file_objects: state.cleared_file_objects,
+            unnamed_creates: state.unnamed_creates,
+            dropped_paths: state.dropped_paths,
             events_lost: None,
         }
     }
@@ -1099,7 +1253,9 @@ mod tests {
     }
 
     /// The open-file map is capped, and what it discards is counted rather than
-    /// silently lost.
+    /// silently lost. A Create that will not be inserted must not pay that
+    /// price: clearing the map for a network-share name would turn every file
+    /// already open into a remainder.
     #[test]
     fn the_open_file_map_is_capped_and_counts_what_it_drops() {
         let shared = shared();
@@ -1113,7 +1269,27 @@ mod tests {
             );
         }
         assert_eq!(shared.state.lock().unwrap().open.len(), MAX_OPEN_FILES);
-        // One more Create hits the cap: the map is cleared and the drop counted.
+        // A name that cannot resolve is not inserted, so it does not clear the
+        // map either: every live entry survives and only the refusal is
+        // counted.
+        deliver(
+            &shared,
+            8,
+            EVENT_CREATE,
+            &create_payload(8, 0x30_0000, r"\SystemRoot\unresolvable"),
+        );
+        {
+            let state = shared.state.lock().unwrap();
+            assert_eq!(state.open.len(), MAX_OPEN_FILES, "nothing was inserted");
+            assert_eq!(state.cleared_file_objects, 0, "nothing was cleared");
+            assert_eq!(state.unnamed_creates, 1);
+            assert!(
+                state.open.contains_key(&0x10_0000),
+                "the first file is still named"
+            );
+        }
+        // One more Create that DOES resolve hits the cap: the map is cleared
+        // and the drop counted.
         deliver(
             &shared,
             8,
@@ -1122,8 +1298,128 @@ mod tests {
         );
         let state = shared.state.lock().unwrap();
         assert_eq!(state.open.len(), 1, "the map restarts bounded");
-        assert_eq!(state.dropped_file_objects, MAX_OPEN_FILES as u64);
+        assert_eq!(state.cleared_file_objects, MAX_OPEN_FILES as u64);
         assert!(state.open.contains_key(&0x20_0000));
+    }
+
+    /// The session-wide path budget is a real bound and a real count: a file
+    /// that cannot be tracked is charged to the omitted remainder, never to a
+    /// neighbouring row and never dropped on the floor.
+    #[test]
+    fn the_session_path_budget_drops_into_the_omitted_remainder() {
+        let shared = shared();
+        deliver(
+            &shared,
+            8,
+            EVENT_CREATE,
+            &create_payload(8, 0x1000, r"\??\C:\data\budget.bin"),
+        );
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.tracked_paths = MAX_TRACKED_FILES;
+        }
+        deliver(&shared, 8, EVENT_WRITE, &transfer_payload(8, 0x1000, 4_096));
+        let sample = sample_of(&shared, 8);
+        assert!(
+            sample.files.is_empty(),
+            "a path with no room must not get a row"
+        );
+        assert_eq!(
+            sample.omitted,
+            Remainder {
+                read_bytes: 0,
+                write_bytes: 4_096
+            }
+        );
+        assert_eq!(sample.dropped_paths, 1);
+        assert_eq!(
+            sample.attributed().write_bytes,
+            4_096,
+            "an untracked file is still part of the process total"
+        );
+
+        // Below the budget the same transfer tracks normally, and an already
+        // tracked path does not consume a second slot.
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.tracked_paths = MAX_TRACKED_FILES - 1;
+        }
+        deliver(&shared, 8, EVENT_WRITE, &transfer_payload(8, 0x1000, 256));
+        let sample = sample_of(&shared, 8);
+        assert_eq!(
+            bytes(&sample, r"C:\data\budget.bin"),
+            Some(FileBytes {
+                read_bytes: 0,
+                write_bytes: 256
+            }),
+            "the rejected transfer is not replayed, only this one counts"
+        );
+        assert_eq!(sample.dropped_paths, 1);
+        assert_eq!(
+            shared.state.lock().unwrap().tracked_paths,
+            MAX_TRACKED_FILES
+        );
+    }
+
+    /// A pid reused between two samples belongs to a different process, so the
+    /// previous process's paths and open file objects must not carry over.
+    #[test]
+    fn a_reused_pid_starts_a_fresh_bucket() {
+        let shared = shared();
+        deliver(
+            &shared,
+            8,
+            EVENT_CREATE,
+            &create_payload(8, 0x1000, r"\??\C:\old.bin"),
+        );
+        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x1000, 4_096));
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.bind_epoch(8, 1_000);
+            assert_eq!(state.pids.get(&8).unwrap().epoch_s, Some(1_000));
+            assert_eq!(state.tracked_paths, 1);
+        }
+        // Same pid, different creation time: the counters belong to a process
+        // that is gone.
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.bind_epoch(8, 2_000);
+            assert!(
+                !state.pids.contains_key(&8),
+                "the previous process's paths are gone"
+            );
+            assert!(
+                !state.open.contains_key(&0x1000),
+                "and so are the names it had open"
+            );
+            assert_eq!(state.tracked_paths, 0);
+        }
+        // The new process starts from nothing and accumulates its own paths.
+        let sample = sample_of(&shared, 8);
+        assert!(sample.files.is_empty());
+        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x1000, 512));
+        let sample = sample_of(&shared, 8);
+        assert!(sample.files.is_empty(), "the old name is not inherited");
+        assert_eq!(
+            sample.unnamed,
+            Remainder {
+                read_bytes: 512,
+                write_bytes: 0
+            }
+        );
+        // Re-binding the same creation time keeps the bucket.
+        deliver(
+            &shared,
+            8,
+            EVENT_CREATE,
+            &create_payload(8, 0x2000, r"\??\C:\new.bin"),
+        );
+        {
+            let mut state = shared.state.lock().unwrap();
+            let before = state.pids.get(&8).unwrap().files.len();
+            state.bind_epoch(8, 2_000);
+            assert_eq!(state.pids.get(&8).unwrap().files.len(), before);
+        }
     }
 
     /// Per-process tracking is capped too, and a file beyond the cap never
@@ -1159,6 +1455,62 @@ mod tests {
             sample.attributed().read_bytes,
             4_096,
             "an omitted file is still part of the process total"
+        );
+        assert_eq!(sample.dropped_paths, 1);
+    }
+
+    /// The payload is written by the kernel, so its pointers are native width
+    /// even when the record is flagged as coming from a 32-bit caller. Reading
+    /// it four bytes narrow would shift every field and leave that process with
+    /// dashes on every row while the session reports Measured.
+    #[test]
+    fn a_32_bit_header_flag_does_not_narrow_a_kernel_payload() {
+        let record = EVENT_RECORD {
+            EventHeader: windows::Win32::System::Diagnostics::Etw::EVENT_HEADER {
+                // EVENT_HEADER_FLAG_32_BIT_HEADER, as a WOW64 caller's record
+                // carries it.
+                Flags: 0x0020,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            etw::pointer_bytes(&record),
+            4,
+            "the caller's width is what the header flag describes"
+        );
+        assert_eq!(
+            KERNEL_FILE_POINTER_BYTES,
+            std::mem::size_of::<usize>(),
+            "and it is NOT the width of this provider's payloads"
+        );
+
+        // The record's payload is native width throughout, and the callback
+        // decodes it with the pinned width: the bytes land on the file.
+        let shared = shared();
+        deliver(
+            &shared,
+            64,
+            EVENT_CREATE,
+            &create_payload(KERNEL_FILE_POINTER_BYTES, 0x8000, r"\??\C:\data\wow64.bin"),
+        );
+        let payload = transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x8000, 4_096);
+        handle_payload(&shared, 64, EVENT_READ, 1, &payload);
+        let sample = sample_of(&shared, 64);
+        assert_eq!(
+            bytes(&sample, r"C:\data\wow64.bin"),
+            Some(FileBytes {
+                read_bytes: 4_096,
+                write_bytes: 0
+            }),
+            "a 32-bit caller's record still names its file"
+        );
+        assert_eq!(sample.unnamed, Remainder::default());
+        // Four-byte pointers would have read the Irp as the object and lost
+        // the record entirely.
+        assert_ne!(
+            parse_event(EVENT_READ, 1, &payload, 4),
+            parse_event(EVENT_READ, 1, &payload, KERNEL_FILE_POINTER_BYTES)
         );
     }
 
@@ -1227,8 +1579,9 @@ mod tests {
         assert_eq!(stopped.state(), FileIoAccountingState::Unavailable);
     }
 
-    /// Undecodable records are counted, never charged, and the last payload
-    /// length is kept so a layout change can be diagnosed from a log line.
+    /// Undecodable records are counted, never charged, and the id, version and
+    /// payload length of the last rejection are kept so a layout change and a
+    /// truncated payload can be told apart from a log line.
     #[test]
     fn undecodable_records_are_counted_but_never_charged() {
         let shared = shared();
@@ -1241,12 +1594,14 @@ mod tests {
             EVENT_READ,
             &transfer_payload(8, 0x1000, u32::MAX),
         );
-        // A truncated transfer; its length is the most recent rejection.
-        shared.undecodable(12);
+        // A truncated transfer; its identity is the most recent rejection.
+        shared.undecodable(EVENT_READ, 1, 12);
         let state = shared.state.lock().unwrap();
         assert_eq!(state.events_seen, 3);
         assert_eq!(state.events_decoded, 0);
         assert!(state.pids.is_empty() || state.pids.values().all(|p| p.files.is_empty()));
+        assert_eq!(state.rejected_event_id, EVENT_READ);
+        assert_eq!(state.rejected_version, 1);
         assert_eq!(state.rejected_payload_len, 12);
     }
 

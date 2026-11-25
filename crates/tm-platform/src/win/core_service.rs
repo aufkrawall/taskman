@@ -2232,7 +2232,10 @@ fn spawn_file_trace_watchdog() {
 /// which is what the unelevated direct path keeps reporting: a Kernel-File
 /// session needs elevation, so without the service there is no source at all
 /// and that state must keep meaning exactly that.
-fn file_io_accounting(pid: u32) -> Option<super::file_etw::FileIoSample> {
+///
+/// `start_epoch_s` is the creation time the request verified, and it is passed
+/// through so a reused pid cannot inherit the previous process's paths.
+fn file_io_accounting(pid: u32, start_epoch_s: i64) -> Option<super::file_etw::FileIoSample> {
     let mut slot = match file_trace().lock() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
@@ -2270,7 +2273,7 @@ fn file_io_accounting(pid: u32) -> Option<super::file_etw::FileIoSample> {
     let trace = slot.as_mut()?;
     trace.last_request = std::time::Instant::now();
     let live = live_pids();
-    Some(trace.usage.sample(pid, &live))
+    Some(trace.usage.sample(pid, start_epoch_s, &live))
 }
 
 /// Attach a Kernel-File sample to the handle rows it names.
@@ -2282,6 +2285,13 @@ fn file_io_accounting(pid: u32) -> Option<super::file_etw::FileIoSample> {
 /// A row with no record keeps `None` (rendered as unavailable), and a record
 /// with no row is NOT dropped: it goes into the unnamed remainder, which is
 /// what makes `read_bytes`/`write_bytes` the whole attribution for the process.
+///
+/// Several records can name ONE row: the trace's path is the provider's own
+/// (resolved from a device path), the row's is the handle walk's, and the
+/// caller's casing survives both, so `C:\Windows\a.dll` and `c:\windows\a.dll`
+/// are two buckets for one file. Their bytes are ADDED into the row; assigning
+/// would let the last bucket overwrite the first, and the row would then hold
+/// less than the process total while nothing absorbed the difference.
 fn attach_file_io(
     snapshot: &mut crate::actions::ProcessFileIoSnapshot,
     sample: &super::file_etw::FileIoSample,
@@ -2291,6 +2301,11 @@ fn attach_file_io(
     accounting.state = sample.state();
     accounting.since_ms = sample.since_ms;
     accounting.events_lost = sample.events_lost;
+    // Why rows can read unavailable while the state is measured: these say it
+    // happened, instead of leaving a user to conclude the feature is broken.
+    accounting.cleared_file_objects = sample.cleared_file_objects;
+    accounting.unnamed_creates = sample.unnamed_creates;
+    accounting.dropped_paths = sample.dropped_paths;
     if accounting.state != crate::actions::FileIoAccountingState::Measured {
         // Nothing was decoded for this process, so there is nothing to attach
         // and every row stays unavailable.
@@ -2309,8 +2324,16 @@ fn attach_file_io(
         match index_by_path.get(&path.to_lowercase()) {
             Some(&index) => {
                 let file = &mut snapshot.files[index];
-                file.read_bytes = Some(bytes.read_bytes);
-                file.write_bytes = Some(bytes.write_bytes);
+                file.read_bytes = Some(
+                    file.read_bytes
+                        .unwrap_or(0)
+                        .saturating_add(bytes.read_bytes),
+                );
+                file.write_bytes = Some(
+                    file.write_bytes
+                        .unwrap_or(0)
+                        .saturating_add(bytes.write_bytes),
+                );
             }
             None => {
                 // Closed since the handle walk, or a file the walk could not
@@ -2328,6 +2351,77 @@ fn attach_file_io(
     accounting.unnamed_write_bytes = unnamed.write_bytes;
     accounting.omitted_read_bytes = sample.omitted.read_bytes;
     accounting.omitted_write_bytes = sample.omitted.write_bytes;
+}
+
+/// Charge rows that were dropped from the response to the omitted remainder.
+///
+/// A row that does not fit is still part of what the trace measured for the
+/// process, so its bytes move into `omitted_*` instead of disappearing.
+fn omit_file_bytes(
+    accounting: &mut crate::actions::FileIoAccounting,
+    files: Vec<crate::actions::ProcessFileIo>,
+) {
+    for file in files {
+        if let Some(read) = file.read_bytes {
+            accounting.omitted_read_bytes = accounting.omitted_read_bytes.saturating_add(read);
+        }
+        if let Some(write) = file.write_bytes {
+            accounting.omitted_write_bytes = accounting.omitted_write_bytes.saturating_add(write);
+        }
+    }
+}
+
+/// Encoded length of a file-I/O snapshot, as it will be framed.
+fn encoded_file_io_len(snapshot: &crate::actions::ProcessFileIoSnapshot) -> Result<usize> {
+    serde_json::to_vec(snapshot)
+        .map(|encoded| encoded.len())
+        .map_err(|error| TmError::platform("broker process file io", error.to_string()))
+}
+
+/// Drop rows from the end of `snapshot.files` until the encoded snapshot fits
+/// `budget` bytes, charging them to the omitted remainder.
+///
+/// Row COUNT is not a size bound (see the caller). Every row adds at least its
+/// own bytes, so the encoded size grows with the row count and the longest
+/// fitting prefix can be found by bisection — ten encodings for a full
+/// thousand-row list, and none in the common case where the list already fits.
+/// A snapshot that cannot fit even with no rows is a real error and still
+/// fails.
+fn trim_file_io_to_budget(
+    snapshot: &mut crate::actions::ProcessFileIoSnapshot,
+    budget: usize,
+) -> Result<()> {
+    if encoded_file_io_len(snapshot)? <= budget {
+        return Ok(());
+    }
+    let rows = std::mem::take(&mut snapshot.files);
+    let mut fits = 0usize;
+    let mut over = rows.len();
+    while fits < over {
+        // Upper middle, so `fits` advances and the loop terminates on the
+        // largest prefix that fits.
+        let probe = fits + (over - fits).div_ceil(2);
+        snapshot.files = rows[..probe].to_vec();
+        if encoded_file_io_len(snapshot)? <= budget {
+            fits = probe;
+        } else {
+            over = probe - 1;
+        }
+    }
+    let mut kept = rows;
+    let dropped = kept.split_off(fits);
+    snapshot.files = kept;
+    if !dropped.is_empty() {
+        snapshot.accounting.handles_complete = false;
+        omit_file_bytes(&mut snapshot.accounting, dropped);
+    }
+    if encoded_file_io_len(snapshot)? > budget {
+        return Err(TmError::platform(
+            "broker process file io",
+            "file I/O snapshot exceeds the bounded broker response limit",
+        ));
+    }
+    Ok(())
 }
 
 /// Test hook for [`live_pids`], so an integration test can check the same
@@ -2537,32 +2631,20 @@ fn dispatch(
             // how many bytes went through them. Attached before the response is
             // trimmed, so rows dropped by the frame budget add to the omitted
             // remainder instead of vanishing from the totals.
-            if let Some(sample) = file_io_accounting(pid) {
+            if let Some(sample) = file_io_accounting(pid, start_epoch_s) {
                 attach_file_io(&mut snapshot, &sample);
             }
             if snapshot.files.len() > MAX_FILES_PER_RESPONSE {
                 let omitted = snapshot.files.split_off(MAX_FILES_PER_RESPONSE);
                 snapshot.accounting.handles_complete = false;
-                for file in omitted {
-                    if let Some(r) = file.read_bytes {
-                        snapshot.accounting.omitted_read_bytes =
-                            snapshot.accounting.omitted_read_bytes.saturating_add(r);
-                    }
-                    if let Some(w) = file.write_bytes {
-                        snapshot.accounting.omitted_write_bytes =
-                            snapshot.accounting.omitted_write_bytes.saturating_add(w);
-                    }
-                }
+                omit_file_bytes(&mut snapshot.accounting, omitted);
             }
-            let encoded_len = serde_json::to_vec(&snapshot)
-                .map_err(|error| TmError::platform("broker process file io", error.to_string()))?
-                .len();
-            if encoded_len > MAX_RESPONSE_BYTES.saturating_sub(1024) {
-                return Err(TmError::platform(
-                    "broker process file io",
-                    "file I/O snapshot exceeds the bounded broker response limit",
-                ));
-            }
+            // The entry cap bounds how many rows there are; it does not bound
+            // how big they are. A row is a path plus five optional numbers, so
+            // 1024 rows of long paths overflow the response while 1024 short
+            // ones leave room to spare — and erroring here made the whole list
+            // disappear for exactly the snapshots that carry the most.
+            trim_file_io_to_budget(&mut snapshot, MAX_RESPONSE_BYTES.saturating_sub(1024))?;
             Ok(BrokerValue::ProcessFileIo(snapshot))
         }
         BrokerRequest::KillProcess {
@@ -4671,6 +4753,9 @@ mod tests {
                         counter_read_bytes: Some(1024),
                         counter_write_bytes: Some(0),
                         events_lost: None,
+                        cleared_file_objects: 0,
+                        unnamed_creates: 0,
+                        dropped_paths: 0,
                         handles_complete: true,
                     },
                 },
@@ -5037,6 +5122,11 @@ mod tests {
             events_decoded: 39,
             pid_read_transfers: 9,
             pid_write_transfers: 2,
+            // The session had to drop names and had nowhere to put paths; both
+            // explain a row that reads unavailable while the state is measured.
+            cleared_file_objects: 12,
+            unnamed_creates: 3,
+            dropped_paths: 4,
             events_lost: Some(1),
         }
     }
@@ -5072,6 +5162,11 @@ mod tests {
         );
         assert_eq!(accounting.since_ms, 12_000);
         assert_eq!(accounting.events_lost, Some(1));
+        // A user needs to see WHY a row reads unavailable while the state is
+        // measured: a lost name, a refused open, or a full path budget.
+        assert_eq!(accounting.cleared_file_objects, 12);
+        assert_eq!(accounting.unnamed_creates, 3);
+        assert_eq!(accounting.dropped_paths, 4);
         // 500 (gone.tmp) + 70 (unnamed) read; 5 + 7 written.
         assert_eq!(accounting.unnamed_read_bytes, 570);
         assert_eq!(accounting.unnamed_write_bytes, 12);
@@ -5082,6 +5177,126 @@ mod tests {
         // The row + the two remainders are the attribution for the process.
         assert_eq!(accounting.read_bytes, 1_000 + 570 + 300);
         assert_eq!(accounting.write_bytes, 20 + 12 + 3);
+    }
+
+    /// One file can arrive as two trace buckets — `C:\...` and `c:\...` — and
+    /// both match the same row. The row must hold their SUM: overwriting with
+    /// the second bucket left the row short of the process total with nothing
+    /// absorbing the difference, so "rows + remainders == attributed" was false.
+    #[test]
+    fn two_case_variants_of_one_path_accumulate_on_that_row() {
+        let mut sample = measured_sample();
+        sample.files = vec![
+            (
+                r"C:\Windows\System32\A.dll".to_string(),
+                crate::win::file_etw::FileBytes {
+                    read_bytes: 1_000,
+                    write_bytes: 20,
+                },
+            ),
+            (
+                r"c:\windows\system32\a.dll".to_string(),
+                crate::win::file_etw::FileBytes {
+                    read_bytes: 400,
+                    write_bytes: 5,
+                },
+            ),
+        ];
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![
+                file_row(r"C:\Windows\System32\a.dll"),
+                file_row(r"C:\data\untouched.bin"),
+            ],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_file_io(&mut snapshot, &sample);
+        assert_eq!(
+            snapshot.files[0].read_bytes,
+            Some(1_400),
+            "both buckets land on the row"
+        );
+        assert_eq!(snapshot.files[0].write_bytes, Some(25));
+        assert_eq!(snapshot.files[1].read_bytes, None);
+        let accounting = &snapshot.accounting;
+        let rows_read: u64 = snapshot
+            .files
+            .iter()
+            .filter_map(|file| file.read_bytes)
+            .sum();
+        assert_eq!(
+            rows_read + accounting.unnamed_read_bytes + accounting.omitted_read_bytes,
+            accounting.read_bytes,
+            "rows plus remainders are still the whole attribution"
+        );
+        assert_eq!(accounting.read_bytes, 1_400 + 70 + 300);
+    }
+
+    /// A row carries a path and five optional numbers, so a thousand long paths
+    /// overflow the response body while a thousand short ones do not. That case
+    /// used to error and the file list vanished; the tail is now trimmed into
+    /// the omitted remainder instead.
+    #[test]
+    fn a_long_path_file_io_snapshot_is_trimmed_not_rejected() {
+        let budget = MAX_RESPONSE_BYTES.saturating_sub(1024);
+        // Well under the entry cap, well over the byte budget.
+        let rows: Vec<crate::actions::ProcessFileIo> = (0..MAX_FILES_PER_RESPONSE)
+            .map(|index| {
+                let mut row = file_row(&format!(
+                    r"C:\Program Files\Example\{index}\{}",
+                    "x".repeat(400)
+                ));
+                row.read_bytes = Some(4_096);
+                row.write_bytes = Some(1_024);
+                row
+            })
+            .collect();
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: rows,
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        assert!(
+            encoded_file_io_len(&snapshot).unwrap() > budget,
+            "the fixture must exceed the budget, or this test proves nothing"
+        );
+        trim_file_io_to_budget(&mut snapshot, budget).expect("a long list must be trimmed");
+        let encoded = encoded_file_io_len(&snapshot).unwrap();
+        assert!(encoded <= budget, "{encoded} still over {budget}");
+        assert!(!snapshot.files.is_empty(), "the list must not disappear");
+        assert!(
+            snapshot.files.len() < MAX_FILES_PER_RESPONSE,
+            "the tail was dropped"
+        );
+        assert!(!snapshot.accounting.handles_complete);
+        // Everything dropped is still part of the process total.
+        let total_rows = MAX_FILES_PER_RESPONSE as u64;
+        let kept_rows = snapshot.files.len() as u64;
+        let kept: u64 = snapshot
+            .files
+            .iter()
+            .filter_map(|file| file.read_bytes)
+            .sum();
+        assert_eq!(
+            kept + snapshot.accounting.omitted_read_bytes,
+            total_rows * 4_096
+        );
+        assert_eq!(
+            snapshot.accounting.omitted_write_bytes,
+            (total_rows - kept_rows) * 1_024
+        );
+        // A list that already fits is left exactly as it is.
+        let mut small = crate::actions::ProcessFileIoSnapshot {
+            files: vec![file_row(r"C:\data\a.bin")],
+            accounting: crate::actions::FileIoAccounting {
+                handles_complete: true,
+                ..crate::actions::FileIoAccounting::default()
+            },
+        };
+        trim_file_io_to_budget(&mut small, budget).expect("a short list fits");
+        assert_eq!(small.files.len(), 1);
+        assert!(
+            small.accounting.handles_complete,
+            "nothing was dropped, so nothing is incomplete"
+        );
     }
 
     /// A measured zero is a measurement and renders as 0; an absent record is

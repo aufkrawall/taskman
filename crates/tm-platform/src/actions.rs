@@ -392,9 +392,10 @@ pub enum FileIoAccountingState {
     /// The rows carry no byte counts.
     #[default]
     Unavailable,
-    /// A trace is running but has delivered no file event for ANY process,
-    /// so a silent window cannot be told apart from a broken subscription.
-    /// Treated as unknown rather than as zero activity.
+    /// A trace is running but delivered nothing this sample could count: no
+    /// file event at all, or none that attributed a read or write to THIS
+    /// process. A silent window cannot be told apart from a broken
+    /// subscription, so it is treated as unknown rather than as zero activity.
     Undelivered,
     /// The target issued file requests but none of the records could be
     /// decoded: the payload layout is not what this build expects.
@@ -408,10 +409,13 @@ pub enum FileIoAccountingState {
 ///
 /// `read_bytes`/`write_bytes` are everything the trace attributed to the
 /// process, whether or not it ended up on a row; the rows plus the three
-/// remainders below add up to them exactly. The counters differ from them by
-/// whatever does not go through a file object (pipes, devices, console) and by
-/// ETW loss, which is why they are carried alongside instead of being
-/// inferred.
+/// remainders below add up to them exactly. Process I/O through an object that
+/// cannot have a row — a pipe, a device, a console, a name that did not
+/// resolve — is therefore INSIDE these totals, in the unnamed remainder: the
+/// handle walk names disk files only, while the session delivers every file
+/// object. They are not the kernel counters' quantity either: the counters are
+/// process-lifetime totals and these cover the trace's lifetime, so the two
+/// differ by the age of the process as well as by every event ETW dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
 pub struct FileIoAccounting {
@@ -429,16 +433,29 @@ pub struct FileIoAccounting {
     /// Part of the totals dropped from `files` by a capacity limit.
     pub omitted_read_bytes: u64,
     pub omitted_write_bytes: u64,
-    /// Kernel per-process read/write byte counters. With
-    /// [`FileIoAccountingState::Measured`] these are growth over the same
-    /// trace span; on platforms without per-file accounting they may be the
-    /// explicitly identified process-lifetime totals (`since_ms == 0`).
+    /// Kernel per-process read/write byte counters: TOTALS SINCE THE PROCESS
+    /// STARTED, not growth over the span `since_ms` measures. They are carried
+    /// alongside the measured bytes as a separate, coarser fact — and are the
+    /// only per-process source on platforms without a per-file trace.
     /// `None` when the counters could not be read.
     pub counter_read_bytes: Option<u64>,
     pub counter_write_bytes: Option<u64>,
     /// Events the trace session reports as lost; counts are lower bounds when
     /// this is non-zero. `None` when it could not be queried.
     pub events_lost: Option<u64>,
+    /// Entries discarded from the trace's `FileObject -> name` map when it hit
+    /// its cap, over the trace's lifetime. Their later transfers are in
+    /// `unnamed_*`, which is why a row can read unavailable while
+    /// [`Self::state`] is still [`FileIoAccountingState::Measured`].
+    pub cleared_file_objects: u64,
+    /// File opens the trace refused to name (a network share, a `\SystemRoot\`
+    /// name, a raw device), over the trace's lifetime. Their transfers are in
+    /// `unnamed_*`.
+    pub unnamed_creates: u64,
+    /// Paths never tracked because a capacity limit (per process or for the
+    /// whole session) was full, over the trace's lifetime. Their transfers are
+    /// in `omitted_*`.
+    pub dropped_paths: u64,
     /// Whether the open-handle enumeration (names, sizes, access) completed.
     ///
     /// This says the handle TABLE was covered, not that every handle in it could

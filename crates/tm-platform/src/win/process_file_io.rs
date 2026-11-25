@@ -231,6 +231,9 @@ pub fn list_process_file_io(
         counter_read_bytes,
         counter_write_bytes,
         events_lost: None,
+        cleared_file_objects: 0,
+        unnamed_creates: 0,
+        dropped_paths: 0,
         handles_complete,
     };
     Ok(ProcessFileIoSnapshot { files, accounting })

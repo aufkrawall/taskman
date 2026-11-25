@@ -980,15 +980,26 @@ rebase runbook.
   (process, path). Names arrive as device paths, so they are translated to the
   DOS paths the handle walk reports (`QueryDosDeviceW`, cached) before being
   matched case-insensitively; a record with no row becomes unnamed bytes and a
-  row with no record stays `None`. Limits: these are REQUESTED sizes, not
+  row with no record stays `None`. Two buckets can name one row (the caller's
+  casing survives the provider's name resolution), so the rows ADD their bytes
+  rather than replace them — rows plus both remainders are the process total.
+  The payloads are written by the kernel, so they are decoded at native pointer
+  width even when the record is flagged `EVENT_HEADER_FLAG_32_BIT_HEADER`;
+  `etw::pointer_bytes` answers the caller's-width question and must not be used
+  here. Buckets are bound to the created time the request verified, so a reused
+  pid starts fresh. Limits: these are REQUESTED sizes, not
   completed transfers; the trace only exists in the elevated service, so the
   direct path keeps reporting `Unavailable`; a handle whose Create is not in
   the trace (opened before the session started, or whose event was dropped)
   contributes unnamed bytes rather than a name; `events_lost` makes every count
-  a lower bound; the open-file map is capped and cleared at the cap with a
-  dropped counter, and paths beyond the per-process cap go to the omitted
-  remainder; and the totals restart when the idle watchdog stops the session
-  and the next request starts a new one.
+  a lower bound; the open-file map is capped and cleared at the cap, and paths
+  beyond the per-process or the session-wide cap go to the omitted remainder
+  (both counted, alongside the unnamed opens, in `FileIoAccounting` so a row of
+  "—" explains itself); the file list is trimmed by serialized bytes, not by
+  row count; and the totals restart when the idle watchdog stops the session
+  and the next request starts a new one. A dropped Close plus Create pair
+  within one process still charges a reused `FileObject` to the earlier name —
+  the payload carries only the address.
   Threads come from one
   `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
   and service processes work unelevated); Windows 11 build 26300 ZEROES that
