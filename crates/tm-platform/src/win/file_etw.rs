@@ -1029,12 +1029,16 @@ impl State {
     ///
     /// A quarter at a time so a process streaming through new files pays the
     /// sort once per few thousand files, not per file. Open paths are never
-    /// evicted: their row is on screen and must keep counting.
+    /// evicted: their row is on screen and must keep counting. That includes
+    /// the objects this process only holds through an inherited or duplicated
+    /// handle — [`State::complete`] charges those to it, so folding them into
+    /// the omitted remainder would drop a live row's bytes and recreate the
+    /// row at zero on its next transfer.
     fn evict(&mut self, pid: u32) {
         let open: HashSet<Arc<str>> = self
             .open
             .values()
-            .filter(|file| file.pid == pid)
+            .filter(|file| file.held_by(pid))
             .map(|file| Arc::clone(&file.path))
             .collect();
         let Some(files) = self.pids.get_mut(&pid) else {
@@ -3016,6 +3020,71 @@ mod tests {
             shared.lock().tracked_paths,
             MAX_TRACKED_FILES_PER_PID - evicted as usize + 1
         );
+    }
+
+    /// A path this process holds through an INHERITED handle is open for it
+    /// too: once the handle table named the object for this process,
+    /// [`State::complete`] charges its transfers to it, so eviction must not
+    /// fold those bytes into the omitted remainder while the handle lives.
+    ///
+    /// Regression: the protected set was built from `OpenFile::pid` alone, so a
+    /// child's redirected stdout — named for the parent that opened it — was
+    /// evicted as if it were closed: its bytes moved to the omitted remainder
+    /// and the next write recreated the row at zero, with the file still open.
+    #[test]
+    fn eviction_keeps_a_path_held_through_an_inherited_handle() {
+        let mut state = State::default();
+        // The parent's Create named the object; the handle table then showed
+        // pid 44 holding it as well (an inherited or duplicated handle).
+        state
+            .open
+            .insert(0x5000, OpenFile::new(40, Arc::from(r"C:\logs\out.txt")));
+        state.apply_names(44, vec![(0x5000, r"C:\logs\out.txt".to_string())]);
+        assert!(
+            state.open.get(&0x5000).is_some_and(|file| file.held_by(44)),
+            "the handle table named the object for pid 44"
+        );
+        state.charge_path(
+            44,
+            Arc::from(r"C:\logs\out.txt"),
+            FileBytes {
+                read_bytes: 0,
+                write_bytes: 10,
+            },
+        );
+        // Two files the process opened and closed, the oldest first.
+        state.charge_path(
+            44,
+            Arc::from(r"C:\old.tmp"),
+            FileBytes {
+                read_bytes: 0,
+                write_bytes: 2,
+            },
+        );
+        state.charge_path(
+            44,
+            Arc::from(r"C:\older.tmp"),
+            FileBytes {
+                read_bytes: 0,
+                write_bytes: 3,
+            },
+        );
+        state.evict(44);
+        let files = &state.pids.get(&44).expect("a bucket").files;
+        assert!(
+            files.contains_key(r"C:\logs\out.txt"),
+            "a path held through an inherited handle is open, not closed"
+        );
+        assert!(
+            !files.contains_key(r"C:\old.tmp"),
+            "the least recently used CLOSED path went instead"
+        );
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            state.pids.get(&44).expect("a bucket").omitted.write_bytes,
+            2
+        );
+        assert_eq!(state.tracked_paths, 2);
     }
 
     /// Coverage: a process created after the session started has been traced

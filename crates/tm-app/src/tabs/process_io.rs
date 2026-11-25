@@ -462,6 +462,41 @@ fn per_file_accounting_note(
     }
 }
 
+/// What the file table says when the row list is EMPTY, or `None` when
+/// [`per_file_accounting_note`] already carries the answer.
+///
+/// An empty list is only a measurement of "this process did no file I/O" when
+/// the handle enumeration covered the table AND the per-file trace measured the
+/// process: then the trace saw every request on the machine and named none of
+/// them for it. Every other answer is a gap, and "no file activity detected"
+/// would state a definite negative about file I/O nothing here observed — the
+/// same rule the Read and Written columns follow, which read "—" rather than 0.
+///
+/// A platform without a per-file source at all keeps the plain list answer
+/// (`elevation_is_a_remedy` is false there): the handle list IS the whole
+/// feature there, so nothing that could have been shown is missing.
+///
+/// The filter wins over all of that: it, not the process, is why nothing is
+/// listed.
+fn empty_file_list_message(
+    accounting: Option<&FileIoAccounting>,
+    handles_complete: bool,
+    filter_active: bool,
+    elevation_is_a_remedy: bool,
+    lang: i18n::Lang,
+) -> Option<String> {
+    if filter_active {
+        return Some(i18n::tr_in(lang, K::NoMatches).to_string());
+    }
+    let Some(accounting) = accounting.filter(|_| handles_complete) else {
+        return Some(i18n::tr_in(lang, K::PropIoFilesUnavailable).to_string());
+    };
+    if accounting.state == FileIoAccountingState::Measured || !elevation_is_a_remedy {
+        return Some(i18n::tr_in(lang, K::PropIoNoFiles).to_string());
+    }
+    None
+}
+
 /// How much of the process's own I/O over the traced window went to files, or
 /// `None` when that cannot be said.
 ///
@@ -957,16 +992,27 @@ pub fn show(
     if display_files.is_empty() {
         ui.add_space(6.0);
         // Per-file byte/op accounting is normally Unavailable, but the file
-        // LIST is still a measured fact when handle enumeration completed.
-        let unavailable = handles_incomplete || state.accounting.is_none();
-        let msg = if unavailable {
-            i18n::tr(K::PropIoFilesUnavailable)
-        } else if !state.file_filter.trim().is_empty() {
-            i18n::tr(K::NoMatches)
-        } else {
-            i18n::tr(K::PropIoNoFiles)
-        };
-        ui.weak(msg);
+        // LIST is still a measured fact when handle enumeration completed. An
+        // EMPTY list is only "no file activity" when the per-file trace
+        // measured the process as well; otherwise the page states which state
+        // it is in, because a negative nothing observed is the one thing the
+        // Read and Written columns must never become.
+        if let Some(msg) = empty_file_list_message(
+            state.accounting.as_ref(),
+            !handles_incomplete,
+            !state.file_filter.trim().is_empty(),
+            ELEVATION_IS_A_REMEDY,
+            i18n::lang(),
+        ) {
+            ui.weak(msg);
+        } else if let Some(note) = per_file_accounting_note(
+            state.accounting.as_ref(),
+            false,
+            ELEVATION_IS_A_REMEDY,
+            i18n::lang(),
+        ) {
+            ui.label(egui::RichText::new(note).small().color(pal.text_dim));
+        }
         if process.disk_read_bps > 0.0
             || process.disk_write_bps > 0.0
             || process.io_other_bps.unwrap_or(0.0) > 0.0
@@ -1625,6 +1671,59 @@ mod tests {
                 "Es läuft keine Ablaufverfolgung: erfordert Administratorrechte oder den \
                  installierten Dienst (12 Ereignisse verloren)"
             )
+        );
+    }
+
+    /// An EMPTY file table renders the same rule as a dashed column: "no file
+    /// activity detected" is a measurement, and without a per-file source the
+    /// row list cannot make it.
+    ///
+    /// Regression: the empty branch keyed on `handles_complete` alone and
+    /// returned before the state line, so an unelevated GUI with no service —
+    /// where an empty list means "no open handles", not "no file I/O" — read
+    /// exactly like a measured zero and never named the missing source.
+    #[test]
+    fn an_empty_file_table_states_the_reason_instead_of_claiming_no_activity() {
+        use tm_core::i18n::Lang;
+
+        let no_files = Some(i18n::tr_in(Lang::En, K::PropIoNoFiles).to_string());
+        let unavailable = Some(i18n::tr_in(Lang::En, K::PropIoFilesUnavailable).to_string());
+        let no_trace = FileIoAccounting {
+            state: FileIoAccountingState::Unavailable,
+            ..Default::default()
+        };
+        let measured = FileIoAccounting {
+            state: FileIoAccountingState::Measured,
+            ..Default::default()
+        };
+        assert_eq!(
+            empty_file_list_message(Some(&no_trace), true, false, true, Lang::En),
+            None,
+            "the state line says why, not the list"
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&measured), true, false, true, Lang::En),
+            no_files,
+            "a measured process that named no file is a measured zero"
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&measured), false, false, true, Lang::En),
+            unavailable,
+            "the enumeration, not the trace, is why the list is unknown"
+        );
+        assert_eq!(
+            empty_file_list_message(None, true, false, true, Lang::En),
+            unavailable
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&no_trace), true, false, false, Lang::En),
+            no_files,
+            "a platform without a per-file source keeps the plain list answer"
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&no_trace), true, true, true, Lang::En),
+            Some(i18n::tr_in(Lang::En, K::NoMatches).to_string()),
+            "a filter that matches nothing is its own answer"
         );
     }
 
