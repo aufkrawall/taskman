@@ -1218,9 +1218,12 @@ impl NativeApp {
 
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
-        // The data pass that follows the app's construction: everything
-        // between `native_shell_ready` and this mark is eframe's own window,
-        // adapter and pipeline setup for the renderer in use.
+        // First data pass after the creator returned. The renderer's own setup
+        // is NOT in this gap: eframe creates the wgpu instance, adapter, device
+        // and surface in `egui_wgpu::winit::Painter::new` and `set_window`,
+        // both before it calls the creator, so that cost lands between
+        // `window_options_built` and `creation_context_enter`. What runs here
+        // is eframe's bookkeeping and the event loop's first turn into the app.
         if !self.first_logic_logged {
             self.first_logic_logged = true;
             StartupTrace::mark("first_logic_enter");
@@ -1409,6 +1412,12 @@ impl eframe::App for NativeApp {
             // `ui` only runs for a visible, unminimized window, so a frame
             // after the restore frame is real content in the restored window.
             if (self.show_ack_pending || self.cloaked_for_restore) && self.restore_ticks >= 1 {
+                // First painted frame of this restore (`restore_window`
+                // cleared the flag, and only a new restore clears it again),
+                // so this mark fires once per restore rather than per frame.
+                if !self.painted_since_restore {
+                    StartupTrace::mark("restored_window_painted");
+                }
                 self.painted_since_restore = true;
             }
             // A changed monitor size means the display layout changed under
