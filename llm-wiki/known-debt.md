@@ -533,6 +533,17 @@ remain follow-up rather than being simulated in headless tests:
   from sorted card enumeration; if cards appear or disappear, a different
   adapter can inherit the same history slot. A stable PCI/sysfs identity is
   needed for multi-GPU hotplug.
+- **A Linux adapter's cached description is revalidated by its `device` link,
+  not by age.** `/sys/class/net/<if>/device` names the PCI function or USB
+  interface the description was read from, so an adapter that is removed and
+  reappears under another name, or is replaced by a device behind a different
+  link, is described again (a failed `/sys/class/net` listing keeps the
+  identities it already has instead of blanking them). A *different* device
+  moved into the *same* port under the *same* interface name keeps the previous
+  model name until TaskMan restarts: sysfs carries no further identity in that
+  case, and re-reading the marketing strings every tick would reintroduce the
+  per-tick sysfs walk the cache exists to avoid. Unlike the DRM card cache
+  (`IDENTITY_TTL`) and the desktop-evidence cache, this one has no expiry.
 - **Users maps only exact `session-N.scope` cgroups.** That is deliberate and
   avoids guessing from usernames, but some systemd user-manager application
   scopes under `user@UID.service` have no session component and therefore do

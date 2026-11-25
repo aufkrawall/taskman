@@ -406,6 +406,12 @@ fn parse_pci_location(slot: &str) -> Option<(u32, u32, u32)> {
                 && !bus.is_empty()
                 && bus.chars().all(|ch| ch.is_ascii_hexdigit()) =>
         {
+            // The published location carries no domain, so a non-zero one would
+            // name two different segments' devices by the same bus/device/
+            // function. No location is honest; an ambiguous one is not.
+            if u32::from_str_radix(domain, 16).ok()? != 0 {
+                return None;
+            }
             bus
         }
         Some(_) => return None,
@@ -533,11 +539,15 @@ mod tests {
     }
 
     #[test]
-    fn pci_location_accepts_domained_and_domainless_slots() {
+    fn pci_location_accepts_zero_domain_and_domainless_slots_only() {
         assert_eq!(parse_pci_location("0000:03:00.1"), Some((3, 0, 1)));
         assert_eq!(parse_pci_location("01:1f.7"), Some((1, 31, 7)));
         assert_eq!(parse_pci_location("[0000:03:00.1]"), Some((3, 0, 1)));
         assert_eq!(parse_pci_location("not-a-pci-slot"), None);
+        // The location has no domain, so a non-zero segment would publish two
+        // different devices under the same bus/device/function.
+        assert_eq!(parse_pci_location("0001:03:00.0"), None);
+        assert_eq!(parse_pci_location("10000:03:00.0"), None);
     }
 
     #[test]

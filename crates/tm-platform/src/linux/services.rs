@@ -47,7 +47,9 @@ pub fn list_systemd_units() -> Result<Vec<ServiceInfo>> {
 /// blocks while its D-Bus connection waits for a daemon that may be wedged.
 /// The shared pidfd/`poll` wait turns that into a bounded failure: a child
 /// that outlives its deadline is killed and reaped, and the error names the
-/// program and context instead of freezing an action lane.
+/// program and context instead of freezing an action lane. Its output is
+/// collected under the same deadline, so a process that inherited the helper's
+/// pipes cannot hold the read open either.
 fn run_systemctl(
     systemctl: &Path,
     arguments: &[&str],
@@ -63,14 +65,12 @@ fn run_systemctl(
         .spawn()
         .map_err(|error| TmError::platform(context, format!("could not start: {error}")))?;
     let deadline = Instant::now() + deadline;
-    if let Err(error) = launch::wait_for_exit(&mut child, deadline, "systemctl") {
+    let result = launch::wait_with_output(&mut child, deadline, "systemctl");
+    if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(TmError::platform(context, error.to_string()));
     }
-    child
-        .wait_with_output()
-        .map_err(|error| TmError::platform(context, error.to_string()))
+    result.map_err(|error| TmError::platform(context, error.to_string()))
 }
 
 fn check_exit(status: std::process::ExitStatus, stderr: &[u8]) -> Result<()> {
