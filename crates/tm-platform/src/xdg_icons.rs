@@ -1223,6 +1223,12 @@ fn theme_directories(theme_dir: &Path) -> Option<Vec<ThemeDir>> {
     dirs.extend(scaled_dirs);
     Some(
         dirs.into_iter()
+            // A theme lists its directories relative to itself. An absolute
+            // entry, or one that climbs with `..`, would point the size-dir
+            // walk — and the `Path::join` of every icon file under it — outside
+            // the theme and outside the icon dirs, so it is not a directory of
+            // this theme.
+            .filter(|d| is_theme_subdirectory(d))
             .map(|d| {
                 let size = sizes.get(&d).copied().unwrap_or(0);
                 let scale = scales.get(&d).copied().unwrap_or_else(|| name_scale(&d));
@@ -1234,6 +1240,15 @@ fn theme_directories(theme_dir: &Path) -> Option<Vec<ThemeDir>> {
             })
             .collect(),
     )
+}
+
+/// Whether a theme's declared directory stays inside the theme: a relative path
+/// whose every component is a normal name.
+fn is_theme_subdirectory(subdir: &str) -> bool {
+    !subdir.is_empty()
+        && Path::new(subdir)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 /// Decode a PNG file to straight-alpha RGBA, box-downsampling anything larger
