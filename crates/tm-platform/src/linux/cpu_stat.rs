@@ -175,16 +175,20 @@ fn parse_proc_stat(text: &str) -> Option<ProcStat> {
         } else {
             continue;
         };
-        let values: Vec<u64> = fields
+        // A line this build cannot read — a field that is not a number, or one it
+        // does not have — is not a partial sample: the counters it lacks are
+        // unknown, not zeroes, and inventing `0` for `iowait`/`irq`/`softirq`/
+        // `steal` reports a machine that spent the whole window in user time. Both
+        // cases ignore the line and leave the core out of the map, so the CPU-set
+        // check above reports the window unavailable; failing the whole file
+        // instead would silently keep the older baseline and span two windows.
+        let Ok(values) = fields
             .take(8)
             .map(str::parse)
-            .collect::<std::result::Result<_, _>>()
-            .ok()?;
-        // A line this build cannot read completely is not a partial sample: the
-        // counters it lacks are unknown, not zeroes, and inventing `0` for
-        // `iowait`/`irq`/`softirq`/`steal` reports a machine that spent the
-        // whole window in user time. Ignoring the line leaves the core out of
-        // the map, and the CPU-set check above reports the window unavailable.
+            .collect::<std::result::Result<Vec<u64>, _>>()
+        else {
+            continue;
+        };
         if values.len() < 8 {
             continue;
         }
@@ -334,5 +338,40 @@ cpu1 45 10 45
             sampler.sample(second).is_none(),
             "a core this build cannot read makes the window unmeasurable"
         );
+    }
+
+    /// An unparsable field is handled like a missing one: the core leaves the
+    /// sample and the CPU-set check reports the window unavailable, instead of the
+    /// whole file failing and the older baseline surviving into later windows.
+    #[test]
+    fn an_unparsable_core_field_leaves_the_core_out_like_a_missing_one() {
+        let mut sampler = CpuStatSampler::default();
+        assert!(sampler.sample(FIRST).is_none());
+        // cpu1's iowait counter is not a number any more.
+        let garbled = "\
+cpu 120 10 70 1000 0 0 0 0 0 0
+cpu0 80 0 15 1005 0 0 0 0 0 0
+cpu1 45 10 45 nope 0 0 0 0 0 0
+";
+        assert!(
+            sampler.sample(garbled).is_none(),
+            "cpu1 left the sample, so the CPU set changed"
+        );
+        // The file itself parsed, so its counters are the baseline: a second read
+        // that leaves cpu1 out for the same reason is measurable, where a file the
+        // parser rejected would have kept the older baseline and covered both
+        // windows with one capacity.
+        let garbled_next = "\
+cpu 150 10 90 1100 0 0 0 0 0 0
+cpu0 100 0 20 1100 0 0 0 0 0 0
+cpu1 50 10 60 still-nope 0 0 0 0 0 0
+";
+        let sample = sampler
+            .sample(garbled_next)
+            .expect("both reads left cpu1 out");
+        // The baseline advanced with the garbled read, so this window covers exactly
+        // those two reads: 150 aggregate jiffies, and the one core left in the map.
+        assert_eq!(sample.window_total_ticks, 150);
+        assert_eq!(sample.per_core_pct.len(), 1);
     }
 }
