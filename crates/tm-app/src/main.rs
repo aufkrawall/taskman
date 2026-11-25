@@ -472,7 +472,12 @@ fn run_gui(mock: bool, args: &[String]) {
             .with_app_id(APP_ID)
             .with_inner_size(creation_size)
             .with_min_inner_size(creation_min_size)
-            .with_visible(!initially_hidden)
+            // EVERY launch starts hidden, on every path: a window created
+            // visible is composed by the desktop before the app has ever run a
+            // frame, which is the white flash. Only eframe's reveal after the
+            // first painted frame may show it, and the present gate keeps it
+            // cloaked until that frame is really behind it.
+            .with_visible(false)
             .with_icon(icon_data());
         if let Some(pos) = window_position {
             viewport = viewport.with_position(pos);
@@ -630,6 +635,43 @@ fn run_gui(mock: bool, args: &[String]) {
             );
             StartupTrace::mark("subpixel_capability_resolved");
             theme::apply_startup(&cc.egui_ctx);
+            // Cloak the window and colour the native caption BEFORE the desktop
+            // can compose it, so the first surface the user can see is the
+            // app's own instead of an empty white one with a light-mode
+            // caption. The gate re-cloaks on every later show and un-minimize;
+            // `NativeApp::finish_reveal` uncovers the window once a frame has
+            // painted into it.
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = creation_hwnd {
+                let palette = theme::palette_ctx(&cc.egui_ctx);
+                let background = [
+                    palette.window_bg.r(),
+                    palette.window_bg.g(),
+                    palette.window_bg.b(),
+                ];
+                tm_platform::install_present_gate(
+                    hwnd,
+                    background,
+                    std::sync::Arc::new({
+                        let ctx = cc.egui_ctx.clone();
+                        move || ctx.request_repaint()
+                    }),
+                );
+                // What `TaskManApp::sync_title_bar` would apply in the first
+                // `ui` — one frame too late to be there when the window is
+                // first composed.
+                tm_platform::apply_title_bar(
+                    hwnd,
+                    background,
+                    [palette.text.r(), palette.text.g(), palette.text.b()],
+                    background,
+                    matches!(cc.egui_ctx.theme(), eframe::egui::Theme::Dark),
+                );
+            } else {
+                tracing::warn!(
+                    "no native window handle at creation; the present gate is unavailable"
+                );
+            }
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
             Ok(Box::new(NativeApp::new(
@@ -644,6 +686,12 @@ fn run_gui(mock: bool, args: &[String]) {
         match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
             Ok(()) => return,
             Err(e) => {
+                // A renderer attempt that got as far as creating its window
+                // installed a present gate on that HWND. Drop it with the
+                // window: the next attempt installs its own, and a failed one
+                // must leave no subclass or cloak behind.
+                #[cfg(target_os = "windows")]
+                tm_platform::remove_present_gate();
                 let abort = should_abort_renderer_fallback(&e);
                 let detail = e.to_string();
                 if abort {
@@ -902,14 +950,51 @@ fn initial_hide_action(tray: Option<(bool, bool)>, before_deadline: bool) -> Ini
     }
 }
 
-/// Upper bound on frames a restore waits for a painted frame before it
+/// Upper bound on frames a reveal waits for a painted frame before it
 /// uncloaks anyway, so the window can never stay invisible.
 #[cfg(target_os = "windows")]
 const RESTORE_MAX_TICKS: u8 = 8;
-/// ...and on the time before the acknowledgement is sent regardless. The
-/// waiting launch gave up long before this; it only releases the state.
+/// ...and on the wall time it waits regardless. The waiting launch or hotkey
+/// worker gave up long before this; it only releases the state.
 #[cfg(target_os = "windows")]
 const RESTORE_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Frames a reveal waits for its own painted frame.
+///
+/// One frame's paint has been presented by the time the next one starts, so
+/// releasing in the pass right after the first painted frame is still one frame
+/// boundary too early for the surface the window is about to show.
+#[cfg(target_os = "windows")]
+const REVEAL_MIN_TICKS: u8 = 2;
+
+/// Decide whether a held reveal may be released.
+///
+/// `painted` is the app's proof that a frame really painted into the window
+/// while the gate held it — the only frame that can have real content in it —
+/// `ticks` counts the frames since the hold began, `needs_frame` says the
+/// platform gate still wants a frame of its own (its background fill is all the
+/// window holds) and `waited` is the wall time since the hold began. The two
+/// bounds are what keeps a reveal whose frame never comes from leaving the
+/// window invisible.
+#[cfg(target_os = "windows")]
+fn reveal_due(painted: bool, ticks: u8, needs_frame: bool, waited: std::time::Duration) -> bool {
+    if ticks >= RESTORE_MAX_TICKS || waited >= RESTORE_ACK_DEADLINE {
+        return true;
+    }
+    painted && ticks >= REVEAL_MIN_TICKS && !needs_frame
+}
+
+/// Does a restore have to take the present gate?
+///
+/// A window hidden to the tray has no painted surface at all, and eframe
+/// suspends its painter once no viewport is visible, so a minimized window can
+/// come back with no surface either. Both would be composed out of nothing. A
+/// window that is visible and not minimized still has its last frame; cloaking
+/// that one would only make it blink.
+#[cfg(target_os = "windows")]
+fn restore_needs_present_gate(was_hidden: bool, minimized: bool) -> bool {
+    was_hidden || minimized
+}
 
 /// Platform-neutral holder for a native instance-activation channel.
 #[derive(Clone, Default)]
@@ -1004,23 +1089,44 @@ struct NativeApp {
     /// Native window handle, cached the first time a frame hands it over.
     #[cfg(target_os = "windows")]
     hwnd: Option<isize>,
-    /// The window was cloaked by [`NativeApp::restore_window`] and still is.
-    #[cfg(target_os = "windows")]
-    cloaked_for_restore: bool,
     /// A show request was accepted but not yet acknowledged: the waiting
     /// launch or hotkey worker gets its answer only once a frame has really
     /// been painted into the restored window.
     #[cfg(target_os = "windows")]
     show_ack_pending: bool,
-    /// `ui` ran in a frame after the restore frame, so the window (visible
-    /// and unminimized by then, or `ui` would not run) has real content.
+    /// `frames_painted` when the show request was accepted.
     #[cfg(target_os = "windows")]
-    painted_since_restore: bool,
-    /// Frames seen since the restore was requested.
+    show_ack_at_frame: u32,
+    /// When the show request was accepted; bounds the acknowledgement so a
+    /// frame that never comes cannot leave the waiting launch unanswered.
     #[cfg(target_os = "windows")]
-    restore_ticks: u8,
+    show_ack_started: std::time::Instant,
+    /// Passes whose `ui` really ran, i.e. that painted into the window. eframe
+    /// runs no `ui` at all for a root viewport the app marked invisible or that
+    /// is minimized (it calls `update_logic_only` instead), so a pass counted
+    /// here painted something. The one exception is the very first pass, which
+    /// eframe runs before it reveals the window
+    /// (`EpiIntegration::is_first_frame`): its paint lands in a still hidden
+    /// window, which is why the gate is not adopted until the counter has
+    /// moved — see `adoptable` in `finish_reveal`. A wait records this counter
+    /// when it starts and is over once the counter has moved past it: one
+    /// frame's paint has been presented by the time the next frame begins, so
+    /// "a later frame painted" is exactly "a presented frame exists".
     #[cfg(target_os = "windows")]
-    restore_started: Option<std::time::Instant>,
+    frames_painted: u32,
+    /// The present gate holds the window cloaked after a show, an un-minimize,
+    /// the initial reveal or a requested restore, until a frame has painted
+    /// into the window it is about to show.
+    #[cfg(target_os = "windows")]
+    present_gate_held: bool,
+    /// `frames_painted` when the current hold began.
+    #[cfg(target_os = "windows")]
+    present_gate_at_frame: u32,
+    /// Logic passes seen since the current hold began.
+    #[cfg(target_os = "windows")]
+    present_gate_ticks: u8,
+    #[cfg(target_os = "windows")]
+    present_gate_started: Option<std::time::Instant>,
     /// Latest monitor size egui reported; a change means the display layout
     /// changed under the window.
     #[cfg(target_os = "windows")]
@@ -1081,15 +1187,21 @@ impl NativeApp {
             #[cfg(target_os = "windows")]
             hwnd: None,
             #[cfg(target_os = "windows")]
-            cloaked_for_restore: false,
-            #[cfg(target_os = "windows")]
             show_ack_pending: false,
             #[cfg(target_os = "windows")]
-            painted_since_restore: false,
+            show_ack_at_frame: 0,
             #[cfg(target_os = "windows")]
-            restore_ticks: 0,
+            show_ack_started: std::time::Instant::now(),
             #[cfg(target_os = "windows")]
-            restore_started: None,
+            frames_painted: 0,
+            #[cfg(target_os = "windows")]
+            present_gate_held: false,
+            #[cfg(target_os = "windows")]
+            present_gate_at_frame: 0,
+            #[cfg(target_os = "windows")]
+            present_gate_ticks: 0,
+            #[cfg(target_os = "windows")]
+            present_gate_started: None,
             #[cfg(target_os = "windows")]
             last_monitor_size: None,
             #[cfg(target_os = "windows")]
@@ -1141,6 +1253,11 @@ impl NativeApp {
     }
 
     fn shutdown(&mut self) {
+        // Before the window goes away: the gate subclasses the window
+        // procedure and owns a class brush, both of which must be gone before
+        // the HWND dies so nothing is left behind for the shell to paint with.
+        #[cfg(target_os = "windows")]
+        tm_platform::remove_present_gate();
         #[cfg(target_os = "windows")]
         if let Some(tray) = &mut self.tray {
             tray.shutdown();
@@ -1248,10 +1365,10 @@ impl eframe::App for NativeApp {
         }
         #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
-        // Before the tray actions, so a restore requested THIS frame cannot
-        // spend one of the frames it is owed on the frame that requested it.
+        // Before the tray actions, so a transition drained here cannot spend
+        // one of the frames it is owed on the frame that requested it.
         #[cfg(target_os = "windows")]
-        self.finish_restore(ctx);
+        self.finish_reveal(ctx);
         #[cfg(target_os = "windows")]
         self.handle_tray_actions(ctx);
         #[cfg(target_os = "windows")]
@@ -1288,6 +1405,11 @@ impl eframe::App for NativeApp {
                             "tray icon unavailable for a start-minimized launch; showing the window"
                         );
                         self.hidden_to_tray = false;
+                        // The window has never been shown, so it has nothing to
+                        // show: take the gate before asking for it.
+                        if let Some(hwnd) = self.hwnd {
+                            self.begin_present_gate(hwnd, "start-minimized fallback");
+                        }
                         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
                         self.initial_hide_pending = false;
                     }
@@ -1370,11 +1492,12 @@ impl eframe::App for NativeApp {
                 tray.set_visible(tray_enabled);
                 tray.sync_menu_theme(ui.ctx().theme());
             }
-            // `ui` only runs for a visible, unminimized window, so a frame
-            // after the restore frame is real content in the restored window.
-            if (self.show_ack_pending || self.cloaked_for_restore) && self.restore_ticks >= 1 {
-                self.painted_since_restore = true;
-            }
+            // eframe runs `ui` only for a viewport that is on screen and not
+            // minimized (apart from the first pass, which it runs before the
+            // first reveal), so this pass really painted into the window.
+            // Every wait below is over once this counter has moved past the
+            // value it started at.
+            self.frames_painted = self.frames_painted.saturating_add(1);
             // A changed monitor size means the display layout changed under
             // the window (resolution switch by a game, monitor unplugged or
             // re-docked): pull the window back inside the visible desktop.
@@ -1830,14 +1953,16 @@ impl TrayShell {
 
 #[cfg(target_os = "windows")]
 impl NativeApp {
-    /// Bring the window back from the tray without the white flash.
+    /// Bring the window back from the tray, the hotkey or another launch
+    /// without the white flash.
     ///
-    /// `ShowWindow` alone composes an unpainted window: a hidden window gets
-    /// no `WM_PAINT`, so the app cannot have a frame ready before it appears,
-    /// and DWM fills the gap with the empty surface. Cloaking first means the
-    /// window is shown — and therefore painting — while still invisible to the
-    /// compositor; [`Self::finish_restore`] uncloaks it once a real frame has
-    /// been presented.
+    /// `ShowWindow` alone composes an unpainted window: a hidden window never
+    /// painted at all, and eframe suspends its painter once no viewport is
+    /// visible, so a minimized window can come back with no surface either.
+    /// Either way the compositor fills the gap with the empty surface. The
+    /// present gate cloaks the window first, so it is shown — and therefore
+    /// painting — while still invisible to the compositor;
+    /// [`Self::finish_reveal`] uncovers it once a real frame is behind it.
     fn restore_window(&mut self, ctx: &eframe::egui::Context) {
         let was_hidden = self.hidden_to_tray;
         self.hidden_to_tray = false;
@@ -1845,15 +1970,13 @@ impl NativeApp {
         // minimized must win: the pending hide would otherwise put the
         // window straight back into the tray in the same frame.
         self.initial_hide_pending = false;
-        // Only a window that is genuinely hidden needs the cloak: it is the
-        // one that would otherwise be composed before it has painted. A
-        // minimized window keeps its last frame, and cloaking it would only
-        // add a blink to the restore animation.
-        if was_hidden && let Some(hwnd) = self.hwnd {
-            tm_platform::set_window_cloaked(hwnd, true);
-            // `finish_restore` uncloaks once a frame has been painted into
-            // the visible window (or after a bounded number of frames).
-            self.cloaked_for_restore = true;
+        // A window that is visible and not minimized still has its last frame,
+        // so taking the gate there would only make a healthy window blink.
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if let Some(hwnd) = self.hwnd
+            && restore_needs_present_gate(was_hidden, minimized)
+        {
+            self.begin_present_gate(hwnd, "restore requested");
         }
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
         // Un-minimize before activating. Activation is a no-op on a minimized
@@ -1888,69 +2011,150 @@ impl NativeApp {
         // The request is NOT acknowledged here. The waiting launch or hotkey
         // worker treats an acknowledgement as "the window is usable", and at
         // this point the show/restore commands above are only queued and the
-        // window may still be cloaked or unpainted. `finish_restore`
-        // acknowledges once a frame has been painted into the window.
+        // window is still cloaked by the gate. `finish_reveal` acknowledges
+        // once a frame has been painted into the window and it is uncovered.
         self.show_ack_pending = true;
-        self.painted_since_restore = false;
-        self.restore_ticks = 0;
-        self.restore_started = Some(std::time::Instant::now());
+        self.show_ack_at_frame = self.frames_painted;
+        self.show_ack_started = std::time::Instant::now();
         // The UI is event driven and the engine may be paused, so the frames
         // the countdown needs have to be asked for explicitly.
         ctx.request_repaint();
     }
 
-    /// Finish what [`Self::restore_window`] started: uncloak and acknowledge.
+    /// Arm the present gate: cloak the window now and owe it a painted frame
+    /// before it may be uncovered.
     ///
-    /// Driven from the START of every frame rather than a one-shot callback.
-    /// A frame's paint has been presented by the time the next one begins, so
-    /// the window is only revealed once real content is behind it
-    /// (`painted_since_restore`, set by `ui`). Running every frame, with
-    /// bounds ([`RESTORE_MAX_TICKS`], [`RESTORE_ACK_DEADLINE`]) for a frame
-    /// that never comes, means the window can never be left invisible and the
-    /// waiting launch is never left without an answer.
-    fn finish_restore(&mut self, ctx: &eframe::egui::Context) {
-        if !self.show_ack_pending && !self.cloaked_for_restore {
+    /// Called from every path that makes the window visible — a requested
+    /// restore, the start-minimized fallback, and the platform's own report of
+    /// a show or un-minimize this app never asked for. An armed gate is never
+    /// re-armed, so a burst of show messages cannot keep pushing the reveal
+    /// back.
+    fn begin_present_gate(&mut self, hwnd: isize, reason: &'static str) {
+        if self.present_gate_held {
             return;
         }
-        self.restore_ticks = self.restore_ticks.saturating_add(1);
-        let painted = self.painted_since_restore && self.restore_ticks >= 2;
-        let waited = self
-            .restore_started
-            .map_or(std::time::Duration::ZERO, |t| t.elapsed());
-        if self.cloaked_for_restore && (painted || self.restore_ticks >= RESTORE_MAX_TICKS) {
-            if let Some(hwnd) = self.hwnd {
-                tm_platform::set_window_cloaked(hwnd, false);
-                tm_platform::ensure_window_on_screen(hwnd);
-                tm_platform::force_foreground(hwnd);
-            }
-            self.cloaked_for_restore = false;
+        tm_platform::present_gate_hold(hwnd);
+        self.present_gate_held = true;
+        self.present_gate_at_frame = self.frames_painted;
+        self.present_gate_ticks = 0;
+        self.present_gate_started = Some(std::time::Instant::now());
+        tracing::debug!(
+            hwnd,
+            reason,
+            frames_painted = self.frames_painted,
+            "present gate: holding the window until a frame paints"
+        );
+    }
+
+    /// Uncover the window and, for a requested show, make it the foreground
+    /// window again.
+    fn release_present_gate(&mut self, hwnd: isize, painted: bool, waited: std::time::Duration) {
+        let ticks = self.present_gate_ticks;
+        let released = tm_platform::present_gate_release(hwnd);
+        self.present_gate_held = false;
+        self.present_gate_started = None;
+        // A window another party (virtual desktops, the shell) left cloaked
+        // would be "shown" yet invisible: repair that before anything is
+        // answered. A cloak that outlived the gate would leave the window
+        // unreachable, so it is cleared whichever side set it.
+        if tm_platform::present_gate_held() || tm_platform::is_window_cloaked(hwnd) {
+            tm_platform::set_window_cloaked(hwnd, false);
         }
-        if self.show_ack_pending
-            && !self.cloaked_for_restore
-            && (painted || waited >= RESTORE_ACK_DEADLINE)
+        // Re-fit: the restore ran before the window had its final geometry, so
+        // a monitor that went away can leave it at its old off-screen place.
+        tm_platform::ensure_window_on_screen(hwnd);
+        // Only a show someone asked for has to fight for the foreground; the
+        // initial reveal and a taskbar click already have it. It also has to
+        // be a window that is still meant to be on screen: `force_foreground`
+        // ends in `ShowWindow(SW_SHOW)` and `SWP_SHOWWINDOW`, so doing it for
+        // a window the app has since put back in the tray would show it again
+        // with no frame behind it — `ui` does not run for a viewport the app
+        // marked invisible, so nothing would repaint it either.
+        if self.show_ack_pending && !self.hidden_to_tray && !self.initial_hide_pending {
+            tm_platform::force_foreground(hwnd);
+        }
+        if painted {
+            tracing::debug!(
+                hwnd,
+                ticks,
+                released,
+                waited_ms = waited.as_millis() as u64,
+                "present gate: uncovered the window behind a painted frame"
+            );
+        } else {
+            tracing::warn!(
+                hwnd,
+                ticks,
+                released,
+                waited_ms = waited.as_millis() as u64,
+                "present gate: uncovered the window without a painted frame"
+            );
+        }
+    }
+
+    /// Drive the present gate every frame: hold every show Windows performs and
+    /// uncover the window only once a frame has painted into it.
+    ///
+    /// The gate is driven from the START of each frame rather than from the
+    /// calls that ask for a window, because a minimized window is restored by
+    /// Windows itself (taskbar click, Alt-Tab, a shell restore) and this app
+    /// only learns about it from the platform gate. A frame's paint has been
+    /// presented by the time the next frame begins, so a reveal here always
+    /// uncovers real content. The bounds ([`RESTORE_MAX_TICKS`],
+    /// [`RESTORE_ACK_DEADLINE`]) mean a frame that never comes can neither
+    /// leave the window invisible nor leave a waiting launch unanswered.
+    fn finish_reveal(&mut self, ctx: &eframe::egui::Context) {
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        // The platform re-cloaks on every show and un-minimize, including the
+        // ones nobody here asked for, and it is still holding the cloak it
+        // installed at creation. Either way the window is invisible until a
+        // frame proves it has content, so both arm the hold. A window that is
+        // not meant to be on screen has nothing to reveal yet; the show that
+        // brings it back arms the gate itself.
+        let transitioned = tm_platform::present_gate_take_transition();
+        let on_screen = !self.hidden_to_tray && !self.initial_hide_pending;
+        // Adopting waits for one real pass: the paint of the very first frame
+        // happened before eframe could reveal the window, so it proves nothing
+        // about the surface the window is about to show.
+        let adoptable = on_screen && self.frames_painted > 0;
+        if (transitioned || (adoptable && tm_platform::present_gate_held()))
+            && !self.present_gate_held
         {
-            if !painted {
-                tracing::warn!(
-                    waited_ms = waited.as_millis() as u64,
-                    "restore acknowledged without a painted frame"
-                );
+            self.begin_present_gate(
+                hwnd,
+                if transitioned {
+                    "window shown"
+                } else {
+                    "gate still holding"
+                },
+            );
+        }
+        if self.present_gate_held {
+            self.present_gate_ticks = self.present_gate_ticks.saturating_add(1);
+            let painted = self.frames_painted > self.present_gate_at_frame;
+            let waited = self
+                .present_gate_started
+                .map_or(std::time::Duration::ZERO, |started| started.elapsed());
+            if reveal_due(
+                painted,
+                self.present_gate_ticks,
+                tm_platform::present_gate_needs_frame(),
+                waited,
+            ) {
+                self.release_present_gate(hwnd, painted, waited);
             }
-            // A window another party (virtual desktops, the shell) left
-            // cloaked would be "shown" yet invisible: repair before answering.
-            // Re-fit as well: a hotkey/tray restore of a minimized window
-            // skipped the pre-unminimize check (`IsIconic` returns early), so
-            // an unplugged monitor can leave it at its old off-screen
-            // geometry until this point.
-            if let Some(hwnd) = self.hwnd {
-                if tm_platform::is_window_cloaked(hwnd) {
-                    tm_platform::set_window_cloaked(hwnd, false);
-                }
-                tm_platform::ensure_window_on_screen(hwnd);
-            }
+        }
+        // A show is answered only once the window is really up: the frame that
+        // proves it has painted has also been presented by now.
+        let answered = self.frames_painted > self.show_ack_at_frame
+            || self.show_ack_started.elapsed() >= RESTORE_ACK_DEADLINE;
+        if self.show_ack_pending && !self.present_gate_held && answered {
             tm_platform::win::instance::acknowledge_show();
             self.show_ack_pending = false;
         }
-        if self.show_ack_pending || self.cloaked_for_restore {
+        if self.show_ack_pending || self.present_gate_held {
             // The countdown must not stall on an idle, event-driven UI.
             ctx.request_repaint();
         }
@@ -2142,6 +2346,38 @@ mod tests {
         assert_eq!(initial_hide_action(Some((false, false)), false), Show);
         assert_eq!(initial_hide_action(Some((false, true)), true), Show);
         assert_eq!(initial_hide_action(None, true), Show);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_reveal_waits_for_a_painted_frame_inside_its_bounds() {
+        let quick = std::time::Duration::from_millis(16);
+
+        // Nothing has painted into the window yet, and the pass that armed the
+        // gate cannot have presented anything either.
+        assert!(!reveal_due(false, 0, false, quick));
+        assert!(!reveal_due(true, 0, false, quick));
+        assert!(!reveal_due(true, 1, false, quick));
+        // A presented frame two passes in is the whole point: uncover it.
+        assert!(reveal_due(true, REVEAL_MIN_TICKS, false, quick));
+        // The platform gate still owning the surface keeps the window cloaked.
+        assert!(!reveal_due(true, REVEAL_MIN_TICKS, true, quick));
+        // A frame that never comes must not leave the window invisible.
+        assert!(!reveal_due(false, RESTORE_MAX_TICKS - 1, true, quick));
+        assert!(reveal_due(false, RESTORE_MAX_TICKS, true, quick));
+        assert!(reveal_due(false, 1, true, RESTORE_ACK_DEADLINE));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn only_a_restore_that_may_have_no_surface_takes_the_present_gate() {
+        // Hidden to the tray: it never painted at all.
+        assert!(restore_needs_present_gate(true, false));
+        // Minimized: eframe suspends the painter, so the surface may be gone.
+        assert!(restore_needs_present_gate(false, true));
+        assert!(restore_needs_present_gate(true, true));
+        // Already showing its last frame: a cloak here would only blink.
+        assert!(!restore_needs_present_gate(false, false));
     }
 
     #[cfg(feature = "wgpu")]
