@@ -58,11 +58,14 @@ pub(super) fn list_process_file_io(
 ) -> Result<ProcessFileIoSnapshot> {
     // The start tick brackets both procfs walks. A recycled PID must not let a
     // partially old handle list and a partially new counter read become one
-    // coherent-looking answer.
-    super::verify_process_identity(pid, expected_start_epoch_s)?;
+    // coherent-looking answer. A sampled generation that is not known yet — a
+    // process that started inside the current sampling tick — is read without
+    // one instead of being refused, exactly as the module, thread and
+    // connection reads in `mod.rs` bracket their own walks.
+    let before = super::process_start_for_read(pid, expected_start_epoch_s)?;
     let handles = enumerate_open_files(pid)?;
     let counters = read_process_counters(pid);
-    super::verify_process_identity(pid, expected_start_epoch_s)?;
+    super::ensure_process_generation(pid, before)?;
 
     Ok(snapshot(handles.files, counters, handles.complete))
 }

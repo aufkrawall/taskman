@@ -389,12 +389,11 @@ fn pci_slot_from_path(device: &Path) -> Option<String> {
 }
 
 fn normalize_pci_slot(slot: &str) -> String {
-    let slot = slot.trim_matches(['[', ']']).to_ascii_lowercase();
-    let Some((prefix, device_function)) = slot.rsplit_once(':') else {
-        return slot;
-    };
-    let bus = prefix.rsplit_once(':').map_or(prefix, |(_, bus)| bus);
-    format!("{bus}:{device_function}")
+    // The domain stays part of the key. A multi-segment host lists two cards as
+    // `0000:03:00.0` and `0001:03:00.0`, and folding both to `03:00.0` made one
+    // card's model name label the other. Both sides of the join carry it: a PCI
+    // device's `PCI_SLOT_NAME` and `/proc/driver/nvidia/gpus/`'s `Bus Location`.
+    slot.trim_matches(['[', ']']).to_ascii_lowercase()
 }
 
 fn parse_pci_location(slot: &str) -> Option<(u32, u32, u32)> {

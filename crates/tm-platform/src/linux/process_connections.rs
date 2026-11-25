@@ -184,16 +184,13 @@ fn parse_net_table<R: BufRead>(
                 let Some((ip, port)) = parse_proc_address(fields[2], ipv6) else {
                     continue;
                 };
-                let remote = SocketAddr::new(ip, port);
-                let remote = match remote_of(state, remote) {
-                    Some(remote) => Some(remote),
-                    // Listeners and placeholder peers are the only TCP rows
-                    // allowed to omit a peer. An established row with a
-                    // malformed address must not masquerade as a listener.
-                    None if state == TcpState::Listen => None,
-                    None => continue,
-                };
-                remote
+                // A peer the row cannot name is an unparsable address and the
+                // row is dropped above. A peer that is *absent* — a listener, a
+                // socket created but never connected (`TCP_CLOSE`, peer
+                // `0.0.0.0:0`), a placeholder on an established row — is not a
+                // reason to drop the endpoint itself: the local address and the
+                // state are measured facts, so the row is listed without a peer.
+                remote_of(state, SocketAddr::new(ip, port))
             }
             None => None,
         };
@@ -225,6 +222,7 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
 
     let mut sockets = Vec::new();
     let mut seen_inodes = HashSet::new();
+    let mut tables_read = 0usize;
     for (table_name, protocol) in TABLES {
         let path = format!("/proc/{pid}/net/{table_name}");
         let table = match std::fs::File::open(&path) {
@@ -237,6 +235,7 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
                 ));
             }
         };
+        tables_read += 1;
         let table_rows = parse_net_table(BufReader::new(table), protocol, Some(&inodes_before))
             .map_err(|error| TmError::platform("read /proc/pid/net", format!("{path}: {error}")))?;
         for socket in table_rows {
@@ -244,6 +243,15 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
                 sockets.push(socket);
             }
         }
+    }
+    if tables_read == 0 {
+        // Not one of the four tables could be opened. An empty list here would
+        // state that the process has no connections, which is a measurement
+        // nobody made — the tab has to render the column unavailable instead.
+        return Err(TmError::platform(
+            "read /proc/pid/net",
+            format!("/proc/{pid}/net: no connection table was readable"),
+        ));
     }
     let namespace_after = net_namespace(pid)?;
     let inodes_after = process_socket_inodes(pid)?;
@@ -396,6 +404,22 @@ mod tests {
         assert_eq!(socket_inode_link("socket:[987]"), Some(987));
         assert_eq!(socket_inode_link("socket:[]"), None);
         assert_eq!(socket_inode_link("/tmp/file"), None);
+    }
+
+    /// A socket created but never connected is `TCP_CLOSE` with the placeholder
+    /// peer `0.0.0.0:0`. It is a real endpoint with no peer, so the row belongs
+    /// in the list — only a peer address that will not parse drops a row.
+    #[test]
+    fn an_unconnected_socket_is_listed_without_a_peer() {
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 5150 1
+";
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].connection.local, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(rows[0].connection.remote, None);
+        assert_eq!(rows[0].connection.state, Some(TcpState::Closed));
     }
 
     #[test]

@@ -452,8 +452,12 @@ impl PlatformActions for MacActions {
         expected_start_epoch_s: Option<i64>,
         priority: PriorityClass,
     ) -> Result<()> {
-        if pid == 0 {
-            return Err(tm_core::TmError::platform("setpriority", "kernel process"));
+        validate_mutation_target(pid)?;
+        // An unknown class is not a request for a specific priority, and the
+        // Linux backend refuses it too. Falling through to nice 10 below would
+        // change a target nobody asked to change.
+        if priority == PriorityClass::Unknown {
+            return Err(tm_core::TmError::Unsupported("unknown priority class"));
         }
         verify_process_identity(pid, expected_start_epoch_s)?;
         let nice: i32 = match priority {
@@ -465,13 +469,16 @@ impl PlatformActions for MacActions {
         };
         let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) };
         if rc == 0 {
-            Ok(())
-        } else {
-            Err(tm_core::TmError::platform(
-                "setpriority",
-                "permission denied",
-            ))
+            return Ok(());
         }
+        // `setpriority` fails for reasons other than the permission denied this
+        // used to report unconditionally: ESRCH means the target is gone, and
+        // only EPERM/EACCES mean the caller may not change it.
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Err(tm_core::TmError::ProcessNotFound { pid });
+        }
+        Err(tm_core::TmError::platform("setpriority", error.to_string()))
     }
 
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
@@ -532,10 +539,23 @@ impl PlatformActions for MacActions {
     }
 }
 
-fn send_signal(pid: u32, sig: i32) -> Result<()> {
-    if pid == 0 {
-        return Err(tm_core::TmError::platform("kill", "kernel process"));
+/// Refuse the two targets a signal or a priority change must never name.
+///
+/// macOS `SIGTERM` to `launchd` (pid 1) takes the whole machine into a restart,
+/// and signalling this process would end the app from inside its own action.
+/// The Linux backend refuses the same two targets.
+fn validate_mutation_target(pid: u32) -> Result<()> {
+    if pid <= 1 || pid == std::process::id() {
+        return Err(tm_core::TmError::platform(
+            "process mutation",
+            format!("pid {pid} is TaskMan itself or the init process"),
+        ));
     }
+    Ok(())
+}
+
+fn send_signal(pid: u32, sig: i32) -> Result<()> {
+    validate_mutation_target(pid)?;
     let Ok(pid_t) = libc::pid_t::try_from(pid) else {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     };
@@ -553,9 +573,7 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
 }
 
 fn send_signal_checked(pid: u32, expected_start_epoch_s: Option<i64>, sig: i32) -> Result<()> {
-    if pid == 0 {
-        return Err(tm_core::TmError::platform("kill", "kernel process"));
-    }
+    validate_mutation_target(pid)?;
     verify_process_identity(pid, expected_start_epoch_s)?;
     send_signal(pid, sig)
 }

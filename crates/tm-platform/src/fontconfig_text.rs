@@ -241,15 +241,27 @@ fn trusted_path_chain(path: &std::path::Path) -> bool {
 #[cfg(target_os = "linux")]
 pub(super) fn query() -> Params {
     static CACHE: std::sync::OnceLock<Params> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(query_uncached)
+    if let Some(params) = CACHE.get() {
+        return *params;
+    }
+    // Only a measured answer is memoized. A failed `fc-match` run has the same
+    // recoverable causes as a missed executable (fontconfig installed after
+    // first use, a stalled mount, the 750 ms deadline lost to a first-run cache
+    // build), so caching its fallback would pin the default policy — and with
+    // it grayscale text — for the rest of the session.
+    match query_uncached() {
+        Some(params) => {
+            let _ = CACHE.set(params);
+            params
+        }
+        None => Params::default(),
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn query_uncached() -> Params {
-    let Some(output) = run_fc_match(&["-v", "sans-serif"]) else {
-        return Params::default();
-    };
-    params_from_output(&String::from_utf8_lossy(&output))
+fn query_uncached() -> Option<Params> {
+    let output = run_fc_match(&["-v", "sans-serif"])?;
+    Some(params_from_output(&String::from_utf8_lossy(&output)))
 }
 
 /// Ask the user's fontconfig for a concrete font file.

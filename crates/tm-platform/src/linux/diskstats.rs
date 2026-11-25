@@ -70,7 +70,12 @@ pub fn read() -> Vec<DiskStat> {
     let out: Vec<DiskStat> = raw
         .into_iter()
         .map(|mut s| {
-            s.prev = prev_map.get(&s.device).copied();
+            // A device that reappears under the same name (a re-created `dm-N`,
+            // a controller reset) restarts its counters. Differencing across
+            // that restart would report one interval of measured zero activity,
+            // so the window is unmeasured instead — the same rule `cpu_stat`
+            // applies to a regressed counter.
+            s.prev = carried_prev(&s, prev_map.get(&s.device).copied());
             s
         })
         .collect();
@@ -92,36 +97,54 @@ pub fn read() -> Vec<DiskStat> {
     out
 }
 
+/// The previous counters one reading may be differenced against.
+///
+/// All three counters must have moved forward. A device that reappeared under
+/// the same name (a re-created `dm-N`, a controller reset) restarts them, and
+/// differencing across that restart would report one interval of measured zero
+/// activity instead of an unmeasured one.
+fn carried_prev(current: &DiskStat, previous: Option<Prev>) -> Option<Prev> {
+    previous.filter(|prev| {
+        current.io_ticks_ms >= prev.io_ticks_ms
+            && current.read_sectors >= prev.read_sectors
+            && current.write_sectors >= prev.write_sectors
+    })
+}
+
 fn parse_raw() -> Vec<DiskStat> {
-    let mut out = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/proc/diskstats") {
-        for line in text.lines() {
+    std::fs::read_to_string("/proc/diskstats")
+        .map(|text| parse_diskstats(&text))
+        .unwrap_or_default()
+}
+
+fn parse_diskstats(text: &str) -> Vec<DiskStat> {
+    text.lines()
+        .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() < 14 {
-                continue;
+                return None;
             }
-            let device = fields[2].to_string();
+            let device = fields[2];
             if device.starts_with("loop") || device.starts_with("ram") {
-                continue;
+                return None;
             }
-            let num = |i: usize| {
-                fields
-                    .get(i)
-                    .and_then(|f| f.parse::<u64>().ok())
-                    .unwrap_or(0)
-            };
-            out.push(DiskStat {
-                device,
-                reads_completed: num(3),
-                writes_completed: num(7),
-                read_sectors: num(5),
-                write_sectors: num(9),
-                io_ticks_ms: num(12),
+            // Every counter must parse. A field this build cannot read is not a
+            // zero: skipping the row keeps its rate unavailable instead of
+            // reporting one measured 0 and then storing that 0 as the next
+            // window's baseline, which turns the next delta into the device's
+            // whole lifetime of traffic.
+            let num = |index: usize| fields.get(index)?.parse::<u64>().ok();
+            Some(DiskStat {
+                device: device.to_string(),
+                reads_completed: num(3)?,
+                writes_completed: num(7)?,
+                read_sectors: num(5)?,
+                write_sectors: num(9)?,
+                io_ticks_ms: num(12)?,
                 prev: None,
-            });
-        }
-    }
-    out
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -152,5 +175,64 @@ mod tests {
         assert_eq!(s.active_pct(1.0), Some(1.0)); // 10ms of IO in 1s
         assert_eq!(s.read_bps(1.0), Some((100 - 60) as f64 * 512.0));
         assert_eq!(s.write_bps(1.0), Some((200 - 120) as f64 * 512.0));
+    }
+
+    /// A row with a counter this build cannot read is not a zero counter: it is
+    /// dropped, so its rate stays unavailable instead of becoming a measurement
+    /// (and then the next window's baseline).
+    #[test]
+    fn an_unreadable_counter_drops_the_row_instead_of_reading_zero() {
+        let text = "\
+   8       0 sda 1234 0 5678 90 1112 0 3344 55 0 66 77 0 0 0 0 0 0
+   8      16 sdb 1234 0 5678 90 1112 0 nope 55 0 66 77 0 0 0 0 0 0
+   8      32 loop0 1 0 1 0 1 0 1 0 0 0 0 0 0 0 0 0 0
+   8      48 ram0 1 0 1 0 1 0 1 0 0 0 0 0 0 0 0 0 0
+";
+        let parsed = parse_diskstats(text);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "only the complete row survives: {parsed:?}"
+        );
+        assert_eq!(parsed[0].device, "sda");
+        assert_eq!(parsed[0].read_sectors, 5678);
+        assert_eq!(parsed[0].write_sectors, 3344);
+        assert_eq!(parsed[0].io_ticks_ms, 66);
+    }
+
+    /// A re-created device keeps its name but restarts its counters. Carrying
+    /// the old baseline forward would publish one interval of measured zero
+    /// activity instead of an unmeasured one.
+    #[test]
+    fn a_regressed_counter_leaves_the_window_unmeasured() {
+        let current = DiskStat {
+            device: "dm-0".into(),
+            reads_completed: 0,
+            writes_completed: 0,
+            read_sectors: 5,
+            write_sectors: 0,
+            io_ticks_ms: 3,
+            prev: None,
+        };
+        let restarted = Some(Prev {
+            io_ticks_ms: 900,
+            read_sectors: 4_000,
+            write_sectors: 2_000,
+        });
+        assert!(carried_prev(&current, restarted).is_none());
+
+        let mut unmeasured = current.clone();
+        unmeasured.prev = carried_prev(&unmeasured, restarted);
+        assert_eq!(unmeasured.active_pct(1.0), None);
+        assert_eq!(unmeasured.read_bps(1.0), None);
+        assert_eq!(unmeasured.write_bps(1.0), None);
+
+        // A monotonic pair is carried, so its delta is a measurement.
+        let monotonic = Some(Prev {
+            io_ticks_ms: 1,
+            read_sectors: 1,
+            write_sectors: 0,
+        });
+        assert!(carried_prev(&current, monotonic).is_some());
     }
 }
