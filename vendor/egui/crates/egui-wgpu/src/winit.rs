@@ -370,6 +370,21 @@ fn report_missing_lcd_pipeline(render_state: &RenderState, has_lcd_pipeline: boo
     );
 }
 
+/// Drop a render state together with the capability answer measured on its device.
+///
+/// [`Painter::suspend`] is the only caller: it is the one path that destroys the device, and the
+/// sub-pixel answer describes the pipelines built from it. Kept, that answer would be reported for
+/// a device that no longer exists; the next [`Painter::add_surface`] installs a new render state
+/// and [`Painter::ensure_renderer`] answers for that one. [`Painter::pause`] keeps the device and
+/// therefore keeps the answer, so it does not come through here.
+///
+/// The field is passed rather than the painter, so the teardown depends on nothing else `suspend`
+/// carries and a call needs no device to exist.
+fn drop_render_state(render_state: &mut Option<RenderState>, ensured: &mut EnsuredRenderer) {
+    *render_state = None;
+    ensured.forget();
+}
+
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
 ///
 /// Alternatively you can use [`crate::Renderer`] directly.
@@ -835,32 +850,29 @@ impl Painter {
     pub fn suspend(&mut self) {
         self.drop_all_surfaces();
 
-        let Some(render_state) = self.render_state.take() else {
-            return;
-        };
+        if let Some(render_state) = self.render_state.as_ref() {
+            // Finish submitted work before explicitly destroying textures. The timeout prevents
+            // a wedged GPU from blocking hide/minimize indefinitely; wgpu still defers the
+            // destruction safely when a submission takes longer than this.
+            if let Err(err) = render_state.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(250)),
+            }) {
+                log::debug!("WGPU did not become idle while suspending: {err}");
+            }
 
-        // Finish submitted work before explicitly destroying textures. The timeout prevents
-        // a wedged GPU from blocking hide/minimize indefinitely; wgpu still defers the
-        // destruction safely when a submission takes longer than this.
-        if let Err(err) = render_state.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_millis(250)),
-        }) {
-            log::debug!("WGPU did not become idle while suspending: {err}");
-        }
-
-        if let Some(renderer) = render_state.renderer() {
-            let mut renderer = renderer.write();
-            for id in self.texture_snapshots.ids() {
-                renderer.free_texture(&id);
+            if let Some(renderer) = render_state.renderer() {
+                let mut renderer = renderer.write();
+                for id in self.texture_snapshots.ids() {
+                    renderer.free_texture(&id);
+                }
             }
         }
 
-        drop(render_state);
         // The device, its pipelines and any renderer built from them are gone, so the
         // capability answer describes nothing the next paint will use. `set_window` installs the
         // next render state, and `ensure_renderer` answers for it.
-        self.ensured.forget();
+        drop_render_state(&mut self.render_state, &mut self.ensured);
     }
 
     /// Present one cleared frame, without the renderer.
@@ -1691,6 +1703,28 @@ mod tests {
         ensured.forget();
         ensured.record(true);
         assert_eq!(ensured.subpixel_text, Some(true));
+    }
+
+    #[test]
+    fn suspend_forgets_the_capability_answer_with_the_render_state() {
+        let mut ensured = EnsuredRenderer::default();
+        ensured.record(true);
+
+        // `Painter::suspend` tears the render state down through this helper. A test has no
+        // device to take, which is also what a painter that never got one holds.
+        let mut render_state: Option<RenderState> = None;
+        drop_render_state(&mut render_state, &mut ensured);
+
+        assert!(render_state.is_none());
+        assert_eq!(ensured.subpixel_text, None);
+        assert!(
+            ensured.is_due(),
+            "the next `ensure_renderer` has to answer for the device that replaces this one"
+        );
+
+        // That answer is the new device's, not the one the teardown cleared.
+        ensured.record(false);
+        assert_eq!(ensured.subpixel_text, Some(false));
     }
 
     #[test]
