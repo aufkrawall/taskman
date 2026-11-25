@@ -1279,6 +1279,10 @@ unsafe fn public_window_callback_inner(
             let should_buffer = userdata.event_loop_runner.should_buffer();
             userdata.window_state_lock().redraw_requested = should_buffer;
 
+            // TaskMan fork: capture the region Windows asked for before
+            // `DefWindowProcW` validates it away, so the re-request below
+            // invalidates exactly that region instead of asking for a repaint
+            // with no invalid area. See `TASKMAN-FORK.md` §3.
             let mut buffered_update_rect = RECT {
                 left: 0,
                 top: 0,
@@ -1307,6 +1311,9 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
             if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
                 if has_buffered_update_rect {
+                    // TaskMan fork: `RDW_INVALIDATE` on the captured rect, not
+                    // just `RDW_INTERNALPAINT`, or the re-request has no invalid
+                    // area to paint and the software renderer presents nothing.
                     unsafe {
                         RedrawWindow(
                             window,
@@ -1321,6 +1328,9 @@ unsafe fn public_window_callback_inner(
             }
         },
         WM_DISPLAYCHANGE | WM_DWMCOMPOSITIONCHANGED => {
+            // TaskMan fork: a display or composition change that keeps the
+            // client size identical still has to repaint, which no egui tile
+            // change would otherwise ask for.
             unsafe { InvalidateRgn(window, 0, FALSE) };
         },
         WM_WINDOWPOSCHANGING => {
@@ -1968,7 +1978,7 @@ unsafe fn public_window_callback_inner(
                     use crate::event::MouseButton::{Back, Forward, Left, Middle, Right};
                     use crate::event::WindowEvent::{CursorLeft, MouseInput};
 
-                    // The pointer may still be over the window, but the
+                    // TaskMan fork: the pointer may still be over the window, but the
                     // interaction was taken away. Tell the toolkit it left
                     // BEFORE the releases: its release handler then clears the
                     // held buttons without turning the interrupted press into
@@ -2322,6 +2332,8 @@ unsafe fn public_window_callback_inner(
                 // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
             }
 
+            // TaskMan fork: a failed `GetWindowRect` leaves the window as it was
+            // instead of panicking inside the window procedure.
             let Ok(old_physical_inner_rect) = util::WindowArea::Inner.get_rect(window) else {
                 result = ProcResult::Value(0);
                 return;

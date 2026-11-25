@@ -60,7 +60,7 @@ every subsequent `build()` call failed with `EventLoopError::RecreationAttempt`
 ## 3. Windows window reliability: paint, display change, capture, DPI
 
 Everything here fixes a path where a window could be blank, stale or stuck without an
-error surfacing. All of it is Windows-only and marked with a `TASKMAN-FORK:` comment.
+error surfacing. All of it is Windows-only and marked with a `TaskMan fork:` comment.
 
 ### Files touched
 

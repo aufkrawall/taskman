@@ -164,6 +164,10 @@ impl Window {
     #[inline]
     pub fn pre_present_notify(&self) {}
 
+    // TaskMan fork: the four position/size accessors below report
+    // `NotSupportedError` or a zero size instead of panicking when the win32
+    // query fails, and subtract the rect borders with `saturating_sub`. See
+    // `TASKMAN-FORK.md` §3.
     #[inline]
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         util::WindowArea::Outer

@@ -310,10 +310,18 @@ fn shape_pixel_bounds(
         {
             return clip;
         }
-        let min_x = (rect.min.x * ppp).floor() as i32 - margin_px;
-        let min_y = (rect.min.y * ppp).floor() as i32 - margin_px;
-        let max_x = (rect.max.x * ppp).ceil() as i32 + margin_px;
-        let max_y = (rect.max.y * ppp).ceil() as i32 + margin_px;
+        // Clamp in points before the cast, not after: `f32 as i32` saturates at
+        // both ends, so the margin added below would wrap a saturated edge to the
+        // opposite side. That is a debug-build panic and, once wrapped, a rect
+        // covering the whole target becomes an empty one -- which the paint loop
+        // then skips, so the shape silently disappears. Ten million physical
+        // pixels is far outside any real target and far inside `i32`, and the
+        // intersect with the clip below is what decides the actual edges.
+        const PX_LIMIT: f32 = 1.0e7;
+        let min_x = (rect.min.x * ppp).clamp(-PX_LIMIT, PX_LIMIT).floor() as i32 - margin_px;
+        let min_y = (rect.min.y * ppp).clamp(-PX_LIMIT, PX_LIMIT).floor() as i32 - margin_px;
+        let max_x = (rect.max.x * ppp).clamp(-PX_LIMIT, PX_LIMIT).ceil() as i32 + margin_px;
+        let max_y = (rect.max.y * ppp).clamp(-PX_LIMIT, PX_LIMIT).ceil() as i32 + margin_px;
         PixelRect {
             min_x,
             min_y,
@@ -857,6 +865,55 @@ mod tests {
         assert_eq!(
             buf, full_buf,
             "a damaged repaint at an odd size must match a full repaint bit-for-bit"
+        );
+    }
+
+    /// An edge past the `i32` pixel range must still report the clip, not vanish.
+    ///
+    /// `f32 as i32` saturates, so the two-pixel margin added after the cast wraps a
+    /// saturated edge to the far side; the intersect then makes the rect empty, the
+    /// damaged paint skips the shape, and only a full repaint ever shows it. A debug
+    /// build panics on the same arithmetic instead.
+    #[test]
+    fn a_shape_beyond_the_i32_pixel_range_still_covers_the_target() {
+        let ctx = shape_ctx();
+        let bounds = PixelRect {
+            min_x: 0,
+            min_y: 0,
+            max_x: W as i32,
+            max_y: H as i32,
+        };
+
+        // Rounded corners keep the rect off `span::fast_rect`, which clamps its own
+        // arithmetic; this is the general `points_bounds` path. The second case saturates
+        // only the `max` edges, so it catches a clamp that was applied to one side.
+        for rect in [
+            Rect::from_min_max(pos2(-3.0e9, -3.0e9), pos2(3.0e9, 3.0e9)),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(3.0e9, 3.0e9)),
+        ] {
+            let clipped = ClippedShape {
+                clip_rect: full_clip(),
+                shape: Shape::rect_filled(rect, CornerRadius::same(4), Color32::WHITE),
+            };
+            assert_eq!(
+                shape_pixel_bounds(&clipped, &ctx, bounds),
+                bounds,
+                "{rect:?} must report the whole target"
+            );
+        }
+
+        // The clamp must not drag a genuinely off-screen rect into view.
+        let off_screen = ClippedShape {
+            clip_rect: full_clip(),
+            shape: Shape::rect_filled(
+                Rect::from_min_max(pos2(3.0e9, 100.0), pos2(3.1e9, 200.0)),
+                CornerRadius::same(4),
+                Color32::WHITE,
+            ),
+        };
+        assert!(
+            shape_pixel_bounds(&off_screen, &ctx, bounds).is_empty(),
+            "a rect far to the right of the target is still empty"
         );
     }
 
