@@ -883,10 +883,14 @@ pub(super) fn taskbar_thread_main(
         // the pointer and sends every other message with a null one to
         // `DefWindowProcW`, so clearing it first is the safe order.
         //
-        // Both steps run only while the handle is still this window: on the
+        // Both steps run only while the handle names a live window: on the
         // ordinary `WM_CLOSE` path it was destroyed before the loop ended, and
         // a `GWLP_USERDATA` write into a recycled handle would zero the user
-        // data of whatever window took it.
+        // data of whatever window took it. `IsWindow` cannot tell a live handle
+        // from a recycled one, so a reused handle would still send both calls
+        // to an unrelated window; HWNDs are per-process, so that needs this
+        // process to create a window in the microsecond gap between the check
+        // and the write.
         if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() } {
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
