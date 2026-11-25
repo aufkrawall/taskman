@@ -90,6 +90,26 @@ pub fn collect() -> HashMap<String, NetMeta> {
                 },
             );
         }
+    } else {
+        // A listing that failed is not "no interfaces". Blanking every description
+        // and pruning the cached names would outlast the failure, so the identities
+        // already measured are published as the only facts left — the same way the
+        // DRM card scan keeps a list it cannot re-read. The live fields stay
+        // unclaimed because they cannot be read without the interface directory.
+        tracing::debug!("could not list /sys/class/net; keeping the known adapter identities");
+        return identities
+            .iter()
+            .map(|(name, identity)| {
+                (
+                    name.clone(),
+                    NetMeta {
+                        desc: identity.desc.clone(),
+                        kind: identity.kind.clone(),
+                        ..NetMeta::default()
+                    },
+                )
+            })
+            .collect();
     }
     // Interfaces that are gone take their cached identity with them.
     identities.retain(|name, _| out.contains_key(name));
