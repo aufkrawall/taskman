@@ -6,10 +6,8 @@
 //! process actions and GUI relaunch fail closed until a protected helper ships.
 
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tm_core::error::{Result, TmError};
@@ -204,54 +202,33 @@ fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<(
                 format!("Polkit's pkexec is unavailable or could not start: {error}"),
             )
         })?;
-    // Neither pipe may wait for the exit: `pkexec` writes its diagnostics while
-    // it authenticates, and a full pipe would block the helper we are timing.
-    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(TmError::platform(
-            "pkexec",
-            "could not capture the authorization helper's output",
-        ));
-    };
-    let (stdout, stderr) = match (
-        drain_pipe("tm-pkexec-out", stdout),
-        drain_pipe("tm-pkexec-err", stderr),
+    // An interactive prompt is expected to take a while, but a hung agent or an
+    // unanswered dialog must not park one of the two action lanes (and then its
+    // queue) for the rest of the session. `wait_with_output` drains both streams
+    // and proves the exit under that one absolute deadline, so a process that
+    // inherited the helper's descriptors cannot outlive it, and the drain needs
+    // no reader thread — a refused thread would have aborted the process under
+    // `panic = "abort"`.
+    let output = match launch::wait_with_output(
+        &mut child,
+        Instant::now() + PKEXEC_DEADLINE,
+        "pkexec",
     ) {
-        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-        // A refused thread must fail this action. `std::thread::spawn` panics
-        // instead, and release builds abort on panic, so the process would die
-        // rather than the service request.
-        (Err(error), _) | (_, Err(error)) => {
+        Ok(output) => output,
+        Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
             return Err(TmError::platform(
                 action,
-                format!("could not start the thread that reads pkexec's output: {error}"),
+                format!(
+                    "Polkit authorization did not complete within {} seconds and was cancelled: {error}",
+                    PKEXEC_DEADLINE.as_secs()
+                ),
             ));
         }
     };
-    // An interactive prompt is expected to take a while, but a hung agent or an
-    // unanswered dialog must not park one of the two action lanes (and then its
-    // queue) for the rest of the session.
-    if let Err(error) =
-        launch::wait_for_exit(&mut child, Instant::now() + PKEXEC_DEADLINE, "pkexec")
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(TmError::platform(
-            action,
-            format!(
-                "Polkit authorization did not complete within {} seconds and was cancelled: {error}",
-                PKEXEC_DEADLINE.as_secs()
-            ),
-        ));
-    }
-    let status = child
-        .wait()
-        .map_err(|error| TmError::platform("pkexec", error.to_string()))?;
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    let status = output.status;
+    let (stdout, stderr) = (output.stdout, output.stderr);
     if status.success() {
         return Ok(());
     }
@@ -276,18 +253,6 @@ fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<(
 /// because a descendant that inherited the pipe would make the join unbounded.
 /// `name` becomes the kernel's `comm`, which Linux truncates to 15 bytes, so keep
 /// it short enough for two concurrent readers to stay distinguishable.
-fn drain_pipe(
-    name: &'static str,
-    pipe: impl Read + Send + 'static,
-) -> std::io::Result<JoinHandle<Vec<u8>>> {
-    std::thread::Builder::new().name(name).spawn(move || {
-        let mut pipe = pipe;
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
-}
-
 fn pkexec_path() -> Result<PathBuf> {
     trusted_program(&PKEXEC_CANDIDATES)
 }
