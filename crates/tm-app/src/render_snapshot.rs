@@ -1019,8 +1019,7 @@ mod tests {
         Frame::finish(ctx, tiles, output)
     }
 
-    /// x of sample `i` on a window-anchored axis, as [`chart::TimeAxis`] places
-    /// it.
+    /// x of sample `i` on a window-anchored axis, when the axis can place it.
     ///
     /// This restates the axis's documented contract rather than borrowing the
     /// widget's own arithmetic: the window opens at `newest - window`, and a
@@ -1028,20 +1027,24 @@ mod tests {
     /// gates need it to know what ONE sample interval is in points, which is the
     /// width a stroke edge is allowed to span.
     ///
-    /// It is only ever asked about IN-WINDOW stamps (the fixtures' regular
-    /// series), because the widget drops a sample older than one window rather
-    /// than pinning it: the clamp below is stated for completeness, not
-    /// exercised. Do not make this helper match a widget that pins out-of-window
-    /// samples onto the edge — pinning them is the bug the gate exists for.
-    fn axis_x(rect: Rect, stamps: &[u64], window_ms: u64, i: usize, n: usize) -> f32 {
-        let even = rect.left() + rect.width() * i as f32 / (n - 1) as f32;
+    /// `None` for a stamp the widget REFUSES rather than pins (see
+    /// `chart::placeable_on_axis`): one more than a window older than the axis
+    /// opening, or one past the axis' right edge — which is the newest ARRIVAL,
+    /// not the largest stamp, so a clock step that is later corrected leaves
+    /// buffer entries stamped beyond it. Returning a clamped x here is how a
+    /// future fixture would bake in the pinned-edge expectation the widget
+    /// dropped, so the refusal is represented in the type instead of assumed
+    /// away.
+    fn axis_x(rect: Rect, stamps: &[u64], window_ms: u64, i: usize, n: usize) -> Option<f32> {
         let (Some(&last), Some(&stamp)) = (stamps.last(), stamps.get(i)) else {
-            return even;
+            return Some(rect.left() + rect.width() * i as f32 / (n - 1) as f32);
         };
         let window = window_ms.max(1);
         let t0 = last.saturating_sub(window);
         let frac = (stamp as f64 - t0 as f64) / window as f64;
-        rect.left() + rect.width() * frac.clamp(-1.0, 1.0) as f32
+        (-1.0..=1.0)
+            .contains(&frac)
+            .then(|| rect.left() + rect.width() * frac as f32)
     }
 
     /// The widest span between two consecutive samples on the axis, in points.
@@ -1055,8 +1058,10 @@ mod tests {
     /// a short bridge through between two regular samples. Keep fixture spacing
     /// regular, or assert per pair instead.
     fn one_interval(rect: Rect, stamps: &[u64], window_ms: u64, n: usize) -> f32 {
+        // Only samples the axis can place are painted, so only those define the
+        // interval a painted edge is allowed to span.
         let xs: Vec<f32> = (0..n)
-            .map(|i| axis_x(rect, stamps, window_ms, i, n))
+            .filter_map(|i| axis_x(rect, stamps, window_ms, i, n))
             .collect();
         xs.windows(2)
             .map(|pair| (pair[1] - pair[0]).abs())
