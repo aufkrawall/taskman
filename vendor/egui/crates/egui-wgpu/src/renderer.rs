@@ -1161,16 +1161,26 @@ impl Renderer {
             })
         });
 
-        queue_write_data_to_texture(&texture, origin);
-
-        // A full update must (re)create the texture at exactly the delta's size,
-        // or glyph UVs (normalized by the CPU atlas size) will sample the wrong rows.
+        // Checked before the upload, because `write_texture` rejects an out-of-bounds region
+        // itself and would hide which delta was wrong. A partial update has to stay inside the
+        // texture it writes into; a full update must (re)create the texture at exactly the
+        // delta's size, or glyph UVs (normalized by the CPU atlas size) will sample the wrong
+        // rows.
         debug_assert!(
-            image_delta.pos.is_some() || [texture.width(), texture.height()] == [width, height],
-            "egui texture {id:?}: GPU texture is {}x{} but full delta is {width}x{height}",
+            match image_delta.pos {
+                Some([x, y]) => {
+                    x + width as usize <= texture.width() as usize
+                        && y + height as usize <= texture.height() as usize
+                }
+                None => [texture.width(), texture.height()] == [width, height],
+            },
+            "egui texture {id:?}: GPU texture is {}x{} but the delta is {width}x{height} at {:?}",
             texture.width(),
             texture.height(),
+            image_delta.pos,
         );
+
+        queue_write_data_to_texture(&texture, origin);
 
         self.textures.insert(
             id,
