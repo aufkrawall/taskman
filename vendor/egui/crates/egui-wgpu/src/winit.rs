@@ -324,11 +324,15 @@ impl StartupTimings {
     /// The start-up line is emitted at the first present, which on the deferred path happens
     /// before the pipelines exist; without this the pipeline cost would never be reported, and
     /// that cost is exactly what this deferral took off the window's reveal path.
-    fn late_renderer_message(&self) -> Option<String> {
+    ///
+    /// Consumes the measurement, so every line describes the compile it just waited for: a
+    /// device created after `Painter::suspend` recompiles the pipelines, and reusing the first
+    /// device's timing for it would report a cost that compile never had.
+    fn late_renderer_message(&mut self) -> Option<String> {
         if !self.logged {
             return None;
         }
-        let renderer_ms = self.renderer_ms?;
+        let renderer_ms = self.renderer_ms.take()?;
         let total_ms = self.since.elapsed().as_secs_f32() * 1000.0;
         Some(format!(
             "wgpu pipelines compiled {renderer_ms:.1} ms, {total_ms:.1} ms after painter creation"
@@ -1780,6 +1784,21 @@ mod tests {
             .late_renderer_message()
             .expect("late phase reported");
         assert!(message.contains("pipelines compiled 13.5 ms"), "{message}");
+
+        // The measurement is consumed, so a device created after `suspend` cannot be
+        // described with the first device's compile cost.
+        assert!(
+            timings.late_renderer_message().is_none(),
+            "one measurement describes one compile"
+        );
+        timings.record_renderer(web_time::Instant::now());
+        let recompiled = timings
+            .late_renderer_message()
+            .expect("the recompile is reported with its own timing");
+        assert!(
+            !recompiled.contains("13.5"),
+            "the recompile must not reuse the first device's cost: {recompiled}"
+        );
     }
 
     #[test]
