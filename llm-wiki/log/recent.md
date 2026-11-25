@@ -1,3 +1,39 @@
+## 2026-11-25 - Performance graphs stopped drawing through missing data
+
+- Reported as "garbage elements" in the CPU graph grid on Windows and Linux: thin strokes in
+  the series colour that belonged to no data run. Screenshot forensics on the report (4x4 tiles,
+  334x100 px each) found a tile painting a straight segment from frac 0.447 at full height to
+  frac 0.952 at 10 % with NO area fill anywhere under it, plus a detached baseline segment, while
+  every other tile painted only the last ~17 % of its window with its fill. Missing fill plus a
+  present stroke in one tile is the fingerprint: `fill_area_to_baseline` and `Shape::line` were
+  fed the SAME point list, so only geometry that poisons one and not the other can do that.
+- Root cause was two-fold and both halves were in the UI's data path, not in a renderer.
+  `core_chart_impl` mapped a raw `&[f64]` straight into `Pos2`, and `f64::clamp` returns NaN for
+  NaN, so a tick without per-core data became a NaN vertex; epaint has no gap support
+  (`PathShape::line` keeps every point, `tessellate_path` neither filters NaN nor clips) and a
+  poisoned path is not even culled (`Rect::extend_with` ignores NaN). Second, `x_on_axis` clamped
+  its fraction to [-1,1], pinning out-of-window / backwards-clock samples onto the plot edge and
+  joining them to live data — the long diagonal. `performance.rs` fed that path sentinel series:
+  NaN for an unmeasured tick, a fabricated 0 B/s for an absent mount or adapter, and a grid sized
+  from the newest snapshot's core count (so one blind tick flipped the page to the aggregate chart).
+- Fix: one `ChartGeometry`/`XSource`/`kernel_runs` builder in `widgets/chart.rs` is now the only
+  place a chart position is born. Non-finite and absent samples are gaps; a stamp that does not
+  advance starts a new run; a sample more than one window older than the axis opening is dropped
+  rather than pinned (post-resume history is exactly that case); the kernel band is indexed
+  against the value series it overlays and skipped on a length mismatch; `y()` asserts
+  finiteness locally. `performance.rs` states gaps as `Option<f64>`, derives the tile count from
+  the newest per-core measurement, and shows "-" instead of a fabricated `0,0 %`.
+- Gate: `render_snapshot.rs` gained a headless chart-geometry gate (windowless `Context`,
+  tessellation, real widgets) that fails on the parent commit in both ways the artifact showed.
+  It asserts every vertex finite and inside the tile's bounded overhang, one stroke per measured
+  run with no edge wider than one sample interval, and no fill triangle across a gap.
+- Loop: three worker branches (chart geometry, performance data, gate) each reviewed on its own
+  branch, then the merged tree re-reviewed. The reviews found a failing kernel test (its shared
+  rule had the CPU-window check at only one call site), a too-weak out-of-window assertion, a
+  clippy trap, and — from the first compile — a `match` whose arms returned different types. The
+  gate then turned up one genuinely wrong test expectation (the disk transfer series is not
+  optional for a mount that is listed) and two clippy lints. All closed; `build.py --check` green.
+
 ## 2026-11-24 - Linux CPU rendering, per-process CPU accounting and icons
 
 - Four fixes landed together, each written on its own branch off the v0.1.33 tree: the
