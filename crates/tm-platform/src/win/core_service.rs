@@ -2067,10 +2067,16 @@ fn process_disk_sample() -> ProcessDiskSample {
         // Same as the network trace; the fresh session's first window is too
         // short to divide by, so this tick stays unknown either way.
         tracing::warn!("broker disk trace ended unexpectedly; restarting it");
+        let now = std::time::Instant::now();
         if let Some(usage) = super::disk_etw::DiskUsage::start(super::etw::TraceRole::Service)
             && let Some(trace) = slot.as_mut()
         {
             trace.usage = usage;
+            // The replacement is timed from this request. `last_request` still
+            // names the last poll before the old session died, so an idle
+            // watchdog whose wake is due would measure that age against the
+            // session that just started and retire it on the way past.
+            trace.last_request = now;
         }
         return ProcessDiskSample::default();
     }
