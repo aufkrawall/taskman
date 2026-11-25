@@ -925,10 +925,7 @@ fn flatpak_command(exec: &str) -> Option<String> {
 /// underscores, so a value holding a path or a field code cannot turn the
 /// assignment itself into the executable.
 fn is_env_assignment_name(key: &str) -> bool {
-    !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// First meaningful token of a desktop `Exec=` line: strip field codes

@@ -107,11 +107,24 @@ fn mark_session(name: &[u16], live: bool) {
     // Saturating, because a teardown that already zeroed the count (a caught
     // panic) followed by this session's own `Drop` must not wrap the count
     // into "many owners" and keep the hook stopping a session that is gone.
-    let _ = owners.fetch_update(
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-        |owners| Some(owners.saturating_sub(1)),
-    );
+    //
+    // A compare-exchange loop rather than `fetch_update`: that name is
+    // deprecated on current nightlies in favour of `try_update`, which the
+    // stable toolchain CI builds with does not have yet, so neither spelling
+    // is portable across both.
+    let mut held = owners.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let next = held.saturating_sub(1);
+        match owners.compare_exchange_weak(
+            held,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => held = observed,
+        }
+    }
 }
 
 /// Stop every session this process still owns, by name.

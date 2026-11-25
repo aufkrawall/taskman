@@ -521,7 +521,11 @@ fn remove_font_from(fonts: &mut FontDefinitions, family: FontFamily, name: &str)
     if let Some(list) = fonts.families.get_mut(&family) {
         list.retain(|entry| entry != name);
     }
-    let still_listed = fonts.families.values().flatten().any(|listed| listed == name);
+    let still_listed = fonts
+        .families
+        .values()
+        .flatten()
+        .any(|listed| listed == name);
     if !still_listed {
         fonts.font_data.remove(name);
     }

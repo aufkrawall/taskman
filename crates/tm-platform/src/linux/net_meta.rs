@@ -302,10 +302,8 @@ mod tests {
 
     impl Tree {
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "tm-linux-netmeta-{name}-{}",
-                std::process::id()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("tm-linux-netmeta-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Self { root }
@@ -351,7 +349,10 @@ mod tests {
         tree.write("usb2/product", "xHCI Host Controller\n");
         // The adapter itself.
         tree.write("usb2/2-1/idVendor", "0b95\n");
-        tree.write("usb2/2-1/product", "AX88179A USB 3.2 Gen1 Ethernet Adapter\n");
+        tree.write(
+            "usb2/2-1/product",
+            "AX88179A USB 3.2 Gen1 Ethernet Adapter\n",
+        );
         tree.write("usb2/2-1/2-1:1.0/uevent", "DRIVER=ax88179_178a\n");
         // `net/eth0/device` → the interface, exactly as sysfs links it.
         tree.link("net/eth0/device", "../../usb2/2-1/2-1:1.0");

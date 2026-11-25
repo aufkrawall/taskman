@@ -1085,7 +1085,13 @@ impl TaskManApp {
                     // the rates' own measurement state with them.
                     .map(|d| {
                         let mount = d.mount.clone();
-                        (mount, d.active_pct, d.read_bps, d.write_bps, d.rates_measured)
+                        (
+                            mount,
+                            d.active_pct,
+                            d.read_bps,
+                            d.write_bps,
+                            d.rates_measured,
+                        )
                     })
                     .collect(),
                 nets: latest
