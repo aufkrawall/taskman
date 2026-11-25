@@ -5,13 +5,31 @@
 //! the same painter the `Software` renderer will use. No window is opened and no GPU is
 //! touched, so this runs in CI and in a normal `cargo test`.
 //!
-//! It serves two purposes:
+//! It serves three purposes:
 //!
-//! * **A regression gate.** [`taskman_widgets_render_without_gaps_or_panics`] asserts
-//!   structural properties of the output (the chrome painted, the heat band is a
-//!   continuous run of blues, the charts drew, nothing is left at the clear colour where
-//!   content belongs). These catch a rasterizer regression without pinning down every
-//!   pixel, which would make the test fail on any innocuous layout tweak.
+//! * **A rasterizer regression gate.**
+//!   [`taskman_widgets_render_without_gaps_or_panics`] asserts structural properties of
+//!   the output (the chrome painted, the heat band is a continuous run of blues, the
+//!   charts drew, nothing is left at the clear colour where content belongs). These catch
+//!   a rasterizer regression without pinning down every pixel, which would make the test
+//!   fail on any innocuous layout tweak.
+//! * **A chart-geometry regression gate,**
+//!   [`a_core_tile_breaks_its_series_at_missing_samples`] and
+//!   [`an_out_of_window_stamp_breaks_the_line_instead_of_bridging_it`]. These drive the
+//!   real per-core tile and multi-series widgets with adversarial telemetry -- a NaN,
+//!   both infinities, a stamp that steps backwards, a stamp from outside the axis -- and
+//!   assert on the TESSELLATED geometry: every vertex finite, nothing painted further
+//!   outside the tile than the documented lead-in overhang, and no stroke edge longer
+//!   than one sample interval. They reproduce the artifact users reported on the
+//!   Performance tab's per-logical-processor grid: thin straight strokes in the series
+//!   colour that belong to no data run, bridge the regions where the tile paints no area
+//!   fill, and run diagonally over thirty sample intervals -- measured off a screenshot,
+//!   one stroke went from 45% of the card's width at full height down to 95% at 10% with
+//!   no fill anywhere under it. epaint has no gap support, so a `Shape::line` through a
+//!   non-finite sample is not culled: it reaches the rasterizer as garbage strokes and as
+//!   an area fill that paints nothing. Where a pixel assertion is used at all it stays
+//!   structural (the series colour must not leave the tile that owns it, and both tiles
+//!   must actually paint their series), never a pinned count or a pinned y for a value.
 //! * **A deliverable.** Set `TASKMAN_RENDER_SNAPSHOT=<path>` to write the frame out as a
 //!   PNG and actually look at it:
 //!
@@ -767,6 +785,719 @@ mod tests {
             "2288x1575 bench: pass={pass_ms:.2}ms full_paint={full_paint_ms:.2}ms dmg_paint={dmg_paint_ms:.2}ms dirty_tiles={}/{}",
             stats.dirty_tiles, stats.total_tiles
         );
+    }
+
+    // ------------------------------------------------- chart geometry regression
+    //
+    // The gates below pin the artifact users reported on the Performance tab's
+    // per-logical-processor grid: thin straight strokes in the series colour
+    // that belong to no data run, bridge the regions where the tile paints no
+    // area fill, and run diagonally over thirty sample intervals. Measured off
+    // the screenshot, one tile carried a stroke from 45% of its width at full
+    // height down to 95% at 10%, with no fill anywhere under it.
+    //
+    // Two defects produced it, and both show up as GEOMETRY rather than as a
+    // wrong colour:
+    //
+    // * `chart::core_chart` mapped the raw `&[f64]` straight into `Pos2`, so a
+    //   NaN sample became `Pos2::new(x, NaN)`. epaint has no gap support: a
+    //   path is not culled for holding a non-finite point, it reaches the
+    //   rasterizer as garbage.
+    // * `chart::x_on_axis` clamps its fraction to `[-1, 1]`, so a stamp from
+    //   outside the axis is pinned one rect width off the plot instead of
+    //   breaking the line -- a long bridging segment across live data.
+    //
+    // These assert on tessellated geometry wherever they can: that is what the
+    // rasterizer consumes, and unlike a pixel comparison it does not care where
+    // egui happened to lay the tile out.
+
+    /// Frame size a single-tile gate lays its chart out in.
+    const GATE_W: f32 = 420.0;
+    const GATE_H: f32 = 220.0;
+
+    /// Tile size, close to a real per-core grid cell (about 219x86 for a 4-wide
+    /// grid on a maximized Performance page; the artifact was reported on a
+    /// 334x100 cell of a 4x4 grid). Every gate assertion is relative to the
+    /// tile and its sample interval, so the exact size does not matter.
+    const TILE: egui::Vec2 = vec2(160.0, 90.0);
+
+    /// Window of the axis the gate fixtures use, in seconds. The same number
+    /// feeds the widget and the derived sample interval; two literals would let
+    /// one edit silently re-scale the other.
+    const WINDOW_S: u32 = 12;
+    const WINDOW_MS: u64 = WINDOW_S as u64 * 1_000;
+
+    /// Values with four runs and three gaps, in twelve samples: a run, a NaN, a
+    /// run, +inf, a run, -inf, and a further run.
+    ///
+    /// `f64::clamp` returns NaN for NaN and saturates the infinities, so the
+    /// old `y()` turned this series into one path through all twelve samples:
+    /// a NaN vertex, and a spike pinned to the ceiling and the floor.
+    const GAP_VALUES: [f64; 12] = [
+        20.0,
+        35.0,
+        50.0,
+        f64::NAN,
+        60.0,
+        45.0,
+        f64::INFINITY,
+        70.0,
+        30.0,
+        f64::NEG_INFINITY,
+        55.0,
+        25.0,
+    ];
+
+    /// Kernel series for the same frame, with its gap at a DIFFERENT index than
+    /// the user series'. The kernel band is filled from its own slice while the
+    /// x positions come from the value series' timestamps, so a fix that reuses
+    /// the value runs' boundaries for the overlay leaves this one bridging.
+    const GAP_KERNEL: [f64; 12] = [
+        4.0,
+        4.0,
+        5.0,
+        5.0,
+        5.0,
+        f64::NAN,
+        6.0,
+        6.0,
+        6.0,
+        7.0,
+        7.0,
+        7.0,
+    ];
+
+    /// Which chart widget a gate frame paints. Both have to break at a gap.
+    #[derive(Clone, Copy, Debug)]
+    enum Widget {
+        Core,
+        Multi,
+    }
+
+    /// The axis a gate frame builds: `(timestamps, window in seconds)`, or
+    /// `None` for a chart drawn without one.
+    type GateAxis<'a> = Option<(&'a [u64], u32)>;
+
+    /// One case for [`a_short_or_tiny_series_stays_inside_its_tile`]: its
+    /// samples and the axis they are plotted on.
+    type SeriesCase<'a> = (&'a [f64], GateAxis<'a>);
+
+    /// One windowless chart frame: the rects the widgets claimed, the shapes
+    /// egui recorded, and the same frame after tessellation.
+    struct Frame {
+        ctx: egui::Context,
+        tiles: Vec<Rect>,
+        shapes: Vec<egui::epaint::ClippedShape>,
+        primitives: Vec<egui::ClippedPrimitive>,
+        textures: egui::TexturesDelta,
+        pixels_per_point: f32,
+    }
+
+    impl Drop for Frame {
+        /// epaint debug-asserts that every `TexturesDelta` was applied or
+        /// explicitly cleared, and a frame the geometry gates only inspect is
+        /// never painted, so its deltas would otherwise panic on drop.
+        fn drop(&mut self) {
+            self.textures.clear();
+        }
+    }
+
+    impl Frame {
+        /// Tessellate a finished pass and keep everything the gates assert on.
+        fn finish(ctx: egui::Context, tiles: Vec<Rect>, mut output: egui::FullOutput) -> Self {
+            let primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+            Self {
+                ctx,
+                tiles,
+                shapes: std::mem::take(&mut output.shapes),
+                primitives,
+                textures: std::mem::take(&mut output.textures_delta),
+                pixels_per_point: output.pixels_per_point,
+            }
+        }
+
+        /// The renderer inputs a real backend gathers from the context.
+        fn shape_context(&self) -> ShapeContext {
+            ShapeContext {
+                pixels_per_point: self.pixels_per_point,
+                options: self.ctx.tessellation_options(|o| *o),
+                font_tex_size: self.ctx.fonts(|f| f.font_image_size()),
+                prepared_discs: self.ctx.fonts(|f| f.fonts.texture_atlas().prepared_discs()),
+            }
+        }
+
+        /// Every vertex of every tessellated primitive: exactly what the
+        /// rasterizer would consume, before any clipping.
+        fn vertices(&self) -> Vec<Pos2> {
+            let mut out = Vec::new();
+            for primitive in &self.primitives {
+                if let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive {
+                    out.extend(mesh.vertices.iter().map(|v| v.pos));
+                }
+            }
+            out
+        }
+
+        /// Paint the frame with the software painter, exactly as the CPU
+        /// renderer does: upload the atlas the pass extracted, then rasterize
+        /// the untessellated shapes (the path the `Software` renderer uses, and
+        /// the only renderer this project ships).
+        fn paint(&mut self, width: u32, height: u32) -> Vec<u32> {
+            let mut painter = Painter::new();
+            for (id, deltas) in &self.textures.set {
+                for delta in deltas {
+                    painter.set_texture(*id, delta);
+                }
+            }
+            for id in &self.textures.free {
+                painter.free_texture(*id);
+            }
+            self.textures.clear();
+
+            let mut buf = vec![0u32; (width * height) as usize];
+            let mut target = Target::new(&mut buf, width, height).expect("target fits");
+            Painter::clear(&mut target, theme::DARK.window_bg);
+            painter.paint_shapes(&mut target, &self.shape_context(), self.shapes.clone());
+            assert_eq!(
+                painter.missing_texture_draws(),
+                0,
+                "a primitive referenced a texture that was never uploaded"
+            );
+            buf
+        }
+    }
+
+    /// Build one headless frame that contains nothing but chart widgets.
+    ///
+    /// `stamps` is the axis `(timestamps, window in seconds)`, or `None` for a
+    /// chart without one.
+    fn chart_frame(
+        widget: Widget,
+        samples: &[f64],
+        kernel: Option<&[f64]>,
+        stamps: GateAxis<'_>,
+    ) -> Frame {
+        let ctx = egui::Context::default();
+        theme::install_visuals(&ctx);
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let axis = stamps.map(|(ts, window_s)| chart::TimeAxis::new(ts, window_s));
+        let mut tiles = Vec::new();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(GATE_W, GATE_H))),
+                ..Default::default()
+            },
+            |ui| {
+                let response = match widget {
+                    Widget::Core => chart::core_chart(
+                        ui,
+                        TILE,
+                        samples,
+                        kernel.map(|k| (k, theme::DARK.cpu_kernel_graph)),
+                        theme::DARK.cpu_graph,
+                        "CPU 0",
+                        axis,
+                    ),
+                    Widget::Multi => chart::chart_multi(
+                        ui,
+                        TILE,
+                        &[MultiSeries::new(
+                            "CPU",
+                            samples.to_vec(),
+                            theme::DARK.cpu_graph,
+                        )],
+                        100.0,
+                        axis,
+                        chart::fmt_percent,
+                    ),
+                };
+                tiles.push(response.rect);
+            },
+        );
+        Frame::finish(ctx, tiles, output)
+    }
+
+    /// x of sample `i` on a window-anchored axis, as [`chart::TimeAxis`] places
+    /// it.
+    ///
+    /// This restates the axis's documented contract rather than borrowing the
+    /// widget's own arithmetic: the window opens at `newest - window`, a sample
+    /// outside it is pinned to the axis edge, and a timestamp slice shorter
+    /// than the series falls back to even spacing. The gates need it to know
+    /// what ONE sample interval is in points, which is the width a stroke edge
+    /// is allowed to span.
+    fn axis_x(rect: Rect, stamps: &[u64], window_ms: u64, i: usize, n: usize) -> f32 {
+        let even = rect.left() + rect.width() * i as f32 / (n - 1) as f32;
+        let (Some(&last), Some(&stamp)) = (stamps.last(), stamps.get(i)) else {
+            return even;
+        };
+        let window = window_ms.max(1);
+        let t0 = last.saturating_sub(window);
+        let frac = (stamp as f64 - t0 as f64) / window as f64;
+        rect.left() + rect.width() * frac.clamp(-1.0, 1.0) as f32
+    }
+
+    /// The widest span between two consecutive samples on the axis, in points.
+    ///
+    /// This is the "one sample interval" a stroke edge may cover: a segment
+    /// joining two neighbouring samples is at most this wide, so anything wider
+    /// jumped over data that does not exist.
+    ///
+    /// The maximum over the fixture, deliberately: a fixture whose spacing is
+    /// irregular would otherwise widen the tolerance by its longest gap and let
+    /// a short bridge through between two regular samples. Keep fixture spacing
+    /// regular, or assert per pair instead.
+    fn one_interval(rect: Rect, stamps: &[u64], window_ms: u64, n: usize) -> f32 {
+        let xs: Vec<f32> = (0..n)
+            .map(|i| axis_x(rect, stamps, window_ms, i, n))
+            .collect();
+        xs.windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// Every painted polyline, one point list per open, unfilled `Shape::Path`.
+    ///
+    /// A chart frame contains no other paths -- the chrome is rects and line
+    /// segments -- so this counts SERIES RUNS, which is the property the gate
+    /// is after: a gap has to end the line and start a new one, because epaint
+    /// cannot express a break inside a path.
+    ///
+    /// Open and unfilled on purpose: a fill that is ever reworked into a closed
+    /// path would otherwise inflate the count and make the run assertion pass
+    /// for the wrong reason. A run of ONE sample is not a path at all -- the
+    /// painter draws a 1.25 px dot for it -- so a fixture that wants to count
+    /// such a run has to count [`egui::Shape::Circle`] as well.
+    fn polyline_runs(shapes: &[egui::epaint::ClippedShape]) -> Vec<Vec<Pos2>> {
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Path(path)
+                    if !path.closed && path.fill == egui::Color32::TRANSPARENT =>
+                {
+                    Some(path.points.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The x extent of every triangle of every mesh in the frame: the area
+    /// fills.
+    ///
+    /// The strip builder emits one triangle pair per segment, so a triangle
+    /// wider than one sample interval means the fill was closed over a gap.
+    /// NaN propagates through the fold on purpose -- `f32::min`/`max` ignore
+    /// NaN, which would silently excuse a poisoned triangle.
+    fn mesh_triangle_x_spans(shapes: &[egui::epaint::ClippedShape]) -> Vec<f32> {
+        let mut spans = Vec::new();
+        for clipped in shapes {
+            let egui::Shape::Mesh(mesh) = &clipped.shape else {
+                continue;
+            };
+            for triangle in mesh.indices.chunks_exact(3) {
+                let x: Vec<f32> = triangle
+                    .iter()
+                    .map(|&i| mesh.vertices[i as usize].pos.x)
+                    .collect();
+                let mut span = 0.0f32;
+                for pair in [[x[0], x[1]], [x[1], x[2]], [x[2], x[0]]] {
+                    let d = (pair[0] - pair[1]).abs();
+                    // Written as a positive test followed by the NaN arm: the
+                    // `!(d <= span)` spelling reads the same but trips
+                    // clippy::neg_cmp_op_on_partial_ord, i.e. the heavy gate.
+                    if d > span || d.is_nan() {
+                        span = d;
+                    }
+                }
+                spans.push(span);
+            }
+        }
+        spans
+    }
+
+    /// The tile grown by its own size, plus the stroke fringe.
+    ///
+    /// The window-anchored axis deliberately carries one sample from just
+    /// before the window so the polyline can enter at the true slope, which
+    /// puts one vertex LEFT of the tile; `x_on_axis` clamps that lead-in to at
+    /// most one rect width out, and the lead-in may be a run of its own once it
+    /// is a break. The extra four points are geometry, not tolerance: the
+    /// rasterizer sees the STROKE, whose half-width (0.7 px for a 1.4 px line)
+    /// plus epaint's one-pixel feather sits outside the path point, and an
+    /// isolated sample is a 1.25 px dot centred on it. Asserting against the
+    /// bare clamp bound would fail on a correct chart at the edge.
+    fn allowed_rect(tile: Rect) -> Rect {
+        tile.expand2(tile.size() + vec2(4.0, 4.0))
+    }
+
+    /// GATE: a missing sample -- NaN, +inf or -inf -- must END the series line
+    /// and start a new one, never be drawn through.
+    ///
+    /// `chart_multi` already did this (`measured_runs`); `core_chart` did not,
+    /// and the per-core grid is where the garbage strokes were seen. On the old
+    /// code this frame carries ONE path through all twelve samples, including
+    /// the NaN that epaint turns into a stroke to nowhere, and the kernel fill
+    /// is poisoned the same way at its own gap.
+    #[test]
+    fn a_core_tile_breaks_its_series_at_missing_samples() {
+        let stamps: Vec<u64> = (0..GAP_VALUES.len() as u64).map(|i| i * 1_000).collect();
+        // Three gaps, so four runs painted. Every one of them is at least two
+        // samples long, which is why the count can be exact: a one-sample run
+        // would be a dot rather than a path (see `polyline_runs`).
+        let runs_expected = 4;
+        let samples_plotted = GAP_VALUES.iter().filter(|v| v.is_finite()).count();
+        for widget in [Widget::Core, Widget::Multi] {
+            let frame = chart_frame(
+                widget,
+                &GAP_VALUES,
+                Some(&GAP_KERNEL),
+                Some((stamps.as_slice(), WINDOW_S)),
+            );
+            let tile = frame.tiles[0];
+            let interval = one_interval(tile, stamps.as_slice(), WINDOW_MS, GAP_VALUES.len());
+
+            // 1. Nothing poisoned reached the tessellator.
+            for pos in frame.vertices() {
+                assert!(
+                    pos.x.is_finite() && pos.y.is_finite(),
+                    "{widget:?}: egui emitted the non-finite vertex {pos:?} -- a NaN \
+                     sample was plotted instead of breaking the line"
+                );
+            }
+
+            // 2. A gap separates runs instead of being drawn through -- and it
+            //    separates them without losing a measured sample on the way.
+            let runs = polyline_runs(&frame.shapes);
+            assert_eq!(
+                runs.len(),
+                runs_expected,
+                "{widget:?}: {} painted polylines for {runs_expected} measured runs -- a \
+                 stroke spans a gap in the data, or the series was split past repair",
+                runs.len()
+            );
+            assert_eq!(
+                runs.iter().map(Vec::len).sum::<usize>(),
+                samples_plotted,
+                "{widget:?}: the painted runs do not hold all {samples_plotted} measured \
+                 samples -- a gap swallowed data"
+            );
+
+            // 3. No stroke edge bridges more than one sample interval.
+            for run in &runs {
+                for pair in run.windows(2) {
+                    let dx = (pair[1].x - pair[0].x).abs();
+                    assert!(
+                        dx <= interval + 2.0,
+                        "{widget:?}: a stroke edge spans {dx:.1} px, more than one sample \
+                         interval ({interval:.1} px) -- it joined samples across a gap"
+                    );
+                }
+            }
+
+            // 4. Neither does the area fill, which is built one triangle pair
+            //    per segment. The empty case is a failure, not a pass: a chart
+            //    that stopped filling would otherwise satisfy this vacuously.
+            let spans = mesh_triangle_x_spans(&frame.shapes);
+            assert!(
+                !spans.is_empty(),
+                "{widget:?}: the chart painted no area fill at all"
+            );
+            for span in spans {
+                assert!(
+                    span <= interval + 2.0,
+                    "{widget:?}: a fill triangle spans {span:.1} px, more than one sample \
+                     interval ({interval:.1} px) -- the fill was closed over a gap"
+                );
+            }
+
+            // 5. Nothing paints further outside the tile than the lead-in
+            //    overhang the axis documents.
+            let allowed = allowed_rect(tile);
+            for pos in frame.vertices() {
+                assert!(
+                    allowed.contains(pos),
+                    "{widget:?}: the chart painted {pos:?}, further outside the tile \
+                     {tile:?} than its own size -- that is the bridging stroke"
+                );
+            }
+        }
+    }
+
+    /// GATE: a sample whose timestamp falls outside the axis must break the
+    /// line, not be pinned a rect width off the plot and joined to live data.
+    ///
+    /// This is the other half of the reported artifact: a stroke that starts at
+    /// the tile's own left edge and runs diagonally down to 10%. A wall clock
+    /// that steps backwards -- an NTP correction, a resume, a duplicated or
+    /// stale stamp -- is enough to produce one.
+    #[test]
+    fn an_out_of_window_stamp_breaks_the_line_instead_of_bridging_it() {
+        // Epoch milliseconds, because the axis is anchored to the newest stamp
+        // and only then does a stale one fall outside it.
+        const NEWEST: u64 = 1_797_000_000_000;
+        let regular: Vec<u64> = (0..11).map(|i| NEWEST - 10_000 + i * 1_000).collect();
+        let mut stamps = regular.clone();
+        // Sample 5 carries a stamp from an hour earlier.
+        stamps[5] = NEWEST - 3_600_000;
+        let values: Vec<f64> = (0..11).map(|i| 30.0 + (i % 5) as f64 * 8.0).collect();
+
+        for widget in [Widget::Core, Widget::Multi] {
+            let frame = chart_frame(
+                widget,
+                values.as_slice(),
+                None,
+                Some((stamps.as_slice(), 10)),
+            );
+            let tile = frame.tiles[0];
+            let slack = one_interval(tile, regular.as_slice(), 10_000, regular.len()) + 2.0;
+            let runs = polyline_runs(&frame.shapes);
+            assert!(
+                !runs.is_empty(),
+                "{widget:?}: the chart painted no polyline at all"
+            );
+
+            // The stale sample is clamped a whole rect width left of the plot.
+            // On its own that is the documented lead-in; what must not happen
+            // is that it is JOINED to the samples inside the window, which is
+            // what turns it into a stroke across the graph. So the assertion is
+            // per run: a run may hold off-axis points or on-axis points, never
+            // both. Counting runs instead would accept a split that still
+            // bridged the stale sample to its neighbours.
+            let off_axis = |p: &Pos2| p.x < tile.left() - slack;
+            let on_axis = |p: &Pos2| p.x >= tile.left() - 0.5;
+            for run in &runs {
+                assert!(
+                    !(run.iter().any(off_axis) && run.iter().any(on_axis)),
+                    "{widget:?}: a run joins a sample from outside the axis to samples \
+                     inside it -- the pinned sample is drawn as a bridging stroke"
+                );
+            }
+
+            // ...and no single edge may cross more plot than the plot is wide.
+            for run in &runs {
+                for pair in run.windows(2) {
+                    let dx = (pair[1].x - pair[0].x).abs();
+                    assert!(
+                        dx <= tile.width() + 2.0,
+                        "{widget:?}: a stroke edge spans {dx:.1} px across a {:.1} px tile",
+                        tile.width()
+                    );
+                }
+            }
+
+            let allowed = allowed_rect(tile);
+            for pos in frame.vertices() {
+                assert!(
+                    pos.x.is_finite() && pos.y.is_finite(),
+                    "{widget:?}: egui emitted the non-finite vertex {pos:?}"
+                );
+                assert!(
+                    allowed.contains(pos),
+                    "{widget:?}: the chart painted {pos:?}, further outside the tile \
+                     {tile:?} than its own size"
+                );
+            }
+        }
+    }
+
+    /// A stamp that steps BACKWARDS but stays inside the axis must not move a
+    /// vertex off the tile or poison the geometry.
+    ///
+    /// Coverage rather than detection: the sample is real data at a real
+    /// instant, so a chart may legitimately draw the little Z the ordering
+    /// implies. What it may not do is leave the tile while handling it.
+    #[test]
+    fn a_backwards_stamp_stays_inside_its_tile() {
+        let stamps: &[u64] = &[0, 1_000, 2_000, 1_500, 3_000];
+        let values: &[f64] = &[10.0, 20.0, 30.0, 25.0, 40.0];
+        for widget in [Widget::Core, Widget::Multi] {
+            let frame = chart_frame(widget, values, None, Some((stamps, 2)));
+            let tile = frame.tiles[0];
+            let allowed = allowed_rect(tile);
+            for pos in frame.vertices() {
+                assert!(
+                    pos.x.is_finite() && pos.y.is_finite(),
+                    "{widget:?}: egui emitted the non-finite vertex {pos:?}"
+                );
+                assert!(
+                    allowed.contains(pos),
+                    "{widget:?}: a backwards stamp put a vertex at {pos:?}, outside the \
+                     tile {tile:?} by more than its own size"
+                );
+            }
+            assert!(
+                !polyline_runs(&frame.shapes).is_empty(),
+                "{widget:?}: the chart painted no polyline at all"
+            );
+        }
+    }
+
+    /// A series longer than its timestamp slice, and the shortest series a
+    /// chart can be asked to draw, must stay on screen: no panic in the paint
+    /// path, no vertex outside the tile.
+    ///
+    /// The slice going short of the series is a desynchronization this code has
+    /// already seen once, and in the paint path it used to be a panic. The
+    /// two-sample cases cover the boundaries that remain: a run of one sample
+    /// is a dot, not a one-point path (epaint tessellates a path from two
+    /// points up), and a gap at the end must not leave a half-built one behind.
+    #[test]
+    fn a_short_or_tiny_series_stays_inside_its_tile() {
+        let stamps: Vec<u64> = (0..4).map(|i| i * 1_000).collect();
+        let long: Vec<f64> = (0..12).map(|i| 20.0 + (i % 5) as f64 * 6.0).collect();
+        let two: &[f64] = &[10.0, 20.0];
+        let two_gapped: &[f64] = &[10.0, f64::NAN];
+        let cases: [SeriesCase<'_>; 3] = [
+            (long.as_slice(), Some((stamps.as_slice(), WINDOW_S))),
+            (two, None),
+            (two_gapped, None),
+        ];
+
+        for widget in [Widget::Core, Widget::Multi] {
+            for (values, axis) in &cases {
+                let frame = chart_frame(widget, *values, None, *axis);
+                let tile = frame.tiles[0];
+                let allowed = allowed_rect(tile);
+                for pos in frame.vertices() {
+                    assert!(
+                        pos.x.is_finite() && pos.y.is_finite(),
+                        "{widget:?}: egui emitted the non-finite vertex {pos:?} for a \
+                         series of {} samples",
+                        values.len()
+                    );
+                    assert!(
+                        allowed.contains(pos),
+                        "{widget:?}: the chart painted {pos:?} for a series of {} samples, \
+                         outside the tile {tile:?} by more than its own size",
+                        values.len()
+                    );
+                }
+                // Two painted samples are a polyline; one is a dot, which is
+                // not a path and must not be asserted as one.
+                if values.iter().filter(|v| v.is_finite()).count() >= 2 {
+                    assert!(
+                        !polyline_runs(&frame.shapes).is_empty(),
+                        "{widget:?}: a series of {} samples painted no polyline",
+                        values.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A gap series must not paint outside the tile that owns it.
+    ///
+    /// A rasterization smoke test, not the artifact detector: the reported
+    /// strokes were INSIDE their tile, and both chart shapes clip their painter
+    /// to it, so this cannot fail for a bridging segment. What it does pin is
+    /// the clip itself -- a chart that stops clipping (or a tile that paints
+    /// nothing where a curve belongs) fails here, and neither is visible in the
+    /// tessellated-geometry gates above, which describe shape data rather than
+    /// what the rasterizer is allowed to cover.
+    ///
+    /// Deliberately structural: two tiles side by side, the first fed the
+    /// adversarial series, and the only claims are that the series colour stays
+    /// inside the two tile rects and that both tiles actually painted it.
+    #[test]
+    fn gap_series_pixels_stay_inside_their_own_tile() {
+        const PW: u32 = 420;
+        const PH: u32 = 140;
+        let stamps: Vec<u64> = (0..GAP_VALUES.len() as u64).map(|i| i * 1_000).collect();
+        let healthy: Vec<f64> = (0..GAP_VALUES.len())
+            .map(|i| 15.0 + (i % 5) as f64 * 7.0)
+            .collect();
+
+        let ctx = egui::Context::default();
+        theme::install_visuals(&ctx);
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut tiles = Vec::new();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+                ..Default::default()
+            },
+            |ui| {
+                // A gap wide enough that a stroke leaving one tile has somewhere
+                // to land rather than immediately hitting its neighbour.
+                ui.spacing_mut().item_spacing = vec2(24.0, 4.0);
+                ui.horizontal(|ui| {
+                    let axis = chart::TimeAxis::new(&stamps, WINDOW_S);
+                    for (values, label) in [
+                        (GAP_VALUES.as_slice(), "CPU 0"),
+                        (healthy.as_slice(), "CPU 1"),
+                    ] {
+                        let response = chart::core_chart(
+                            ui,
+                            TILE,
+                            values,
+                            None,
+                            theme::DARK.cpu_graph,
+                            label,
+                            Some(axis),
+                        );
+                        tiles.push(response.rect);
+                    }
+                });
+            },
+        );
+        let mut frame = Frame::finish(ctx, tiles, output);
+        let buf = frame.paint(PW, PH);
+        assert_eq!(frame.tiles.len(), 2, "two tiles are expected");
+
+        // The series colour, as [`the_charts_paint_their_series`] defines it: a
+        // pixel that is clearly blue-dominant. The chrome around it -- card
+        // fill, grid, border -- is neutral grey and cannot be mistaken for one.
+        let tinted = |px: u32| {
+            let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+            b > 70 && b > r + 30
+        };
+        let at_px = |x: u32, y: u32| buf[(y * PW + x) as usize];
+
+        // 1. Nothing of the series escapes the tile that drew it. The two-pixel
+        //    margin covers the tile's own antialiasing and the half-pixel the
+        //    painter snaps its clip rect by.
+        let mut outside = 0usize;
+        let mut first = None;
+        for y in 0..PH {
+            for x in 0..PW {
+                let p = pos2(x as f32 + 0.5, y as f32 + 0.5);
+                if frame.tiles.iter().any(|tile| tile.expand(2.0).contains(p)) {
+                    continue;
+                }
+                if tinted(at_px(x, y)) {
+                    outside += 1;
+                    if first.is_none() {
+                        first = Some(p);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            outside, 0,
+            "{outside} series-coloured pixels outside every tile (first at {first:?}) -- a \
+             stroke escaped the chart that owns it"
+        );
+
+        // 2. Both tiles painted their series, so the check above is not passing
+        //    on an empty frame.
+        for (i, tile) in frame.tiles.iter().enumerate() {
+            let mut hit = 0usize;
+            for y in 0..PH {
+                for x in 0..PW {
+                    if tile.contains(pos2(x as f32 + 0.5, y as f32 + 0.5)) && tinted(at_px(x, y)) {
+                        hit += 1;
+                    }
+                }
+            }
+            assert!(
+                hit > 50,
+                "tile {i} painted only {hit} series-coloured pixels -- the chart did not \
+                 draw its series at all"
+            );
+        }
     }
 }
 
