@@ -1926,6 +1926,106 @@ mod tests {
         }
     }
 
+    /// The attach step, driven by synthetic records through the decoder rather
+    /// than by a hand-built sample, because the GUI's own trace depends on this
+    /// identity too: every byte the session attributed to the process is on a
+    /// row or in one of the two remainders, and a row only carries what named
+    /// it.
+    #[test]
+    fn the_attach_step_accounts_for_every_byte_the_trace_measured() {
+        let shared = shared();
+        let pid = 20;
+        // A file the handle walk also reports, under the caller's casing.
+        deliver(
+            &shared,
+            pid,
+            EVENT_CREATE,
+            &create_payload(8, 0x1000, r"\??\C:\data\a.bin"),
+        );
+        deliver(
+            &shared,
+            pid,
+            EVENT_READ,
+            &transfer_payload(8, 0x1000, 4_096),
+        );
+        deliver(
+            &shared,
+            pid,
+            EVENT_WRITE,
+            &transfer_payload(8, 0x1000, 1_024),
+        );
+        // A transfer on a file object whose Create was never seen: unnamed.
+        deliver(&shared, pid, EVENT_READ, &transfer_payload(8, 0x9000, 512));
+        // A file past the session's path budget: omitted, and no row.
+        deliver(
+            &shared,
+            pid,
+            EVENT_CREATE,
+            &create_payload(8, 0x2000, r"\??\C:\data\b.bin"),
+        );
+        shared.state.lock().unwrap().tracked_paths = MAX_TRACKED_FILES;
+        deliver(
+            &shared,
+            pid,
+            EVENT_WRITE,
+            &transfer_payload(8, 0x2000, 2_048),
+        );
+
+        let sample = sample_of(&shared, pid);
+        assert_eq!(sample.state(), FileIoAccountingState::Measured);
+
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![
+                // Deliberately not the trace's casing: the walk and the trace
+                // resolve the same file differently.
+                file_row(r"c:\DATA\A.BIN"),
+                file_row(r"C:\data\untouched.bin"),
+            ],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_file_io(&mut snapshot, &sample);
+
+        assert_eq!(snapshot.files[0].read_bytes, Some(4_096));
+        assert_eq!(snapshot.files[0].write_bytes, Some(1_024));
+        assert_eq!(
+            snapshot.files[1].read_bytes, None,
+            "a row with no record stays unmeasured"
+        );
+        assert_eq!(snapshot.files[1].write_bytes, None);
+        let accounting = &snapshot.accounting;
+        assert_eq!(accounting.state, FileIoAccountingState::Measured);
+        assert_eq!(accounting.read_ops, sample.pid_read_transfers);
+        assert_eq!(accounting.write_ops, sample.pid_write_transfers);
+        assert_eq!(accounting.unnamed_read_bytes, 512);
+        assert_eq!(accounting.unnamed_write_bytes, 0);
+        assert_eq!(accounting.omitted_read_bytes, 0);
+        assert_eq!(accounting.omitted_write_bytes, 2_048);
+        // The identity: rows plus both remainders are the attribution for the
+        // process, so the dialog's totals never understate what it moved.
+        let rows_read: u64 = snapshot
+            .files
+            .iter()
+            .filter_map(|file| file.read_bytes)
+            .sum();
+        let rows_written: u64 = snapshot
+            .files
+            .iter()
+            .filter_map(|file| file.write_bytes)
+            .sum();
+        assert_eq!(
+            rows_read + accounting.unnamed_read_bytes + accounting.omitted_read_bytes,
+            accounting.read_bytes
+        );
+        assert_eq!(
+            rows_written + accounting.unnamed_write_bytes + accounting.omitted_write_bytes,
+            accounting.write_bytes
+        );
+        assert_eq!(accounting.read_bytes, sample.attributed().read_bytes);
+        assert_eq!(accounting.write_bytes, sample.attributed().write_bytes);
+        assert_eq!(accounting.read_bytes, 4_096 + 512);
+        assert_eq!(accounting.write_bytes, 1_024 + 2_048);
+    }
+
     /// The whole point of the wiring: bytes reach exactly the rows they name,
     /// everything else is accounted for as a remainder, and nothing is
     /// invented. Rows plus both remainders must add up to the process totals.

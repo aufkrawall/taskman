@@ -125,7 +125,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     versions are decoded at native pointer width, device paths are translated
     to the DOS paths the handle walk reports, the open-file map and both the
     per-process and session-wide path budgets drop with a counter, and buckets
-    are bound to the created time that prevents pid reuse from inheriting),
+    are bound to the created time that prevents pid reuse from inheriting; the
+    sample becomes rows in `attach_file_io`, the one mapping both the service's
+    session and the GUI's own elevated one share),
     `profile_etw.rs` (demand-only system-profile sampling for one exact
     process; MOF sample type 46, profile-privilege enablement, thread
     ownership, page aggregation, module attribution, ETW-loss/lower-bound

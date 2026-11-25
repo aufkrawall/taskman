@@ -974,8 +974,16 @@ rebase runbook.
   fields and leaves the accounting state unavailable.
   Per-file read and written bytes (2026-11-25) come from an elevated
   `Microsoft-Windows-Kernel-File` trace (`win/file_etw.rs`), started on demand
-  by the installed service and stopped by the same idle watchdog as the disk
-  and network traces: the Create event names a `FileObject`, that object's
+  and stopped by the same idle watchdog as the disk and network traces. Two
+  hosts exist and keep separate fixed session names (`FileTraceHost` in
+  `core_service.rs`): the installed LocalSystem service (`TaskMan-File-Service`)
+  answers `ProcessFileIo` requests from its own session, and an ELEVATED GUI
+  without the service (`TaskMan-File-App`) hosts the same trace on the direct
+  `WinActions::list_process_file_io` path, attaching its sample through the one
+  shared `file_etw::attach_file_io`. An app-side start that fails (the ordinary
+  unelevated GUI) is throttled for `APP_FILE_TRACE_RETRY` so the
+  once-per-second poll does not spin on a kernel refusal, and the snapshot then
+  stays `Unavailable`. The Create event names a `FileObject`, that object's
   Read and Write events carry the requested size, and the sizes are summed per
   (process, path). Names arrive as device paths, so they are translated to the
   DOS paths the handle walk reports (`QueryDosDeviceW`, cached) before being
@@ -988,9 +996,9 @@ rebase runbook.
   `etw::pointer_bytes` answers the caller's-width question and must not be used
   here. Buckets are bound to the created time the request verified, so a reused
   pid starts fresh. Limits: these are REQUESTED sizes, not
-  completed transfers; the trace only exists in the elevated service, so the
-  direct path keeps reporting `Unavailable`; a handle whose Create is not in
-  the trace (opened before the session started, or whose event was dropped)
+  completed transfers; an unelevated process has no session at all, so the
+  direct path there keeps reporting `Unavailable`; a handle whose Create is
+  not in the trace (opened before the session started, or dropped by ETW)
   contributes unnamed bytes rather than a name; `events_lost` makes every count
   a lower bound; the open-file map is capped and cleared at the cap, and paths
   beyond the per-process or the session-wide cap go to the omitted remainder
