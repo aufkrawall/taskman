@@ -119,7 +119,9 @@
 //! * [`MAX_TRACKED_FILES_PER_PID`] and [`MAX_TRACKED_FILES`] cap paths; past
 //!   them bytes go to the omitted remainder and the drop is counted.
 //! * A `FileObject` used by a DIFFERENT process than the one that opened it (a
-//!   duplicated handle) keeps its bytes unnamed for that process.
+//!   duplicated or inherited handle) is not a name that process inherits: its
+//!   bytes wait as unnamed until the handle table shows that process holding
+//!   the object, and are charged to it from then on (see [`OpenFile`]).
 //!
 //! ## Lifetime
 //!
