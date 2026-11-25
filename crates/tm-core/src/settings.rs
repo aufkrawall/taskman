@@ -780,6 +780,14 @@ impl Settings {
     /// Load settings from `path` (or the platform default). A missing file
     /// yields defaults; unparsable values fall back per-key to defaults.
     pub fn load_from(path: &Path) -> Self {
+        Self::load_from_checked(path).0
+    }
+
+    /// Read `path` and report whether its contents could be used. A file that
+    /// is present but unreadable (oversized, corrupt, locked) is kept aside
+    /// and reported unusable, so [`Settings::load`] can still fall back to the
+    /// legacy JSON settings instead of letting defaults shadow them.
+    fn load_from_checked(path: &Path) -> (Self, bool) {
         let bytes = read_capped(path, MAX_SETTINGS_BYTES);
         match bytes {
             Ok(bytes) => {
@@ -788,18 +796,18 @@ impl Settings {
                 let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
                 let s = Self::from_ini_text(text);
                 tracing::debug!(path = %path.display(), "settings loaded");
-                s
+                (s, true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(path = %path.display(), "no settings file; using defaults");
-                Self::default()
+                (Self::default(), false)
             }
             Err(error) => {
                 // Present but unusable (oversized, unreadable): keep it so the
                 // first autosave cannot overwrite the user's real settings.
                 tracing::warn!(path = %path.display(), %error, "settings file unusable");
                 crate::persist::set_aside(path, "settings file");
-                Self::default()
+                (Self::default(), false)
             }
         }
     }
@@ -1063,12 +1071,22 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let ini = taskman_config_dir().join("config.ini");
-        if ini.exists() {
-            return Self::load_from(&ini);
+        Self::load_from_dir(&taskman_config_dir())
+    }
+
+    /// Read the settings files in `dir`: `config.ini`, else the legacy
+    /// `settings.json` of older builds. An INI that exists but cannot be read
+    /// is unusable rather than empty, so the JSON migration still runs and the
+    /// first autosave cannot replace JSON-era settings with defaults. When
+    /// neither source is usable the INI result (defaults) is returned.
+    fn load_from_dir(dir: &Path) -> Self {
+        let ini = dir.join("config.ini");
+        let (from_ini, ini_usable) = Self::load_from_checked(&ini);
+        if ini_usable {
+            return from_ini;
         }
         // One-time migration from the legacy JSON settings of older builds.
-        let json = taskman_config_dir().join("settings.json");
+        let json = dir.join("settings.json");
         if json.exists() {
             let legacy = read_capped(&json, MAX_SETTINGS_BYTES).and_then(|bytes| {
                 String::from_utf8(bytes)
@@ -1094,7 +1112,7 @@ impl Settings {
                 Err(e) => tracing::warn!(error = %e, "cannot read legacy settings.json"),
             }
         }
-        Self::load_from(&ini)
+        from_ini
     }
 
     // --------------------------------------------------------------- saving
@@ -1567,6 +1585,36 @@ text_smoothing=banana
         assert_eq!(Settings::load_from(&path), Settings::default());
         // ...and the unusable file is kept aside, so the first autosave of
         // those defaults cannot destroy what it held.
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("config.ini.bad"))
+                .unwrap()
+                .len(),
+            (MAX_SETTINGS_BYTES + 1) as u64
+        );
+    }
+
+    /// A successful legacy migration must survive an INI that exists but is
+    /// unusable. Returning defaults there would let the first autosave write
+    /// them into config.ini and shadow the user's JSON-era settings forever.
+    #[test]
+    fn unusable_ini_still_migrates_the_legacy_json_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"theme":"Dark","update_speed":"High","graph_seconds":90}"#,
+        )
+        .unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, vec![b'x'; MAX_SETTINGS_BYTES + 1]).unwrap();
+
+        let loaded = Settings::load_from_dir(dir.path());
+
+        // The JSON values, not the defaults (System/Normal/60).
+        assert_eq!(loaded.theme, ThemeMode::Dark);
+        assert_eq!(loaded.update_speed, UpdateSpeed::High);
+        assert_eq!(loaded.graph_seconds, 90);
+        // The unusable INI is still kept aside instead of being overwritten.
         assert!(!path.exists());
         assert_eq!(
             std::fs::metadata(dir.path().join("config.ini.bad"))
