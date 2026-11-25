@@ -389,6 +389,18 @@ fn measured_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     measured.then_some(total)
 }
 
+/// Whether the per-file byte columns have no source AT ALL, as opposed to a
+/// source that has measured nothing for this process yet.
+///
+/// This is the one state a user can act on, and the only one that needs a line
+/// of its own: a Kernel-File trace requires elevation and either the installed
+/// service or an elevated process, so without them the Read and Written columns
+/// are not a gap in time but a gap in privilege. Left unexplained, a table full
+/// of "—" reads as a broken feature.
+fn per_file_bytes_need_a_source(accounting: Option<&FileIoAccounting>) -> bool {
+    accounting.is_some_and(|accounting| accounting.state == FileIoAccountingState::Unavailable)
+}
+
 fn cmp_known_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) if ascending => a.cmp(&b),
@@ -832,6 +844,18 @@ pub fn show(
             );
         }
         return;
+    }
+
+    // Above the table, so the Read and Written columns are explained rather
+    // than left to look broken: without a trace there is nothing to show in
+    // them for any row, however open the files are.
+    if per_file_bytes_need_a_source(state.accounting.as_ref()) {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(i18n::tr(K::PropIoPerFileNeedsSource))
+                .small()
+                .color(pal.text_dim),
+        );
     }
 
     ui.add_space(4.0);
@@ -1333,6 +1357,36 @@ mod tests {
         let half = files_summary(Some(1024), None).expect("a measured read total is stated");
         assert!(half.contains(read_bytes.as_str()));
         assert!(half.contains('\u{2014}'));
+    }
+
+    /// The table's Read and Written columns can be empty for two different
+    /// reasons and only one of them is actionable. "No trace at all" (an
+    /// unelevated run without the service) is explained above the table as a
+    /// privilege requirement; "nothing measured yet" is a gap in time and gets
+    /// no such line, or the page would blame the token for a quiet process.
+    #[test]
+    fn only_a_missing_trace_needs_the_elevation_note() {
+        let accounting = |state| FileIoAccounting {
+            state,
+            ..Default::default()
+        };
+        assert!(per_file_bytes_need_a_source(Some(&accounting(
+            FileIoAccountingState::Unavailable
+        ))));
+        for state in [
+            FileIoAccountingState::Measured,
+            FileIoAccountingState::Undelivered,
+            FileIoAccountingState::Undecodable,
+        ] {
+            assert!(
+                !per_file_bytes_need_a_source(Some(&accounting(state))),
+                "{state:?} has a source and must not claim it needs elevation"
+            );
+        }
+        assert!(
+            !per_file_bytes_need_a_source(None),
+            "no answer yet is not the same as no source"
+        );
     }
 
     #[test]

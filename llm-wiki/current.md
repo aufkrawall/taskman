@@ -983,7 +983,11 @@ rebase runbook.
   shared `file_etw::attach_file_io`. An app-side start that fails (the ordinary
   unelevated GUI) is throttled for `APP_FILE_TRACE_RETRY` so the
   once-per-second poll does not spin on a kernel refusal, and the snapshot then
-  stays `Unavailable`. The Create event names a `FileObject`, that object's
+  stays `Unavailable`. The I/O page keys one dim line above the file table off
+  exactly that state (`per_file_bytes_need_a_source`), saying per-file bytes
+  need elevation or the installed service — `Undelivered`/`Undecodable` get no
+  such line, because a source exists and the gap is in time, not privilege.
+  The Create event names a `FileObject`, that object's
   Read and Write events carry the requested size, and the sizes are summed per
   (process, path). Names arrive as device paths, so they are translated to the
   DOS paths the handle walk reports (`QueryDosDeviceW`, cached) before being

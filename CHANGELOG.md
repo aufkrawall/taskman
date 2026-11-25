@@ -8,6 +8,7 @@
 
 ### Improved
 
+- **The I/O page says why per-file bytes are missing.** When no per-file trace can run, Process Properties → I/O prints one dim line above the file table saying that bytes per file need administrator rights or the installed service, instead of leaving the Read and Written columns to read as a broken table. A row without a record still shows "—", and a measured zero still shows "0 B".
 - **Process lists stop rebuilding paint inputs they never read.** The Processes list laid out every visible row's name text on every repaint only to answer a tooltip, and cloned each row's tooltip string even when a higher-precedence tip won; the name is measured only under the pointer now and the tip is borrowed. The file-I/O summary moved into one predicate so a measured-zero list, an all-unknown list and a half-measured list each have a test.
 - **Table guides are one crisp physical pixel from header to body.** Column dividers and the header separators now snap to a pixel centre and use a 1-physical-pixel stroke, so the guides match at any DPI or UI zoom instead of smearing across two pixels (and falling below one when zoomed out).
 - **The settings INI is parsed once per start.** The usability check and the field mapping shared one read and one parse instead of reading a file of up to 4 MiB twice.
