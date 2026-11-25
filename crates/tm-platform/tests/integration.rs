@@ -1476,6 +1476,90 @@ fn the_file_trace_measures_exact_bytes_per_file() {
     );
 }
 
+/// Follow a live process through the production trace for 15 s and print
+/// what each step saw: the handle-table names, then the sample. Set
+/// `TASKMAN_FILE_TRACE_PID`; skipped without it.
+#[test]
+#[ignore = "starts a machine-wide ETW session; needs elevation and TASKMAN_FILE_TRACE_PID"]
+fn the_file_trace_follows_a_live_process() {
+    let Some(pid) = std::env::var("TASKMAN_FILE_TRACE_PID")
+        .ok()
+        .and_then(|pid| pid.parse::<u32>().ok())
+    else {
+        eprintln!("TASKMAN_FILE_TRACE_PID is not set");
+        return;
+    };
+    let epoch = tm_platform::win::process_start_epoch_for_test(pid);
+    eprintln!("pid {pid} epoch {epoch}");
+    let names = tm_platform::win::name_file_objects_for_test(pid, epoch);
+    eprintln!("handle table named {} objects", names.len());
+    for (object, path) in &names {
+        eprintln!("  {object:#x} {path}");
+    }
+    let (trace, session) = match tm_platform::win::file_etw_test_start() {
+        Ok(started) => started,
+        Err(refusal) => {
+            eprintln!("no per-file session was started: {refusal:?}");
+            return;
+        }
+    };
+    eprintln!("session {session}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut sample = trace.sample(pid, epoch, &tm_platform::win::live_pids_for_test());
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        sample = trace.sample(pid, epoch, &tm_platform::win::live_pids_for_test());
+    }
+    eprintln!(
+        "state={:?} transfers r/w={}/{} unnamed={:?} omitted={:?}",
+        sample.state(),
+        sample.pid_read_transfers,
+        sample.pid_write_transfers,
+        sample.unnamed,
+        sample.omitted
+    );
+    for (path, bytes) in &sample.files {
+        eprintln!(
+            "  {path} read={} written={}",
+            bytes.read_bytes, bytes.write_bytes
+        );
+    }
+    drop(trace);
+    // The request path the GUI uses: the broker when it answers, this
+    // process's own trace otherwise.
+    use tm_platform::actions::PlatformActions;
+    let actions = tm_platform::win::WinActions;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        last = Some(actions.list_process_file_io(pid, Some(epoch)));
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    match last.expect("asked at least once") {
+        Ok(snapshot) => {
+            let accounting = &snapshot.accounting;
+            eprintln!(
+                "request path: state={:?} since={} ms r/w={}/{} bytes r/w={}/{} unnamed r/w={}/{}",
+                accounting.state,
+                accounting.since_ms,
+                accounting.read_ops,
+                accounting.write_ops,
+                accounting.read_bytes,
+                accounting.write_bytes,
+                accounting.unnamed_read_bytes,
+                accounting.unnamed_write_bytes
+            );
+            for file in &snapshot.files {
+                eprintln!(
+                    "  {} handles={} read={:?} written={:?}",
+                    file.path, file.open_handles, file.read_bytes, file.write_bytes
+                );
+            }
+        }
+        Err(error) => eprintln!("request path failed: {error}"),
+    }
+}
+
 #[test]
 fn list_process_file_io_for_system_process_succeeds_without_error() {
     let actions = tm_platform::win::WinActions;

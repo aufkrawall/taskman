@@ -39,6 +39,15 @@
   within milliseconds (sequential reuse; matching by `Irp` stays correct because
   every request on an `Irp` retires the previous one), and without
   `SeDebugPrivilege` the handle table reports every object address as 0.
+- Second check: "greencurve writes its debug log every few seconds, not shown".
+  The raw stream and the production trace agreed over the same 40 s: zero write
+  requests by the process. Its `Win32_Process` counters showed 5 writes / 98 KB
+  in 15 s — IPC to its GUI (pipe/device writes are in `IO_COUNTERS` but not in
+  the `FileIo` stream) — and the log file itself had not changed for minutes
+  (last appends ~45 s–2 min apart). When it does append, the trace attributes
+  it (104 B on the log row in one window). The page cannot yet say that the
+  graph's writes went to non-file objects; that needs a counter baseline per
+  traced process.
 - Rejected: dedup of fast-I/O retries by (thread, object, offset, size) — the
   completion status says it directly. Not done: completed sizes for memory-mapped
   I/O, and a Linux per-file source (needs eBPF).

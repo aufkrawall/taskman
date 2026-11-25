@@ -89,6 +89,14 @@ rights. The per-file probe prints which of the ordered attempts actually started
 the refusal that stopped both, then checks exact (read, written) bytes for a file
 opened before the trace started (named from the handle table) and one opened
 after it (named by its Create), with cache-flush paging writes excluded.
+`the_file_trace_follows_a_live_process` (also ignored) follows another process:
+set `TASKMAN_FILE_TRACE_PID`, and it prints the handle-table names, the trace's
+own 15 s sample and then 20 s of the GUI's request path (`WinActions`, broker
+first), so "the page shows nothing" can be split into "the process did no file
+I/O", "the trace missed it" and "the request path lost it". Compare against the
+process's `WriteOperationCount`/`WriteTransferCount` (`Win32_Process`): those
+count every `NtWriteFile`, including pipes and devices, which the `FileIo`
+stream does not carry.
 `sudo` (Windows 11, enabled here) runs it elevated; with the new-window mode
 redirect the output to a file from a `.cmd` wrapper.
 The protected-module and profile probes print an explicit privilege

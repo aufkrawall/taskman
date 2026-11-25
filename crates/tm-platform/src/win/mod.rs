@@ -66,6 +66,30 @@ pub fn own_start_epoch_for_test() -> i64 {
     .unwrap_or(0)
 }
 
+/// Another process's creation identity, as a broker request would carry it,
+/// or 0 when it cannot be read.
+#[doc(hidden)]
+pub fn process_start_epoch_for_test(pid: u32) -> i64 {
+    let Ok(handle) = process_ops::open_process_verified(
+        pid,
+        windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+        None,
+    ) else {
+        return 0;
+    };
+    let epoch = process_ops::creation_epoch_from_handle(handle).unwrap_or(0);
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+    epoch
+}
+
+/// The handle-table naming the per-file trace uses, for a live diagnostic.
+#[doc(hidden)]
+pub fn name_file_objects_for_test(pid: u32, start_epoch: i64) -> Vec<(u64, String)> {
+    process_file_io::name_file_objects(pid, start_epoch, None)
+}
+
 #[doc(hidden)]
 pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
     core_service::live_pids_for_test()
