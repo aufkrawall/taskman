@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Per-file read and written bytes:** the I/O page of Process Properties shows how many bytes a process read from and wrote to each open file, measured by a `Microsoft-Windows-Kernel-File` trace hosted by the elevated service (Create names the file object, its Read and Write events carry the size, and the sizes are summed per process and path). The column stays "—" for a file the trace saw nothing of, and the non-elevated path still reports per-file accounting as unavailable, so without the installed and elevated service the numbers are absent rather than zero.
+
 ### Improved
 
 - **Process lists stop rebuilding paint inputs they never read.** The Processes list laid out every visible row's name text on every repaint only to answer a tooltip, and cloned each row's tooltip string even when a higher-precedence tip won; the name is measured only under the pointer now and the tip is borrowed. The file-I/O summary moved into one predicate so a measured-zero list, an all-unknown list and a half-measured list each have a test.

@@ -119,6 +119,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     through a thread map seeded from ToolHelp and maintained by the
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
+    `file_etw.rs` (per-file read/written bytes from
+    `Microsoft-Windows-Kernel-File`: Create correlates a `FileObject` with its
+    name, Read/Write add `IOSize` to that (pid, path) pair, both template
+    versions are decoded, device paths are translated to the DOS paths the
+    handle walk reports, and the open-file map and per-process path list are
+    capped with a counted drop),
     `profile_etw.rs` (demand-only system-profile sampling for one exact
     process; MOF sample type 46, profile-privilege enablement, thread
     ownership, page aggregation, module attribution, ETW-loss/lower-bound
@@ -430,8 +436,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   `panic = "abort"` and a kill run no destructor, so an orphan remains until
   the next run reclaims it by name or the user reboots. Only sessions THIS
   process started are stopped — a crashing GUI must not stop the still-healthy
-  service's. `net_etw`/`disk_etw`/`profile_etw`/`module_etw` pin their names
-  against that list.
+  service's. `net_etw`/`disk_etw`/`file_etw`/`profile_etw`/`module_etw` pin
+  their names against that list.
 - The GUI's `--selfcheck-code-samples` diagnostic runs the installed-path
   client through the real broker, workload, system-profile provider, and
   page-to-module attribution. It is the end-to-end coverage that a unit test

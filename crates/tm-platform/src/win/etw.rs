@@ -1,9 +1,10 @@
 //! Shared plumbing for the real-time ETW sessions this program hosts.
 //!
-//! Two features need one: per-process network bytes ([`super::net_etw`]) and
-//! per-process disk service time ([`super::disk_etw`]). The lifetime rules are
-//! identical for both and every one of them has already been learned the hard
-//! way, so they live here once instead of being copied:
+//! Three features need one: per-process network bytes ([`super::net_etw`]),
+//! per-process disk service time ([`super::disk_etw`]) and per-file read and
+//! written bytes ([`super::file_etw`]). The lifetime rules are identical for
+//! all of them and every one has already been learned the hard way, so they
+//! live here once instead of being copied:
 //!
 //! * **Starting a session needs administrator rights** (or membership in
 //!   "Performance Log Users"). When that fails the caller stays inactive and
@@ -46,14 +47,16 @@ const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
 
 /// Every session name this program can ever start.
 ///
-/// Fixed and exhaustive by design (see the module docs): eight names, four
+/// Fixed and exhaustive by design (see the module docs): ten names, five
 /// features times two hosting roles. Knowing them all is what lets a crashed
 /// run be cleaned up without a per-process registry.
-pub(crate) const SESSION_NAMES: [&str; 8] = [
+pub(crate) const SESSION_NAMES: [&str; 10] = [
     "TaskMan-Net-Service",
     "TaskMan-Net-App",
     "TaskMan-Disk-Service",
     "TaskMan-Disk-App",
+    "TaskMan-File-Service",
+    "TaskMan-File-App",
     "TaskMan-Profile-Service",
     "TaskMan-Profile-App",
     "TaskMan-Modules-Service",
@@ -151,6 +154,12 @@ pub(crate) struct Provider {
 pub(crate) enum LoggerKind {
     /// An ordinary session for manifest providers.
     Manifest,
+    /// An ordinary session for a manifest provider with a much higher event
+    /// rate than the rest. `Microsoft-Windows-Kernel-File` reports every read
+    /// and write on the machine, which fills the 64 KiB default buffer set in
+    /// tens of milliseconds under a build and loses events by the thousand, so
+    /// this kind asks for larger buffers (and more of them) instead.
+    ManifestBulk,
     /// A system logger, the only kind that can carry the kernel's own
     /// providers (`SystemIoProviderGuid` and friends). Their events arrive as
     /// classic MOF records — identified by the MOF class GUID in
@@ -452,7 +461,7 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         (*properties).Wnode.ClientContext = 1;
         (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE
             | match kind {
-                LoggerKind::Manifest => 0,
+                LoggerKind::Manifest | LoggerKind::ManifestBulk => 0,
                 // The only way to subscribe to the kernel's own providers
                 // without taking over the single global "NT Kernel Logger".
                 LoggerKind::System | LoggerKind::SystemLoader | LoggerKind::SystemProfile => {
@@ -464,18 +473,22 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         // the logger. Request the corresponding legacy flags up front so a
         // loader/sample session reliably receives that initial state.
         (*properties).EnableFlags = match kind {
-            LoggerKind::Manifest | LoggerKind::System => EVENT_TRACE_FLAG::default(),
+            LoggerKind::Manifest | LoggerKind::ManifestBulk | LoggerKind::System => {
+                EVENT_TRACE_FLAG::default()
+            }
             LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
             LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
         };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
         // sampling tick without reserving much non-paged memory. The profile
-        // stream and the initial loader rundown have much higher event rates,
-        // so they ask for a larger set.
+        // stream, the initial loader rundown and the file I/O stream have much
+        // higher event rates, so they ask for a larger set.
         let (buffer_kb, minimum, maximum) = match kind {
             LoggerKind::Manifest | LoggerKind::System => (64, 4, 16),
-            LoggerKind::SystemLoader | LoggerKind::SystemProfile => (256, 8, 32),
+            LoggerKind::ManifestBulk | LoggerKind::SystemLoader | LoggerKind::SystemProfile => {
+                (256, 8, 32)
+            }
         };
         (*properties).BufferSize = buffer_kb;
         (*properties).MinimumBuffers = minimum;
@@ -536,6 +549,22 @@ fn stop_session(handle: CONTROLTRACE_HANDLE, name: &[u16], properties: &mut [u64
     };
     if status != ERROR_SUCCESS {
         tracing::debug!(error = status.0, "stopping a real-time trace failed");
+    }
+}
+
+/// Pointer width of the process the record came from.
+///
+/// ETW flags 32-bit records explicitly, and the pointers embedded in a payload
+/// occupy that many bytes. Getting this wrong does not fail loudly: it shifts
+/// every following field by four bytes and charges whatever number lands
+/// there. Callers validate the fields they read so a misread becomes
+/// "unknown" instead of a confident lie.
+pub(crate) fn pointer_bytes(record: &EVENT_RECORD) -> usize {
+    const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
+    if record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER != 0 {
+        4
+    } else {
+        8
     }
 }
 
@@ -608,6 +637,23 @@ mod tests {
                 };
                 assert_eq!((*properties).EnableFlags, expected_flags);
             }
+        }
+    }
+
+    /// The file trace is the highest-rate provider this program subscribes
+    /// to, but it is still an ordinary manifest session: taking the system
+    /// logger mode for it would be wrong, and the small default buffer set
+    /// loses events.
+    #[test]
+    fn a_bulk_manifest_logger_stays_a_manifest_logger_with_bigger_buffers() {
+        let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
+        let buffer = properties_buffer(&name, LoggerKind::ManifestBulk);
+        let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        unsafe {
+            assert_eq!((*properties).LogFileMode, EVENT_TRACE_REAL_TIME_MODE);
+            assert_eq!((*properties).EnableFlags, EVENT_TRACE_FLAG::default());
+            assert_eq!((*properties).BufferSize, 256);
+            assert!((*properties).MaximumBuffers >= 32);
         }
     }
 

@@ -8,6 +8,7 @@ pub(crate) mod cpu_load;
 mod disk_etw;
 mod etw;
 mod explorer_restart;
+mod file_etw;
 mod gpu;
 pub(crate) mod hotkey_hook;
 pub mod icons;

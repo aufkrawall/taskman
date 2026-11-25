@@ -756,6 +756,27 @@ mod tests {
         assert!(snapshot.accounting.counter_read_bytes.is_some());
     }
 
+    /// The local walk has no per-file byte source and must keep saying so: a
+    /// Kernel-File trace needs elevation, which this path does not have. If a
+    /// caller ever sees anything but `Unavailable` here, the numbers came from
+    /// somewhere they should not have.
+    #[test]
+    fn the_local_walk_reports_per_file_bytes_as_unavailable() {
+        let snapshot =
+            list_process_file_io(std::process::id(), None).expect("query current process files");
+        assert_eq!(
+            snapshot.accounting.state,
+            FileIoAccountingState::Unavailable
+        );
+        assert!(snapshot.files.iter().all(|file| file.read_bytes.is_none()
+            && file.write_bytes.is_none()
+            && file.read_ops.is_none()
+            && file.write_ops.is_none()));
+        assert_eq!(snapshot.accounting.read_bytes, 0);
+        assert_eq!(snapshot.accounting.unnamed_read_bytes, 0);
+        assert_eq!(snapshot.accounting.omitted_read_bytes, 0);
+    }
+
     #[test]
     fn non_existent_process_returns_error() {
         let result = list_process_file_io(999_999_999, None);

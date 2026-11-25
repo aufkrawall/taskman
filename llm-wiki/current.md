@@ -972,6 +972,23 @@ rebase runbook.
   non-regular devices. It has no per-file trace, so every row's byte/op counts
   stay `None`; `/proc/<pid>/io` fills only the explicit process-wide counter
   fields and leaves the accounting state unavailable.
+  Per-file read and written bytes (2026-11-25) come from an elevated
+  `Microsoft-Windows-Kernel-File` trace (`win/file_etw.rs`), started on demand
+  by the installed service and stopped by the same idle watchdog as the disk
+  and network traces: the Create event names a `FileObject`, that object's
+  Read and Write events carry the requested size, and the sizes are summed per
+  (process, path). Names arrive as device paths, so they are translated to the
+  DOS paths the handle walk reports (`QueryDosDeviceW`, cached) before being
+  matched case-insensitively; a record with no row becomes unnamed bytes and a
+  row with no record stays `None`. Limits: these are REQUESTED sizes, not
+  completed transfers; the trace only exists in the elevated service, so the
+  direct path keeps reporting `Unavailable`; a handle whose Create is not in
+  the trace (opened before the session started, or whose event was dropped)
+  contributes unnamed bytes rather than a name; `events_lost` makes every count
+  a lower bound; the open-file map is capped and cleared at the cap with a
+  dropped counter, and paths beyond the per-process cap go to the omitted
+  remainder; and the totals restart when the idle watchdog stops the session
+  and the next request starts a new one.
   Threads come from one
   `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
   and service processes work unelevated); Windows 11 build 26300 ZEROES that

@@ -504,7 +504,7 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
             // Flush and the *Init variants carry no completed transfer.
             _ => return,
         };
-        match parse_disk_event(payload, pointer_bytes(record)) {
+        match parse_disk_event(payload, etw::pointer_bytes(record)) {
             Some(request) => shared.record_request(request, write),
             None => shared.record_undecodable(record.UserDataLength.into()),
         }
@@ -522,18 +522,6 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
             }
             _ => {}
         }
-    }
-}
-
-/// Pointer width of the process the record came from. ETW flags 32-bit
-/// records explicitly, and the disk payload embeds two pointers before the
-/// fields we read.
-fn pointer_bytes(record: &EVENT_RECORD) -> usize {
-    const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = 0x0020;
-    if record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER != 0 {
-        4
-    } else {
-        8
     }
 }
 
