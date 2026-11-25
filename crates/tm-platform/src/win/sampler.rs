@@ -642,11 +642,11 @@ impl Sampler {
                         security.virtualization = token.virtualization;
                     }
                 }
-                // No service, a foreign client, a busy telemetry lane or a
-                // policy refusal: the account stays unknown ("—", never a
-                // guess), and the ask is retried after the horizon. Only the
-                // first refusal is worth a line — it is a state explanation,
-                // not per-process news.
+                // No service, a foreign client, a busy telemetry lane, a policy
+                // refusal or an answer that was lost in transport: the account
+                // stays unknown ("—", never a guess), and the ask is retried
+                // after the horizon. Only the first refusal is worth a line —
+                // it is a state explanation, not per-process news.
                 core_service::BrokeredIdentity::Unavailable => {
                     identity_retry_at = Some(Instant::now());
                 }
