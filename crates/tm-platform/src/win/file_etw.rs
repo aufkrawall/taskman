@@ -244,13 +244,23 @@ const EVENT_READ: u8 = 67;
 const EVENT_WRITE: u8 = 68;
 const EVENT_OP_END: u8 = 76;
 
-/// The other `FileIo` REQUEST opcodes (set/query information, directory
-/// enumeration and notification, flush, file-system control, path
-/// operations). Their payloads lead with the `Irp`, which is all this module
-/// reads from them: a new request on an `Irp` retires whatever was pending on
-/// it. Name records (0, 32, 35, 36) lead with a file key instead and are not in
-/// this range.
-const OTHER_REQUESTS: std::ops::RangeInclusive<u8> = 69..=86;
+/// Whether `opcode` is one of the other `FileIo` REQUEST opcodes (set/query
+/// information, directory enumeration and notification, flush, file-system
+/// control, path operations). Their payloads lead with the `Irp`, which is all
+/// this module reads from them: a new request on an `Irp` retires whatever was
+/// pending on it.
+///
+/// The range is split around [`EVENT_OP_END`] (76) on purpose. It belongs to
+/// the same numbered family but is a COMPLETION, not a request, and it is
+/// decoded rather than retired: a single `69..=86` range silently classified a
+/// completion as "another request on this `Irp`", so any reordering of
+/// [`handle_payload`]'s arms (or a future early dispatch) would have retired a
+/// transfer instead of charging it and dropped every byte it carried. Name
+/// records (0, 32, 35, 36) lead with a file key instead and are not in this
+/// range either.
+fn is_other_request(opcode: u8) -> bool {
+    matches!(opcode, 69..=75 | 77..=86)
+}
 
 /// The template version every layout here was measured on.
 const FILE_IO_VERSION: u8 = 3;
@@ -299,8 +309,15 @@ const MAX_TRACKED_FILES: usize = 65_536;
 /// not trigger one per poll. A process's FIRST sample is never throttled.
 const SEED_INTERVAL: Duration = Duration::from_secs(2);
 
-/// `Process` class opcode of a process exit.
+/// `Process` class opcode of a process start: it names the pid's
+/// `UniqueProcessKey`.
+const PROCESS_START: u8 = 1;
+/// `Process` class opcode of a process exit: it ends the accounting of the
+/// process that holds the pid; see [`State::process_ended`].
 const PROCESS_END: u8 = 2;
+/// The session-start rundown's start record: every process alive when the
+/// session opened, with the same layout as [`PROCESS_START`].
+const PROCESS_DC_START: u8 = 3;
 
 /// How long a miss may reuse the drive list before it is rescanned. A miss is
 /// normal (`\Device\Mup\...` is a network share and never maps to a drive), and
@@ -857,6 +874,21 @@ struct State {
     /// Entries across all of `unresolved`, for [`MAX_UNRESOLVED_OBJECTS`].
     unresolved_count: usize,
     pids: HashMap<u32, PidFiles>,
+    /// `UniqueProcessKey` of the process currently holding a pid, from its
+    /// `Process` start record (or the session-start rundown).
+    ///
+    /// The callback cannot tell which incarnation of a pid a record belongs to,
+    /// which is why every other decision here is made from a record's own
+    /// evidence. An exit record was the exception: it dropped by pid alone.
+    /// Windows reuses a pid within about a second while the `Process` class
+    /// itself arrives up to a flush interval (the session asks for a 1 s timer)
+    /// late, so the PREVIOUS owner's exit could arrive after the pid's new
+    /// owner had already written — and dropping by pid alone threw those bytes
+    /// away with the bucket, so the new process read as a measured zero until
+    /// its next transfer. The key the record carries settles it; a pid with no
+    /// recorded key (started before the session, or its start record was lost)
+    /// keeps the old behaviour: an exit drops it.
+    process_keys: HashMap<u32, u64>,
     /// Distinct paths held across every bucket in `pids`. Rebuilt by
     /// [`State::prune_dead`] and [`State::bind_epoch`] after they drop buckets.
     tracked_paths: usize,
@@ -888,6 +920,7 @@ impl State {
     /// entries would otherwise accumulate for the lifetime of the service.
     fn prune_dead(&mut self, live_pids: &HashSet<u32>) {
         self.pids.retain(|pid, _| live_pids.contains(pid));
+        self.process_keys.retain(|pid, _| live_pids.contains(pid));
         self.keep_pids(|pid| live_pids.contains(&pid));
         self.tracked_paths = self.pids.values().map(|files| files.files.len()).sum();
     }
@@ -936,6 +969,10 @@ impl State {
                 self.tracked_paths = self.tracked_paths.saturating_sub(files.files.len());
             }
             self.keep_pids(|other| other != pid);
+            // `process_keys[pid]` is deliberately NOT cleared with the bucket:
+            // a delayed exit record for the PREVIOUS incarnation is still
+            // compared against it, and forgetting it would make that record
+            // look unverifiable and drop this bucket instead.
             tracing::debug!(
                 pid,
                 start_epoch_s,
@@ -1066,9 +1103,37 @@ impl State {
         self.dropped_paths = self.dropped_paths.saturating_add(count as u64);
     }
 
-    /// A process exited: everything it owned in the session goes, so a pid
-    /// reused later starts from nothing.
-    fn process_ended(&mut self, pid: u32) {
+    /// A `Process` start (or the session-start rundown): bind `pid` to the
+    /// `UniqueProcessKey` of the incarnation that just started.
+    ///
+    /// The bucket itself is created by that process's first transfer, not here:
+    /// a start record says nothing about file I/O, and creating one per
+    /// process would put every pid on the machine into the path-budget maps.
+    fn process_started(&mut self, pid: u32, key: u64) {
+        self.process_keys.insert(pid, key);
+    }
+
+    /// A `Process/End` record: everything the process owned in the session goes,
+    /// so a pid reused later starts from nothing.
+    ///
+    /// The exit record carries the `UniqueProcessKey` of the process that
+    /// actually exited ([`Self::process_keys`]). When it names an EARLIER
+    /// holder of the pid — Windows reuses pids quickly and the record can be a
+    /// flush interval late — the bucket on screen belongs to the live process
+    /// that holds the pid now, and dropping it would discard bytes this session
+    /// already measured. Its own exit record drops it. No recorded key (or a
+    /// truncated payload) cannot be told apart, so it drops, as before.
+    fn process_ended(&mut self, pid: u32, key: Option<u64>) {
+        if let (Some(known), Some(ending)) = (self.process_keys.get(&pid).copied(), key)
+            && known != ending
+        {
+            tracing::trace!(
+                pid,
+                "file trace ignored a delayed process exit for a reused pid"
+            );
+            return;
+        }
+        self.process_keys.remove(&pid);
         if let Some(files) = self.pids.remove(&pid) {
             self.tracked_paths = self.tracked_paths.saturating_sub(files.files.len());
         }
@@ -1300,12 +1365,23 @@ impl Shared {
         }
     }
 
-    /// A `Process/End` record: drop everything `pid` owned.
-    fn process_ended(&self, pid: u32) {
+    /// A `Process` start (or rundown) record: the pid's process key; see
+    /// [`State::process_started`].
+    fn process_started(&self, pid: u32, key: u64) {
         if !self.live.load(Ordering::Relaxed) {
             return;
         }
-        self.lock().process_ended(pid);
+        self.lock().process_started(pid, key);
+    }
+
+    /// A `Process/End` record: drop everything `pid` owned, unless that pid
+    /// belongs to a later process than the one that exited; see
+    /// [`State::process_ended`].
+    fn process_ended(&self, pid: u32, key: Option<u64>) {
+        if !self.live.load(Ordering::Relaxed) {
+            return;
+        }
+        self.lock().process_ended(pid, key);
     }
 
     /// Another `FileIo` request on `irp`: retire what was pending on it.
@@ -1763,14 +1839,29 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         return;
     };
     if record.EventHeader.ProviderId == ProcessGuid {
-        // Only exits matter; the start rundown and starts carry nothing the
-        // accounting needs (a new process's bucket is created by its first
-        // transfer, and its coverage comes from its creation time).
-        if record.EventHeader.EventDescriptor.Opcode == PROCESS_END
-            && let Some(pid) = unsafe { etw::payload_of(record) }
-                .and_then(|payload| read_u32(payload, KERNEL_FILE_POINTER_BYTES))
-        {
-            shared.process_ended(pid);
+        // A start (or the rundown) names the pid's `UniqueProcessKey`; an exit
+        // ends the accounting of the process that holds the pid, which the key
+        // is what decides (see [`State::process_ended`]). A start record says
+        // nothing about file I/O, so a bucket is still created by that
+        // process's first transfer, and coverage comes from its creation time.
+        let opcode = record.EventHeader.EventDescriptor.Opcode;
+        if !matches!(opcode, PROCESS_START | PROCESS_END | PROCESS_DC_START) {
+            return;
+        }
+        let Some(payload) = (unsafe { etw::payload_of(record) }) else {
+            return;
+        };
+        // `UniqueProcessKey` at 0, the pid at `P`. A payload too short for
+        // either is no identity evidence, and both cases keep the old
+        // behaviour: an exit with no readable key drops the bucket.
+        let Some(pid) = read_u32(payload, KERNEL_FILE_POINTER_BYTES) else {
+            return;
+        };
+        let key = read_pointer(payload, 0, KERNEL_FILE_POINTER_BYTES);
+        if opcode == PROCESS_END {
+            shared.process_ended(pid, key);
+        } else if let Some(key) = key {
+            shared.process_started(pid, key);
         }
         return;
     }
@@ -1807,7 +1898,7 @@ fn handle_payload(shared: &Shared, pid: u32, opcode: u8, version: u8, payload: &
                 None => shared.undecodable(opcode, version, payload.len() as u32),
             }
         }
-        _ if OTHER_REQUESTS.contains(&opcode) && version == FILE_IO_VERSION => {
+        _ if is_other_request(opcode) && version == FILE_IO_VERSION => {
             if let Some(irp) = read_pointer(payload, 0, KERNEL_FILE_POINTER_BYTES) {
                 shared.other_request(irp);
             }
@@ -1896,6 +1987,28 @@ mod tests {
         payload.extend_from_slice(&bytes.to_le_bytes()[..P]); // ExtraInfo
         payload.extend_from_slice(&status.to_le_bytes()); // NtStatus
         payload
+    }
+
+    /// `Process` class start/exit payload, version 4: `UniqueProcessKey`, then
+    /// the pid.
+    fn process_payload(key: u64, pid: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&key.to_le_bytes()[..P]); // UniqueProcessKey
+        payload.extend_from_slice(&pid.to_le_bytes()); // ProcessId
+        payload.extend_from_slice(&[0u8; 60]); // the rest of the template
+        payload
+    }
+
+    /// Drive a `Process` class record of `opcode` through the real callback.
+    fn deliver_process(shared: &Shared, opcode: u8, key: u64, pid: u32) {
+        deliver_record_as(
+            shared,
+            windows::Win32::System::Diagnostics::Etw::ProcessGuid,
+            opcode,
+            4,
+            pid,
+            &process_payload(key, pid),
+        );
     }
 
     fn shared() -> Shared {
@@ -2774,6 +2887,66 @@ mod tests {
         assert_eq!(state.rejected_payload_len, 12);
     }
 
+    /// The opcode that RETIRES a pending request must never be the one that
+    /// completes it.
+    ///
+    /// Regression risk this pins: the "other request" range was `69..=86`,
+    /// which contains `OpEnd` (76). It only escaped retiring a transfer
+    /// because [`handle_payload`] matches the decoded opcodes first, so any
+    /// reordering of its arms would have dropped every completed transfer's
+    /// bytes with no counter changing.
+    #[test]
+    fn the_completion_opcode_is_not_an_other_request() {
+        assert!(
+            !is_other_request(EVENT_OP_END),
+            "a completion completes a request; it does not retire one"
+        );
+        for decoded in [
+            EVENT_CREATE,
+            EVENT_CLEANUP,
+            EVENT_CLOSE,
+            EVENT_READ,
+            EVENT_WRITE,
+        ] {
+            assert!(!is_other_request(decoded), "decoded opcode {decoded}");
+        }
+        // The request family around the completion still retires.
+        for request in [69u8, 70, 74, 75, 77, 78, 86] {
+            assert!(is_other_request(request), "opcode {request}");
+        }
+        // Name records and the ends of the range are not requests.
+        for other in [0u8, 32, 35, 36, 68, 87, 255] {
+            assert!(!is_other_request(other), "opcode {other}");
+        }
+        // And driving the real dispatch: a completion for a pending request
+        // still charges its bytes.
+        let shared = shared();
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\kept.bin"),
+        );
+        handle_payload(
+            &shared,
+            20,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 4_096),
+        );
+        handle_payload(
+            &shared,
+            20,
+            EVENT_OP_END,
+            FILE_IO_VERSION,
+            &op_end_payload(IRP, 4_096, 0),
+        );
+        assert_eq!(
+            bytes(&sample_of(&shared, 20), r"C:\data\kept.bin"),
+            read(4_096)
+        );
+    }
+
     /// The version-3 layouts, pinned against the bytes the live probe dumped
     /// (x64): a 100 000-byte read and a 64 KiB write on one file object, its
     /// Cleanup, and an `OpEnd`.
@@ -2911,6 +3084,69 @@ mod tests {
         assert_eq!(reborn.pid_transfers(), 1);
     }
 
+    /// A DELAYED exit record must not drop the accounting of the pid's next
+    /// owner.
+    ///
+    /// Windows reuses a pid within about a second and the `Process` class
+    /// arrives up to a flush interval late, so the previous owner's
+    /// `Process/End` can land after the new process has already written. The
+    /// `UniqueProcessKey` each record carries is what tells the two apart;
+    /// dropping by pid alone threw away the new process's measured bytes with
+    /// the bucket, and it then read as a measured zero until its next transfer.
+    #[test]
+    fn a_delayed_process_exit_keeps_the_pid_s_next_owner() {
+        const OLD_KEY: u64 = 0xffff_d007_0000_0040;
+        const NEW_KEY: u64 = 0xffff_d007_0000_0100;
+        let shared = shared();
+        // The session-start rundown named the previous owner's key, and it
+        // measured a transfer of its own.
+        deliver_process(&shared, PROCESS_DC_START, OLD_KEY, 50);
+        deliver(
+            &shared,
+            50,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\old\gone.bin"),
+        );
+        deliver(&shared, 50, EVENT_READ, &request_payload(0x1000, 64));
+        // The pid is reused: the new owner's start record arrives, it opens and
+        // writes its own file — and only then does the OLD owner's exit arrive.
+        deliver_process(&shared, PROCESS_START, NEW_KEY, 50);
+        deliver(
+            &shared,
+            50,
+            EVENT_CREATE,
+            &create_payload(0x2000, r"\??\C:\new\kept.bin"),
+        );
+        deliver(&shared, 50, EVENT_WRITE, &request_payload(0x2000, 40));
+        deliver_process(&shared, PROCESS_END, OLD_KEY, 50);
+        let sample = sample_of(&shared, 50);
+        assert_eq!(
+            bytes(&sample, r"C:\new\kept.bin"),
+            written(40),
+            "the live owner keeps the bytes this session measured"
+        );
+        assert_eq!(sample.pid_transfers(), 2, "both measured transfers survive");
+        assert_eq!(
+            shared.lock().process_keys.get(&50).copied(),
+            Some(NEW_KEY),
+            "the live owner's key is still the one on record"
+        );
+
+        // The live owner's own exit drops everything.
+        deliver_process(&shared, PROCESS_END, NEW_KEY, 50);
+        let sample = sample_of(&shared, 50);
+        assert!(sample.files.is_empty());
+        assert_eq!(sample.pid_transfers(), 0);
+        assert!(!shared.lock().process_keys.contains_key(&50));
+
+        // A pid with NO recorded key cannot be told apart, so an exit still
+        // drops it: the old behaviour survives where there is no evidence.
+        deliver(&shared, 50, EVENT_WRITE, &request_payload(0x2000, 8));
+        assert!(shared.lock().pids.contains_key(&50));
+        deliver_process(&shared, PROCESS_END, NEW_KEY, 50);
+        assert!(!shared.lock().pids.contains_key(&50));
+    }
+
     /// An inherited handle — a parent's redirected output written by its child
     /// — names one object for two processes. Once the handle table shows the
     /// child holding it, the child's bytes (including those that arrived
@@ -2949,7 +3185,7 @@ mod tests {
             "the parent keeps only its own bytes"
         );
         // The parent exits; the child still holds the object and its name.
-        shared.lock().process_ended(40);
+        shared.lock().process_ended(40, None);
         deliver(&shared, 44, EVENT_WRITE, &request_payload(0x5000, 1));
         assert_eq!(
             bytes(&sample_of(&shared, 44), r"C:\logs\out.txt"),
