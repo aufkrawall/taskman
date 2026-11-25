@@ -98,7 +98,12 @@ pub fn validate_name(name: &str) -> Result<()> {
 /// compared afterwards. Reading one byte past it is what proves an oversized
 /// stream without inflating the rest.
 fn inflate_bounded(decoder: impl Read, name: &str, declared: u64) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(declared.min(64 * 1024 * 1024) as usize);
+    // The declared size sizes nothing: it is untrusted, and a few hundred
+    // hostile bytes can claim a gigabyte and reserve 64 MiB before a single
+    // byte is read. Growth happens geometrically under the `take` bound below,
+    // which still caps the result at `declared + 1` bytes.
+    let reserve = declared.min(64 * 1024) as usize;
+    let mut out = Vec::with_capacity(reserve);
     decoder
         .take(declared.saturating_add(1))
         .read_to_end(&mut out)?;
