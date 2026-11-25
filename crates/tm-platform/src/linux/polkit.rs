@@ -67,11 +67,10 @@ pub fn handle_helper(args: &[String]) -> Option<i32> {
 
 /// Elevating the portable, user-writable TaskMan image would turn the Polkit
 /// prompt into privilege escalation for mutable code, so this path fails
-/// closed until a protected helper image exists.
+/// closed until a protected helper image exists. The refusal text is the same
+/// constructor the hidden helper's own arm uses.
 pub fn relaunch_elevated() -> Result<()> {
-    Err(TmError::Unsupported(
-        "elevated GUI relaunch from a portable, user-writable installation",
-    ))
+    Err(unsupported_relaunch())
 }
 
 /// Split the Run dialog's command line into argv and launch it directly. The
