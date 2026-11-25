@@ -95,10 +95,10 @@ fn reaping_thread(child: Child) -> Result<()> {
 ///
 /// The kernel's `pidfd` is preferred: it is readable as soon as the child
 /// exits, so no polling is needed. A kernel or seccomp profile that refuses
-/// `pidfd_open` falls back to a bounded `try_wait` poll. `what` names the
-/// program in the timeout diagnostic. A `TimedOut` return leaves the child
-/// running on purpose: only the caller knows whether the work is still wanted,
-/// so it decides to kill and reap.
+/// `pidfd_open`, or one whose `pidfd` never becomes readable, falls back to a
+/// bounded `try_wait` poll. `what` names the program in the timeout diagnostic.
+/// A `TimedOut` return leaves the child running on purpose: only the caller
+/// knows whether the work is still wanted, so it decides to kill and reap.
 pub(super) fn wait_for_exit(
     child: &mut Child,
     deadline: Instant,
@@ -112,7 +112,15 @@ pub(super) fn wait_for_exit(
             unsafe {
                 libc::close(fd as libc::c_int);
             }
-            return result;
+            // Only a pidfd that became readable proves the exit. A readiness
+            // that is not `POLLIN` — `poll` reports an unusable descriptor as
+            // `POLLNVAL` instead of failing — proves nothing, so the bounded
+            // `try_wait` loop below decides instead. Claiming an exit nobody
+            // observed would let the caller's `wait_with_output` block past
+            // this deadline.
+            if result? {
+                return Ok(());
+            }
         }
     }
 
@@ -128,8 +136,13 @@ pub(super) fn wait_for_exit(
     }
 }
 
+/// Poll the kernel's `pidfd` for the child's exit before `deadline`.
+///
+/// `Ok(true)` means the descriptor became readable, which is the kernel's exit
+/// signal. `Ok(false)` means it cannot be polled for exit at all, and the caller
+/// must prove the exit itself. An error is a passed deadline or a failed poll.
 #[cfg(target_os = "linux")]
-fn wait_pidfd(fd: libc::c_int, deadline: Instant, what: &str) -> std::io::Result<()> {
+fn wait_pidfd(fd: libc::c_int, deadline: Instant, what: &str) -> std::io::Result<bool> {
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -143,7 +156,7 @@ fn wait_pidfd(fd: libc::c_int, deadline: Instant, what: &str) -> std::io::Result
         };
         let result = unsafe { libc::poll(&mut pollfd, 1, remaining_ms) };
         if result > 0 {
-            return Ok(());
+            return Ok(pollfd.revents & libc::POLLIN != 0);
         }
         if result == 0 {
             continue;

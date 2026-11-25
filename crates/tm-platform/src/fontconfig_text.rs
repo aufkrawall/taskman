@@ -520,9 +520,10 @@ impl Drop for ChildWaiter {
 ///
 /// Returns whether the wait actually happened. A timeout counts as a wait — the caller
 /// re-checks its deadline either way — while an interrupted, failed or nonsensical call does
-/// not, so the caller can fall back to its backoff instead of re-polling at full speed.
-/// `poll` reports an unusable descriptor as `POLLNVAL` rather than an error, hence that check
-/// as well.
+/// not, so the caller can fall back to its backoff instead of re-polling at full speed. Only
+/// a readable `POLLIN` proves the exit: `poll` reports an unusable descriptor as `POLLNVAL`
+/// and a refused capability as `POLLERR`, both with a positive return value, so any other
+/// readiness has to fall back to the backoff as well.
 #[cfg(target_os = "linux")]
 fn poll_child_exit(fd: libc::c_int, remaining: std::time::Duration) -> bool {
     let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
@@ -534,7 +535,13 @@ fn poll_child_exit(fd: libc::c_int, remaining: std::time::Duration) -> bool {
     // SAFETY: `pollfd` describes one live descriptor for the duration of the call and the
     // timeout is bounded; a timeout or an interrupted call just re-enters the caller's loop.
     let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-    ready >= 0 && (pollfd.revents & libc::POLLNVAL) == 0
+    if ready < 0 {
+        return false;
+    }
+    if ready == 0 {
+        return true;
+    }
+    pollfd.revents & libc::POLLIN != 0
 }
 
 #[cfg(target_os = "linux")]
