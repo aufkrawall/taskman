@@ -214,8 +214,23 @@ fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<(
             "could not capture the authorization helper's output",
         ));
     };
-    let stdout = drain_pipe(stdout);
-    let stderr = drain_pipe(stderr);
+    let (stdout, stderr) = match (
+        drain_pipe("tm-linux-pkexec-stdout", stdout),
+        drain_pipe("tm-linux-pkexec-stderr", stderr),
+    ) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        // A refused thread must fail this action. `std::thread::spawn` panics
+        // instead, and release builds abort on panic, so the process would die
+        // rather than the service request.
+        (Err(error), _) | (_, Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TmError::platform(
+                action,
+                format!("could not start the thread that reads pkexec's output: {error}"),
+            ));
+        }
+    };
     // An interactive prompt is expected to take a while, but a hung agent or an
     // unanswered dialog must not park one of the two action lanes (and then its
     // queue) for the rest of the session.
@@ -255,12 +270,15 @@ fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<(
 }
 
 /// Read one of the helper's pipes to its end on its own thread, so the deadline
-/// wait and a chatty helper cannot block each other. The handle is deliberately
-/// dropped, never joined, on the timeout path: a descendant that inherited the
-/// pipe would make the join unbounded, which is the failure this bound exists
-/// to prevent.
-fn drain_pipe(pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
+/// wait and a chatty helper cannot block each other. A refused thread is
+/// returned to the caller, which kills and reaps the child and fails the action:
+/// the handle is deliberately dropped, never joined, on the timeout path,
+/// because a descendant that inherited the pipe would make the join unbounded.
+fn drain_pipe(
+    name: &'static str,
+    pipe: impl Read + Send + 'static,
+) -> std::io::Result<JoinHandle<Vec<u8>>> {
+    std::thread::Builder::new().name(name).spawn(move || {
         let mut pipe = pipe;
         let mut bytes = Vec::new();
         let _ = pipe.read_to_end(&mut bytes);
