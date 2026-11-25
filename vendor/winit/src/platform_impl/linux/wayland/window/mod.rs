@@ -367,6 +367,8 @@ impl Window {
     /// Wayland has no direct visibility query or compositor-level minimize query.
     ///
     /// The xdg-shell `SUSPENDED` repaint hint is the available hidden/minimized signal.
+    ///
+    /// TaskMan fork: upstream always returned `None` here. See `TASKMAN-FORK.md` §4.
     #[inline]
     pub fn is_minimized(&self) -> Option<bool> {
         Some(self.window_state.lock().unwrap().is_suspended())

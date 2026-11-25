@@ -162,6 +162,9 @@ pub struct WindowState {
     frame: Option<WinitFrame>,
 }
 
+// TaskMan fork: xdg-shell's `SUSPENDED` repaint hint is the only minimize/visibility
+// signal a Wayland client gets, so its transitions are tracked here and in
+// `WindowState::configure`. See `TASKMAN-FORK.md` §4.
 fn is_suspended_state(state: XdgWindowState) -> bool {
     state.contains(XdgWindowState::SUSPENDED)
 }
@@ -403,9 +406,10 @@ impl WindowState {
         // NOTE: Set the configure before doing a resize, since we query it during it.
         self.last_configure = Some(configure);
         if suspended_changed {
-            // A suspended surface does not necessarily receive the frame callback that
-            // normally throttles redraws. Let the compositor-triggered configure redraw
-            // through on both suspend and resume transitions.
+            // TaskMan fork: a suspended surface does not necessarily receive the
+            // frame callback that normally throttles redraws. Let the
+            // compositor-triggered configure redraw through on both suspend and
+            // resume transitions.
             self.frame_callback_reset();
         }
 
