@@ -996,9 +996,18 @@ impl BrokeredActions {
         }
     }
 
+    /// Run `request` and decode its answer, falling back to `local` when the
+    /// service is absent — and, when `lost_answer_falls_back` is set, when the
+    /// answer never arrived either.
+    ///
+    /// A lost answer is an unknown rather than a decision, so a caller that only
+    /// reads may take the local arm; a caller that changes state must pass
+    /// `false`, because repeating its side effect locally after an
+    /// unacknowledged attempt is how one reference becomes two.
     fn value_or_local<T>(
         &self,
         request: BrokerRequest,
+        lost_answer_falls_back: bool,
         decode: impl FnOnce(BrokerValue) -> Option<T>,
         local: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
@@ -1006,9 +1015,7 @@ impl BrokeredActions {
             Ok(value) => decode(value)
                 .ok_or_else(|| TmError::platform("core service", "unexpected response type")),
             Err(BrokerCallError::Unavailable(_)) => local(),
-            // One of this helper's callers changes state (a module unload), so a
-            // lost answer cannot fall back: repeating it locally could release a
-            // second reference after the service already released one.
+            Err(BrokerCallError::NoAnswer(_)) if lost_answer_falls_back => local(),
             Err(BrokerCallError::NoAnswer(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -1195,6 +1202,9 @@ impl PlatformActions for BrokeredActions {
                 pid,
                 expected_start_epoch_s: Some(start_epoch_s),
             },
+            // A read: the local arm reads the same mask, so a lost answer may
+            // take it.
+            true,
             |value| match value {
                 BrokerValue::AffinityMask(mask) => Some(mask),
                 _ => None,
@@ -1496,6 +1506,9 @@ impl PlatformActions for BrokeredActions {
                 base_address,
                 expected_path: expected_path.to_string(),
             },
+            // A state change: repeating a FreeLibrary locally after an
+            // unacknowledged attempt could release a second reference.
+            false,
             |value| match value {
                 BrokerValue::ModuleUnload {
                     still_mapped,
