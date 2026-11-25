@@ -580,12 +580,13 @@ impl IconResolver {
             if direct.is_file() {
                 return Some(direct);
             }
-            if let Ok(contexts) = std::fs::read_dir(&dir.path) {
-                for ctx in contexts.flatten() {
-                    let f = ctx.path().join(file_name);
-                    if f.is_file() {
-                        return Some(f);
-                    }
+            // Sorted like every other directory walk here: one icon name can
+            // exist in more than one context of the same size dir, and a
+            // filesystem-defined order must not decide which file wins.
+            for ctx in sorted_dir_paths(&dir.path) {
+                let f = ctx.join(file_name);
+                if f.is_file() {
+                    return Some(f);
                 }
             }
         }
@@ -2322,6 +2323,34 @@ mod tests {
         let r = IconResolver::new(sb.lookup());
         let f = r.find_icon_file("vector").expect("png fallback");
         assert!(f.ends_with("48x48/apps/vector.png"), "{f:?}");
+    }
+
+    /// One icon name can exist in several contexts of the same size dir. The
+    /// first context in `read_dir` order used to win, so which pixels a row
+    /// painted depended on the filesystem's hash order; the walk is sorted now
+    /// and `apps` supplies the file.
+    #[test]
+    fn a_shared_icon_name_resolves_to_the_sorted_first_context() {
+        let sb = Sandbox::new("context-order");
+        let size_dir = sb.root.join("share/icons/custom/32x32");
+        write_png(&size_dir.join("apps/ctxapp.png"), 32, 32, [0, 200, 0, 255]);
+        write_png(&size_dir.join("mimetypes/ctxapp.png"), 32, 32, [200, 0, 0, 255]);
+
+        let r = IconResolver::new(sb.lookup());
+        let found = r.find_icon_file("ctxapp").expect("context icon");
+        assert_eq!(
+            found
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some("apps"),
+            "{found:?}"
+        );
+        assert_eq!(
+            decode_png_rgba(&found).map(|(_, _, rgba)| rgba[..4].to_vec()),
+            Some(vec![0, 200, 0, 255]),
+            "the apps context must supply the pixels: {found:?}"
+        );
     }
 
     /// Plasma writes the icon theme to `kdeglobals`, not to a GTK file; without
