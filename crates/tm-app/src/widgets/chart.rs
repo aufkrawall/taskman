@@ -659,12 +659,64 @@ impl<'a> ChartGeometry<'a> {
         }
     }
 
+    /// The sample the readout reports, given the index the pointer (or the
+    /// keyboard cursor) picked and the first index it may name
+    /// ([`first_on_axis`]: the lead-in sample before the window is a real entry
+    /// slope, but its marker is clipped away, so it is not a readout target).
+    ///
+    /// [`place`](Self::place) answers `None` for a sample the axis refuses, but
+    /// [`x`](Self::x) still clamps such a sample onto the nearest edge — so
+    /// pointing the marker and the readout at one reported a stale value beside
+    /// the newest measurement, with the age saturated to "Now" and the marker
+    /// standing on a sample nobody pointed at (the reported case: 1 s ticks, a
+    /// +5 s clock step, then the correction, where every pre-correction stamp
+    /// lies past the axis end).
+    ///
+    /// The readout therefore resolves its pick through here: the sample the axis
+    /// CAN place whose instant is closest to the picked one, ties to the lower
+    /// index. `None` means the series has nothing placeable from `first` on, and
+    /// the caller drops the readout rather than inventing one. A series without
+    /// timestamps (even spacing places every index) always answers the pick
+    /// itself.
+    fn placeable_index(&self, from: usize, first: usize) -> Option<usize> {
+        if self.len == 0 || first >= self.len {
+            return None;
+        }
+        let from = from.clamp(first, self.len - 1);
+        if self.place(from).is_some() {
+            return Some(from);
+        }
+        // The pick is refused: report the nearest measurement that IS drawn, so
+        // a pointer over a stale region still reads the closest real sample
+        // instead of a value with no marker anywhere near it.
+        let target = self.stamp(from)?;
+        let mut best: Option<(u64, usize)> = None;
+        for index in first..self.len {
+            if self.place(index).is_none() {
+                continue;
+            }
+            let Some(stamp) = self.stamp(index) else {
+                continue;
+            };
+            let distance = stamp.abs_diff(target);
+            if best.is_none_or(|(nearest, _)| distance < nearest) {
+                best = Some((distance, index));
+            }
+        }
+        best.map(|(_, index)| index)
+    }
+
     /// Screen x of series index `i` — for the hover marker, which marks a single
     /// sample rather than a run.
     ///
-    /// Deliberately the clamped position rather than [`place`](Self::place): the
-    /// readout never points at a sample outside the axis (`first_on_axis`), and a
-    /// marker asking for an x must not have to answer "no".
+    /// Callers hand over an index the geometry can PLACE: the readout resolves
+    /// its pick through [`placeable_index`](Self::placeable_index) and
+    /// [`first_on_axis`], the same rules the polyline obeys, so a sample the
+    /// axis refuses is never the one being described. What the clamp inside
+    /// [`x_on_axis`] is left for is the lead-in — the single sample carried from
+    /// before the window overhangs the left edge by at most one chart width, and
+    /// the painter clips it — plus the coordinate guard for a pathological
+    /// timestamp.
     fn x(&self, i: usize) -> f32 {
         match (self.stamp(i), self.bounds) {
             (Some(stamp), Some(bounds)) => x_on_axis(self.rect, bounds, stamp),
@@ -833,6 +885,13 @@ fn pin_id(id: egui::Id) -> egui::Id {
 ///
 /// The lock is released when the pointer moves, when the pinned sample rolls
 /// out of the window, and when the chart has no timestamps to pin against.
+///
+/// The returned index is the pin's instant resolved to the closest sample by
+/// timestamp ALONE: the pin says which instant the user pointed at, and the
+/// geometry says whether that instant has a position on the plot. A buffer that
+/// holds stamps past the axis end (a corrected clock step) can therefore make
+/// this answer name a sample the axis refuses, so callers resolve it through
+/// [`ChartGeometry::placeable_index`] before drawing anything.
 fn pinned_sample(
     ctx: &egui::Context,
     id: egui::Id,
@@ -1148,23 +1207,37 @@ fn core_chart_impl(
     } else {
         hover_pos(ui, &response, rect)
     };
-    if let Some(pos) =
-        hover.or_else(|| keyboard.map(|(idx, _)| Pos2::new(geometry.x(idx), rect.top() + 20.0)))
-    {
-        let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let first = first_on_axis(axis, bounds);
-        let idx = match (bounds, axis) {
-            (Some((t0, span)), Some(a)) => nearest_sample(a.stamps, t0, span, frac),
-            _ => ((frac * (n - 1) as f32).round() as usize).min(n - 1),
-        }
-        .max(first);
-        let idx = keyboard
-            .map_or_else(
-                || pinned_sample(ui.ctx(), response.id, axis, bounds, pos, idx),
-                |(index, _)| index,
-            )
-            .max(first)
-            .min(n - 1);
+    // The sample the readout reports, resolved through the geometry before
+    // anything is drawn. `place` refuses a stamp the axis cannot honestly
+    // position while `x` clamps one onto the nearest edge, so a refused pick
+    // used to read out a stale value with its age saturated to "Now" — the
+    // marker standing on the newest sample, describing an older one. The
+    // keyboard cursor is clamped to the first ON-axis sample for the same
+    // reason: it starts at the newest sample, but `Home` walks to index 0, the
+    // lead-in from before the window, whose marker is painted outside the clip
+    // rect entirely. `None` means nothing the pick can mean is placeable, and
+    // then there is no honest readout to show.
+    let first = first_on_axis(axis, bounds);
+    let read_idx = keyboard
+        .map(|(index, _)| index)
+        .or_else(|| {
+            hover.map(|pos| {
+                let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let under = match (bounds, axis) {
+                    (Some((t0, span)), Some(a)) => nearest_sample(a.stamps, t0, span, frac),
+                    _ => ((frac * (n - 1) as f32).round() as usize).min(n - 1),
+                }
+                .max(first);
+                pinned_sample(ui.ctx(), response.id, axis, bounds, pos, under).min(n - 1)
+            })
+        })
+        .and_then(|index| geometry.placeable_index(index, first));
+    if let Some((idx, pos)) = read_idx.map(|idx| {
+        (
+            idx,
+            hover.unwrap_or_else(|| Pos2::new(geometry.x(idx), rect.top() + 20.0)),
+        )
+    }) {
         let mut rows = vec![ReadoutRow {
             color,
             label: label.to_owned(),
@@ -1400,22 +1473,33 @@ pub fn chart_multi_with_bg(
     };
     // A keyboard cursor marks one sample rather than a run, so it only needs
     // that index's x — through the same builder, so it cannot land anywhere but
-    // on the curve it marks.
-    let cursor_x = |idx: usize| ChartGeometry::new(rect, y_max, axis, max_len.max(2)).x(idx);
-    if let Some(pos) =
-        hover.or_else(|| keyboard.map(|(idx, _)| Pos2::new(cursor_x(idx), rect.top() + 20.0)))
+    // on the curve it marks. Its index is resolved FIRST, by the same two rules
+    // the pointer path obeys: it starts at the newest sample, but `Home` walks
+    // to index 0, the lead-in from before the axis, whose marker would be
+    // painted entirely outside the clipped rect (a value and an age with no
+    // marker anywhere), and a sample the axis refuses is resolved to the
+    // nearest one it can place (see [`ChartGeometry::placeable_index`]).
+    let readout_geometry = ChartGeometry::new(rect, y_max, axis, max_len.max(2));
+    let first = first_on_axis(axis, bounds);
+    let keyboard_idx = keyboard
+        .map(|(idx, _)| idx)
+        .and_then(|idx| readout_geometry.placeable_index(idx, first));
+    if let Some(pos) = hover
+        .or_else(|| keyboard_idx.map(|idx| Pos2::new(readout_geometry.x(idx), rect.top() + 20.0)))
     {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
-        // sample — even-spacing math skips across sampling gaps.
-        let first = first_on_axis(axis, bounds);
-        let time_idx = keyboard.map(|(idx, _)| idx).or_else(|| {
+        // sample — even-spacing math skips across sampling gaps. The pick is
+        // resolved through the geometry, so the readout can never name a sample
+        // the axis refuses while its marker lands on another.
+        let time_idx = keyboard_idx.or_else(|| {
             bounds
                 .zip(axis)
                 .map(|((t0, span), a)| nearest_sample(a.stamps, t0, span, frac).max(first))
                 .map(|under| {
                     pinned_sample(ui.ctx(), response.id, axis, bounds, pos, under).max(first)
                 })
+                .and_then(|idx| readout_geometry.placeable_index(idx, first))
         });
         let mut rows = Vec::with_capacity(series.len());
         let mut dots = Vec::with_capacity(series.len());
@@ -2302,6 +2386,59 @@ mod tests {
             "the right edge carries a stale value: {:?}",
             points[0]
         );
+    }
+
+    /// The readout resolves its pick through the axis, so it can never describe
+    /// a sample the chart does not draw.
+    ///
+    /// Regression: `nearest_at` compared timestamps only, so a query near the
+    /// right edge returned a sample the axis refuses — 1 s ticks, a +5 s clock
+    /// step, then the correction leaves the pre-correction stamps past the axis
+    /// end. `x_on_axis` clamped that sample onto the right edge and
+    /// `sample_age` saturated the difference to zero, so the readout showed a
+    /// five-second-old value with the newest sample's age ("Now"), its marker
+    /// standing on the newest sample it was not describing.
+    #[test]
+    fn the_readout_never_reports_a_sample_the_axis_refuses() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 50.0));
+        // The reproduced buffer. The newest ARRIVAL carries 106 000 ms, so the
+        // axis opens at 46 000 and the three 108/109/110 s stamps sit past its
+        // right edge.
+        let stamps = [103_000u64, 108_000, 109_000, 110_000, 106_000];
+        let axis = TimeAxis::new(&stamps, 60);
+        let geometry = ChartGeometry::new(rect, 100.0, Some(axis), stamps.len());
+
+        // Whatever the pointer (or a pin) picked, the readout gets a sample the
+        // axis can place, and that sample's marker is inside the chart.
+        for picked in 0..stamps.len() {
+            let resolved = geometry
+                .placeable_index(picked, 0)
+                .unwrap_or_else(|| panic!("sample {picked} resolved to nothing at all"));
+            assert!(
+                geometry.place(resolved).is_some(),
+                "sample {picked} resolved to sample {resolved}, which the axis refuses too"
+            );
+            assert!(
+                geometry.x(resolved) <= rect.right() + 0.5,
+                "sample {picked}: marker at {} is past the right edge",
+                geometry.x(resolved)
+            );
+        }
+        // The stale pick (stamp 108 000, frac 1.033) reads the nearest sample
+        // that IS drawn — the newest one — not the smaller 103 s index and not
+        // the off-axis lead-in.
+        assert_eq!(geometry.placeable_index(1, 0), Some(4));
+        assert_eq!(geometry.placeable_index(2, 0), Some(4));
+        assert_eq!(geometry.placeable_index(3, 0), Some(4));
+        // A pick the axis CAN place is reported unchanged: the resolution never
+        // moves the readout off the sample under the pointer.
+        for placeable in [0, 4] {
+            assert_eq!(geometry.placeable_index(placeable, 0), Some(placeable));
+        }
+        // The lead-in before the window is not a readout target: passing
+        // `first_on_axis` in moves a pick that would resolve onto it up to the
+        // first on-axis sample instead (its marker is clipped away).
+        assert_eq!(geometry.placeable_index(0, 2), Some(4));
     }
 
     /// However stale a stamp is, the lead-in overhang stays within one chart

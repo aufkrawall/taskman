@@ -1311,7 +1311,13 @@ rebase runbook.
   step forward that is later corrected the samples already buffered are
   stamped past the window. `placeable_on_axis` drops those too instead of
   pinning them onto the edge, where they read as the newest measurement (or
-  joined the in-window sample before them). See `log/recent.md` 2026-09-11.
+  joined the in-window sample before them). The READOUT obeys the same rule
+  through `ChartGeometry::placeable_index`: whatever the pointer or the pin
+  picked, the marker and the value describe a sample the axis can place (or the
+  readout is dropped), because `x_on_axis` clamps a refused stamp onto the edge
+  and `sample_age` would saturate it to "Now". The keyboard cursor additionally
+  clamps to `first_on_axis` on both charts, so `Home` cannot land on the
+  off-axis lead-in. See `log/recent.md` 2026-09-11.
 - Build: `build.py` release driver (host + Linux by default), profiles
   tuned for compile speed (thin LTO, parallel codegen, line-tables-only
   debuginfo).
