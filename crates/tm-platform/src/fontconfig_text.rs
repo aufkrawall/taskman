@@ -8,7 +8,7 @@
 //! real configuration. Every invocation has one absolute deadline, capped stdout and
 //! kill/reap cleanup on timeout.
 
-use super::text_rendering::{LcdFilterChoice, Params};
+use super::text_rendering::{HintStyleChoice, LcdFilterChoice, Params};
 
 const TRUSTED_FC_MATCH_PATHS: &[&str] = &[
     "/usr/bin/fc-match",
@@ -46,6 +46,8 @@ struct FontconfigProperties {
     antialias: Option<bool>,
     rgba: Option<u8>,
     lcdfilter: Option<u8>,
+    hinting: Option<bool>,
+    hintstyle: Option<u8>,
 }
 
 fn token(value: &str) -> Option<&str> {
@@ -85,6 +87,16 @@ fn parse_lcdfilter(value: &str) -> Option<u8> {
     }
 }
 
+fn parse_hintstyle(value: &str) -> Option<u8> {
+    match token(value)?.to_ascii_lowercase().as_str() {
+        "hintnone" | "none" | "0" => Some(0),
+        "hintslight" | "slight" | "1" => Some(1),
+        "hintmedium" | "medium" | "2" => Some(2),
+        "hintfull" | "full" | "3" => Some(3),
+        _ => None,
+    }
+}
+
 fn parse_properties(text: &str) -> FontconfigProperties {
     let mut properties = FontconfigProperties::default();
     for line in text.lines() {
@@ -95,6 +107,8 @@ fn parse_properties(text: &str) -> FontconfigProperties {
             "antialias" => properties.antialias = parse_bool(value),
             "rgba" => properties.rgba = parse_rgba(value),
             "lcdfilter" => properties.lcdfilter = parse_lcdfilter(value),
+            "hinting" => properties.hinting = parse_bool(value),
+            "hintstyle" => properties.hintstyle = parse_hintstyle(value),
             _ => {}
         }
     }
@@ -103,7 +117,24 @@ fn parse_properties(text: &str) -> FontconfigProperties {
 
 fn params_from_output(text: &str) -> Params {
     let properties = parse_properties(text);
-    let mut params = Params::default();
+    // FreeType/Fontconfig on Linux has no DirectWrite enhanced-contrast boost, so keep
+    // contrast at 0.0 instead of inheriting Windows' 0.5 default.
+    let mut params = Params {
+        contrast: 0.0,
+        ..Params::default()
+    };
+
+    params.hint_style = if properties.hinting == Some(false) {
+        HintStyleChoice::None
+    } else {
+        match properties.hintstyle {
+            Some(0) => HintStyleChoice::None,
+            Some(1) => HintStyleChoice::Slight,
+            Some(2) => HintStyleChoice::Medium,
+            Some(3) => HintStyleChoice::Full,
+            _ => HintStyleChoice::Default,
+        }
+    };
 
     // `antialias: False` is an explicit user choice. Missing or malformed values are not
     // evidence that sub-pixel text is safe, so they fail closed too.
@@ -199,16 +230,20 @@ fn query_uncached() -> Params {
 /// text-policy query above, so font selection no longer falls back to a PATH lookup.
 #[cfg(target_os = "linux")]
 pub(super) fn match_file(pattern: &str) -> Option<String> {
-    let output = run_fc_match(&["-f", "%{file}\n", pattern])?;
-    font_path_from_output(&output)
+    match_face(pattern).map(|(path, _)| path)
 }
 
-fn font_path_from_output(output: &[u8]) -> Option<String> {
-    let path = String::from_utf8_lossy(output)
-        .lines()
-        .next()?
-        .trim()
-        .to_owned();
+/// Ask the user's fontconfig for both the concrete font file and its face index (`%{index}`).
+#[cfg(target_os = "linux")]
+pub(super) fn match_face(pattern: &str) -> Option<(String, u32)> {
+    let output = run_fc_match(&["-f", "%{file}\n%{index}\n", pattern])?;
+    font_face_from_output(&output)
+}
+
+fn font_face_from_output(output: &[u8]) -> Option<(String, u32)> {
+    let text = String::from_utf8_lossy(output);
+    let mut lines = text.lines();
+    let path = lines.next()?.trim().to_owned();
     if path.is_empty() {
         return None;
     }
@@ -217,9 +252,19 @@ fn font_path_from_output(output: &[u8]) -> Option<String> {
         return None;
     }
     let canonical = std::fs::canonicalize(path).ok()?;
-    canonical
-        .is_file()
-        .then(|| canonical.to_string_lossy().into_owned())
+    if !canonical.is_file() {
+        return None;
+    }
+    let index = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((canonical.to_string_lossy().into_owned(), index))
+}
+
+#[cfg(test)]
+fn font_path_from_output(output: &[u8]) -> Option<String> {
+    font_face_from_output(output).map(|(path, _)| path)
 }
 
 #[cfg(target_os = "linux")]
@@ -396,6 +441,57 @@ mod tests {
         assert_eq!(filter("2"), LcdFilterChoice::Light);
         assert_eq!(filter("3"), LcdFilterChoice::Legacy);
         assert_eq!(filter("future"), LcdFilterChoice::Default);
+    }
+
+    #[test]
+    fn linux_params_zero_contrast_and_parse_hintstyle() {
+        let slight = params_from_output(
+            "Pattern has 34 elts (size 16)\n\
+             \tantialias: True(w)\n\
+             \thinting: True(w)\n\
+             \thintstyle: 1(i)(w)\n\
+             \trgba: 1(i)(w)\n\
+             \tlcdfilter: 1(i)(w)\n",
+        );
+        assert_eq!(slight.contrast, 0.0);
+        assert_eq!(slight.hint_style, HintStyleChoice::Slight);
+
+        let disabled_hinting = params_from_output(
+            "Pattern has 34 elts (size 16)\n\
+             \tantialias: True(w)\n\
+             \thinting: False(w)\n\
+             \thintstyle: 3(i)(w)\n\
+             \trgba: 5(i)(w)\n",
+        );
+        assert!(!disabled_hinting.enabled);
+        assert_eq!(disabled_hinting.contrast, 0.0);
+        assert_eq!(disabled_hinting.hint_style, HintStyleChoice::None);
+
+        let full = params_from_output(
+            "\tantialias: True(w)\n\
+             \thintstyle: hintfull(s)\n\
+             \trgba: 1(i)(w)\n",
+        );
+        assert_eq!(full.hint_style, HintStyleChoice::Full);
+    }
+
+    #[test]
+    fn font_face_from_output_parses_collection_index() {
+        let current = std::env::current_exe().expect("test executable");
+        let current = std::fs::canonicalize(current).expect("canonical test executable");
+        let expected = current.to_string_lossy().into_owned();
+
+        let with_index = format!("{}\n2\n", current.display());
+        assert_eq!(
+            font_face_from_output(with_index.as_bytes()),
+            Some((expected.clone(), 2))
+        );
+
+        let missing_index = format!("{}\n", current.display());
+        assert_eq!(
+            font_face_from_output(missing_index.as_bytes()),
+            Some((expected, 0))
+        );
     }
 
     #[test]

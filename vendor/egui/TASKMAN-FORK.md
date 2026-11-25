@@ -85,7 +85,7 @@ math in the new `subpixel.rs`.
 | File | Nature |
 | --- | --- |
 | `crates/epaint/src/text/subpixel.rs` | **new** — `SubpixelMode`, LCD filters and coverage filtering |
-| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, explicit zero-alpha LCD tag |
+| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, explicit zero-alpha LCD tag, and per-face `GlyphScratch` reuse (`BezPath`, `vello_cpu::Resources`, 3x sample/filter buffers) |
 | `crates/epaint/src/text/mod.rs` | **edit** — `subpixel`, `lcd_filter`, `cleartype_level`, `text_gamma`, `text_contrast` |
 | `crates/epaint/src/lib.rs` | **edit** — re-exports `LcdFilter` and `SubpixelMode` |
 
@@ -340,17 +340,14 @@ feature, the ordinary pipeline remains selected.
 
 | File | Change | Why |
 | --- | --- | --- |
-| `crates/egui-wgpu/src/egui_lcd.wgsl` | **new** — dual-source fragment outputs, per-channel coverage blend, RGB/BGR swap, contrast curve, one-texel-per-pixel derivative/center test | A fixed-function GPU needs source color and per-channel source alpha separately; one scalar alpha cannot express LCD stripes |
-| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()` with non-white UVs; 32-byte padded order/contrast uniform; Naga validation and 250 ms-bounded Validation/Internal/OutOfMemory error scopes | Keep non-font textures, all-white solid geometry, color glyphs and unsupported devices on the byte-identical ordinary path, and never advertise a pipeline that failed validation |
+| `crates/egui-wgpu/src/egui_lcd.wgsl` | **new** — dual-source fragment outputs, per-channel coverage blend, RGB/BGR swap, contrast curve, foreground-luminance `subpixel_gamma` compensation on gamma framebuffers, linear-space foreground premultiplication on sRGB framebuffers, covered-only dithering, one-texel-per-pixel derivative/center test | A fixed-function GPU needs source color and per-channel source alpha separately; one scalar alpha cannot express LCD stripes, and gamma surfaces need luminance-directed gamma compensation to match CPU `TextGamma` weight |
+| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()` with non-white UVs; 32-byte padded order/contrast/gamma uniform (`Locals.subpixel_gamma`); Naga validation and 250 ms-bounded Validation/Internal/OutOfMemory error scopes | Keep non-font textures, all-white solid geometry, color glyphs and unsupported devices on the byte-identical ordinary path, and never advertise a pipeline that failed validation |
 | `crates/egui-wgpu/src/setup.rs` | request `DUAL_SOURCE_BLENDING` as `adapter.features() & DUAL_SOURCE_BLENDING` | Request only what the selected adapter advertises; never make device creation fail for an unsupported adapter |
-| `crates/egui-wgpu/src/winit.rs` | publish current `TextOptions` to the renderer each frame; expose whether the LCD pipeline exists | The renderer needs the atlas order and weight but must not guess them from colors |
+| `crates/egui-wgpu/src/winit.rs` | publish current `TextOptions` (`subpixel`, `text_gamma`, `text_contrast`) to the renderer each frame; expose whether the LCD pipeline exists | The renderer needs the atlas order, gamma and weight but must not guess them from colors |
 | `crates/egui_software/src/{raster.rs,texture.rs,text.rs,lib.rs}` | transformed glyph triangles convert LCD texels to mean grayscale before filtering; direct blits choose LCD vs ordinary blending per texel | Rotated/scaled/fractionally aligned software text must not smear color fringes, and mixed grayscale/color glyphs must keep their normal blend |
 | `crates/egui_kittest/tests/subpixel_text.rs` | **new, manual** — ignored GPU color/BGR/transform/contrast/sampling/dithering/sRGB coverage; requires `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1` and a suitable adapter | Detect shader/pipeline regressions on real dual-source hardware without claiming portable CI coverage or reporting a missing-adapter skip as a pass |
 
-The GPU path carries the selected `TextOptions::text_contrast` and RGB/BGR order through a
-uniform. It deliberately does not claim to implement the software renderer's nonlinear
-destination gamma: fixed-function blending cannot read the destination. The software path
-keeps its full gamma/contrast model.
+The GPU path carries the selected `TextOptions::text_gamma`, `TextOptions::text_contrast`, and RGB/BGR order through the 32-byte `Locals` uniform. Fixed-function blending still cannot read the destination pixel, so on gamma (`Unorm`) surfaces `fs_lcd_gamma_framebuffer` applies a foreground-luminance gamma compensation (`mix(1 - (1 - c)^(1/g), c^(1/g), lum)`) to match the software renderer's weight across dark and light UIs without framebuffer reads, while `fs_lcd_linear_framebuffer` converts straight foreground sRGB to linear before premultiplying by channel coverage. The software path keeps its full destination-aware gamma/contrast model.
 
 **Coverage:** `egui-wgpu` unit tests cover feature detection/request, full/partial atlas
 state transitions, default-texture/non-white-UV selection, transform mapping, order/contrast
@@ -377,7 +374,7 @@ alive in the tray.
 | File | Change | Why |
 | --- | --- | --- |
 | `crates/eframe/src/native/wgpu_integration.rs` | Tracks explicit app visibility, does not call `set_window()` for hidden viewports, clears the `Frame` render-state clone, and calls `Painter::suspend()` after the final visible surface hides. Keeps logic-only ticks and visible-descendant rendering; the last first-frame `Visible` command controls eframe's reveal. | A hidden surface must not keep a device/swapchain merely because eframe still owns its viewport. |
-| `crates/egui-wgpu/src/winit.rs` | `Painter::suspend()` drops surfaces, depth/MSAA/capture state, managed textures and `RenderState`; CPU `TextureSnapshots` compose full/partial image updates and replay them into the replacement renderer. `max_texture_side` and subpixel capability remain cached. `destroy()` uses the same path. | egui sends texture bytes once and keeps metadata only, so dropping a renderer without replay loses the font atlas/icons. |
+| `crates/egui-wgpu/src/winit.rs` | `Painter::suspend()` drops surfaces, depth/MSAA/capture state, managed textures and `RenderState`; CPU `TextureSnapshots` compose full/partial image updates for user textures and record only sampler options for `TextureId::default()`, replaying the live font atlas from `Context::fonts` on recreation. `max_texture_side` and subpixel capability remain cached. `destroy()` uses the same path. | egui sends user texture bytes once and keeps metadata only, so dropping a renderer without replay loses icons; meanwhile the font atlas already lives in `FontsImpl`, so skipping a second CPU pixel copy avoids duplicating multi-megabyte atlas RAM. |
 | `crates/egui-wgpu/src/setup.rs` | Requests `MemoryHints::MemoryUsage`, caps native non-sampler bindings at 8,192, and retains the 8,192px texture-dimension limit. | wgpu's performance hints start with 128/64 MiB device/host blocks and D3D12 eagerly sizes its visible descriptor heap from a one-million-binding default. |
 | `crates/egui-wgpu/src/renderer.rs` | Shrinks vertex/index buffers only after 120 mostly-underused updates (including empty/callback-only frames), to twice the live requirement with an initial-capacity floor. | Large history cards should not pin an oversized buffer for the rest of the session. |
 

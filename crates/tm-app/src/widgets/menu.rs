@@ -306,26 +306,20 @@ struct Marks {
     open: bool,
 }
 
-/// Natural (unjustified) width an entry wants. The popup sizes itself to the
-/// widest entry during egui's sizing pass; the justified layout then stretches
-/// every row to that width.
-fn desired_width(ui: &Ui, text: &str, marks: Marks) -> f32 {
-    let text_w = ui
-        .painter()
-        .layout_no_wrap(
-            text.to_owned(),
-            FontId::proportional(FONT_SIZE),
-            Color32::WHITE,
-        )
-        .size()
-        .x;
+/// Natural (unjustified) width an entry wants for a pre-laid-out label galley.
+fn desired_width_for(text_w: f32, marks: Marks) -> f32 {
     GUTTER_W + text_w + TEXT_PAD_RIGHT + if marks.arrow { ARROW_W } else { 0.0 }
 }
 
 /// Paint one full-width menu row and return its response.
 fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
     let pal = theme::palette(ui);
-    let want = egui::vec2(desired_width(ui, text, marks), ITEM_H);
+    let enabled = ui.is_enabled();
+    let text_color = if enabled { pal.text } else { pal.text_dim };
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), FontId::proportional(FONT_SIZE), text_color);
+    let want = egui::vec2(desired_width_for(galley.size().x, marks), ITEM_H);
     // `allocate_at_least` (not `allocate_exact_size`) is what returns the
     // JUSTIFIED rect: menus lay out top-down-justified, and the exact variant
     // re-aligns the desired size back inside the justified frame, which would
@@ -343,7 +337,6 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
         });
         ui.close();
     }
-    let enabled = ui.is_enabled();
 
     // A keyboard-opened menu hands focus to its first enabled entry so the
     // arrow keys have somewhere to start. The popup's FIRST frame is a sizing
@@ -419,7 +412,6 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
         );
     }
 
-    let text_color = if enabled { pal.text } else { pal.text_dim };
     if marks.checked {
         draw_tick(
             ui,
@@ -427,13 +419,13 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
             text_color,
         );
     }
-    ui.painter().text(
-        Pos2::new(rect.left() + GUTTER_W, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        FontId::proportional(FONT_SIZE),
-        text_color,
-    );
+    let text_pos = egui::Align2::LEFT_CENTER
+        .anchor_size(
+            Pos2::new(rect.left() + GUTTER_W, rect.center().y),
+            galley.size(),
+        )
+        .min;
+    ui.painter().galley(text_pos, galley, text_color);
     if marks.arrow {
         draw_arrow(
             ui,
@@ -656,15 +648,20 @@ fn hairline(popup: Color32, text: Color32) -> Color32 {
 /// commands below.
 pub fn title(ui: &mut Ui, text: &str) {
     let pal = theme::palette(ui);
-    let want = egui::vec2(desired_width(ui, text, Marks::default()), ITEM_H);
-    let (rect, _) = ui.allocate_at_least(want, Sense::hover());
-    ui.painter().text(
-        Pos2::new(rect.left() + GUTTER_W, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        FontId::proportional(FONT_SIZE + 0.5),
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        theme::font_semibold_in(ui, FONT_SIZE),
         pal.text,
     );
+    let want = egui::vec2(desired_width_for(galley.size().x, Marks::default()), ITEM_H);
+    let (rect, _) = ui.allocate_at_least(want, Sense::hover());
+    let text_pos = egui::Align2::LEFT_CENTER
+        .anchor_size(
+            Pos2::new(rect.left() + GUTTER_W, rect.center().y),
+            galley.size(),
+        )
+        .min;
+    ui.painter().galley(text_pos, galley, pal.text);
 }
 
 #[cfg(test)]

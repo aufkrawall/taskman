@@ -231,11 +231,11 @@ fn readout(ui: &egui::Ui, at: Pos2, head: &str, rows: &[ReadoutRow]) {
     }
     let pal = crate::theme::palette(ui);
     let ppp = ui.ctx().pixels_per_point();
-    let head_font = FontId::proportional(11.0);
-    let font = FontId::proportional(12.5);
-    let layout = |text: &str, font: &FontId| {
+    let head_font = crate::theme::font_small_in(ui, 11.0);
+    let font = FontId::proportional(12.0);
+    let layout = |text: &str, font: &FontId, color: Color32| {
         ui.painter()
-            .layout_no_wrap(text.to_owned(), font.clone(), pal.text)
+            .layout_no_wrap(text.to_owned(), font.clone(), color)
     };
 
     const PAD_X: f32 = 9.0;
@@ -245,14 +245,22 @@ fn readout(ui: &egui::Ui, at: Pos2, head: &str, rows: &[ReadoutRow]) {
     const LABEL_GAP: f32 = 16.0;
     const ROW_H: f32 = 17.0;
 
-    let head_galley = (!head.is_empty()).then(|| layout(head, &head_font));
-    let label_w = rows
+    let head_galley = (!head.is_empty()).then(|| layout(head, &head_font, pal.text_dim));
+    let row_galleys: Vec<_> = rows
         .iter()
-        .map(|r| layout(&r.label, &font).size().x)
+        .map(|r| {
+            let label = (!r.label.is_empty()).then(|| layout(&r.label, &font, pal.text_dim));
+            let value = layout(&r.value, &font, pal.text);
+            (r.color, label, value)
+        })
+        .collect();
+    let label_w = row_galleys
+        .iter()
+        .filter_map(|(_, label, _)| label.as_ref().map(|g| g.size().x))
         .fold(0.0f32, f32::max);
-    let value_w = rows
+    let value_w = row_galleys
         .iter()
-        .map(|r| layout(&r.value, &font).size().x)
+        .map(|(_, _, value)| value.size().x)
         .fold(0.0f32, f32::max);
     let body_w = SWATCH + SWATCH_GAP + label_w + LABEL_GAP + value_w;
     let head_w = head_galley.as_ref().map_or(0.0, |g| g.size().x);
@@ -300,38 +308,33 @@ fn readout(ui: &egui::Ui, at: Pos2, head: &str, rows: &[ReadoutRow]) {
 
     let mut y = rect.top() + PAD_Y;
     if let Some(g) = head_galley {
-        painter.text(
-            Pos2::new(rect.left() + PAD_X, y),
-            Align2::LEFT_TOP,
-            head,
-            head_font,
-            pal.text_dim,
-        );
-        y += g.size().y + 4.0;
+        let g_h = g.size().y;
+        painter.galley(Pos2::new(rect.left() + PAD_X, y), g, pal.text_dim);
+        y += g_h + 4.0;
     }
-    for row in rows {
+    for (color, label_galley, value_galley) in row_galleys {
         let center_y = y + ROW_H * 0.5;
         let swatch = Rect::from_center_size(
             Pos2::new(rect.left() + PAD_X + SWATCH * 0.5, center_y),
             Vec2::splat(SWATCH),
         );
-        painter.rect_filled(snap_rect(swatch, ppp), 1.5, row.color);
-        if !row.label.is_empty() {
-            painter.text(
-                Pos2::new(rect.left() + PAD_X + SWATCH + SWATCH_GAP, center_y),
-                Align2::LEFT_CENTER,
-                &row.label,
-                font.clone(),
-                pal.text_dim,
-            );
+        painter.rect_filled(snap_rect(swatch, ppp), 1.5, color);
+        if let Some(label_g) = label_galley {
+            let label_pos = Align2::LEFT_CENTER
+                .anchor_size(
+                    Pos2::new(rect.left() + PAD_X + SWATCH + SWATCH_GAP, center_y),
+                    label_g.size(),
+                )
+                .min;
+            painter.galley(label_pos, label_g, pal.text_dim);
         }
-        painter.text(
-            Pos2::new(rect.right() - PAD_X, center_y),
-            Align2::RIGHT_CENTER,
-            &row.value,
-            font.clone(),
-            pal.text,
-        );
+        let value_pos = Align2::RIGHT_CENTER
+            .anchor_size(
+                Pos2::new(rect.right() - PAD_X, center_y),
+                value_galley.size(),
+            )
+            .min;
+        painter.galley(value_pos, value_galley, pal.text);
         y += ROW_H;
     }
 }

@@ -211,15 +211,37 @@ self_cell! {
     }
 }
 
+/// Reusable scratch buffers for glyph outline extraction and rasterization,
+/// avoiding fresh heap allocations on every uncached glyph.
+struct GlyphScratch {
+    path: kurbo::BezPath,
+    resources: vello_cpu::Resources,
+    samples: Vec<u8>,
+    filtered: Vec<[u8; 3]>,
+}
+
+impl Default for GlyphScratch {
+    fn default() -> Self {
+        Self {
+            path: kurbo::BezPath::new(),
+            resources: vello_cpu::Resources::new(),
+            samples: Vec::new(),
+            filtered: Vec::new(),
+        }
+    }
+}
+
 impl FontCell {
     fn px_scale_factor(&self, scale: f32) -> f32 {
         let units_per_em = self.borrow_dependent().metrics.units_per_em as f32;
         scale / units_per_em
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn allocate_glyph_uncached(
         &mut self,
         atlas: &mut TextureAtlas,
+        scratch: &mut GlyphScratch,
         metrics: &StyledMetrics,
         glyph_id: GlyphId,
         bin: SubpixelBin,
@@ -231,9 +253,9 @@ impl FontCell {
             "Can't allocate glyph for id 0"
         );
 
-        let mut path = kurbo::BezPath::new();
+        scratch.path.truncate(0);
         let mut pen = VelloPen {
-            path: &mut path,
+            path: &mut scratch.path,
             x_offset: bin.as_float() as f64,
         };
 
@@ -269,7 +291,7 @@ impl FontCell {
         // integer number of pixels, which is what lets `tessellate_glyphs`' rounding --
         // and the software renderer's 1:1 blit -- stay exact.
         let subpixel = atlas.options().subpixel;
-        let mut bounds = path.control_box().expand();
+        let mut bounds = scratch.path.control_box().expand();
         if !subpixel.is_off() {
             bounds.x0 -= 1.0;
             bounds.x1 += 1.0;
@@ -280,7 +302,7 @@ impl FontCell {
         let uv_rect = if width == 0 || height == 0 {
             UvRect::default()
         } else if !subpixel.is_off() {
-            let glyph_pos = rasterize_subpixel(atlas, &path, bounds, width, height);
+            let glyph_pos = rasterize_subpixel(atlas, scratch, bounds, width, height);
             let offset_in_pixels = vec2(bounds.x0 as f32, bounds.y0 as f32);
             let offset =
                 offset_in_pixels / metrics.pixels_per_point + metrics.y_offset_in_points * Vec2::Y;
@@ -297,10 +319,9 @@ impl FontCell {
             let mut ctx = vello_cpu::RenderContext::new(width, height);
             ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
             ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
-            ctx.fill_path(&path);
+            ctx.fill_path(&scratch.path);
             let mut dest = vello_cpu::Pixmap::new(width, height);
-            let mut resources = vello_cpu::Resources::new();
-            ctx.render(&mut dest, &mut resources);
+            ctx.render(&mut dest, &mut scratch.resources);
 
             let glyph_pos = {
                 let color_transfer_function = atlas.options().color_transfer_function;
@@ -350,7 +371,7 @@ impl FontCell {
 /// to sub-pixel boundaries and destroy the vertical alignment hinting exists for.
 fn rasterize_subpixel(
     atlas: &mut TextureAtlas,
-    path: &kurbo::BezPath,
+    scratch: &mut GlyphScratch,
     bounds: kurbo::Rect,
     width: u16,
     height: u16,
@@ -366,24 +387,32 @@ fn rasterize_subpixel(
             * kurbo::Affine::translate((-bounds.x0, -bounds.y0)),
     );
     ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
-    ctx.fill_path(path);
+    ctx.fill_path(&scratch.path);
     let mut dest = vello_cpu::Pixmap::new(w3 as u16, height);
-    let mut resources = vello_cpu::Resources::new();
-    ctx.render(&mut dest, &mut resources);
+    ctx.render(&mut dest, &mut scratch.resources);
 
     let pixels = dest.data_as_u8_slice();
     let (glyph_pos, image) = atlas.allocate((width as usize, height as usize));
 
-    let mut samples: Vec<u8> = Vec::with_capacity(w3);
-    let mut filtered: Vec<[u8; 3]> = Vec::with_capacity(width as usize);
+    scratch.samples.clear();
+    scratch.samples.reserve(w3);
+    scratch.filtered.clear();
+    scratch.filtered.reserve(width as usize);
     for y in 0..height as usize {
         // The glyph is painted white, so the alpha channel is the coverage.
-        samples.clear();
-        samples.extend((0..w3).map(|x| pixels[4 * (y * w3 + x) + 3]));
+        scratch.samples.clear();
+        scratch
+            .samples
+            .extend((0..w3).map(|x| pixels[4 * (y * w3 + x) + 3]));
 
-        crate::text::subpixel::filter_row(&samples, width as usize, opts.lcd_filter, &mut filtered);
+        crate::text::subpixel::filter_row(
+            &scratch.samples,
+            width as usize,
+            opts.lcd_filter,
+            &mut scratch.filtered,
+        );
 
-        for (x, rgb) in filtered.iter().enumerate() {
+        for (x, rgb) in scratch.filtered.iter().enumerate() {
             let rgb = crate::text::subpixel::apply_cleartype_level(*rgb, opts.cleartype_level);
             // R, G and B carry per-channel coverage. Alpha is the explicit LCD tag, not
             // coverage: every non-empty LCD texel is stored as alpha zero so neutral,
@@ -464,6 +493,7 @@ pub struct FontFace {
     advance_width_cache: ahash::HashMap<(char, LocationHash), OrderedFloat<f32>>,
 
     glyph_alloc_cache: ahash::HashMap<GlyphCacheKey, GlyphAllocation>,
+    scratch: GlyphScratch,
 }
 
 impl FontFace {
@@ -527,6 +557,7 @@ impl FontFace {
             glyph_id_cache: Default::default(),
             advance_width_cache: Default::default(),
             glyph_alloc_cache: Default::default(),
+            scratch: GlyphScratch::default(),
         })
     }
 
@@ -725,6 +756,7 @@ impl FontFace {
             self.font
                 .allocate_glyph_uncached(
                     atlas,
+                    &mut self.scratch,
                     metrics,
                     glyph_id,
                     bin,

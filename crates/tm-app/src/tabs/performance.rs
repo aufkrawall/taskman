@@ -1473,7 +1473,7 @@ fn caption_dropdown_cell(
 fn big_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 56.0), egui::Sense::hover());
     let label_font = FontId::proportional(13.0);
-    let value_font = FontId::proportional(23.0);
+    let value_font = crate::theme::font_display_in(ui, 23.0);
     let label = ellipsize(ui, label, &label_font, w - 4.0);
     let value = ellipsize(ui, value, &value_font, w - 4.0);
     ui.painter().text(
@@ -1496,7 +1496,7 @@ fn big_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) 
 fn med_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 48.0), egui::Sense::hover());
     let label_font = FontId::proportional(13.0);
-    let value_font = FontId::proportional(23.0);
+    let value_font = crate::theme::font_display_in(ui, 23.0);
     let label = ellipsize(ui, label, &label_font, w - 4.0);
     let value = ellipsize(ui, value, &value_font, w - 4.0);
     ui.painter().text(

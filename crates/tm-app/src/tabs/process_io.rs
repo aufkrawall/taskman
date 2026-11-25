@@ -845,7 +845,7 @@ pub fn show(
                                     i18n::tr(K::PropIoColFile),
                                     file_arrow
                                 ))
-                                .strong(),
+                                .font(crate::theme::font_semibold_in(ui, 13.0)),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -881,7 +881,7 @@ pub fn show(
                                     i18n::tr(K::ColPath),
                                     path_arrow
                                 ))
-                                .strong(),
+                                .font(crate::theme::font_semibold_in(ui, 13.0)),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -914,8 +914,11 @@ pub fn show(
                             |ui| {
                                 ui.set_min_size(egui::vec2(width, 18.0));
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(text).strong())
-                                        .sense(egui::Sense::click()),
+                                    egui::Label::new(
+                                        egui::RichText::new(text)
+                                            .font(crate::theme::font_semibold_in(ui, 13.0)),
+                                    )
+                                    .sense(egui::Sense::click()),
                                 )
                             },
                         )
@@ -991,9 +994,12 @@ pub fn show(
                     |ui| {
                         ui.set_min_size(egui::vec2(COL_FILE_MIN_W, 18.0));
                         let name_text = if is_selected {
-                            egui::RichText::new(&file.name).strong().color(pal.accent)
+                            egui::RichText::new(&file.name)
+                                .font(crate::theme::font_semibold_in(ui, 13.0))
+                                .color(pal.accent)
                         } else {
-                            egui::RichText::new(&file.name).strong()
+                            egui::RichText::new(&file.name)
+                                .font(crate::theme::font_semibold_in(ui, 13.0))
                         };
                         let l_resp =
                             ui.add(egui::Label::new(name_text).selectable(true).truncate());
@@ -1119,7 +1125,12 @@ pub fn show(
 
                 // Total bytes
                 let s = fmt_optional_bytes(file.total_bytes);
-                show_num_cell(ui, egui::RichText::new(&s).strong(), &s, COL_TOTAL_W);
+                show_num_cell(
+                    ui,
+                    egui::RichText::new(&s).font(crate::theme::font_semibold_in(ui, 13.0)),
+                    &s,
+                    COL_TOTAL_W,
+                );
 
                 // File size
                 let s = file

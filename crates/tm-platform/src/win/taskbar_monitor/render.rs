@@ -16,12 +16,12 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1Factory, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_PIXEL_GEOMETRY_BGR,
-    DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, DWRITE_RENDERING_MODE_GDI_CLASSIC,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, IDWriteTextFormat,
-    IDWriteTextLayout,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_PIXEL_GEOMETRY_BGR, DWRITE_PIXEL_GEOMETRY_RGB,
+    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteRenderingParams, IDWriteTextFormat, IDWriteTextLayout, IDWriteTypography,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -193,10 +193,11 @@ pub(super) struct CachedFormatLayout {
 pub(super) struct Renderer {
     pub(super) d2d_factory: ID2D1Factory,
     pub(super) dwrite_factory: IDWriteFactory,
+    pub(super) tabular_typography: Option<IDWriteTypography>,
     pub(super) dc_rt: ID2D1DCRenderTarget,
     pub(super) surface: Option<DibSurface>,
     pub(super) format_cache: Vec<CachedFormatLayout>,
-    pub(super) rendering_params: Option<(isize, bool, IDWriteRenderingParams)>,
+    pub(super) rendering_params: Option<(isize, IDWriteRenderingParams)>,
     pub(super) text_brush: Option<([u8; 3], ID2D1SolidColorBrush)>,
     pub(super) hover_brush: Option<(bool, ID2D1SolidColorBrush)>,
 }
@@ -208,6 +209,13 @@ impl Renderer {
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()?;
             let dwrite_factory: IDWriteFactory =
                 DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let tabular_typography = dwrite_factory.CreateTypography().ok().filter(|typo| {
+                typo.AddFontFeature(DWRITE_FONT_FEATURE {
+                    nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+                    parameter: 1,
+                })
+                .is_ok()
+            });
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -224,6 +232,7 @@ impl Renderer {
             Some(Self {
                 d2d_factory,
                 dwrite_factory,
+                tabular_typography,
                 dc_rt,
                 surface: None,
                 format_cache: Vec::new(),
@@ -274,6 +283,23 @@ impl Renderer {
         fmt: &IDWriteTextFormat,
         text: &str,
     ) -> (f32, f32, Option<IDWriteTextLayout>) {
+        self.measure_text_inner(fmt, text, false)
+    }
+
+    pub(super) fn measure_numeric_text(
+        &self,
+        fmt: &IDWriteTextFormat,
+        text: &str,
+    ) -> (f32, f32, Option<IDWriteTextLayout>) {
+        self.measure_text_inner(fmt, text, true)
+    }
+
+    fn measure_text_inner(
+        &self,
+        fmt: &IDWriteTextFormat,
+        text: &str,
+        tabular_figures: bool,
+    ) -> (f32, f32, Option<IDWriteTextLayout>) {
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             let Ok(layout) = self
@@ -282,6 +308,15 @@ impl Renderer {
             else {
                 return (0.0, 0.0, None);
             };
+            if tabular_figures && let Some(typography) = &self.tabular_typography {
+                let _ = layout.SetTypography(
+                    typography,
+                    DWRITE_TEXT_RANGE {
+                        startPosition: 0,
+                        length: wide.len() as u32,
+                    },
+                );
+            }
             let mut metrics = DWRITE_TEXT_METRICS::default();
             if layout.GetMetrics(&mut metrics).is_err() {
                 return (0.0, 0.0, Some(layout));
@@ -342,7 +377,7 @@ impl Renderer {
         Some(self.format_cache.len() - 1)
     }
 
-    pub(super) fn apply_text_rendering_params(&mut self, hwnd: Option<isize>, dpi: u32) {
+    pub(super) fn apply_text_rendering_params(&mut self, hwnd: Option<isize>) {
         let monitor_raw = unsafe {
             MonitorFromWindow(
                 HWND(hwnd.unwrap_or(0) as *mut std::ffi::c_void),
@@ -350,10 +385,8 @@ impl Renderer {
             )
         }
         .0 as isize;
-        let classic = dpi <= 120;
-        if let Some((cached_mon, cached_classic, _)) = &self.rendering_params
+        if let Some((cached_mon, _)) = &self.rendering_params
             && *cached_mon == monitor_raw
-            && *cached_classic == classic
         {
             return;
         }
@@ -363,25 +396,20 @@ impl Renderer {
         } else {
             DWRITE_PIXEL_GEOMETRY_RGB
         };
-        let mode = if classic {
-            // Grid-fitted classic hinting keeps small taskbar fonts crisp at 100%–125% DPI.
-            DWRITE_RENDERING_MODE_GDI_CLASSIC
-        } else {
-            DWRITE_RENDERING_MODE_DEFAULT
-        };
         unsafe {
             // UpdateLayeredWindow uses scalar alpha, so D2D grayscale AA must stay active
-            // while inheriting the monitor's ClearType gamma/contrast calibration.
+            // while inheriting the monitor's ClearType gamma/contrast calibration. Natural
+            // symmetric rendering matches `CreateTextLayout`'s natural advances at all DPIs.
             if let Ok(rp) = self.dwrite_factory.CreateCustomRenderingParams(
                 params.gamma,
-                params.contrast.max(0.5),
+                params.contrast,
                 0.0,
                 geom,
-                mode,
+                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
             ) {
                 let rp_base: IDWriteRenderingParams = rp;
                 self.dc_rt.SetTextRenderingParams(&rp_base);
-                self.rendering_params = Some((monitor_raw, classic, rp_base));
+                self.rendering_params = Some((monitor_raw, rp_base));
             }
         }
     }
@@ -450,11 +478,11 @@ impl Renderer {
         let arrow_w = up_w.max(down_w);
 
         let (sent_w, line_h1, sent_layout) = match display.net_sent.as_deref() {
-            Some(s) if has_net => self.measure_text(&fmt, s),
+            Some(s) if has_net => self.measure_numeric_text(&fmt, s),
             _ => (0.0, 0.0, None),
         };
         let (recv_w, line_h2, recv_layout) = match display.net_recv.as_deref() {
-            Some(s) if has_net => self.measure_text(&fmt, s),
+            Some(s) if has_net => self.measure_numeric_text(&fmt, s),
             _ => (0.0, 0.0, None),
         };
         let net_sample_w = if has_net {
@@ -463,7 +491,7 @@ impl Renderer {
             {
                 *cached_w
             } else {
-                let (w, _, _) = self.measure_text(&fmt, &display.net_sample);
+                let (w, _, _) = self.measure_numeric_text(&fmt, &display.net_sample);
                 self.format_cache[cache_idx].net_sample = Some((display.net_sample.clone(), w));
                 w
             }
@@ -493,7 +521,7 @@ impl Renderer {
             None => (0.0, 0.0, None),
         };
         let (cpu_vw, line_h3, cpu_val_layout) = match display.cpu_val.as_deref() {
-            Some(s) => self.measure_text(&fmt, s),
+            Some(s) => self.measure_numeric_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
         let (ram_lw, ram_lh, ram_label_layout) = match display.ram_label.as_deref() {
@@ -503,7 +531,7 @@ impl Renderer {
             None => (0.0, 0.0, None),
         };
         let (ram_vw, line_h4, ram_val_layout) = match display.ram_val.as_deref() {
-            Some(s) => self.measure_text(&fmt, s),
+            Some(s) => self.measure_numeric_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
         let sys_val_sample_w = if has_sys {
@@ -512,7 +540,7 @@ impl Renderer {
             {
                 *cached_w
             } else {
-                let (w, _, _) = self.measure_text(&fmt, &display.sys_val_sample);
+                let (w, _, _) = self.measure_numeric_text(&fmt, &display.sys_val_sample);
                 self.format_cache[cache_idx].sys_val_sample =
                     Some((display.sys_val_sample.clone(), w));
                 w
@@ -660,7 +688,7 @@ impl Renderer {
         };
         let dpi_f = display.dpi.max(96) as f32;
         let snap_dip = |v: f32| -> f32 { (v * layout.dpi_scale).round() / layout.dpi_scale };
-        self.apply_text_rendering_params(hwnd, display.dpi.max(96));
+        self.apply_text_rendering_params(hwnd);
         unsafe {
             self.dc_rt.SetDpi(dpi_f, dpi_f);
             self.dc_rt.BindDC(surface_hdc, &bind_rect).ok()?;
@@ -1315,5 +1343,25 @@ mod tests {
         // Missing accent value falls back safely to SystemUsesLightTheme.
         assert!(resolve_light_taskbar(true, true, None));
         assert!(!resolve_light_taskbar(false, true, None));
+    }
+
+    #[test]
+    fn numeric_layouts_use_tabular_figures_so_digits_have_stable_width() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        assert!(
+            renderer.tabular_typography.is_some(),
+            "DirectWrite tabular figures typography must be initialized"
+        );
+        let fmt = renderer
+            .create_text_format("Segoe UI", 9.0)
+            .expect("Segoe UI text format");
+        let (w_ones, _, _) = renderer.measure_numeric_text(&fmt, "11.1 KB/s");
+        let (w_eights, _, _) = renderer.measure_numeric_text(&fmt, "88.8 KB/s");
+        assert_eq!(
+            w_ones, w_eights,
+            "tabular figures should keep digit widths equal across 1 and 8"
+        );
+        unsafe { CoUninitialize() };
     }
 }

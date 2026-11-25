@@ -284,6 +284,20 @@ pub mod text_rendering {
         None,
     }
 
+    /// Which hinting style the desktop asked for (Linux Fontconfig `hinting` / `hintstyle`).
+    ///
+    /// `Default` means the platform did not specify an explicit Fontconfig override (e.g.
+    /// Windows or macOS), so `tm-ui` applies its own smoothing preset.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum HintStyleChoice {
+        #[default]
+        Default,
+        None,
+        Slight,
+        Medium,
+        Full,
+    }
+
     /// Plain data, deliberately free of any platform type so the renderer and the egui
     /// fork stay platform-independent.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -294,6 +308,7 @@ pub mod text_rendering {
         pub contrast: f32,
         pub cleartype_level: f32,
         pub lcd_filter: LcdFilterChoice,
+        pub hint_style: HintStyleChoice,
     }
 
     impl Default for Params {
@@ -305,6 +320,7 @@ pub mod text_rendering {
                 contrast: 0.5,
                 cleartype_level: 1.0,
                 lcd_filter: LcdFilterChoice::Default,
+                hint_style: HintStyleChoice::Default,
             }
         }
     }
@@ -364,6 +380,7 @@ pub mod text_rendering {
             contrast: p.contrast,
             cleartype_level: p.cleartype_level,
             lcd_filter: LcdFilterChoice::Default,
+            hint_style: HintStyleChoice::Default,
         }
     }
 
@@ -409,6 +426,12 @@ pub mod fontconfig {
     /// by the text-policy query.
     pub fn match_file(pattern: &str) -> Option<String> {
         crate::fontconfig_text::match_file(pattern)
+    }
+
+    /// Resolve a generic family to both its canonical file path and TrueType collection
+    /// face index (`%{index}`), so `.ttc` collections load the exact matched face.
+    pub fn match_face(pattern: &str) -> Option<(String, u32)> {
+        crate::fontconfig_text::match_face(pattern)
     }
 }
 

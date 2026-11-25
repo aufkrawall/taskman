@@ -1649,6 +1649,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             for family in [
                                 "Segoe UI",
                                 "Segoe UI Variable Text",
+                                "Segoe UI Variable Small",
                                 "Consolas",
                                 "Cascadia Mono",
                                 "Arial",
@@ -2672,8 +2673,7 @@ pub fn help_overlay(ctx: &egui::Context, pal: &Palette) -> bool {
                     for (combo, description) in shortcut_rows(i18n::lang()) {
                         ui.label(
                             egui::RichText::new(combo)
-                                .size(13.0)
-                                .strong()
+                                .font(crate::theme::font_semibold_in(ui, 13.0))
                                 .color(pal.accent),
                         );
                         ui.label(egui::RichText::new(description).size(13.0));

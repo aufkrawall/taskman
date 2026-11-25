@@ -36,14 +36,12 @@ pub fn checkbox_enabled(
 ) -> egui::Response {
     const BOX: f32 = 18.0;
     let spacing = ui.spacing().item_spacing.x;
-    let text_w = if text.is_empty() {
-        0.0
-    } else {
+    let text_color = if enabled { pal.text } else { pal.text_dim };
+    let label_galley = (!text.is_empty()).then(|| {
         ui.painter()
-            .layout_no_wrap(text.to_owned(), FontId::proportional(13.0), Color32::WHITE)
-            .size()
-            .x
-    };
+            .layout_no_wrap(text.to_owned(), FontId::proportional(13.0), text_color)
+    });
+    let text_w = label_galley.as_ref().map_or(0.0, |g| g.size().x);
     let w = if text.is_empty() {
         BOX
     } else {
@@ -143,15 +141,14 @@ pub fn checkbox_enabled(
         p.add(egui::Shape::line(vec![a, b, d], Stroke::new(2.0, color)));
     }
 
-    if !text.is_empty() {
-        let color = if enabled { pal.text } else { pal.text_dim };
-        ui.painter().text(
-            Pos2::new(box_rect.right() + spacing, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            FontId::proportional(13.0),
-            color,
-        );
+    if let Some(galley) = label_galley {
+        let pos = egui::Align2::LEFT_CENTER
+            .anchor_size(
+                Pos2::new(box_rect.right() + spacing, rect.center().y),
+                galley.size(),
+            )
+            .min;
+        ui.painter().galley(pos, galley, text_color);
     }
 
     resp.widget_info(|| {

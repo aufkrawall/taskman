@@ -888,7 +888,7 @@ pub fn show(
                 inspector::num_cell(ui, table, rect, 0, &thread.tid.to_string(), pal, dim);
                 inspector::num_cell(ui, table, rect, 1, &view.cpu, pal, dim);
                 inspector::num_cell(ui, table, rect, 2, &view.cpu_time, pal, dim);
-                let start_truncated = table.text_cell(ui, rect, 3, &view.start, pal, dim);
+                let start_truncated = table.mono_cell(ui, rect, 3, &view.start, pal, dim);
                 table.text_cell(ui, rect, 4, &view.priority, pal, dim);
                 let state_truncated = table.text_cell(ui, rect, 5, &view.state, pal, dim);
                 table.text_cell(ui, rect, 6, &view.activity, pal, dim);

@@ -620,6 +620,10 @@ fn run_gui(mock: bool, args: &[String]) {
                 subpixel_capable,
                 "resolved sub-pixel text capability"
             );
+            // Publish the user's saved smoothing preference BEFORE `apply_startup` and
+            // `fonts::install_async` so Frame 1 and the async font load both use the
+            // real hinting/weight profile instead of racing against `TaskManApp::new`.
+            theme::set_text_smoothing(app_settings.text_smoothing);
             theme::set_subpixel_capable(
                 subpixel_capable,
                 tm_platform::text_rendering::query(creation_hwnd),
@@ -1148,7 +1152,7 @@ impl NativeApp {
     }
 
     #[cfg(target_os = "windows")]
-    fn sync_text_rendering(&mut self, ctx: &eframe::egui::Context) {
+    fn sync_text_rendering(&mut self, ctx: &eframe::egui::Context, force_requery: bool) {
         let Some(hwnd) = self.hwnd else {
             return;
         };
@@ -1161,7 +1165,7 @@ impl NativeApp {
             }
             return;
         };
-        if self.last_text_rendering_key == Some(key) {
+        if !force_requery && self.last_text_rendering_key == Some(key) {
             return;
         }
 
@@ -1175,6 +1179,7 @@ impl NativeApp {
                 monitor = key.monitor,
                 monitor_rect = ?key.monitor_rect,
                 effective_dpi = key.effective_dpi,
+                force_requery,
                 ?params,
                 "updated text-rendering policy for window placement"
             );
@@ -1303,11 +1308,17 @@ impl eframe::App for NativeApp {
         ctx: &eframe::egui::Context,
         raw_input: &mut eframe::egui::RawInput,
     ) {
-        // This hook runs before egui begins the pass, so a monitor-policy
-        // change can affect the same frame instead of leaving one frame on
-        // the previous stripe order.
+        // This hook runs before egui begins the pass, so a monitor-policy or
+        // live ClearType-tuner change on focus return affects the same frame
+        // instead of leaving one frame on the previous stripe order.
         #[cfg(target_os = "windows")]
-        self.sync_text_rendering(ctx);
+        {
+            let focus_gained = raw_input
+                .events
+                .iter()
+                .any(|event| matches!(event, eframe::egui::Event::WindowFocused(true)));
+            self.sync_text_rendering(ctx, focus_gained);
+        }
         // `ui` does not run while the window is minimized or hidden, and
         // `logic` cannot read the viewport's close request from the context
         // then; the raw input reaches both paths.

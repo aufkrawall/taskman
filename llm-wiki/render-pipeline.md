@@ -1,6 +1,6 @@
 # Render Pipeline
 
-Last verified: 2026-11-24 (GPU LCD path, manual D3D12/Vulkan validation, Linux fontconfig, and the Linux CPU-renderer damage/age contract)
+Last verified: 2026-11-25 (GPU gamma compensation & sRGB linear premultiplication, `GlyphScratch` pooling, `TextureSnapshots` font-atlas deduplication, Windows RDP/portrait/focus-return policy, Linux Fontconfig contrast/hintstyle/collection index, and Light Mode `Sharp` polarity)
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
@@ -104,7 +104,10 @@ rectangle, effective DPI). A same-sized move, monitor topology change or DPI cha
 fresh DirectWrite query for every monitor intersecting the window rectangle.
 
 - All intersecting monitors agreeing updates only the theme blend parameters. `SUBPIXEL_CAPABLE`
-  is preserved; the next WGPU frame uploads the new order/contrast from `TextOptions`.
+  is preserved; the next WGPU frame uploads the new order/gamma/contrast from `TextOptions`.
+  Regaining window focus (`Event::WindowFocused(true)`) also forces a fresh DirectWrite query
+  so live `cttune.exe` / Windows Settings changes apply immediately even when the window did
+  not move or resize.
 - Any unavailable DirectWrite query, disagreement in validated parameters or RGB/BGR order,
   or malformed parameter set disables LCD for the whole window/viewport. Choosing one half
   of a straddling window or assuming RGB after a failed query is never allowed.
@@ -164,10 +167,11 @@ warns about.
 for a visible viewport. When no viewport remains on screen, hidden logic ticks continue, but
 `EpiIntegration::frame.wgpu_render_state` is cleared, all surfaces/depth/MSAA/capture state
 and managed renderer textures are freed, and the painter's `RenderState` and device are
-dropped. A later visible repaint recreates the device/renderer/surface. Managed textures are
-snapshotted on the CPU as egui uploads full or partial images; the latest full image is
-replayed into the replacement renderer so the font atlas and cached row icons survive the
-round-trip. An explicit `Visible(false)` suppresses eframe's first-frame reveal.
+dropped. A later visible repaint recreates the device/renderer/surface. Managed user textures are snapshotted on the CPU as egui uploads full or partial images, while
+`TextureId::default()` records only its `TextureOptions` and replays live from
+`Context::fonts(|f| f.image())` so the replacement renderer restores both the font atlas and
+cached row icons without keeping a permanent second CPU copy of the atlas. An explicit
+`Visible(false)` suppresses eframe's first-frame reveal.
 
 Wayland has no direct window-visibility or minimize query. The vendored winit exposes
 xdg-shell v6's `SUSPENDED` configure hint through `Window::is_minimized()`, which makes a
@@ -238,14 +242,18 @@ replace the required per-driver pipeline run.
 For the managed atlas, `egui_lcd.wgsl` emits source color at location 0 / source 0 and
 per-channel coverage at location 0 / source 1. The pipeline blends `ONE` against
 `ONE_MINUS_SRC1`, so RGB each use their own coverage. BGR is a blend-time channel swap;
-the atlas remains RGB-filtered. The same uniform carries the active order and
-`TextOptions::text_contrast`, so Sharp/Standard/Smooth still change weight without a
-hardcoded color-dependent approximation.
+the atlas remains RGB-filtered. The 32-byte `Locals` uniform carries the active order,
+`TextOptions::text_contrast`, and `TextOptions::text_gamma`. Dithering runs only on covered
+pixels (`coverage > 0` / `alpha > 0`), never into transparent glyph padding.
 
-**GPU gamma limitation:** fixed-function dual-source blending cannot read the framebuffer,
-so it cannot implement the software path's nonlinear `dst^gamma` term. WGPU applies the
-contrast curve and preserves the configured stripe order, but the result is not claimed to
-be DirectWrite-gamma-exact. The software renderer keeps the full gamma/contrast model.
+**GPU gamma handling:** fixed-function dual-source blending cannot read the destination pixel,
+so it cannot evaluate the software path's exact `dst^gamma` term. On non-sRGB `Unorm` surfaces
+(`fs_lcd_gamma_framebuffer`), the shader applies foreground-luminance gamma compensation
+(`mix(1 - (1 - c)^(1/g), c^(1/g), lum)`) using `Locals.subpixel_gamma` so D3D12/Vulkan text
+weight tracks CPU `TextGamma` across both dark and light UIs. On sRGB surfaces
+(`fs_lcd_linear_framebuffer`), straight foreground sRGB is converted to linear before
+premultiplying by channel coverage to conserve energy. The software renderer keeps the full
+destination-aware gamma/contrast model.
 
 ## Text weight, and what `TextSmoothing` now means
 
@@ -255,16 +263,15 @@ glowing next to native Windows text -- Windows errs thin. So the smoothing profi
 a weight control, which is the useful thing left for it to be now that the coverage ramp it
 used to select is not consulted on the sub-pixel path at all:
 
-| profile | grid-fit | binning | blend | ink @150% |
+| profile | grid-fit | binning | blend (Dark) | blend (Light) |
 | --- | --- | --- | --- | --- |
-| `Sharp` | yes | no | `gamma * 0.88`, contrast 0.25 | 991 |
-| `Standard` | no | no | the display's own parameters | 1117 |
-| `Smooth` | no | yes | the display's own parameters | -- |
+| `Sharp` | yes | no | `gamma * 0.88`, `contrast.min(0.25)` | `gamma * 1.06`, `contrast.min(0.25)` |
+| `Standard` | no (follows Linux Fontconfig `hintstyle`) | no | the display's own parameters | the display's own parameters |
+| `Smooth` | no | yes | the display's own parameters | the display's own parameters |
 
-`theme::cleartype_weight` is the single definition, shared with the comparison harness.
-The software renderer consumes both returned values. The WGPU path carries the contrast
-value and its RGB/BGR order through its uniform, but cannot carry the gamma term into a
-fixed-function destination blend (see above).
+`theme::cleartype_weight` is the single definition, shared with the comparison harness (which
+pins thinner `Sharp` ink in both Dark and Light modes). Both the software renderer and the
+WGPU LCD shader consume gamma and contrast from `TextOptions`.
 
 **Measure at 150% scaling, not 100%.** At 100% the three profiles are indistinguishable
 (edge sharpness 75.4 / 75.3 / 75.5) and the weight question is invisible. At 150%, where
@@ -283,9 +290,13 @@ Enabling it where it is not valid looks *worse* than grayscale, so it is gated o
 
 - `SPI_GETFONTSMOOTHING` off, or `SPI_GETFONTSMOOTHINGTYPE` not ClearType — explicit user
   choices.
+- Remote Desktop session (`GetSystemMetrics(SM_REMOTESESSION) != 0`), where compression and
+  client rescaling turn sub-pixel fringes into color noise.
+- Portrait-rotated displays (`DMDO_90` / `DMDO_270` from `EnumDisplaySettingsW`) or
+  `DWRITE_PIXEL_GEOMETRY_FLAT`, where horizontal RGB/BGR stripes do not exist.
 - A ClearType level of 0 from the tuner, which means the same thing.
 - The process not being per-monitor DPI aware: DWM would bitmap-stretch the window and
-  smear the fringes into colour noise. Also covers RDP and Magnifier. winit sets
+  smear the fringes into colour noise. winit sets
   per-monitor-v2, so this normally passes — but it is checked, because the failure mode is
   ugly rather than obvious. (It correctly reports "off" inside `cargo test`.)
 - The active GPU backend is Glow, or WGPU did not enable dual-source blending. These are
@@ -298,11 +309,14 @@ Enabling it where it is not valid looks *worse* than grayscale, so it is gated o
 Linux `fc-match` is resolved from absolute root-owned system locations rather than
 `PATH`, but it inherits the user's environment and reads the effective per-user KDE/GNOME
 fontconfig files. The result is cached process-wide; no frame spawns `fc-match`.
-`lcdfilter` maps to FreeType default, light, legacy/classic and none. The system-font lookup
-uses the same canonical absolute executable and parent-directory policy as the policy
-query. One 750 ms absolute deadline covers process output, which is capped at 64 KiB; a
-timed-out or oversized helper is killed and reaped, and every failure returns unavailable
-grayscale rather than the user's `PATH` or an invented policy.
+Linux sets `contrast = 0.0` (no DirectWrite enhanced-contrast boost), parses `hinting` and
+`hintstyle` for `TextSmoothing::Standard`, maps `lcdfilter` to FreeType default, light,
+legacy/classic and none, and resolves both file path and `.ttc` face index (`%{index}`) for
+system-font selection. The system-font lookup uses the same canonical absolute executable and
+parent-directory policy as the policy query. One 750 ms absolute deadline covers process
+output, which is capped at 64 KiB; a timed-out or oversized helper is killed and reaped, and
+every failure returns unavailable grayscale rather than the user's `PATH` or an invented
+policy.
 
 ## Verification
 

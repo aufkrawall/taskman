@@ -1176,19 +1176,17 @@ impl TmTable {
                 );
             }
 
+            let label_painter = ui.painter_at(cell);
+            let label_galley = label_painter.layout_no_wrap(
+                col.label.to_owned(),
+                FontId::proportional(FONT_HDR_LABEL),
+                pal.text_dim,
+            );
             if let Some((_, asc)) = sorted {
                 let cx = if col.numeric {
                     cell.right() - 16.0
                 } else {
-                    let label_w = painter
-                        .layout_no_wrap(
-                            col.label.to_owned(),
-                            FontId::proportional(FONT_HDR_LABEL),
-                            Color32::WHITE,
-                        )
-                        .size()
-                        .x;
-                    tx + label_w + 9.0
+                    tx + label_galley.size().x + 9.0
                 };
                 let cy = if two_line {
                     cell.top() + 19.0
@@ -1198,13 +1196,10 @@ impl TmTable {
                 caret(painter.clone(), Pos2::new(cx, cy), asc, pal.text_dim);
             }
 
-            ui.painter_at(cell).text(
-                Pos2::new(tx, label_y),
-                align,
-                col.label,
-                FontId::proportional(FONT_HDR_LABEL),
-                pal.text_dim,
-            );
+            let label_pos = align
+                .anchor_size(Pos2::new(tx, label_y), label_galley.size())
+                .min;
+            label_painter.galley(label_pos, label_galley, pal.text_dim);
             x += w;
         }
 
@@ -1391,12 +1386,14 @@ impl TmTable {
         }
         // Carry the header's column boundaries through the body. Native
         // Task Manager keeps these guides very quiet, but without them wide
-        // text tables are unnecessarily hard to scan horizontally.
+        // text tables are unnecessarily hard to scan horizontally. Snap stroke
+        // width to 1 physical pixel so dividers stay crisp at 100%-200% DPI.
+        let divider_w = 1.0 / ui.ctx().pixels_per_point().max(1.0);
         for i in 1..self.cols.len() {
             let x = self.boundary_x(rect, i);
             painter.line_segment(
                 [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                Stroke::new(0.75, pal.stroke.gamma_multiply(0.72)),
+                Stroke::new(divider_w, pal.stroke.gamma_multiply(0.72)),
             );
         }
         (rect, resp)
@@ -1470,11 +1467,10 @@ impl TmTable {
         self.row_overlay.set(Some(fill));
     }
 
-    /// Left-aligned text cell. The painter is clipped to this exact cell so
-    /// long values can never bleed into the neighbouring column.
-    /// Paint a left-aligned text cell clipped to its column. Returns whether
-    /// the text was clipped by the cell — the caller can turn that into a
-    /// full-value hover tooltip on the row response.
+    /// Paint a left-aligned text cell clipped to its column in a single
+    /// layout pass. Returns whether the text was clipped by the cell — the
+    /// caller can turn that into a full-value hover tooltip on the row
+    /// response.
     pub fn text_cell(
         &self,
         ui: &egui::Ui,
@@ -1486,19 +1482,35 @@ impl TmTable {
     ) -> bool {
         let cell = self.col_rect(i, row);
         self.text_measures.set(self.text_measures.get() + 1);
-        let truncated = text_width(ui, text, FONT_ROW) + 10.0 > cell.width();
-        self.paint_text_cell(ui, cell, i, text, pal, dim);
-        truncated
+        let color = if dim { pal.text_dim } else { pal.text };
+        let text_w =
+            self.paint_cell_with_font(ui, cell, i, text, FontId::proportional(FONT_ROW), color);
+        text_w + 10.0 > cell.width()
+    }
+
+    /// Left-aligned monospace text cell (e.g. hex start addresses) clipped to
+    /// its column in a single layout pass.
+    pub fn mono_cell(
+        &self,
+        ui: &egui::Ui,
+        row: Rect,
+        i: usize,
+        text: &str,
+        pal: &Palette,
+        dim: bool,
+    ) -> bool {
+        let cell = self.col_rect(i, row);
+        self.text_measures.set(self.text_measures.get() + 1);
+        let color = if dim { pal.text_dim } else { pal.text };
+        let text_w =
+            self.paint_cell_with_font(ui, cell, i, text, FontId::monospace(FONT_ROW), color);
+        text_w + 10.0 > cell.width()
     }
 
     /// [`Self::text_cell`] for callers that only consume the clipped-text
-    /// answer under the pointer.
-    ///
-    /// The answer is a hover tooltip, so a table that checks it per cell pays
-    /// for one text layout per visible cell per repaint — on a dense Details
-    /// list that is hundreds of layouts per frame for at most one answer it
-    /// uses. Both variants paint exactly the same thing; only the measurement
-    /// is skipped.
+    /// answer under the pointer. Both variants paint identically in one
+    /// layout pass; this variant leaves the explicit measurement counter
+    /// untouched.
     pub fn text_cell_unmeasured(
         &self,
         ui: &egui::Ui,
@@ -1508,26 +1520,38 @@ impl TmTable {
         pal: &Palette,
         dim: bool,
     ) {
-        self.paint_text_cell(ui, self.col_rect(i, row), i, text, pal, dim);
+        let color = if dim { pal.text_dim } else { pal.text };
+        let _ = self.paint_cell_with_font(
+            ui,
+            self.col_rect(i, row),
+            i,
+            text,
+            FontId::proportional(FONT_ROW),
+            color,
+        );
     }
 
-    fn paint_text_cell(
+    fn paint_cell_with_font(
         &self,
         ui: &egui::Ui,
         cell: Rect,
         i: usize,
         text: &str,
-        pal: &Palette,
-        dim: bool,
-    ) {
+        font: FontId,
+        color: Color32,
+    ) -> f32 {
         self.describe_cell(ui, i, text);
-        ui.painter_at(cell).text(
-            Pos2::new(cell.left() + 10.0, cell.center().y),
-            Align2::LEFT_CENTER,
-            text,
-            FontId::proportional(FONT_ROW),
-            if dim { pal.text_dim } else { pal.text },
-        );
+        let painter = ui.painter_at(cell);
+        let galley = painter.layout_no_wrap(text.to_owned(), font, color);
+        let width = galley.size().x;
+        let pos = Align2::LEFT_CENTER
+            .anchor_size(
+                Pos2::new(cell.left() + 10.0, cell.center().y),
+                galley.size(),
+            )
+            .min;
+        painter.galley(pos, galley, color);
+        width
     }
 
     /// Paint the blue value band for the numeric columns starting at `from`.

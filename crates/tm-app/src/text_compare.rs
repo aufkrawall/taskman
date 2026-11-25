@@ -91,6 +91,7 @@ struct Cfg {
     smoothing: TextSmoothing,
     subpixel: SubpixelMode,
     filter: LcdFilter,
+    theme: egui::Theme,
     /// Physical pixels per point. 1.5 is Windows' 150% scaling.
     ppp: f32,
     /// `None` uses the display's own DirectWrite parameters.
@@ -103,9 +104,14 @@ impl Cfg {
             smoothing,
             subpixel,
             filter: LcdFilter::default(),
+            theme: egui::Theme::Dark,
             ppp: 1.0,
             blend: None,
         }
+    }
+    fn theme(mut self, theme: egui::Theme) -> Self {
+        self.theme = theme;
+        self
     }
     fn ppp(mut self, ppp: f32) -> Self {
         self.ppp = ppp;
@@ -139,14 +145,15 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
         smoothing,
         subpixel,
         filter,
+        theme,
         ppp,
         blend,
     } = cfg;
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(ppp);
     ctx.set_fonts(definitions(bytes, smoothing));
-    for theme in [egui::Theme::Dark, egui::Theme::Light] {
-        ctx.style_mut_of(theme, |style| {
+    for t in [egui::Theme::Dark, egui::Theme::Light] {
+        ctx.style_mut_of(t, |style| {
             let o = &mut style.visuals.text_options;
             o.subpixel = subpixel;
             o.lcd_filter = filter;
@@ -158,14 +165,27 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
                 // Either an explicit sweep value, or exactly what the app would pick
                 // for this profile -- so the profile rows show real behaviour.
                 let (gamma, contrast) = blend.unwrap_or_else(|| {
-                    crate::theme::cleartype_weight(smoothing, &crate::theme::subpixel_params())
+                    crate::theme::cleartype_weight(smoothing, t, &crate::theme::subpixel_params())
                 });
                 o.text_gamma = gamma;
                 o.text_contrast = contrast;
             }
         });
     }
-    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_theme(match theme {
+        egui::Theme::Dark => egui::ThemePreference::Dark,
+        egui::Theme::Light => egui::ThemePreference::Light,
+    });
+    let (bg_color, fg_color) = match theme {
+        egui::Theme::Dark => (
+            Color32::from_rgb(0x19, 0x19, 0x19),
+            Color32::from_rgb(0xe6, 0xe6, 0xe6),
+        ),
+        egui::Theme::Light => (
+            Color32::from_rgb(0xf3, 0xf3, 0xf3),
+            Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        ),
+    };
 
     let build = |ui: &mut egui::Ui| {
         ui.painter().text(
@@ -173,7 +193,7 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
             egui::Align2::LEFT_TOP,
             SAMPLE,
             FontId::proportional(13.0),
-            Color32::from_rgb(0xe6, 0xe6, 0xe6),
+            fg_color,
         );
     };
     let input = || egui::RawInput {
@@ -218,7 +238,7 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
 
     let mut buf = vec![0u32; (W * H) as usize];
     let mut target = Target::new(&mut buf, W, H).expect("target");
-    Painter::clear(&mut target, Color32::from_rgb(0x19, 0x19, 0x19));
+    Painter::clear(&mut target, bg_color);
     painter.paint_shapes(&mut target, &shape_ctx, out.shapes);
     buf
 }
@@ -389,6 +409,43 @@ mod tests {
         assert!(
             sharp > standard * 0.6,
             "Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0}) -- text this              faint reads as broken rather than crisp"
+        );
+    }
+
+    /// Total dark ink below the light background: how "fat" dark-on-light text is.
+    fn dark_ink(buf: &[u32]) -> f64 {
+        let bg: u32 = (299 * 0xf3 + 587 * 0xf3 + 114 * 0xf3) / 1000;
+        buf.iter()
+            .map(|&px| {
+                let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+                let l = (299 * r + 587 * g + 114 * b) / 1000;
+                f64::from(bg.saturating_sub(l)) / 255.0
+            })
+            .sum()
+    }
+
+    /// Under sub-pixel rendering on a light UI, `Sharp` must also render *thinner*
+    /// than `Standard` — lowering gamma blindly would thicken dark-on-light text.
+    #[test]
+    fn sharp_renders_thinner_than_standard_under_subpixel_in_light_mode() {
+        let Some(bytes) = ui_font() else { return };
+        let at = |sm| {
+            dark_ink(&render_cfg(
+                &bytes,
+                Cfg::new(sm, SubpixelMode::Rgb)
+                    .theme(egui::Theme::Light)
+                    .ppp(1.5),
+            ))
+        };
+        let sharp = at(TextSmoothing::Sharp);
+        let standard = at(TextSmoothing::Standard);
+        assert!(
+            sharp < standard * 0.96,
+            "Light Mode Sharp ({sharp:.0}) is not thinner than Standard ({standard:.0})"
+        );
+        assert!(
+            sharp > standard * 0.6,
+            "Light Mode Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0})"
         );
     }
 }

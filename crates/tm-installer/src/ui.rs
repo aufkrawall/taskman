@@ -46,7 +46,7 @@ pub fn run(opts: Options) -> tm_core::error::Result<()> {
     eframe::run_native(
         &title,
         native,
-        Box::new(|cc| Ok(Box::new(SetupApp::new(&cc.egui_ctx, opts)))),
+        Box::new(|cc| Ok(Box::new(SetupApp::new(cc, opts)))),
     )
     .map_err(|error| tm_core::error::TmError::platform("setup window", error.to_string()))
 }
@@ -88,11 +88,31 @@ struct SetupApp {
 }
 
 impl SetupApp {
-    fn new(ctx: &egui::Context, opts: Options) -> Self {
-        // The software renderer can blend per channel, but the installer's
-        // window does not exist yet. Start grayscale and resolve the real
-        // monitor policy from the first frame's window handle.
-        theme::set_subpixel_capable(true, tm_platform::text_rendering::Params::default());
+    fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> Self {
+        #[cfg(target_os = "windows")]
+        let creation_hwnd = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            cc.window_handle()
+                .ok()
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                    _ => None,
+                })
+        };
+        #[cfg(not(target_os = "windows"))]
+        let creation_hwnd: Option<isize> = None;
+        Self::new_with_hwnd(&cc.egui_ctx, opts, creation_hwnd)
+    }
+
+    fn new_with_hwnd(ctx: &egui::Context, opts: Options, creation_hwnd: Option<isize>) -> Self {
+        #[cfg(not(target_os = "windows"))]
+        let _ = creation_hwnd;
+        // The window already exists inside `eframe`'s creator callback, so query the
+        // real monitor ClearType policy up front instead of rebuilding the atlas on Frame 2.
+        let params = tm_platform::text_rendering::query(creation_hwnd);
+        #[cfg(target_os = "windows")]
+        let initial_key = creation_hwnd.and_then(tm_platform::text_rendering::window_placement_key);
+        theme::set_subpixel_capable(true, params);
         theme::apply_startup(ctx);
         fonts::install_async(ctx.clone());
         let icon = ctx.load_texture(
@@ -137,9 +157,9 @@ impl SetupApp {
             worker: None,
             ctx: ctx.clone(),
             #[cfg(target_os = "windows")]
-            last_text_rendering_key: None,
+            last_text_rendering_key: initial_key,
             #[cfg(target_os = "windows")]
-            hwnd: None,
+            hwnd: creation_hwnd,
         }
     }
 
@@ -257,16 +277,24 @@ impl eframe::App for SetupApp {
     fn raw_input_hook(
         &mut self,
         ctx: &eframe::egui::Context,
-        _raw_input: &mut eframe::egui::RawInput,
+        raw_input: &mut eframe::egui::RawInput,
     ) {
         #[cfg(target_os = "windows")]
-        self.sync_text_rendering(ctx);
+        {
+            let focus_gained = raw_input
+                .events
+                .iter()
+                .any(|event| matches!(event, eframe::egui::Event::WindowFocused(true)));
+            self.sync_text_rendering(ctx, focus_gained);
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = (ctx, raw_input);
     }
 }
 
 impl SetupApp {
     #[cfg(target_os = "windows")]
-    fn sync_text_rendering(&mut self, ctx: &egui::Context) {
+    fn sync_text_rendering(&mut self, ctx: &egui::Context, force_requery: bool) {
         let Some(hwnd) = self.hwnd else {
             if theme::set_subpixel_params(tm_platform::text_rendering::Params::default()) {
                 theme::refresh_text_rendering(ctx);
@@ -281,7 +309,7 @@ impl SetupApp {
             self.last_text_rendering_key = None;
             return;
         };
-        if self.last_text_rendering_key == Some(key) {
+        if !force_requery && self.last_text_rendering_key == Some(key) {
             return;
         }
         let params = tm_platform::text_rendering::query(Some(hwnd));
@@ -352,8 +380,7 @@ fn header_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &SetupApp) {
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new("Task Manager")
-                            .size(22.0)
-                            .strong()
+                            .font(theme::font_semibold_in(ui, 22.0))
                             .color(pal.text),
                     );
                     ui.add_space(2.0);
@@ -744,7 +771,7 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_visuals(&ctx);
         ctx.set_theme(egui::ThemePreference::Dark);
-        let app = SetupApp::new(&ctx, Options::default());
+        let app = SetupApp::new_with_hwnd(&ctx, Options::default(), None);
         (ctx, app)
     }
 

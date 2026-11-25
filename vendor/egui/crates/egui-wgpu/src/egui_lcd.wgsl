@@ -10,10 +10,16 @@
 //
 //   dst = text_color * coverage + dst * (1 - coverage)
 //
-// independently for R, G and B. This cannot reproduce the software renderer's nonlinear
-// destination-gamma blend, because a fixed-function blend cannot read the destination in
-// the fragment shader. We apply the requested contrast/weight curve and document the
-// gamma limitation rather than pretending the result is DirectWrite-exact.
+// independently for R, G and B.
+//
+// * On linear (sRGB-converting) framebuffers, hardware already converts `dst` to linear
+//   and encodes the blended output back to sRGB, so the shader converts the straight text
+//   color to linear *before* multiplying by per-channel coverage (conserving energy).
+// * On gamma (non-sRGB `Unorm`) framebuffers, fixed-function blending cannot read `dst`,
+//   so the shader applies a foreground-luminance gamma compensation curve to coverage:
+//   exact `a'^(1/g)` for white-on-dark, exact `1 - (1 - a')^(1/g)` for black-on-light,
+//   interpolated by text luminance in between. This matches the CPU renderer's `TextGamma`
+//   weight closely in both dark and light themes without framebuffer reads.
 
 fn is_lcd_texel(tex: vec4<f32>) -> bool {
     return tex.a <= 0.5 / 255.0
@@ -28,10 +34,17 @@ fn enhance_lcd_contrast(coverage: vec3<f32>) -> vec3<f32> {
     );
 }
 
-fn lcd_fallback_gray(tex: vec4<f32>) -> vec4<f32> {
-    let gray = (tex.r + tex.g + tex.b) / 3.0;
-    let weighted = enhance_lcd_contrast(vec3<f32>(gray)).x;
-    return vec4<f32>(weighted);
+fn gamma_adjust_lcd_coverage(coverage: vec3<f32>, straight_rgb: vec3<f32>, gamma: f32) -> vec3<f32> {
+    let g = clamp(gamma, 1.0, 3.0);
+    if g <= 1.0001 {
+        return coverage;
+    }
+    let inv_g = 1.0 / g;
+    let c = clamp(coverage, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lum = clamp(dot(straight_rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+    let c_dark_bg = pow(c, vec3<f32>(inv_g));
+    let c_light_bg = vec3<f32>(1.0) - pow(vec3<f32>(1.0) - c, vec3<f32>(inv_g));
+    return mix(c_light_bg, c_dark_bg, lum);
 }
 
 // Only a one-texel-per-pixel, center-aligned mapping preserves the panel's horizontal
@@ -59,37 +72,66 @@ fn lcd_output(in: VertexOutput, linear_framebuffer: bool) -> LcdOutput {
     let aligned = lcd_texels_on_pixels(in);
     let subpixel_texel = is_lcd_texel(sampled);
 
+    let has_alpha = in.color.a > 0.0;
+    let straight_rgb = select(
+        vec3<f32>(0.0),
+        clamp(in.color.rgb / max(in.color.a, 1e-5), vec3<f32>(0.0), vec3<f32>(1.0)),
+        has_alpha,
+    );
+
     var color: vec4<f32>;
     var coverage: vec4<f32>;
-    if subpixel_texel && aligned {
+    if subpixel_texel {
         var rgb = sampled.rgb;
-        if r_locals.subpixel_order == 2u {
-            rgb = rgb.bgr;
+        if aligned {
+            if r_locals.subpixel_order == 2u {
+                rgb = rgb.bgr;
+            }
+        } else {
+            // LCD texels sampled off the pixel grid collapse to their mean coverage so
+            // rotated/scaled/fractional text cannot smear colored fringes.
+            let gray = (rgb.r + rgb.g + rgb.b) / 3.0;
+            rgb = vec3<f32>(gray);
         }
-        let weighted = enhance_lcd_contrast(rgb);
-        let channel_coverage = weighted * in.color.a;
-        color = vec4<f32>(
-            in.color.rgb * weighted,
-            in.color.a * (weighted.r + weighted.g + weighted.b) / 3.0,
-        );
-        coverage = vec4<f32>(channel_coverage, color.a);
-    } else {
-        // Color glyphs pass through unchanged. LCD texels sampled off the pixel grid are
-        // drawn as their mean coverage, which is correct grayscale text and cannot smear
-        // colored fringes.
-        let tex = select(sampled, lcd_fallback_gray(sampled), subpixel_texel);
-        color = in.color * tex;
-        coverage = vec4<f32>(color.a);
-    }
 
-    if r_locals.dithering == 1 {
-        color = vec4<f32>(
-            dither_interleaved(color.rgb, 256.0, in.position),
-            color.a,
-        );
-    }
-    if linear_framebuffer {
-        color = vec4<f32>(linear_from_gamma_rgb(color.rgb), color.a);
+        let contrasted = enhance_lcd_contrast(rgb);
+        if linear_framebuffer {
+            // Hardware blends in linear space: convert the straight text color first,
+            // then premultiply by per-channel coverage so weights stay energy-conserving.
+            let channel_coverage = contrasted * in.color.a;
+            let linear_rgb = linear_from_gamma_rgb(straight_rgb);
+            let mean_alpha = in.color.a * (contrasted.r + contrasted.g + contrasted.b) / 3.0;
+            color = vec4<f32>(linear_rgb * channel_coverage, mean_alpha);
+            coverage = vec4<f32>(channel_coverage, mean_alpha);
+        } else {
+            let weighted = gamma_adjust_lcd_coverage(
+                contrasted,
+                straight_rgb,
+                r_locals.subpixel_gamma,
+            );
+            let channel_coverage = weighted * in.color.a;
+            let mean_alpha = in.color.a * (weighted.r + weighted.g + weighted.b) / 3.0;
+            var gamma_rgb = straight_rgb * channel_coverage;
+            if r_locals.dithering == 1 && max(channel_coverage.r, max(channel_coverage.g, channel_coverage.b)) > 0.0 {
+                gamma_rgb = dither_interleaved(gamma_rgb, 256.0, in.position);
+            }
+            color = vec4<f32>(gamma_rgb, mean_alpha);
+            coverage = vec4<f32>(channel_coverage, mean_alpha);
+        }
+    } else {
+        // Color glyphs, grayscale glyphs, and WHITE_UV untextured geometry merged into
+        // the same mesh pass through unchanged on the ordinary premultiplied blend.
+        color = in.color * sampled;
+        coverage = vec4<f32>(color.a);
+        if r_locals.dithering == 1 && color.a > 0.0 {
+            color = vec4<f32>(
+                dither_interleaved(color.rgb, 256.0, in.position),
+                color.a,
+            );
+        }
+        if linear_framebuffer {
+            color = vec4<f32>(linear_from_gamma_rgb(color.rgb), color.a);
+        }
     }
 
     var out: LcdOutput;

@@ -3331,8 +3331,7 @@ pub fn dump_progress_dialog(
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(&current.process_name)
-                        .strong()
-                        .size(15.0)
+                        .font(crate::theme::font_semibold_in(ui, 15.0))
                         .color(pal.text),
                 );
                 ui.label(
@@ -3852,7 +3851,10 @@ fn process_properties_security(
     let Some(info) = info else {
         ui.add_space(8.0);
         if let Some(error) = error {
-            ui.label(egui::RichText::new(i18n::tr(K::SecurityUnavailable)).strong());
+            ui.label(
+                egui::RichText::new(i18n::tr(K::SecurityUnavailable))
+                    .font(crate::theme::font_semibold_in(ui, 13.0)),
+            );
             ui.weak(error);
         } else {
             ui.horizontal(|ui| {
@@ -3898,7 +3900,10 @@ fn process_properties_security(
         });
 
     ui.add_space(12.0);
-    ui.label(egui::RichText::new(i18n::tr(K::PropMitigationPolicies)).strong());
+    ui.label(
+        egui::RichText::new(i18n::tr(K::PropMitigationPolicies))
+            .font(crate::theme::font_semibold_in(ui, 13.0)),
+    );
     ui.add_space(4.0);
     egui::Grid::new("process-properties-security-policies")
         .num_columns(2)

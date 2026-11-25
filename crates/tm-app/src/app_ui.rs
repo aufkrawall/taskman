@@ -118,12 +118,12 @@ pub fn tab_header(
 
     ui.horizontal(|ui| {
         ui.add_space(16.0);
-        ui.label(egui::RichText::new(title).size(15.5).strong());
+        ui.label(egui::RichText::new(title).font(crate::theme::font_semibold_in(ui, 15.5)));
         if let Some(count) = selected {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(i18n::trf(K::SelectedCount, &[&count.to_string()]))
-                    .size(12.5)
+                    .size(12.0)
                     .color(pal.text_dim),
             );
         }

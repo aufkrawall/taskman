@@ -16,11 +16,47 @@
 //! for the sharp profile.
 
 use egui::epaint::text::{FontTweak, HintingTarget, SmoothHinting, VariationCoords};
-use egui::{self, FontData, FontDefinitions};
-use std::sync::Arc;
+use egui::{self, FontData, FontDefinitions, FontFamily};
+use std::sync::{Arc, OnceLock};
 use tm_core::settings::TextSmoothing;
+use tm_platform::text_rendering::HintStyleChoice;
+
+pub const FAMILY_SEMIBOLD: &str = "semibold";
+pub const FAMILY_DISPLAY: &str = "display";
+pub const FAMILY_SMALL: &str = "small";
+
+const FAMILIES_READY_KEY: &str = "tm-fonts-families-ready";
+
+/// Ensure the named semantic families (`semibold`, `display`, `small`) exist on
+/// `ctx` before the first frame paints (before async system fonts finish loading,
+/// or in headless tests that skip `install_async`).
+pub fn ensure_named_families(ctx: &egui::Context) {
+    let ready = ctx.data(|d| d.get_temp::<bool>(egui::Id::new(FAMILIES_READY_KEY)));
+    if ready != Some(true) {
+        ctx.set_fonts(initial_definitions());
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(FAMILIES_READY_KEY), true));
+    }
+}
+
+/// Default bundled definitions with our semantic named families registered as
+/// aliases to `Proportional` so Frame 1 never panics before system fonts arrive.
+pub fn initial_definitions() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
+    let base = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for name in [FAMILY_SEMIBOLD, FAMILY_DISPLAY, FAMILY_SMALL] {
+        fonts
+            .families
+            .insert(FontFamily::Name(Arc::from(name)), base.clone());
+    }
+    fonts
+}
 
 pub fn install_async(ctx: egui::Context) {
+    ensure_named_families(&ctx);
     let ctx2 = ctx.clone();
     let spawned = std::thread::Builder::new()
         .name("tm-fonts".into())
@@ -32,6 +68,7 @@ pub fn install_async(ctx: egui::Context) {
     if spawned.is_err() {
         let defs = build_definitions();
         ctx.set_fonts(defs);
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(FAMILIES_READY_KEY), true));
     }
 }
 
@@ -39,41 +76,60 @@ pub fn install_async(ctx: egui::Context) {
 ///
 /// The hinting target lives in each face's [`FontTweak`], not in the global
 /// text options, so changing the smoothing profile has to hand egui a fresh
-/// [`FontDefinitions`]. The parsed font FILES are reused; only the tweak
-/// changes, and this runs on a settings click, not per frame.
+/// [`FontDefinitions`]. The raw font bytes are cached once in process memory
+/// so re-applying never re-reads disk or duplicates the font files.
 pub fn reapply(ctx: &egui::Context) {
     ctx.set_fonts(build_definitions());
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(FAMILIES_READY_KEY), true));
 }
 
-/// Grid-fitting profile for the active smoothing choice.
+/// Grid-fitting profile for the active smoothing choice and platform hinting preference.
 ///
 /// `preserve_linear_metrics: false` + `symmetric_rendering: false` is the
 /// combination epaint documents as "lets the (auto)hinter snap horizontally
 /// for crisper stems"; egui positions glyphs from the shaper's advances, so
 /// this changes sharpness, not layout.
-fn hinting_target(smoothing: TextSmoothing) -> HintingTarget {
+fn hinting_target(smoothing: TextSmoothing, hint_style: HintStyleChoice) -> HintingTarget {
     match smoothing {
         TextSmoothing::Sharp => HintingTarget::Smooth(SmoothHinting {
             light: false,
             symmetric_rendering: false,
             preserve_linear_metrics: false,
         }),
-        TextSmoothing::Standard | TextSmoothing::Smooth => HintingTarget::default(),
+        TextSmoothing::Standard => match hint_style {
+            HintStyleChoice::Slight => HintingTarget::Smooth(SmoothHinting {
+                light: true,
+                symmetric_rendering: true,
+                preserve_linear_metrics: true,
+            }),
+            HintStyleChoice::Full => HintingTarget::Smooth(SmoothHinting {
+                light: false,
+                symmetric_rendering: false,
+                preserve_linear_metrics: false,
+            }),
+            HintStyleChoice::Default | HintStyleChoice::None | HintStyleChoice::Medium => {
+                HintingTarget::default()
+            }
+        },
+        TextSmoothing::Smooth => HintingTarget::default(),
     }
 }
 
 /// Tweak applied to every face we install.
-fn tweak(smoothing: TextSmoothing, coords: VariationCoords) -> FontTweak {
+fn tweak(
+    smoothing: TextSmoothing,
+    hint_style: HintStyleChoice,
+    coords: VariationCoords,
+) -> FontTweak {
     FontTweak {
-        hinting_target: hinting_target(smoothing),
+        hinting_target: hinting_target(smoothing, hint_style),
         coords,
         ..Default::default()
     }
 }
 
 fn apply_result() -> &'static std::sync::Mutex<Option<FontDefinitions>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<FontDefinitions>>> =
-        std::sync::OnceLock::new();
+    static SLOT: OnceLock<std::sync::Mutex<Option<FontDefinitions>>> = OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -85,218 +141,438 @@ pub fn poll_async_apply(ctx: &egui::Context) {
     if let Some(defs) = ready {
         tracing::info!("system fonts applied after first frame");
         ctx.set_fonts(defs);
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(FAMILIES_READY_KEY), true));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LoadedFace {
+    name: &'static str,
+    /// Process-lifetime raw font bytes leaked once inside `SYSTEM_FONTS`.
+    /// Sharing `&'static [u8]` lets multiple `FontData` instances (e.g.
+    /// Regular, Semibold, Display, Small of `SegUIVar.ttf`) and repeated
+    /// `fonts::reapply` calls share one allocation with zero copies.
+    bytes: &'static [u8],
+    index: u32,
+    is_segoe_var: bool,
+}
+
+impl LoadedFace {
+    fn to_font_data(
+        self,
+        smoothing: TextSmoothing,
+        hint_style: HintStyleChoice,
+        coords: VariationCoords,
+    ) -> Arc<FontData> {
+        let mut data = FontData::from_static(self.bytes);
+        data.index = self.index;
+        Arc::new(data.tweak(tweak(smoothing, hint_style, coords)))
+    }
+}
+
+struct SystemFontCache {
+    proportional: Option<LoadedFace>,
+    semibold: Option<LoadedFace>,
+    symbol: Option<LoadedFace>,
+    monospace: Option<LoadedFace>,
+}
+
+fn system_font_cache() -> &'static SystemFontCache {
+    static CACHE: OnceLock<SystemFontCache> = OnceLock::new();
+    CACHE.get_or_init(load_system_fonts)
+}
+
+type FontSource = (String, u32);
+
+struct ProportionalCandidate {
+    name: &'static str,
+    sources: Vec<FontSource>,
+    is_segoe_var: bool,
+}
+
+fn load_system_fonts() -> SystemFontCache {
+    let mut proportional_candidates: Vec<ProportionalCandidate> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(face) = fontconfig_match_face("sans-serif") {
+        proportional_candidates.push(ProportionalCandidate {
+            name: "FontconfigSans",
+            sources: vec![face],
+            is_segoe_var: false,
+        });
+    }
+    proportional_candidates.extend([
+        // Windows 11's actual UI face first; `segoeui.ttf` is the Windows 10
+        // static fallback.
+        ProportionalCandidate {
+            name: "SegoeUIVariable",
+            sources: vec![(r"C:\Windows\Fonts\SegUIVar.ttf".into(), 0)],
+            is_segoe_var: true,
+        },
+        ProportionalCandidate {
+            name: "SegoeUI",
+            sources: vec![(r"C:\Windows\Fonts\segoeui.ttf".into(), 0)],
+            is_segoe_var: false,
+        },
+        ProportionalCandidate {
+            name: "SFNS",
+            sources: vec![("/System/Library/Fonts/SFNS.ttf".into(), 0)],
+            is_segoe_var: false,
+        },
+        ProportionalCandidate {
+            name: "NotoSans",
+            sources: vec![
+                (
+                    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf".into(),
+                    0,
+                ),
+                ("/usr/share/fonts/TTF/NotoSans-Regular.ttf".into(), 0),
+                ("/usr/share/noto-cjk/NotoSansCJK-Regular.ttc".into(), 0),
+            ],
+            is_segoe_var: false,
+        },
+        ProportionalCandidate {
+            name: "DejaVuSans",
+            sources: vec![("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(), 0)],
+            is_segoe_var: false,
+        },
+    ]);
+
+    let proportional = proportional_candidates.iter().find_map(|candidate| {
+        let (bytes, index) = load_first_face(&candidate.sources)?;
+        tracing::info!(
+            font = candidate.name,
+            index,
+            "using system proportional font"
+        );
+        Some(LoadedFace {
+            name: candidate.name,
+            bytes,
+            index,
+            is_segoe_var: candidate.is_segoe_var,
+        })
+    });
+
+    // When Segoe UI Variable is available, its `wght: 600` axis provides Semibold
+    // from the exact same file bytes — no need to read or parse `segoeuib.ttf`.
+    let semibold = if proportional.is_some_and(|p| p.is_segoe_var) {
+        None
+    } else {
+        let mut bold_candidates: Vec<(&'static str, Vec<FontSource>)> = Vec::new();
+        #[cfg(target_os = "linux")]
+        if let Some(face) = fontconfig_match_face("sans-serif:weight=demibold") {
+            bold_candidates.push(("FontconfigSemibold", vec![face]));
+        }
+        bold_candidates.extend([
+            (
+                "SegoeUI-Semibold",
+                vec![
+                    (r"C:\Windows\Fonts\seguisb.ttf".into(), 0),
+                    (r"C:\Windows\Fonts\segoeuib.ttf".into(), 0),
+                ],
+            ),
+            (
+                "NotoSans-Bold",
+                vec![("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf".into(), 0)],
+            ),
+            (
+                "DejaVuSans-Bold",
+                vec![(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into(),
+                    0,
+                )],
+            ),
+        ]);
+        bold_candidates.iter().find_map(|(name, paths)| {
+            let (bytes, index) = load_first_face(paths)?;
+            Some(LoadedFace {
+                name,
+                bytes,
+                index,
+                is_segoe_var: false,
+            })
+        })
+    };
+
+    // Symbol fallback: on Windows, Segoe UI relies on Segoe UI Symbol for
+    // math, symbols, and punctuation (like one-dot leader U+2024).
+    let symbol_candidates: &[(&'static str, Vec<FontSource>)] = &[
+        (
+            "SegoeUISymbol",
+            vec![(r"C:\Windows\Fonts\seguisym.ttf".into(), 0)],
+        ),
+        (
+            "NotoSansSymbols",
+            vec![
+                (
+                    "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf".into(),
+                    0,
+                ),
+                (
+                    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf".into(),
+                    0,
+                ),
+            ],
+        ),
+    ];
+    let symbol = symbol_candidates.iter().find_map(|(name, paths)| {
+        let (bytes, index) = load_first_face(paths)?;
+        Some(LoadedFace {
+            name,
+            bytes,
+            index,
+            is_segoe_var: false,
+        })
+    });
+
+    let mut mono_candidates: Vec<(&'static str, Vec<FontSource>)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(face) = fontconfig_match_face("monospace") {
+        mono_candidates.push(("FontconfigMono", vec![face]));
+    }
+    mono_candidates.extend([
+        (
+            "CascadiaMono",
+            vec![(r"C:\Windows\Fonts\CascadiaMono.ttf".into(), 0)],
+        ),
+        (
+            "Consolas",
+            vec![(r"C:\Windows\Fonts\consola.ttf".into(), 0)],
+        ),
+        (
+            "JetBrainsMono",
+            vec![(
+                "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMono-Regular.ttf".into(),
+                0,
+            )],
+        ),
+        (
+            "DejaVuSansMono",
+            vec![(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf".into(),
+                0,
+            )],
+        ),
+        (
+            "Menlo",
+            vec![
+                ("/System/Library/Fonts/Menlo.ttc".into(), 0),
+                ("/System/Library/Fonts/Monaco.ttf".into(), 0),
+            ],
+        ),
+    ]);
+    let monospace = mono_candidates.iter().find_map(|(name, paths)| {
+        let (bytes, index) = load_first_face(paths)?;
+        tracing::info!(font = *name, index, "using system monospace font");
+        Some(LoadedFace {
+            name,
+            bytes,
+            index,
+            is_segoe_var: false,
+        })
+    });
+
+    SystemFontCache {
+        proportional,
+        semibold,
+        symbol,
+        monospace,
     }
 }
 
 fn build_definitions() -> FontDefinitions {
     let smoothing = crate::theme::text_smoothing();
+    let hint_style = crate::theme::subpixel_params().hint_style;
+    let cache = system_font_cache();
     let mut fonts = FontDefinitions::default();
 
-    // Variable-font axes for Segoe UI Variable: regular weight at the "Text"
-    // optical size, which is the face Windows 11 itself uses for UI chrome.
-    // `opsz` 10.5 is the font's own default; naming it keeps us independent of
-    // that default and documents the intent.
-    let ui_coords = || VariationCoords::new([(b"wght", 400.0), (b"opsz", 10.5)]);
-
-    let mut proportional_candidates: Vec<(&str, Vec<String>, VariationCoords)> = Vec::new();
-    #[cfg(target_os = "linux")]
-    if let Some(path) = fontconfig_match("sans-serif") {
-        proportional_candidates.push(("FontconfigSans", vec![path], VariationCoords::default()));
+    // Remove bundled fallback faces once OS-native replacements are present so
+    // epaint does not keep unused font bytes and skrifa metadata in RAM.
+    if cache.proportional.is_some() {
+        remove_font(&mut fonts, "Ubuntu-Light");
     }
-    proportional_candidates.extend([
-        // Windows 11's actual UI face first; `segoeui.ttf` is the Windows 10
-        // static fallback.
-        (
-            "SegoeUIVariable",
-            vec![r"C:\Windows\Fonts\SegUIVar.ttf".into()],
-            ui_coords(),
-        ),
-        (
-            "SegoeUI",
-            vec![r"C:\Windows\Fonts\segoeui.ttf".into()],
-            VariationCoords::default(),
-        ),
-        (
-            "SFNS",
-            vec!["/System/Library/Fonts/SFNS.ttf".into()],
-            VariationCoords::default(),
-        ),
-        (
-            "NotoSans",
-            vec![
-                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf".into(),
-                "/usr/share/fonts/TTF/NotoSans-Regular.ttf".into(),
-                "/usr/share/noto-cjk/NotoSansCJK-Regular.ttc".into(),
-            ],
-            VariationCoords::default(),
-        ),
-        (
-            "DejaVuSans",
-            vec!["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into()],
-            VariationCoords::default(),
-        ),
-    ]);
+    if cache.monospace.is_some() {
+        remove_font(&mut fonts, "Hack");
+    }
 
-    for (name, paths, coords) in &proportional_candidates {
-        if let Some(data) = load_first(paths) {
-            tracing::info!(font = *name, "using system proportional font");
-            let data = data.tweak(tweak(smoothing, coords.clone()));
-            fonts.font_data.insert((*name).to_string(), Arc::new(data));
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, (*name).to_string());
-            break;
+    if let Some(prop) = cache.proportional {
+        if prop.is_segoe_var {
+            // Variable-font axes for Segoe UI Variable: one file in RAM supplies
+            // Text (wght 400, opsz 10.5), Semibold (wght 600, opsz 10.5),
+            // Display (wght 400, opsz 36), and Small (wght 400, opsz 8).
+            let text_coords = VariationCoords::new([(b"wght", 400.0), (b"opsz", 10.5)]);
+            let semibold_coords = VariationCoords::new([(b"wght", 600.0), (b"opsz", 10.5)]);
+            let display_coords = VariationCoords::new([(b"wght", 400.0), (b"opsz", 36.0)]);
+            let small_coords = VariationCoords::new([(b"wght", 400.0), (b"opsz", 8.0)]);
+
+            fonts.font_data.insert(
+                prop.name.to_string(),
+                prop.to_font_data(smoothing, hint_style, text_coords),
+            );
+            fonts.font_data.insert(
+                "SegoeUIVariable-Semibold".into(),
+                prop.to_font_data(smoothing, hint_style, semibold_coords),
+            );
+            fonts.font_data.insert(
+                "SegoeUIVariable-Display".into(),
+                prop.to_font_data(smoothing, hint_style, display_coords),
+            );
+            fonts.font_data.insert(
+                "SegoeUIVariable-Small".into(),
+                prop.to_font_data(smoothing, hint_style, small_coords),
+            );
+        } else {
+            fonts.font_data.insert(
+                prop.name.to_string(),
+                prop.to_font_data(smoothing, hint_style, VariationCoords::default()),
+            );
         }
+
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, prop.name.to_string());
     }
 
-    // Bold remains an optional fallback. Egui's font system does not select
-    // a separate face purely from RichText::strong, so do not pretend this is
-    // native DirectWrite/Fontconfig shaping; it is kept for glyph fallback.
-    let bold_candidates: &[(&str, Vec<String>)] = &[
-        (
-            "SegoeUI-Bold",
-            vec![r"C:\Windows\Fonts\segoeuib.ttf".into()],
-        ),
-        (
-            "NotoSans-Bold",
-            vec!["/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf".into()],
-        ),
-        (
-            "DejaVuSans-Bold",
-            vec!["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into()],
-        ),
-    ];
-    for (name, paths) in bold_candidates {
-        if let Some(data) = load_first(paths) {
-            let data = data.tweak(tweak(smoothing, VariationCoords::default()));
-            fonts.font_data.insert(name.to_string(), Arc::new(data));
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push(name.to_string());
-            break;
-        }
+    if let Some(bold) = cache.semibold {
+        fonts.font_data.insert(
+            bold.name.to_string(),
+            bold.to_font_data(smoothing, hint_style, VariationCoords::default()),
+        );
     }
 
-    // Symbol fallback: on Windows, Segoe UI relies on Segoe UI Symbol for
-    // math, symbols, and punctuation (like one-dot leader U+2024). Egui
-    // searches FontFamily::Proportional in order; putting the symbol font as
-    // a fallback ensures standard text still renders via Segoe UI Variable
-    // while missing glyphs fall back cleanly instead of rendering as tofu boxes.
-    let symbol_candidates: &[(&str, Vec<String>)] = &[
-        (
-            "SegoeUISymbol",
-            vec![r"C:\Windows\Fonts\seguisym.ttf".into()],
-        ),
-        (
-            "NotoSansSymbols",
-            vec![
-                "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf".into(),
-                "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf".into(),
-            ],
-        ),
-    ];
-    for (name, paths) in symbol_candidates {
-        if let Some(data) = load_first(paths) {
-            let data = data.tweak(tweak(smoothing, VariationCoords::default()));
-            fonts.font_data.insert(name.to_string(), Arc::new(data));
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push(name.to_string());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push(name.to_string());
-            break;
-        }
+    if let Some(sym) = cache.symbol {
+        fonts.font_data.insert(
+            sym.name.to_string(),
+            sym.to_font_data(smoothing, hint_style, VariationCoords::default()),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .push(sym.name.to_string());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push(sym.name.to_string());
     }
 
-    let mut mono_candidates: Vec<(&str, Vec<String>)> = Vec::new();
-    #[cfg(target_os = "linux")]
-    if let Some(path) = fontconfig_match("monospace") {
-        mono_candidates.push(("FontconfigMono", vec![path]));
+    if let Some(mono) = cache.monospace {
+        fonts.font_data.insert(
+            mono.name.to_string(),
+            mono.to_font_data(smoothing, hint_style, VariationCoords::default()),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, mono.name.to_string());
     }
-    mono_candidates.extend([
-        (
-            "CascadiaMono",
-            vec![r"C:\Windows\Fonts\CascadiaMono.ttf".into()],
-        ),
-        ("Consolas", vec![r"C:\Windows\Fonts\consola.ttf".into()]),
-        (
-            "JetBrainsMono",
-            vec!["/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMono-Regular.ttf".into()],
-        ),
-        (
-            "DejaVuSansMono",
-            vec!["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf".into()],
-        ),
-        (
-            "Menlo",
-            vec![
-                "/System/Library/Fonts/Menlo.ttc".into(),
-                "/System/Library/Fonts/Monaco.ttf".into(),
-            ],
-        ),
-    ]);
-    for (name, paths) in &mono_candidates {
-        if let Some(data) = load_first(paths) {
-            tracing::info!(font = *name, "using system monospace font");
-            let data = data.tweak(tweak(smoothing, VariationCoords::default()));
-            fonts.font_data.insert((*name).to_string(), Arc::new(data));
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, (*name).to_string());
-            break;
-        }
+
+    // Populate the semantic named families (`semibold`, `display`, `small`) with
+    // the full Proportional fallback chain behind their primary face.
+    let prop_chain = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut semibold_chain = prop_chain.clone();
+    if cache.proportional.is_some_and(|p| p.is_segoe_var) {
+        semibold_chain.insert(0, "SegoeUIVariable-Semibold".into());
+    } else if let Some(bold) = cache.semibold {
+        semibold_chain.insert(0, bold.name.to_string());
     }
+    fonts
+        .families
+        .insert(FontFamily::Name(Arc::from(FAMILY_SEMIBOLD)), semibold_chain);
+
+    let mut display_chain = prop_chain.clone();
+    if cache.proportional.is_some_and(|p| p.is_segoe_var) {
+        display_chain.insert(0, "SegoeUIVariable-Display".into());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(Arc::from(FAMILY_DISPLAY)), display_chain);
+
+    let mut small_chain = prop_chain;
+    if cache.proportional.is_some_and(|p| p.is_segoe_var) {
+        small_chain.insert(0, "SegoeUIVariable-Small".into());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(Arc::from(FAMILY_SMALL)), small_chain);
 
     fonts
 }
 
-/// Ask Fontconfig for the user's configured generic family. This respects
-/// KDE Plasma's font settings, per-user ~/.config/fontconfig rules and distro
-/// aliases instead of assuming a particular Noto/DejaVu installation path. The
-/// `tm-platform` helper uses the same trusted absolute `fc-match`, bounded capture and
-/// fail-closed environment handling as the text-rendering policy query.
-#[cfg(target_os = "linux")]
-fn fontconfig_match(pattern: &str) -> Option<String> {
-    tm_platform::fontconfig::match_file(pattern)
+fn remove_font(fonts: &mut FontDefinitions, name: &str) {
+    fonts.font_data.remove(name);
+    for list in fonts.families.values_mut() {
+        list.retain(|entry| entry != name);
+    }
 }
 
-fn load_first(paths: &[String]) -> Option<FontData> {
-    for path in paths {
+/// Ask Fontconfig for the user's configured generic family and collection face index.
+#[cfg(target_os = "linux")]
+fn fontconfig_match_face(pattern: &str) -> Option<(String, u32)> {
+    tm_platform::fontconfig::match_face(pattern)
+}
+
+fn load_first_face(paths: &[(String, u32)]) -> Option<(&'static [u8], u32)> {
+    for (path, index) in paths {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
         // epaint panics on a face it cannot parse, and Fontconfig can answer
         // with PCF, Type 1 or other non-sfnt files; try the next candidate.
-        if is_loadable_font(&bytes) {
-            return Some(FontData::from_owned(bytes));
+        if is_loadable_font_face(&bytes, *index) {
+            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            return Some((leaked, *index));
         }
-        tracing::warn!(path = %path, "skipping font that is not TrueType/OpenType");
+        tracing::warn!(
+            path = %path,
+            index = *index,
+            "skipping font that is not a loadable TrueType/OpenType face"
+        );
     }
     None
 }
 
 /// Whether `bytes` pass the header check epaint's parser (skrifa) starts
 /// with: an sfnt table directory (TrueType or CFF-flavoured OpenType), or a
-/// TrueType collection whose first face, the index epaint loads, is one.
-fn is_loadable_font(bytes: &[u8]) -> bool {
+/// TrueType collection whose face at `index` is one.
+fn is_loadable_font_face(bytes: &[u8], index: u32) -> bool {
     match bytes.get(..4) {
-        Some(b"ttcf") => bytes
-            .get(12..16)
-            .and_then(|offset| usize::try_from(u32::from_be_bytes(offset.try_into().ok()?)).ok())
-            .is_some_and(|offset| is_sfnt_face(bytes, offset)),
-        _ => is_sfnt_face(bytes, 0),
+        Some(b"ttcf") => {
+            let Some(num_fonts) = bytes
+                .get(8..12)
+                .and_then(|raw| Some(u32::from_be_bytes(raw.try_into().ok()?)))
+            else {
+                return false;
+            };
+            if index >= num_fonts {
+                return false;
+            }
+            let Some(offset_pos) = (index as usize)
+                .checked_mul(4)
+                .and_then(|o| o.checked_add(12))
+            else {
+                return false;
+            };
+            bytes
+                .get(offset_pos..offset_pos + 4)
+                .and_then(|raw| usize::try_from(u32::from_be_bytes(raw.try_into().ok()?)).ok())
+                .is_some_and(|offset| is_sfnt_face(bytes, offset))
+        }
+        _ => index == 0 && is_sfnt_face(bytes, 0),
     }
+}
+
+#[cfg(test)]
+fn is_loadable_font(bytes: &[u8]) -> bool {
+    is_loadable_font_face(bytes, 0)
 }
 
 fn is_sfnt_face(bytes: &[u8], at: usize) -> bool {
@@ -360,5 +636,81 @@ mod tests {
         assert!(!is_loadable_font(
             b"ttcf\0\x01\0\0\0\0\0\x01\xff\xff\xff\xff"
         ));
+    }
+
+    #[test]
+    fn collection_validates_requested_face_index() {
+        let face0 = sfnt(b"\0\x01\0\0", 1);
+        let face1 = sfnt(b"OTTO", 1);
+        let off0 = 20u32; // 12-byte ttcf header + 2 * 4-byte offsets
+        let off1 = off0 + face0.len() as u32;
+        let mut ttc = b"ttcf\0\x01\0\0".to_vec();
+        ttc.extend(2u32.to_be_bytes());
+        ttc.extend(off0.to_be_bytes());
+        ttc.extend(off1.to_be_bytes());
+        ttc.extend(&face0);
+        ttc.extend(&face1);
+
+        assert!(is_loadable_font_face(&ttc, 0));
+        assert!(is_loadable_font_face(&ttc, 1));
+        assert!(!is_loadable_font_face(&ttc, 2));
+        // Non-collection font files only accept face index 0.
+        assert!(!is_loadable_font_face(&face0, 1));
+    }
+
+    #[test]
+    fn semantic_named_families_are_registered_before_and_after_system_load() {
+        let initial = initial_definitions();
+        for name in [FAMILY_SEMIBOLD, FAMILY_DISPLAY, FAMILY_SMALL] {
+            let chain = initial
+                .families
+                .get(&FontFamily::Name(Arc::from(name)))
+                .expect("semantic family must exist in initial_definitions");
+            assert!(!chain.is_empty());
+        }
+
+        let built = build_definitions();
+        for name in [FAMILY_SEMIBOLD, FAMILY_DISPLAY, FAMILY_SMALL] {
+            let chain = built
+                .families
+                .get(&FontFamily::Name(Arc::from(name)))
+                .expect("semantic family must exist in build_definitions");
+            assert!(!chain.is_empty());
+        }
+        // System proportional/monospace faces should drop unused bundled defaults.
+        if system_font_cache().proportional.is_some() {
+            assert!(!built.font_data.contains_key("Ubuntu-Light"));
+        }
+        if system_font_cache().monospace.is_some() {
+            assert!(!built.font_data.contains_key("Hack"));
+        }
+    }
+
+    #[test]
+    fn fontconfig_hintstyle_maps_cleanly_under_standard_smoothing() {
+        assert_eq!(
+            hinting_target(TextSmoothing::Standard, HintStyleChoice::Slight),
+            HintingTarget::Smooth(SmoothHinting {
+                light: true,
+                symmetric_rendering: true,
+                preserve_linear_metrics: true,
+            })
+        );
+        assert_eq!(
+            hinting_target(TextSmoothing::Standard, HintStyleChoice::Full),
+            HintingTarget::Smooth(SmoothHinting {
+                light: false,
+                symmetric_rendering: false,
+                preserve_linear_metrics: false,
+            })
+        );
+        assert_eq!(
+            hinting_target(TextSmoothing::Sharp, HintStyleChoice::Slight),
+            HintingTarget::Smooth(SmoothHinting {
+                light: false,
+                symmetric_rendering: false,
+                preserve_linear_metrics: false,
+            })
+        );
     }
 }

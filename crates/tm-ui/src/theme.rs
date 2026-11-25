@@ -1,10 +1,62 @@
 //! Theme: Windows-11-Task-Manager palette for dark and light mode plus the
 //! blue heat-map gradient used by the table value cells.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use egui::{self, Color32, CornerRadius, FontId, Visuals};
+use egui::{self, Color32, CornerRadius, FontFamily, FontId, Visuals};
 use tm_core::settings::TextSmoothing;
+
+/// Semibold UI face (`Segoe UI Variable` `wght: 600` on Win11, bold fallback elsewhere).
+pub fn font_semibold(size: f32) -> FontId {
+    FontId::new(
+        size,
+        FontFamily::Name(Arc::from(crate::fonts::FAMILY_SEMIBOLD)),
+    )
+}
+
+/// Display optical-size face for large KPI readouts (`Segoe UI Variable` `opsz: 36` on Win11).
+pub fn font_display(size: f32) -> FontId {
+    FontId::new(
+        size,
+        FontFamily::Name(Arc::from(crate::fonts::FAMILY_DISPLAY)),
+    )
+}
+
+/// Small optical-size face for captions, axis ticks, and sublabels (`opsz: 8` on Win11).
+pub fn font_small(size: f32) -> FontId {
+    FontId::new(
+        size,
+        FontFamily::Name(Arc::from(crate::fonts::FAMILY_SMALL)),
+    )
+}
+
+fn named_family_in(ui: &egui::Ui, name: &'static str, size: f32) -> FontId {
+    if matches!(
+        ui.style().text_styles.get(&egui::TextStyle::Heading),
+        Some(id) if matches!(id.family, FontFamily::Name(_))
+    ) {
+        FontId::new(size, FontFamily::Name(Arc::from(name)))
+    } else {
+        FontId::proportional(size)
+    }
+}
+
+/// Like [`font_semibold`], falling back to `Proportional` in isolated widget
+/// tests that run on a bare `egui::Context::default()` without `install_visuals`.
+pub fn font_semibold_in(ui: &egui::Ui, size: f32) -> FontId {
+    named_family_in(ui, crate::fonts::FAMILY_SEMIBOLD, size)
+}
+
+/// Like [`font_display`], with the same bare-context fallback as [`font_semibold_in`].
+pub fn font_display_in(ui: &egui::Ui, size: f32) -> FontId {
+    named_family_in(ui, crate::fonts::FAMILY_DISPLAY, size)
+}
+
+/// Like [`font_small`], with the same bare-context fallback as [`font_semibold_in`].
+pub fn font_small_in(ui: &egui::Ui, size: f32) -> FontId {
+    named_family_in(ui, crate::fonts::FAMILY_SMALL, size)
+}
 
 /// Whether the active renderer can display sub-pixel (`ClearType`) text.
 ///
@@ -267,9 +319,12 @@ pub fn ensure_visuals(ctx: &egui::Context) {
     let state = (
         ctx.style_of(egui::Theme::Dark).visuals.dark_mode,
         text_aa_state(egui::Theme::Dark),
+        text_aa_state(egui::Theme::Light),
     );
     let applied = ctx.data(|d| {
-        d.get_temp::<(bool, egui::epaint::TextOptions)>(egui::Id::new("tm-visuals-dark"))
+        d.get_temp::<(bool, egui::epaint::TextOptions, egui::epaint::TextOptions)>(egui::Id::new(
+            "tm-visuals-dark",
+        ))
     });
     if applied != Some(state) {
         install_visuals(ctx);
@@ -278,6 +333,7 @@ pub fn ensure_visuals(ctx: &egui::Context) {
 }
 
 pub fn install_visuals(ctx: &egui::Context) {
+    crate::fonts::ensure_named_families(ctx);
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.style_mut_of(theme, |style| {
             if theme == egui::Theme::Dark {
@@ -289,15 +345,16 @@ pub fn install_visuals(ctx: &egui::Context) {
             // Centralized text-style ladder so egui widgets and the
             // hand-painted chrome share one scale, matched to Win11 TM's
             // measured sizes: body/button/table text 13, dialog section
-            // headings = tab titles 15.5, monospace 12.0 (debug overlay).
+            // headings = tab titles 15.5 (semibold), small 11.0 (small optical
+            // size), monospace 12.0 (debug overlay & diagnostic hex values).
             // Without this, egui's defaults (13.0/18.0) leak into every
             // dialog, menu and label next to 13 px chrome.
             style.text_styles = [
-                (egui::TextStyle::Small, FontId::proportional(11.0)),
+                (egui::TextStyle::Small, font_small(11.0)),
                 (egui::TextStyle::Body, FontId::proportional(13.0)),
                 (egui::TextStyle::Button, FontId::proportional(13.0)),
-                (egui::TextStyle::Heading, FontId::proportional(15.5)),
-                (egui::TextStyle::Monospace, FontId::proportional(12.0)),
+                (egui::TextStyle::Heading, font_semibold(15.5)),
+                (egui::TextStyle::Monospace, FontId::monospace(12.0)),
             ]
             .into();
             style.visuals.window_corner_radius = CornerRadius::same(8);
@@ -396,9 +453,9 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     // changes how glyphs are RASTERIZED, and is gated on the active renderer being able
     // to blend per channel at all.
     let subpixel = subpixel_mode();
+    let params = subpixel_params();
     opts.subpixel = subpixel;
     if !subpixel.is_off() {
-        let params = subpixel_params();
         opts.cleartype_level = params.cleartype_level;
         opts.lcd_filter = lcd_filter(params.lcd_filter);
 
@@ -412,18 +469,19 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
         // pixel from 128 to 178, which reads as fat and glowing next to native Windows
         // text -- Windows errs thin. Measured at 150% scaling, dropping the contrast
         // boost and pulling gamma back takes ~14% of the ink out and sharpens the stems.
-        let (gamma, contrast) = cleartype_weight(smoothing, &params);
+        let (gamma, contrast) = cleartype_weight(smoothing, theme, &params);
         opts.text_gamma = gamma;
         opts.text_contrast = contrast;
-        // A sub-pixel atlas holds three times as many distinct coverage values per glyph
-        // and one extra pixel of margin per side. 2048 overflows, and the atlas's
-        // response to overflow is to restart a third smaller, which shows up as visibly
-        // corrupted glyphs rather than as an error.
-        opts.max_texture_side = opts.max_texture_side.max(4096);
     }
-    // Hinting is already the default; assert the intent so a future default
-    // flip cannot silently soften our text.
-    opts.font_hinting = true;
+    // High-DPI multi-face / sub-pixel / multilingual sessions easily exceed epaint's
+    // 2048 default atlas ceiling, whose overflow fallback restarts a third smaller.
+    // Raise the ceiling to 4096 unconditionally so grayscale and LCD atlases both
+    // avoid eviction churn; the atlas still starts small and grows lazily.
+    opts.max_texture_side = opts.max_texture_side.max(4096);
+    // Respect Linux Fontconfig `hinting: false` / `hintstyle: hintnone` under Standard;
+    // otherwise keep hinting on so stems stay crisp.
+    opts.font_hinting = !(smoothing == TextSmoothing::Standard
+        && params.hint_style == tm_platform::text_rendering::HintStyleChoice::None);
 }
 
 /// Map the platform-neutral fontconfig choice onto the fork's filter tables.
@@ -447,19 +505,32 @@ fn lcd_filter(choice: tm_platform::text_rendering::LcdFilterChoice) -> egui::epa
 ///
 /// Set by eye against native Windows text on a dark UI at 150% scaling, which is the
 /// regime where the difference is visible at all. `0.72`/`0.0` was measurably too thin.
-const SHARP_GAMMA_SCALE: f32 = 0.88;
+/// On light backgrounds gamma acts in the opposite direction on dark ink (`(1 - a')^(1/g)`),
+/// so lowering gamma would thicken dark-on-light text instead of thinning it; Light Mode
+/// raises gamma slightly and lowers contrast to match Dark Mode's ~14% ink reduction.
+const SHARP_DARK_GAMMA_SCALE: f32 = 0.88;
+const SHARP_LIGHT_GAMMA_SCALE: f32 = 1.06;
 const SHARP_CONTRAST: f32 = 0.25;
 
 pub fn cleartype_weight(
     smoothing: TextSmoothing,
+    theme: egui::Theme,
     params: &tm_platform::text_rendering::Params,
 ) -> (f32, f32) {
-    match smoothing {
+    match (smoothing, theme) {
         // Thin and crisp: closest to native Windows on a dark UI. Measured at 150%
         // scaling this removes ~14% of the ink and sharpens the stems.
-        TextSmoothing::Sharp => (params.gamma * SHARP_GAMMA_SCALE, SHARP_CONTRAST),
-        // The display's own DirectWrite parameters, unmodified.
-        TextSmoothing::Standard | TextSmoothing::Smooth => (params.gamma, params.contrast),
+        (TextSmoothing::Sharp, egui::Theme::Dark) => (
+            (params.gamma * SHARP_DARK_GAMMA_SCALE).clamp(1.0, 3.0),
+            params.contrast.min(SHARP_CONTRAST),
+        ),
+        // Same crispness goal on a light UI without inverting gamma polarity.
+        (TextSmoothing::Sharp, egui::Theme::Light) => (
+            (params.gamma * SHARP_LIGHT_GAMMA_SCALE).clamp(1.0, 3.0),
+            params.contrast.min(SHARP_CONTRAST),
+        ),
+        // The display's own DirectWrite / Fontconfig parameters, unmodified.
+        (TextSmoothing::Standard | TextSmoothing::Smooth, _) => (params.gamma, params.contrast),
     }
 }
 
@@ -522,6 +593,7 @@ pub fn light_visuals() -> Visuals {
     v.widgets.active.bg_fill = Color32::from_rgb(0xe2, 0xee, 0xfa);
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0, LIGHT.accent);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.6, Color32::BLACK);
+    v.override_text_color = Some(LIGHT.text);
     v
 }
 
@@ -725,5 +797,67 @@ mod tests {
                 + (small.b() as i32 - idle.b() as i32).abs();
             assert!(delta >= 8, "5% of the column max is invisible: {delta}");
         }
+    }
+
+    #[test]
+    fn installed_text_styles_and_light_visuals_match_contract() {
+        let ctx = egui::Context::default();
+        install_visuals(&ctx);
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let style = ctx.style_of(theme);
+            assert_eq!(
+                style.text_styles[&egui::TextStyle::Monospace],
+                FontId::monospace(12.0),
+                "TextStyle::Monospace must use the Monospace family"
+            );
+            assert_eq!(
+                style.text_styles[&egui::TextStyle::Heading],
+                font_semibold(15.5)
+            );
+            assert_eq!(style.text_styles[&egui::TextStyle::Small], font_small(11.0));
+            assert!(
+                style.visuals.text_options.max_texture_side >= 4096,
+                "atlas ceiling must be at least 4096 even in grayscale mode"
+            );
+        }
+        assert_eq!(light_visuals().override_text_color, Some(LIGHT.text));
+        assert_eq!(dark_visuals().override_text_color, Some(DARK.text));
+    }
+
+    #[test]
+    fn sharp_cleartype_weight_respects_polarity_in_dark_and_light_modes() {
+        let win = tm_platform::text_rendering::Params {
+            enabled: true,
+            gamma: 1.8,
+            contrast: 0.5,
+            ..Default::default()
+        };
+        let (dark_g, dark_c) = cleartype_weight(TextSmoothing::Sharp, egui::Theme::Dark, &win);
+        let (light_g, light_c) = cleartype_weight(TextSmoothing::Sharp, egui::Theme::Light, &win);
+        assert!(
+            dark_g < win.gamma,
+            "dark Sharp should lower gamma to thin white ink"
+        );
+        assert!(
+            light_g > win.gamma,
+            "light Sharp must raise gamma (not lower it) to thin dark ink"
+        );
+        assert!(dark_c < win.contrast && light_c < win.contrast);
+
+        // Zero-contrast (Linux) must not be boosted by Sharp.
+        let linux = tm_platform::text_rendering::Params {
+            enabled: true,
+            gamma: 1.8,
+            contrast: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            cleartype_weight(TextSmoothing::Sharp, egui::Theme::Dark, &linux).1,
+            0.0
+        );
+        assert_eq!(
+            cleartype_weight(TextSmoothing::Sharp, egui::Theme::Light, &linux).1,
+            0.0
+        );
     }
 }

@@ -156,9 +156,12 @@ struct UniformBuffer {
     /// Enhanced-contrast weight from [`epaint::TextOptions::text_contrast`].
     subpixel_contrast: f32,
 
+    /// Blend-space gamma from [`epaint::TextOptions::text_gamma`].
+    subpixel_gamma: f32,
+
     /// WGSL uniform structs have a 16-byte size/alignment contract. Keep the Rust layout
-    /// explicit rather than relying on a backend to accept the otherwise 24-byte struct.
-    _padding: [u32; 2],
+    /// explicit so this stays 32 bytes.
+    _padding: u32,
 }
 
 fn subpixel_order_code(mode: epaint::text::SubpixelMode) -> u32 {
@@ -181,12 +184,35 @@ fn normalized_contrast(contrast: f32) -> f32 {
     }
 }
 
+fn normalized_gamma(gamma: f32) -> f32 {
+    if gamma.is_finite() {
+        gamma.clamp(1.0, 3.0)
+    } else {
+        1.8
+    }
+}
+
 /// Reference CPU formula for the contrast curve implemented by `egui_lcd.wgsl`.
 #[cfg(test)]
 fn enhanced_lcd_coverage(coverage: f32, contrast: f32) -> f32 {
     let coverage = coverage.clamp(0.0, 1.0);
     let contrast = normalized_contrast(contrast);
     (coverage * (1.0 + contrast * (1.0 - coverage))).clamp(0.0, 1.0)
+}
+
+/// Reference CPU formula for the foreground-luminance gamma compensation in `egui_lcd.wgsl`.
+#[cfg(test)]
+fn gamma_adjusted_lcd_coverage(coverage: f32, lum: f32, gamma: f32) -> f32 {
+    let g = normalized_gamma(gamma);
+    if g <= 1.0001 {
+        return coverage.clamp(0.0, 1.0);
+    }
+    let inv_g = 1.0 / g;
+    let c = coverage.clamp(0.0, 1.0);
+    let lum = lum.clamp(0.0, 1.0);
+    let c_dark = c.powf(inv_g);
+    let c_light = 1.0 - (1.0 - c).powf(inv_g);
+    c_light + (c_dark - c_light) * lum
 }
 
 fn lcd_shader_source() -> String {
@@ -429,6 +455,7 @@ pub struct Renderer {
     /// Current atlas contract and weight. These are uploaded through the uniform buffer;
     /// the renderer never guesses them from colors.
     subpixel_mode: epaint::text::SubpixelMode,
+    subpixel_gamma: f32,
     subpixel_contrast: f32,
 
     index_buffer: SlicedBuffer,
@@ -472,11 +499,16 @@ impl Renderer {
     /// Publish the atlas contract and the user's text-weight choice for the next frame.
     ///
     /// RGB/BGR is a blend-time swap because the atlas is always filtered in RGB signal
-    /// order. Contrast is the renderer's coverage-weight curve. The software renderer's
-    /// nonlinear destination-gamma blend is documented as a GPU limitation: fixed-function
-    /// blending cannot reproduce it without reading the framebuffer.
-    pub fn set_subpixel_text_options(&mut self, mode: epaint::text::SubpixelMode, contrast: f32) {
+    /// order. Contrast is the renderer's coverage-weight curve, and gamma drives the
+    /// foreground-luminance weight compensation on non-sRGB targets.
+    pub fn set_subpixel_text_options(
+        &mut self,
+        mode: epaint::text::SubpixelMode,
+        gamma: f32,
+        contrast: f32,
+    ) {
         self.subpixel_mode = mode;
+        self.subpixel_gamma = normalized_gamma(gamma);
         self.subpixel_contrast = normalized_contrast(contrast);
     }
 
@@ -509,7 +541,8 @@ impl Renderer {
                 predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
                 subpixel_order: subpixel_order_code(epaint::text::SubpixelMode::Off),
                 subpixel_contrast: 0.5,
-                _padding: [0; 2],
+                subpixel_gamma: 1.8,
+                _padding: 0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -750,6 +783,7 @@ impl Renderer {
             lcd_pipeline,
             font_atlas_has_subpixel: false,
             subpixel_mode: epaint::text::SubpixelMode::Off,
+            subpixel_gamma: 1.8,
             subpixel_contrast: 0.5,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
@@ -1276,7 +1310,8 @@ impl Renderer {
             predictable_texture_filtering: u32::from(self.options.predictable_texture_filtering),
             subpixel_order: subpixel_order_code(self.subpixel_mode),
             subpixel_contrast: self.subpixel_contrast,
-            _padding: [0; 2],
+            subpixel_gamma: self.subpixel_gamma,
+            _padding: 0,
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1566,8 +1601,9 @@ mod tests {
     use super::{
         BUFFER_SHRINK_AFTER_UPDATES, BUFFER_SHRINK_MIN_CAPACITY, UniformBuffer,
         capacity_after_sustained_underuse, enhanced_lcd_coverage, font_subpixel_after,
-        lcd_shader_source, normalized_contrast, subpixel_order_code, supports_subpixel_features,
-        texel_mapping_is_one_to_one, use_lcd_pipeline, validate_lcd_shader_source,
+        gamma_adjusted_lcd_coverage, lcd_shader_source, normalized_contrast, normalized_gamma,
+        subpixel_order_code, supports_subpixel_features, texel_mapping_is_one_to_one,
+        use_lcd_pipeline, validate_lcd_shader_source,
     };
     use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
 
@@ -1707,6 +1743,27 @@ mod tests {
         assert_eq!(normalized_contrast(-1.0), 0.0);
         assert_eq!(normalized_contrast(2.0), 1.0);
         assert_eq!(normalized_contrast(f32::NAN), 0.5);
+        assert_eq!(normalized_gamma(1.6), 1.6);
+        assert_eq!(normalized_gamma(0.5), 1.0);
+        assert_eq!(normalized_gamma(9.0), 3.0);
+        assert_eq!(normalized_gamma(f32::NAN), 1.8);
+    }
+
+    #[test]
+    fn gamma_compensation_boosts_light_on_dark_and_thins_dark_on_light() {
+        assert_eq!(gamma_adjusted_lcd_coverage(0.0, 1.0, 1.8), 0.0);
+        assert_eq!(gamma_adjusted_lcd_coverage(1.0, 1.0, 1.8), 1.0);
+        assert_eq!(gamma_adjusted_lcd_coverage(0.0, 0.0, 1.8), 0.0);
+        assert_eq!(gamma_adjusted_lcd_coverage(1.0, 0.0, 1.8), 1.0);
+        assert!((gamma_adjusted_lcd_coverage(0.5, 1.0, 1.0) - 0.5).abs() < 1e-6);
+        assert!(
+            gamma_adjusted_lcd_coverage(0.5, 1.0, 1.8) > 0.65,
+            "white-on-dark half coverage must be boosted above linear midpoint"
+        );
+        assert!(
+            gamma_adjusted_lcd_coverage(0.5, 0.0, 1.8) < 0.35,
+            "black-on-light half coverage must be thinned below linear midpoint"
+        );
     }
 
     #[test]
@@ -1733,6 +1790,7 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_order), 16);
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_contrast), 20);
+        assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_gamma), 24);
         assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
         assert!(std::mem::size_of::<UniformBuffer>().is_multiple_of(16));
     }

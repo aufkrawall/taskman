@@ -73,20 +73,31 @@ impl TextureSnapshot {
     }
 }
 
-/// CPU-side copies of every managed texture uploaded to the renderer.
+/// CPU-side copies of managed user textures uploaded to the renderer, plus the sampler
+/// options for egui's built-in font atlas.
 ///
 /// `epaint::TextureManager` keeps metadata only, and egui emits texture data just once.
 /// Keeping the latest full image lets a suspended painter recreate its renderer without
-/// losing the font atlas or any images that are still in use.
+/// losing any user images that are still in use. The font atlas (`TextureId::default()`)
+/// already lives in `egui::Context`'s `FontsImpl`, so we only record its sampler options
+/// and pull the live atlas image on replay instead of keeping a permanent second copy in RAM.
 #[derive(Default)]
 struct TextureSnapshots {
+    font_atlas_options: Option<epaint::textures::TextureOptions>,
     textures: HashMap<epaint::TextureId, TextureSnapshot>,
 }
 
 impl TextureSnapshots {
     #[expect(clippy::iter_over_hash_type)]
     fn record(&mut self, delta: &epaint::textures::TexturesDelta) {
+        let font_id = epaint::TextureId::default();
         for (id, image_deltas) in &delta.set {
+            if *id == font_id {
+                if let Some(last) = image_deltas.last() {
+                    self.font_atlas_options = Some(last.options);
+                }
+                continue;
+            }
             for image_delta in image_deltas {
                 match self.textures.entry(*id) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -106,17 +117,35 @@ impl TextureSnapshots {
         }
 
         for id in &delta.free {
-            self.textures.remove(id);
+            if *id == font_id {
+                self.font_atlas_options = None;
+            } else {
+                self.textures.remove(id);
+            }
         }
     }
 
     #[expect(clippy::iter_over_hash_type)]
-    fn replay_into(&self, render_state: &RenderState) {
-        if self.textures.is_empty() {
+    fn replay_into(&self, context: &Context, render_state: &RenderState) {
+        if self.textures.is_empty() && self.font_atlas_options.is_none() {
             return;
         }
 
+        let font_delta = self.font_atlas_options.and_then(|options| {
+            let image = context.fonts(|fonts| fonts.image());
+            (image.width() > 0 && image.height() > 0)
+                .then(|| epaint::ImageDelta::full(image, options))
+        });
+
         let mut renderer = render_state.renderer.write();
+        if let Some(font_delta) = font_delta {
+            renderer.update_texture(
+                &render_state.device,
+                &render_state.queue,
+                epaint::TextureId::default(),
+                &font_delta,
+            );
+        }
         for (id, texture) in &self.textures {
             renderer.update_texture(
                 &render_state.device,
@@ -127,8 +156,11 @@ impl TextureSnapshots {
         }
     }
 
-    fn ids(&self) -> impl Iterator<Item = &epaint::TextureId> + '_ {
-        self.textures.keys()
+    fn ids(&self) -> impl Iterator<Item = epaint::TextureId> + '_ {
+        self.font_atlas_options
+            .map(|_| epaint::TextureId::default())
+            .into_iter()
+            .chain(self.textures.keys().copied())
     }
 }
 
@@ -372,7 +404,8 @@ impl Painter {
             let render_state =
                 RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
                     .await?;
-            self.texture_snapshots.replay_into(&render_state);
+            self.texture_snapshots
+                .replay_into(&self.context, &render_state);
             self.max_texture_side =
                 Some(render_state.device.limits().max_texture_dimension_2d as usize);
             self.subpixel_text = Some(render_state.renderer.read().has_subpixel_pipeline());
@@ -489,7 +522,7 @@ impl Painter {
         {
             let mut renderer = render_state.renderer.write();
             for id in self.texture_snapshots.ids() {
-                renderer.free_texture(id);
+                renderer.free_texture(&id);
             }
         }
 
@@ -748,12 +781,16 @@ impl Painter {
 
         let subpixel_text_options = self.context.fonts(|fonts| {
             let options = fonts.options();
-            (options.subpixel, options.text_contrast)
+            (options.subpixel, options.text_gamma, options.text_contrast)
         });
 
         let user_cmd_bufs = {
             let mut renderer = render_state.renderer.write();
-            renderer.set_subpixel_text_options(subpixel_text_options.0, subpixel_text_options.1);
+            renderer.set_subpixel_text_options(
+                subpixel_text_options.0,
+                subpixel_text_options.1,
+                subpixel_text_options.2,
+            );
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {
@@ -999,7 +1036,7 @@ mod tests {
 
     #[test]
     fn texture_snapshots_compose_partial_updates_for_replay() {
-        let id = epaint::TextureId::default();
+        let id = epaint::TextureId::Managed(1);
         let full = ColorImage::new(
             [3, 2],
             vec![
@@ -1047,7 +1084,7 @@ mod tests {
 
     #[test]
     fn texture_snapshots_forget_freed_textures() {
-        let id = epaint::TextureId::default();
+        let id = epaint::TextureId::Managed(1);
         let mut snapshots = TextureSnapshots::default();
         let mut deltas = epaint::textures::TexturesDelta::default();
         deltas.push(
@@ -1065,5 +1102,52 @@ mod tests {
         snapshots.record(&deltas);
         deltas.clear();
         assert!(!snapshots.textures.contains_key(&id));
+    }
+
+    #[test]
+    fn texture_snapshots_skip_duplicating_font_atlas_pixels() {
+        let font_id = epaint::TextureId::default();
+        let mut snapshots = TextureSnapshots::default();
+        let mut deltas = epaint::textures::TexturesDelta::default();
+        deltas.push(
+            font_id,
+            ImageDelta::full(
+                ColorImage::filled([4, 4], Color32::WHITE),
+                epaint::textures::TextureOptions::NEAREST,
+            ),
+        );
+        snapshots.record(&deltas);
+        deltas.clear();
+
+        assert!(
+            !snapshots.textures.contains_key(&font_id),
+            "font atlas must not be duplicated in CPU snapshot memory"
+        );
+        assert_eq!(
+            snapshots.font_atlas_options,
+            Some(epaint::textures::TextureOptions::NEAREST)
+        );
+        assert!(snapshots.ids().any(|id| id == font_id));
+
+        deltas.push(
+            font_id,
+            ImageDelta::partial(
+                [1, 1],
+                ColorImage::filled([1, 1], Color32::WHITE),
+                epaint::textures::TextureOptions::LINEAR,
+            ),
+        );
+        snapshots.record(&deltas);
+        deltas.clear();
+        assert_eq!(
+            snapshots.font_atlas_options,
+            Some(epaint::textures::TextureOptions::LINEAR)
+        );
+
+        deltas.free(font_id);
+        snapshots.record(&deltas);
+        deltas.clear();
+        assert_eq!(snapshots.font_atlas_options, None);
+        assert!(!snapshots.ids().any(|id| id == font_id));
     }
 }

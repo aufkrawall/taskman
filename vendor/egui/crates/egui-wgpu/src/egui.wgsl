@@ -22,9 +22,12 @@ struct Locals {
     /// Enhanced-contrast coverage weight for LCD text.
     subpixel_contrast: f32,
 
+    /// Blend-space gamma for LCD text weight compensation on non-sRGB targets.
+    subpixel_gamma: f32,
+
     /// Keep the uniform struct at 32 bytes (a multiple of the required 16-byte
     /// uniform-struct alignment) and matched to the Rust `UniformBuffer` layout.
-    _padding: vec2<u32>,
+    _padding: u32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 

@@ -78,6 +78,12 @@ pub fn query(hwnd: Option<isize>) -> TextRenderingParams {
         tracing::debug!("font smoothing is off or not ClearType; sub-pixel text disabled");
         return TextRenderingParams::disabled();
     }
+    if is_remote_session() {
+        // Remote Desktop compresses and may rescale the framebuffer for an unknown client
+        // panel geometry, turning sub-pixel fringes into colour noise.
+        tracing::debug!("remote desktop session active; sub-pixel text disabled");
+        return TextRenderingParams::disabled();
+    }
     if !is_per_monitor_dpi_aware() {
         // DWM would stretch our output, smearing the sub-pixel fringes into visible
         // colour noise. Grayscale survives scaling; sub-pixel does not.
@@ -312,6 +318,13 @@ fn system_wants_cleartype() -> bool {
     ok.is_ok() && kind == FE_FONTSMOOTHINGCLEARTYPE
 }
 
+/// Is this session being remoted over RDP?
+fn is_remote_session() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+
+    unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+}
+
 /// Is this process per-monitor DPI aware?
 ///
 /// winit sets per-monitor-v2 during event-loop creation, so this normally passes -- but
@@ -353,6 +366,55 @@ fn dwrite_factory() -> Option<windows::Win32::Graphics::DirectWrite::IDWriteFact
     unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.ok()
 }
 
+fn orientation_supports_horizontal_lcd(
+    orientation: windows::Win32::Graphics::Gdi::DEVMODE_DISPLAY_ORIENTATION,
+) -> bool {
+    use windows::Win32::Graphics::Gdi::{DMDO_90, DMDO_270};
+
+    orientation != DMDO_90 && orientation != DMDO_270
+}
+
+fn monitor_supports_horizontal_lcd(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        DEVMODEW, DM_DISPLAYORIENTATION, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+        GetMonitorInfoW, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows::core::PCWSTR;
+
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) }.as_bool() {
+        return true;
+    }
+
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    if !unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(info.szDevice.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut dm,
+        )
+    }
+    .as_bool()
+    {
+        return true;
+    }
+
+    if dm.dmFields.contains(DM_DISPLAYORIENTATION) {
+        let orientation = unsafe { dm.Anonymous1.Anonymous2.dmDisplayOrientation };
+        return orientation_supports_horizontal_lcd(orientation);
+    }
+    true
+}
+
 fn dwrite_params_for_monitor(
     factory: &windows::Win32::Graphics::DirectWrite::IDWriteFactory,
     monitor: windows::Win32::Graphics::Gdi::HMONITOR,
@@ -368,14 +430,15 @@ fn dwrite_params_for_monitor(
     let contrast = unsafe { params.GetEnhancedContrast() };
     let level = unsafe { params.GetClearTypeLevel() };
     let geometry = unsafe { params.GetPixelGeometry() };
+    let horizontal_panel = monitor_supports_horizontal_lcd(monitor);
 
     Some(TextRenderingParams {
         // A ClearType level of zero means the user asked for grayscale through the tuner
         // even though the system reports ClearType; honour it rather than drawing fringes
-        // they explicitly turned off. A FLAT pixel geometry means the display has no
-        // usable RGB/BGR stripes (rotated or unusual panel): coloured fringes would be
-        // wrong there, so draw grayscale.
-        enabled: level > 0.0 && geometry != DWRITE_PIXEL_GEOMETRY_FLAT,
+        // they explicitly turned off. A FLAT pixel geometry or 90/270-degree portrait
+        // rotation means the display has no usable horizontal RGB/BGR stripes, so draw
+        // grayscale instead of coloured fringes.
+        enabled: level > 0.0 && geometry != DWRITE_PIXEL_GEOMETRY_FLAT && horizontal_panel,
         bgr: geometry == DWRITE_PIXEL_GEOMETRY_BGR,
         gamma,
         contrast,
@@ -491,5 +554,15 @@ mod tests {
             validated_params(TextRenderingParams::default()),
             Some(TextRenderingParams::default())
         );
+    }
+
+    #[test]
+    fn portrait_display_orientations_disable_horizontal_lcd() {
+        use windows::Win32::Graphics::Gdi::{DMDO_90, DMDO_180, DMDO_270, DMDO_DEFAULT};
+
+        assert!(orientation_supports_horizontal_lcd(DMDO_DEFAULT));
+        assert!(orientation_supports_horizontal_lcd(DMDO_180));
+        assert!(!orientation_supports_horizontal_lcd(DMDO_90));
+        assert!(!orientation_supports_horizontal_lcd(DMDO_270));
     }
 }
