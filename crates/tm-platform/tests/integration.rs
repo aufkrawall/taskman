@@ -1405,17 +1405,23 @@ fn files_of_a_child_process_survive_handle_type_probing() {
     let expected = path.to_string_lossy().to_ascii_lowercase();
 
     let actions = tm_platform::win::WinActions;
-    // What the last walk said, so a timeout can name what was still missing
-    // instead of blaming only the file.
-    let mut last_walk: Option<(bool, bool)> = None;
+    // What the last walk reported or why it failed, so a timeout can name the
+    // case it hit instead of reading as "a complete walk lacked the file".
+    let mut last_walk: Option<Result<(bool, bool), String>> = None;
     let snapshot = poll_for(
         || {
-            let snapshot = actions.list_process_file_io(pid, None).ok()?;
+            let snapshot = match actions.list_process_file_io(pid, None) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    last_walk = Some(Err(error.to_string()));
+                    return None;
+                }
+            };
             let holds_file = snapshot
                 .files
                 .iter()
                 .any(|file| file.path.to_ascii_lowercase() == expected);
-            last_walk = Some((holds_file, snapshot.accounting.handles_complete));
+            last_walk = Some(Ok((holds_file, snapshot.accounting.handles_complete)));
             // A walk can legitimately report itself incomplete: the child opens
             // and closes handles of its own while it is being read, and a disk
             // handle whose path, position or access cannot be read leaves the
@@ -1432,11 +1438,15 @@ fn files_of_a_child_process_survive_handle_type_probing() {
     let snapshot = match snapshot {
         Some(snapshot) => snapshot,
         None => {
-            let (holds_file, complete) = last_walk.unwrap_or((false, false));
-            panic!(
-                "child {pid} never reported the held file in a complete handle walk \
-                 (holds_file={holds_file}, handles_complete={complete})"
-            );
+            let observed = match last_walk {
+                Some(Ok((holds_file, complete))) => format!(
+                    "the last walk read the handle table \
+                     (holds_file={holds_file}, handles_complete={complete})"
+                ),
+                Some(Err(error)) => format!("the last walk failed: {error}"),
+                None => "no walk ran".to_string(),
+            };
+            panic!("child {pid} never reported the held file: {observed}");
         }
     };
     let row = snapshot
@@ -1445,11 +1455,9 @@ fn files_of_a_child_process_survive_handle_type_probing() {
         .find(|file| file.path.to_ascii_lowercase() == expected)
         .expect("the found file is still there");
     assert!(row.is_read, "`type` opened the file for reading: {row:?}");
-    // The poll waited for a complete walk, so the flag must still say so.
-    assert!(
-        snapshot.accounting.handles_complete,
-        "the child's handle table was fully readable but the flag says otherwise"
-    );
+    // No `handles_complete` assertion follows: the poll only answered for a walk
+    // that reported a complete handle table, so the flag is part of the
+    // condition that produced this snapshot and could not read false here.
 }
 
 /// The class procedure for the throwaway window below. The presentation gate's
