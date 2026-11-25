@@ -813,8 +813,7 @@ impl Settings {
                     // the JSON migration and let the first autosave of
                     // defaults overwrite what the user actually chose. A file
                     // with bytes in it is as empty as a zero-byte one, so the
-                    // parse decides here, not the file size: dropping it keeps
-                    // the `.bad` copy that a real failure kept instead.
+                    // parse decides here, not the file size.
                     tracing::warn!(
                         path = %path.display(),
                         bytes = bytes.len(),
