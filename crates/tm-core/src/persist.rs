@@ -113,12 +113,14 @@ pub(crate) fn replace_file(
 }
 
 /// Move an existing file that could not be used out of the way (to
-/// `<name>.bad`) before the caller starts over with defaults.
+/// `<name>.bad`) before the caller starts over.
 ///
-/// Starting fresh means the next save replaces the file. A file that is
-/// oversized, corrupt, not UTF-8 or merely unreadable right now still holds
-/// the user's settings or history, so it is kept for recovery instead of
-/// being overwritten. Best effort: failing to move it is logged, never fatal.
+/// Starting over means the next save replaces that file name; the caller may
+/// also build its state from another source instead (the settings loader falls
+/// back to the legacy `settings.json`). A file that is oversized, corrupt, not
+/// UTF-8 or merely unreadable right now still holds the user's settings or
+/// history, so it is kept for recovery instead of being overwritten. Best
+/// effort: failing to move it is logged, never fatal.
 pub(crate) fn set_aside(path: &Path, what: &str) {
     let mut aside = path.as_os_str().to_owned();
     aside.push(".bad");
@@ -126,7 +128,7 @@ pub(crate) fn set_aside(path: &Path, what: &str) {
         Ok(()) => tracing::warn!(
             path = %path.display(),
             kept = %Path::new(&aside).display(),
-            "{what} could not be used; kept it aside and starting fresh"
+            "{what} could not be used; kept it aside and starting over"
         ),
         Err(error) => tracing::warn!(
             path = %path.display(),
