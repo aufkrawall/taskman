@@ -135,10 +135,12 @@ fn adapter_description(base: &Path) -> String {
     }
     // A USB NIC's `device` link names its `usb_interface` (`…/2-1/2-1:1.0`),
     // where none of the marketing strings above exist; they live on the
-    // `usb_device` one level further up. `idVendor` is what identifies that
-    // device, so a PCI parent — whose `product` would name the bridge, not the
-    // NIC — is never consulted.
-    let usb_device = device.join("../..");
+    // `usb_device` that is its parent (`…/2-1`). One level further up is the
+    // xHCI root hub, which carries `idVendor` and a `product` of its own, so
+    // reading there would describe every USB NIC as "xHCI Host Controller".
+    // `idVendor` is what identifies the parent as a USB device, so a PCI parent
+    // — whose `product` would name the bridge, not the NIC — is never consulted.
+    let usb_device = device.join("..");
     if usb_device.join("idVendor").is_file() {
         for candidate in ["product", "manufacturer"] {
             if let Some(value) = read_trim(usb_device.join(candidate)).filter(|v| !v.is_empty()) {
@@ -291,6 +293,94 @@ fn ipv4_addresses() -> HashMap<String, Vec<Ipv4Addr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway directory tree, so a sysfs layout can be pinned without the
+    /// machine's own devices.
+    struct Tree {
+        root: PathBuf,
+    }
+
+    impl Tree {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "tm-linux-netmeta-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+
+        fn link(&self, relative: &str, target: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, &path).unwrap();
+            path
+        }
+
+        fn mkdir(&self, relative: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// `/sys/class/net/<if>/device` is a link to the `usb_interface`, so the
+    /// interface's marketing name is its PARENT. The grandparent is the xHCI
+    /// root hub, which carries `idVendor` and a `product` of its own — reading
+    /// there names every USB NIC after the host controller.
+    #[test]
+    fn a_usb_adapter_is_named_after_its_device_not_the_root_hub() {
+        let tree = Tree::new("usb-nic");
+        // The host controller: a decoy `idVendor` and `product` one level above
+        // the device the interface belongs to.
+        tree.write("usb2/idVendor", "1d6b\n");
+        tree.write("usb2/product", "xHCI Host Controller\n");
+        // The adapter itself.
+        tree.write("usb2/2-1/idVendor", "0b95\n");
+        tree.write("usb2/2-1/product", "AX88179A USB 3.2 Gen1 Ethernet Adapter\n");
+        tree.write("usb2/2-1/2-1:1.0/uevent", "DRIVER=ax88179_178a\n");
+        // `net/eth0/device` → the interface, exactly as sysfs links it.
+        tree.link("net/eth0/device", "../../usb2/2-1/2-1:1.0");
+
+        assert_eq!(
+            adapter_description(&tree.root.join("net/eth0")),
+            "AX88179A USB 3.2 Gen1 Ethernet Adapter"
+        );
+    }
+
+    /// A PCI device has no `idVendor` file and no marketing strings of its own,
+    /// so the description stays the driver plus hardware id — the parent PCI
+    /// bridge must never be described as the adapter.
+    #[test]
+    fn a_pci_adapter_keeps_the_driver_and_hardware_id_description() {
+        let tree = Tree::new("pci-nic");
+        tree.write("0000:00:1c.0/product", "PCIe Root Port\n");
+        tree.write(
+            "0000:00:1c.0/0000:03:00.0/uevent",
+            "DRIVER=e1000e\nPCI_ID=8086:15B8\n",
+        );
+        tree.mkdir("net/eth0");
+        tree.link("net/eth0/device", "../../0000:00:1c.0/0000:03:00.0");
+
+        assert_eq!(
+            adapter_description(&tree.root.join("net/eth0")),
+            "e1000e (8086:15B8)"
+        );
+    }
 
     #[test]
     fn uevent_description_preserves_driver_and_hardware_id() {
