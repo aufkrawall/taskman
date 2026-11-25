@@ -42,22 +42,36 @@
   hook, against its own doc); the `## Bounds` bullet that still claimed a
   duplicated handle's bytes stay unnamed; the `known-debt` claim that an early
   `OpEnd` is counted in `orphaned_requests` (it charges nothing at all). Then,
-  from review pass 1: the "other request" opcode set contained `OpEnd` (69..=86
-  against a decoder that lists 76), one arm reordering away from retiring every
-  transfer it should charge; and a delayed `Process/End` dropped the bucket of
-  the pid's NEXT owner, because an exit was identified by pid alone — the
-  record's `UniqueProcessKey` now has to match (a pid with no recorded key
-  still drops, as before).
+  from review passes 1 and 2: the "other request" opcode set contained `OpEnd`
+  (69..=86 against a decoder that lists 76), one arm reordering away from
+  retiring every transfer it should charge; and a reused pid's bucket survived
+  its predecessor. The first attempt at the second fix only made a mismatched
+  `Process/End` ("this pid's older owner exited") stop dropping the bucket,
+  which left the dead owner's paths, bytes and transfer count being published
+  as the live process's — and when the bucket was epoch-bound, `bind_epoch`
+  removed it at the next sample anyway, taking the successor's already-measured
+  bytes with it. The reuse point is now the successor's `Process/Start`: a key
+  that differs from the pid's recorded one drops the predecessor's bucket, names,
+  pending requests and waiting bytes, so nothing of it is published and the
+  fresh bucket has no epoch to disagree with. A mismatched exit stays ignored
+  (its start record already dropped that state), the rundown only SEEDS a key
+  (it is a snapshot a live start can overtake), and a pid with no recorded key
+  keeps the old drop-on-exit behaviour. Accepted cost, stated in the code: a
+  transfer charged between a reused pid's real start and its start record
+  arriving goes with the predecessor's bucket and is unknown.
 - Not fixed, recorded in `known-debt.md`: a killed run that owns the exclusive
   NT Kernel Logger leaves it taken until reboot.
 - Left as-is on purpose, with the reasoning: `resolve_name`'s drive rescan runs
   in the ETW consumer (one scan per 5 s, only on a miss, and `QueryDosDeviceW`
   resolves in the object manager); `disk_etw` ignores a poisoned state mutex
   while `file_etw` recovers from one (a panic inside the callback aborts the
-  process, so that branch is unreachable); the `Process` class layouts (`pid` at
-  `P`, `UniqueProcessKey` at 0) are trusted for every version, while only v4 has
-  been probed — a version guard would risk the verified path more than it
-  protects. The Create layout is assumed rather than probed (above).
+  process, so that branch is unreachable); the `Process` class VERSION is trusted
+  as-is (only v4 has been probed live, and a guard would risk the verified path
+  more than it protects) and only the PID offset at `P` is pinned by that probe —
+  `UniqueProcessKey` at offset 0 is ASSUMED from the MOF, with the same "wrong
+  together" risk as the Create tail: `process_payload` encodes the same
+  assumption, so a wrong offset 0 fails no test. The Create layout is assumed
+  rather than probed (above).
 
 ## 2026-11-25 - Per-file I/O for the host's whole life, and what the graphs hold beyond files
 
