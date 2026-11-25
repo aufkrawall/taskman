@@ -17,12 +17,21 @@
     `EVENT_TRACE_SYSTEM_LOGGER_MODE` for it, and both file kinds subscribe
     through `FILE_SESSION_FLAGS` alone.
   - The FileIo layouts are pinned against a live dump
-    (`the_layouts_match_the_records_the_kernel_wrote`): `Irp` really is
-    pointer-sized at offset 8 of a Read/Write record, and the Create tail
-    starts at `2P + 16`. Byte accounting is completion-only
-    (`OpEnd.ExtraInfo`, success status, capped at the requested size), paging
-    requests are skipped AFTER retiring their `Irp`, and a request record on
-    any opcode 69..=86 retires the same `Irp`.
+    (`the_layouts_match_the_records_the_kernel_wrote`) for Read, Write,
+    Cleanup and `OpEnd`: `Irp` really is pointer-sized at offset 8 of a
+    Read/Write record. The CREATE layout — `Irp`, `FileObject`, four `u32`s,
+    then the `OpenPath` tail at `2P + 16` — is ASSUMED from the MOF, not
+    pinned: the hex test carries no Create record, and `create_payload_on`
+    encodes the same assumption `parse_event` reads, so the two would be wrong
+    together without either test failing. `the_file_trace_measures_exact_bytes_per_file`
+    cannot settle it either: a file opened under the trace is re-named from the
+    handle table once its bytes stay unnamed for `SEED_INTERVAL`, so its row
+    can be exact with the Create decode broken. Capture a real Create record
+    (and the name it resolves to) before trusting a name only a Create can
+    provide. Byte accounting is completion-only (`OpEnd.ExtraInfo`, success
+    status, capped at the requested size), paging requests are skipped AFTER
+    retiring their `Irp`, and another REQUEST on 69..=75 or 77..=86 retires the
+    same `Irp` — 76 is the completion and is decoded, never retired.
   - `handle_payload` pins native pointer width for kernel-written payloads;
     `etw::pointer_bytes` stays for user-mode-written ones (it moved there from
     `disk_etw`).
@@ -32,16 +41,23 @@
 - Fixed: the crash teardown's per-name `Vec<u16>` (an allocation in the panic
   hook, against its own doc); the `## Bounds` bullet that still claimed a
   duplicated handle's bytes stay unnamed; the `known-debt` claim that an early
-  `OpEnd` is counted in `orphaned_requests` (it charges nothing at all).
+  `OpEnd` is counted in `orphaned_requests` (it charges nothing at all). Then,
+  from review pass 1: the "other request" opcode set contained `OpEnd` (69..=86
+  against a decoder that lists 76), one arm reordering away from retiring every
+  transfer it should charge; and a delayed `Process/End` dropped the bucket of
+  the pid's NEXT owner, because an exit was identified by pid alone — the
+  record's `UniqueProcessKey` now has to match (a pid with no recorded key
+  still drops, as before).
 - Not fixed, recorded in `known-debt.md`: a killed run that owns the exclusive
   NT Kernel Logger leaves it taken until reboot.
 - Left as-is on purpose, with the reasoning: `resolve_name`'s drive rescan runs
   in the ETW consumer (one scan per 5 s, only on a miss, and `QueryDosDeviceW`
   resolves in the object manager); `disk_etw` ignores a poisoned state mutex
   while `file_etw` recovers from one (a panic inside the callback aborts the
-  process, so that branch is unreachable); the Process/End layout is trusted
-  for every version (only v4 has been probed, and a version guard would risk
-  the verified path more than it protects).
+  process, so that branch is unreachable); the `Process` class layouts (`pid` at
+  `P`, `UniqueProcessKey` at 0) are trusted for every version, while only v4 has
+  been probed — a version guard would risk the verified path more than it
+  protects. The Create layout is assumed rather than probed (above).
 
 ## 2026-11-25 - Per-file I/O for the host's whole life, and what the graphs hold beyond files
 

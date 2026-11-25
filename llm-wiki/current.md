@@ -980,12 +980,20 @@ rebase runbook.
   fails). It is no longer idle-stopped with the page: a 60 s maintenance
   thread restarts a session stopped underneath it and prunes exited
   processes. The session also carries `EVENT_TRACE_FLAG_PROCESS`; a
-  `Process/End` record (opcode 2, pid at payload offset `P`) drops the
-  process's buckets, names, pending requests and waiting bytes at once, so a
-  reused pid inherits nothing. Coverage is stated: a process created after the
-  session started (creation ticks > session start) has its whole life traced
-  (`traced_since_process_start`); for older ones the session snapshots every
-  process's `IO_COUNTERS` just before it starts
+  `Process/End` record (opcode 2, `UniqueProcessKey` at payload offset 0, pid
+  at `P`) drops the process's buckets, names, pending requests and waiting
+  bytes at once, so a reused pid inherits nothing — but only while the key it
+  carries still belongs to the pid's CURRENT incarnation. Windows reuses a pid
+  within about a second and this class arrives up to a flush interval (1 s)
+  late, so the previous owner's exit can land after the pid's new owner has
+  already written; comparing against the key a `Process/Start` or the
+  session-start rundown recorded (`State::process_keys`) is what keeps those
+  measured bytes, and the live owner's own exit drops them. A pid with no
+  recorded key — started before the session, or its start record was lost —
+  cannot be told apart and still drops on any exit. Coverage is stated: a
+  process created after the session started (creation ticks > session start)
+  has its whole life traced (`traced_since_process_start`); for older ones the
+  session snapshots every process's `IO_COUNTERS` just before it starts
   (`process_file_io::snapshot_io_counters`), and `attach_file_io` turns the
   baseline into `counter_window_*` — the process's own counters over exactly
   the traced window. The page's second line compares them with the file

@@ -778,9 +778,11 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   (paging I/O is excluded on purpose); a completion whose request has not
   arrived yet (an `OpEnd` delivered before its own record, cross-CPU delivery
   order) charges nothing and increments nothing, so that one request's bytes
-  are never attributed — `orphaned_requests` counts only requests retired by a
-  LATER request on the same `Irp`, which is a different fact; naming objects
-  from the handle table needs `SeDebugPrivilege` for object addresses
+  are never attributed — `orphaned_requests` does not count it either: that
+  counter holds the requests retired by a LATER request on the same `Irp` plus
+  the ones dropped when the pending map hit `MAX_PENDING_REQUESTS`, so it is
+  not a count of early completions; naming objects from the handle table needs
+  `SeDebugPrivilege` for object addresses
   (LocalSystem and an elevated admin have it). A run of the service or an
   elevated GUI that is KILLED — no destructor and no panic hook — while it owns
   the exclusive NT Kernel Logger fallback leaves that session taken until the
