@@ -977,16 +977,25 @@ rebase runbook.
   and stopped by the same idle watchdog as the disk and network traces. Two
   hosts exist and keep separate fixed session names (`FileTraceHost` in
   `core_service.rs`): the installed LocalSystem service (`TaskMan-File-Service`)
-  answers `ProcessFileIo` requests from its own session, and an ELEVATED GUI
-  without the service (`TaskMan-File-App`) hosts the same trace on the direct
-  `WinActions::list_process_file_io` path, attaching its sample through the one
-  shared `file_etw::attach_file_io`. An app-side start that fails (the ordinary
-  unelevated GUI) is throttled for `APP_FILE_TRACE_RETRY` so the
-  once-per-second poll does not spin on a kernel refusal, and the snapshot then
-  stays `Unavailable`. The I/O page keys one dim line above the file table off
-  exactly that state (`per_file_bytes_need_a_source`), saying per-file bytes
-  need elevation or the installed service — `Undelivered`/`Undecodable` get no
-  such line, because a source exists and the gap is in time, not privilege.
+  answers `ProcessFileIo` requests from its own session, and the GUI
+  (`TaskMan-File-App`) hosts the same trace on the direct
+  `WinActions::list_process_file_io` path whenever a request does not get a
+  served answer — no service installed, the broker unavailable, or the broker
+  rejecting the request — which still requires elevation, and attaches its
+  sample through the one shared `file_etw::attach_file_io`. An app-side start
+  that fails (the ordinary unelevated GUI) is throttled for
+  `APP_FILE_TRACE_RETRY` so the once-per-second poll does not spin on a kernel
+  refusal, and the snapshot then stays `Unavailable`. A session is only kept
+  while its idle watchdog runs: the spawn result is part of the decision,
+  because a session nothing stops would trace the machine for the life of the
+  process. The I/O page keys one dim line above the file table off exactly that
+  state (`per_file_bytes_need_a_source`), saying per-file bytes need elevation
+  or the installed service and that no trace is running —
+  `Undelivered`/`Undecodable` get no such line, because a source exists and the
+  gap is in time, not privilege. The line is Windows-only (the Linux backend
+  reports `Unavailable` for every snapshot and has no elevated host) and is
+  suppressed while a displayed row still carries a count, since `merge_files`
+  replaces the accounting wholesale while keeping the larger of two row counts.
   The Create event names a `FileObject`, that object's
   Read and Write events carry the requested size, and the sizes are summed per
   (process, path). Names arrive as device paths, so they are translated to the

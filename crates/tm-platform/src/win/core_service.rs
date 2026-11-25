@@ -2497,8 +2497,9 @@ fn app_trace_start_due(failed_at: Option<std::time::Instant>, now: std::time::In
     failed_at.is_none_or(|at| now.saturating_duration_since(at) >= APP_FILE_TRACE_RETRY)
 }
 
-/// Cumulative per-file bytes from the GUI's OWN session, for an elevated GUI
-/// without the installed service.
+/// Cumulative per-file bytes from the GUI's OWN session: the answer whenever a
+/// request does not get a served one, which is a direct run without the service
+/// as well as a broker rejection.
 ///
 /// This is what closes the "columns look broken" gap in a direct run: the trace
 /// is hosted here and its sample is attached exactly as the broker attaches

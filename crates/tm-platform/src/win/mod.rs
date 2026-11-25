@@ -564,9 +564,10 @@ impl PlatformActions for WinActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
         let mut snapshot = process_file_io::list_process_file_io(pid, expected_start_epoch_s)?;
-        // An elevated GUI without the installed service hosts the per-file
-        // trace itself; the broker path attaches its own session's sample the
-        // same way. Without a verified identity there is nothing to bind the
+        // A request that did not get a served answer — no service installed,
+        // the broker unavailable, or the broker rejecting it — has the GUI host
+        // the per-file trace itself, which an elevated token allows; the broker
+        // path attaches its own session's sample the same way. Without a verified identity there is nothing to bind the
         // counters to, and without elevation no session can start, so every
         // row keeps saying unavailable rather than zero.
         if let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) {
