@@ -363,11 +363,15 @@ pub fn install_present_gate(hwnd: isize, background: [u8; 3], wake: Arc<dyn Fn()
     // than the state the gate asked for: `Some(0)` next to the refusal warning
     // says the write did not land, and a nonzero mask names whichever party
     // cloaks the window.
+    // `cloak_window` writes the cloak attribute, so it has to run before the
+    // log rather than as a tracing field: tracing does not evaluate field
+    // expressions at all when the event's level is disabled.
+    let cloak_bits = cloak_window(hwnd);
     tracing::debug!(
         hwnd,
         ?background,
         subclassed,
-        cloak_bits = ?cloak_window(hwnd),
+        ?cloak_bits,
         "presentation gate installed; gate holding the window"
     );
 }
@@ -467,9 +471,12 @@ pub fn present_gate_hold(hwnd: isize) {
             "presentation gate holding the window; no handle to cloak"
         );
     } else {
+        // Not a tracing field expression: `cloak_window` writes the attribute,
+        // and tracing skips fields of a disabled event.
+        let cloak_bits = cloak_window(target);
         tracing::debug!(
             hwnd = target,
-            cloak_bits = ?cloak_window(target),
+            ?cloak_bits,
             "presentation gate holding the window"
         );
     }
