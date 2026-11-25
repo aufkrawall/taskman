@@ -600,7 +600,10 @@ impl Painter {
             }
         } else {
             log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            // The whole teardown, not just the surface map: the depth/MSAA views, the capture
+            // target and the primer request all belong to the surfaces that are going away, and
+            // leaving them behind keeps their GPU textures alive for a window that is gone.
+            self.drop_all_surfaces();
         }
         Ok(())
     }
@@ -629,7 +632,10 @@ impl Painter {
             }
         } else {
             log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            // The whole teardown, not just the surface map: the depth/MSAA views, the capture
+            // target and the primer request all belong to the surfaces that are going away, and
+            // leaving them behind keeps their GPU textures alive for a window that is gone.
+            self.drop_all_surfaces();
         }
         Ok(())
     }
