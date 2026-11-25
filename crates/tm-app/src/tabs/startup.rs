@@ -53,7 +53,9 @@ impl Derived {
             return None;
         }
         let (_, key) = self.targets.get(&item.id)?;
-        app.startup_impact.get(key).copied()
+        // The store is loaded after the first frame; an item cannot reach this
+        // row before its own fetch returns, which is later still.
+        app.startup_impact.as_ref()?.get(key).copied()
     }
 
     /// The impact the Impact column shows — and therefore sorts by.

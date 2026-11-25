@@ -117,14 +117,29 @@ pub(crate) fn request_programmatic_exit() {
 pub struct StartupTrace;
 
 impl StartupTrace {
+    /// Log one startup milestone.
+    ///
+    /// `ms` counts from the first mark (`process_start`, the first statement of
+    /// `main`), and `since_ms` is the gap from the mark before it — the number
+    /// that answers "what delayed this phase". Callers mark one-shot
+    /// milestones only: `info` is the highest level the log file keeps, and a
+    /// per-frame phase would bury the ones that matter.
     pub fn mark(name: &'static str) {
         static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let elapsed = T0.get_or_init(Instant::now).elapsed().as_millis();
-        tracing::info!(ms = elapsed as u64, phase = name, "startup");
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let elapsed = T0.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let previous = LAST_MS.swap(elapsed, std::sync::atomic::Ordering::Relaxed);
+        let gap = elapsed.saturating_sub(previous);
+        tracing::info!(ms = elapsed, since_ms = gap, phase = name, "startup");
     }
 }
 
 fn main() {
+    // First statement: this mark is the origin every later `ms` is measured
+    // from. The record itself is dropped (no subscriber yet in the early-log
+    // configuration), which is the point — the loader and CRT time before it
+    // are not ours to attribute.
+    StartupTrace::mark("process_start");
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Root-only diagnostic/helper entry point retained for a future protected
@@ -433,6 +448,9 @@ fn run_gui(mock: bool, args: &[String]) {
         .then(ui_state::window_position_px)
         .flatten();
     let restore_maximized = restore_position && ui_state::window_maximized();
+    // The last file read before the window exists; everything after this point
+    // is renderer/adapter work and the app's own construction.
+    StartupTrace::mark("window_state_loaded");
 
     let initial_tab_arg = args
         .iter()
@@ -611,11 +629,18 @@ fn run_gui(mock: bool, args: &[String]) {
                 }
                 tm_platform::ensure_window_on_screen(hwnd);
             }
+            // The dual-source answer has to be the pre-pipeline capability, not
+            // `renderer.has_subpixel_pipeline()`: pipelines are compiled on the
+            // first paint, and this runs in the creator, before that. The
+            // capability predicate fails closed (device feature AND the LCD
+            // shader validating), so it can only claim a pipeline that
+            // `Renderer::new` will actually be able to build. A backend that
+            // still refuses it is logged once by `Painter::ensure_renderer`.
             #[cfg(feature = "wgpu")]
             let wgpu_dual_source = cc
                 .wgpu_render_state
                 .as_ref()
-                .is_some_and(|state| state.renderer.read().has_subpixel_pipeline());
+                .is_some_and(|state| state.supports_subpixel_text());
             #[cfg(not(feature = "wgpu"))]
             let wgpu_dual_source = false;
             let subpixel_capable = renderer_supports_subpixel(renderer, wgpu_dual_source);
@@ -673,15 +698,19 @@ fn run_gui(mock: bool, args: &[String]) {
                 );
             }
             fonts::install_async(cc.egui_ctx.clone());
+            StartupTrace::mark("visuals_installed");
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
-            Ok(Box::new(NativeApp::new(
+            let shell = NativeApp::new(
                 application,
                 &cc.egui_ctx,
                 start_hidden,
                 native_activation,
-            )) as Box<dyn eframe::App>)
+            );
+            StartupTrace::mark("native_shell_ready");
+            Ok(Box::new(shell) as Box<dyn eframe::App>)
         };
         let opts = options(renderer);
+        StartupTrace::mark("window_options_built");
 
         match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
             Ok(()) => return,
@@ -1084,6 +1113,11 @@ struct NativeApp {
     tray_init_attempted: bool,
     hidden_to_tray: bool,
     initial_hide_pending: bool,
+    /// Startup diagnostics: `logic` was entered and the first `ui` returned.
+    /// The marks must fire once, so the flags exist only to keep them from
+    /// repeating on every later frame.
+    first_logic_logged: bool,
+    first_ui_logged: bool,
     #[cfg(target_os = "windows")]
     exit_requested: bool,
     /// Native window handle, cached the first time a frame hands it over.
@@ -1114,6 +1148,10 @@ struct NativeApp {
     /// "a later frame painted" is exactly "a presented frame exists".
     #[cfg(target_os = "windows")]
     frames_painted: u32,
+    /// Set once the marked restore's first painted frame has been traced, so
+    /// `restored_window_painted` is logged once per restore, not per frame.
+    #[cfg(target_os = "windows")]
+    restore_paint_marked: bool,
     /// The present gate holds the window cloaked after a show, an un-minimize,
     /// the initial reveal or a requested restore, until a frame has painted
     /// into the window it is about to show.
@@ -1182,6 +1220,8 @@ impl NativeApp {
             tray_init_attempted: tray_requested,
             hidden_to_tray: initially_hidden,
             initial_hide_pending: initially_hidden,
+            first_logic_logged: false,
+            first_ui_logged: false,
             #[cfg(target_os = "windows")]
             exit_requested: false,
             #[cfg(target_os = "windows")]
@@ -1194,6 +1234,8 @@ impl NativeApp {
             show_ack_started: std::time::Instant::now(),
             #[cfg(target_os = "windows")]
             frames_painted: 0,
+            #[cfg(target_os = "windows")]
+            restore_paint_marked: false,
             #[cfg(target_os = "windows")]
             present_gate_held: false,
             #[cfg(target_os = "windows")]
@@ -1306,6 +1348,16 @@ impl NativeApp {
 
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        // First data pass after the creator returned. The renderer's own setup
+        // is NOT in this gap: eframe creates the wgpu instance, adapter, device
+        // and surface in `egui_wgpu::winit::Painter::new` and `set_window`,
+        // both before it calls the creator, so that cost lands between
+        // `window_options_built` and `creation_context_enter`. What runs here
+        // is eframe's bookkeeping and the event loop's first turn into the app.
+        if !self.first_logic_logged {
+            self.first_logic_logged = true;
+            StartupTrace::mark("first_logic_enter");
+        }
         #[cfg(target_os = "linux")]
         self.resolve_linux_activations(ctx);
         #[cfg(target_os = "linux")]
@@ -1498,6 +1550,16 @@ impl eframe::App for NativeApp {
             // Every wait below is over once this counter has moved past the
             // value it started at.
             self.frames_painted = self.frames_painted.saturating_add(1);
+            // First painted frame of a restore. `restore_window` arms the wait
+            // and only a new restore re-arms it, so this mark fires once per
+            // restore rather than per frame.
+            if self.show_ack_pending
+                && !self.restore_paint_marked
+                && self.frames_painted > self.show_ack_at_frame
+            {
+                self.restore_paint_marked = true;
+                StartupTrace::mark("restored_window_painted");
+            }
             // A changed monitor size means the display layout changed under
             // the window (resolution switch by a game, monitor unplugged or
             // re-docked): pull the window back inside the visible desktop.
@@ -1539,6 +1601,13 @@ impl eframe::App for NativeApp {
                 }
                 ui_state::set_window_maximized(maximized);
             }
+        }
+        // The first UI pass is complete. eframe tessellates, paints and
+        // only then reveals the window, so this mark ends the phase the
+        // renderer pays for before anything is on screen.
+        if !self.first_ui_logged {
+            self.first_ui_logged = true;
+            StartupTrace::mark("first_ui_left");
         }
     }
 
@@ -2016,6 +2085,7 @@ impl NativeApp {
         self.show_ack_pending = true;
         self.show_ack_at_frame = self.frames_painted;
         self.show_ack_started = std::time::Instant::now();
+        self.restore_paint_marked = false;
         // The UI is event driven and the engine may be paused, so the frames
         // the countdown needs have to be asked for explicitly.
         ctx.request_repaint();
