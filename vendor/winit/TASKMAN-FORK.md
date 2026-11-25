@@ -35,10 +35,14 @@ value differs from the startup value.
     the user32 import library — Task Manager resolves it dynamically too), and
     falls back to the stock `CreateWindowExW` path when the variable is unset,
     zero, or unparseable.
-  - `create_window()` calls `create_window_native()` instead of
-    `CreateWindowExW` directly.
+  - `init()` calls `create_window_native()` instead of `CreateWindowExW`
+    directly. The call site carries a `TaskMan fork:` comment of its own so
+    the rebase grep lands on it.
   - Imports for `GetModuleHandleW`/`GetProcAddress`, `HINSTANCE`, `HMENU`,
-    `WINDOW_EX_STYLE` and `WINDOW_STYLE`.
+    `WINDOW_EX_STYLE` and `WINDOW_STYLE`, with the same comment on the
+    `LibraryLoader` import: a reapply that restores only
+    `create_window_native()` would otherwise leave the call and the imports
+    untouched.
 
 Nothing else in `windows/window.rs` is changed. `grep -n TASKMAN_WINDOW_BAND vendor/winit/src` lists
 every window-band line.

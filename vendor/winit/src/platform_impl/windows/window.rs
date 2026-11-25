@@ -24,6 +24,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
 };
+// TaskMan fork: `GetModuleHandleW`/`GetProcAddress` exist here to resolve
+// `CreateWindowInBand` for the window-band patch (§1 of `TASKMAN-FORK.md`). That patch's
+// signature also needs `HINSTANCE`, `HMENU`, `WINDOW_EX_STYLE` and `WINDOW_STYLE` from the
+// imports above and below.
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Ole::{OleInitialize, RegisterDragDrop};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -1368,6 +1372,8 @@ unsafe fn init(
     let mut initdata = InitData { event_loop, attributes, window_flags, window: None };
 
     let (style, ex_style) = window_flags.to_window_styles();
+    // TaskMan fork: create through the window-band helper instead of `CreateWindowExW`.
+    // See `TASKMAN-FORK.md` §1.
     let handle = unsafe {
         create_window_native(
             ex_style,
