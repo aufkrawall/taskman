@@ -201,8 +201,12 @@ impl PrimerState {
         self.unprimed.retain(|id| active_viewports.contains(id));
     }
 
-    fn needs_primer(&self) -> bool {
-        !self.unprimed.is_empty()
+    /// Whether `viewport_id`'s surface still owes its first presented frame.
+    ///
+    /// Per viewport, not for the painter as a whole: one window that has presented says
+    /// nothing about another window that has not.
+    fn needs_primer(&self, viewport_id: ViewportId) -> bool {
+        self.unprimed.contains(&viewport_id)
     }
 }
 
@@ -291,6 +295,22 @@ impl StartupTimings {
             "wgpu pipelines compiled {renderer_ms:.1} ms, {total_ms:.1} ms after painter creation"
         ))
     }
+}
+
+/// Report the one case where the capability answer and what was built disagree.
+///
+/// A device that advertises dual-source blending lets a font atlas rasterize LCD coverage; if
+/// no pipeline came out of it, those texels reach the ordinary pipeline as additive
+/// per-channel coverage while their alpha is zero, so text is corrupted instead of degraded.
+/// That must never be silent.
+fn report_missing_lcd_pipeline(render_state: &RenderState, has_lcd_pipeline: bool) {
+    if has_lcd_pipeline || !crate::Renderer::advertises_subpixel_text(&render_state.device) {
+        return;
+    }
+    log::error!(
+        "The device advertises dual-source blending but the LCD text pipeline was not created; \
+         sub-pixel text cannot be drawn (see the warnings above for the shader or pipeline error)"
+    );
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -561,10 +581,19 @@ impl Painter {
     pub fn ensure_renderer(&mut self) {
         profiling::function_scope!();
 
-        let Some(render_state) = self.render_state.as_mut() else {
+        let Some(render_state) = self.render_state.as_ref() else {
             return;
         };
-        if render_state.renderer.is_some() {
+        if let Some(renderer) = render_state.renderer() {
+            // The renderer slot is shared with every clone of the render state, so an
+            // application that compiled the pipelines through a clone would otherwise leave
+            // this painter without a capability answer and without its snapshots uploaded.
+            if self.subpixel_text.is_none() {
+                let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
+                self.subpixel_text = Some(has_lcd_pipeline);
+                report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
+                self.texture_snapshots.replay_into(&self.context, render_state);
+            }
             return;
         }
 
@@ -574,7 +603,10 @@ impl Painter {
         if let Some(message) = self.startup.late_renderer_message() {
             log::info!("{message}");
         }
-        self.subpixel_text = Some(renderer.read().has_subpixel_pipeline());
+
+        let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
+        self.subpixel_text = Some(has_lcd_pipeline);
+        report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
         self.texture_snapshots.replay_into(&self.context, render_state);
     }
 
@@ -660,15 +692,32 @@ impl Painter {
         self.subpixel_text
     }
 
-    /// Whether a surface still owes its first presented frame.
+    /// Whether `viewport_id`'s surface still owes its first presented frame.
     ///
-    /// True from the moment [`Self::set_window`] (or a surface re-create) installs a surface
-    /// until that viewport has presented once — either through [`Self::present_clear`] or
-    /// through [`Self::paint_and_update_textures`]. A caller uses it to put the correct
-    /// background colour on screen while the full first egui pass is still being prepared,
-    /// instead of showing an unpainted backbuffer.
-    pub fn needs_primer(&self) -> bool {
-        self.primer.needs_primer()
+    /// True from the moment [`Self::set_window`] (or a surface re-create) installs that
+    /// viewport's surface until it has presented once — either through
+    /// [`Self::present_clear`] or through [`Self::paint_and_update_textures`]. A caller uses it
+    /// to put the correct background colour on screen while the full first egui pass is still
+    /// being prepared, instead of showing an unpainted backbuffer.
+    ///
+    /// Per viewport: a second window that has not presented yet does not make the first one
+    /// ask for another primer.
+    pub fn needs_primer(&self, viewport_id: ViewportId) -> bool {
+        self.primer.needs_primer(viewport_id)
+    }
+
+    /// Drop every per-surface object, including which surfaces still owe a primer.
+    ///
+    /// The primer requirement belongs to the surface: once the surface is gone there is
+    /// nothing left whose pixels are undefined, and the re-created surface is marked again by
+    /// [`Self::install_surface`]. Keeping both in one place is what stops one teardown path
+    /// from clearing the surfaces and leaving a stale primer request behind.
+    fn drop_all_surfaces(&mut self) {
+        self.surfaces.clear();
+        self.depth_texture_view.clear();
+        self.msaa_texture_view.clear();
+        self.screen_capture_state = None;
+        self.primer.clear();
     }
 
     /// Release the swapchain while keeping the device and its pipelines resident.
@@ -686,11 +735,7 @@ impl Painter {
     /// lets wgpu retire submissions that already finished and release the surface's
     /// backbuffers without waiting for a frame that is still in flight.
     pub fn pause(&mut self) {
-        self.surfaces.clear();
-        self.depth_texture_view.clear();
-        self.msaa_texture_view.clear();
-        self.screen_capture_state = None;
-        self.primer.clear();
+        self.drop_all_surfaces();
 
         let Some(render_state) = self.render_state.as_ref() else {
             return;
@@ -712,11 +757,7 @@ impl Painter {
     /// Prefer [`Self::pause`] when the window is coming back: keeping the device and pipelines
     /// is what makes minimize/restore instant.
     pub fn suspend(&mut self) {
-        self.surfaces.clear();
-        self.depth_texture_view.clear();
-        self.msaa_texture_view.clear();
-        self.screen_capture_state = None;
-        self.primer.clear();
+        self.drop_all_surfaces();
 
         let Some(render_state) = self.render_state.take() else {
             return;
@@ -1529,17 +1570,17 @@ mod tests {
     #[test]
     fn primer_state_requires_a_present_after_each_new_surface() {
         let mut primer = PrimerState::default();
-        assert!(!primer.needs_primer());
+        assert!(!primer.needs_primer(ViewportId::ROOT));
 
         primer.mark_new_surface(ViewportId::ROOT);
-        assert!(primer.needs_primer());
+        assert!(primer.needs_primer(ViewportId::ROOT));
 
         primer.mark_presented(ViewportId::ROOT);
-        assert!(!primer.needs_primer());
+        assert!(!primer.needs_primer(ViewportId::ROOT));
 
         // A re-created surface holds undefined pixels again.
         primer.mark_new_surface(ViewportId::ROOT);
-        assert!(primer.needs_primer());
+        assert!(primer.needs_primer(ViewportId::ROOT));
     }
 
     #[test]
@@ -1549,19 +1590,28 @@ mod tests {
         primer.mark_new_surface(second_viewport());
 
         primer.mark_presented(ViewportId::ROOT);
-        assert!(primer.needs_primer(), "the second viewport has not presented yet");
+        assert!(!primer.needs_primer(ViewportId::ROOT), "the root viewport presented");
+        assert!(
+            primer.needs_primer(second_viewport()),
+            "the second viewport has not presented yet, whatever the root did"
+        );
 
         primer.mark_presented(second_viewport());
-        assert!(!primer.needs_primer());
+        assert!(!primer.needs_primer(second_viewport()));
     }
 
     #[test]
-    fn pause_and_suspend_drop_the_primer_requirement() {
-        // Both drop every surface, so nothing is left whose pixels are undefined.
+    fn primer_state_clear_forgets_every_pending_surface() {
+        // `Painter::drop_all_surfaces` is the only caller: both teardown paths drop the
+        // surfaces and their primer requirement together, so nothing is left whose pixels are
+        // undefined.
         let mut primer = PrimerState::default();
         primer.mark_new_surface(ViewportId::ROOT);
+        primer.mark_new_surface(second_viewport());
+
         primer.clear();
-        assert!(!primer.needs_primer());
+        assert!(!primer.needs_primer(ViewportId::ROOT));
+        assert!(!primer.needs_primer(second_viewport()));
     }
 
     #[test]
@@ -1573,9 +1623,10 @@ mod tests {
         let active: ViewportIdSet = [ViewportId::ROOT].into_iter().collect();
         primer.retain(&active);
 
-        assert!(primer.needs_primer());
+        assert!(!primer.needs_primer(second_viewport()));
+        assert!(primer.needs_primer(ViewportId::ROOT));
         primer.mark_presented(ViewportId::ROOT);
-        assert!(!primer.needs_primer());
+        assert!(!primer.needs_primer(ViewportId::ROOT));
     }
 
     /// Timing values a test can reason about, without a GPU deciding how long anything took.

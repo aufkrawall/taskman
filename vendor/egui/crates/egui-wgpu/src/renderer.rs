@@ -176,6 +176,17 @@ fn supports_subpixel_features(features: wgpu::Features) -> bool {
     features.contains(wgpu::Features::DUAL_SOURCE_BLENDING)
 }
 
+/// Whether the LCD pipeline can be built, from both halves of the question.
+///
+/// The device has to advertise dual-source blending, and the dual-source shader has to pass
+/// the deterministic validation that [`Renderer::new`] runs before it asks the backend to
+/// compile it. Folding the second half in keeps the capability answer fail-closed: a device
+/// that advertises the feature but cannot build the pipeline must not be described as
+/// sub-pixel capable.
+fn subpixel_text_supported(features: wgpu::Features, shader_valid: bool) -> bool {
+    supports_subpixel_features(features) && shader_valid
+}
+
 fn normalized_contrast(contrast: f32) -> f32 {
     if contrast.is_finite() {
         contrast.clamp(0.0, 1.0)
@@ -238,6 +249,16 @@ fn validate_lcd_shader_source(source: &str) -> Result<(), String> {
     .validate(&module)
     .map_err(|error| error.emit_to_string(source))?;
     Ok(())
+}
+
+/// The deterministic validation result for the LCD shader source, computed once.
+///
+/// The source is a compile-time constant, so its parse and validation outcome cannot differ
+/// between devices or calls. Caching it lets the capability predicate answer without asking
+/// the backend, and keeps [`Renderer::new`] from validating the same source a second time.
+fn lcd_shader_validation() -> &'static Result<(), String> {
+    static VALIDATION: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    VALIDATION.get_or_init(|| validate_lcd_shader_source(&lcd_shader_source()))
 }
 
 /// Resolve an error scope without an unbounded wait.
@@ -482,13 +503,29 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Whether this device can draw sub-pixel text.
+    /// Whether the device advertises sub-pixel text through dual-source blending.
+    ///
+    /// Only the device half of the capability: [`Self::supports_subpixel_text`] additionally
+    /// requires the dual-source shader to validate, and [`Self::has_subpixel_pipeline`] reports
+    /// what was actually built. A caller that wants to tell an unsupported device from a
+    /// rejected pipeline asks this one.
     ///
     /// This is deliberately checked on the device rather than the adapter alone: a caller
     /// may supply an existing `wgpu::Device`, and an adapter feature only matters if the
     /// application actually requested it during device creation.
-    pub fn supports_subpixel_text(device: &wgpu::Device) -> bool {
+    pub fn advertises_subpixel_text(device: &wgpu::Device) -> bool {
         supports_subpixel_features(device.features())
+    }
+
+    /// Whether an LCD pipeline can be built for this device.
+    ///
+    /// Combines [`Self::advertises_subpixel_text`] with the deterministic validation of the
+    /// dual-source shader, so it only reports true when [`Self::new`] really can create the
+    /// pipeline; it fails closed rather than promising a blend the driver will not provide.
+    /// The backend's own compile result is not knowable before the pipeline exists, so
+    /// [`Self::has_subpixel_pipeline`] stays the authoritative answer afterwards.
+    pub fn supports_subpixel_text(device: &wgpu::Device) -> bool {
+        subpixel_text_supported(device.features(), lcd_shader_validation().is_ok())
     }
 
     /// Whether [`Self::new`] created the LCD pipeline on this renderer.
@@ -516,7 +553,6 @@ impl Renderer {
     ///
     /// `output_color_format` should preferably be [`wgpu::TextureFormat::Rgba8Unorm`] or
     /// [`wgpu::TextureFormat::Bgra8Unorm`], i.e. in gamma-space.
-    #[expect(clippy::single_match_else)]
     pub fn new(
         device: &wgpu::Device,
         output_color_format: wgpu::TextureFormat,
@@ -708,73 +744,69 @@ impl Renderer {
 
         // The font atlas can use a source color plus a per-channel coverage source. Both
         // sources share location 0; WGSL marks the second output with `@blend_src(1)`.
-        // Validate the complete shader on the CPU first, then keep backend validation in a
-        // bounded error scope. Any failure drops only the LCD pipeline.
+        // `supports_subpixel_text` already validated the complete shader on the CPU, so only
+        // the backend's own compilation is left, kept in a bounded error scope. Any failure
+        // drops only the LCD pipeline.
         let lcd_pipeline = if Self::supports_subpixel_text(device) {
             let source = lcd_shader_source();
-            match validate_lcd_shader_source(&source) {
-                Err(error) => {
-                    log::warn!("LCD shader validation failed; using grayscale pipeline: {error}");
-                    None
-                }
-                Ok(()) => {
-                    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-                    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
-                    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-                    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("egui_lcd"),
-                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
-                    });
-                    let pipeline = create_pipeline(
-                        "egui_lcd_pipeline",
-                        &module,
-                        if linear_framebuffer {
-                            "fs_lcd_linear_framebuffer"
-                        } else {
-                            "fs_lcd_gamma_framebuffer"
-                        },
-                        wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: alpha_blend,
-                        },
-                    );
-                    let mut failed = false;
-                    for (kind, scope) in [
-                        (
-                            "out-of-memory",
-                            bounded_validation_error(device, out_of_memory.pop()),
-                        ),
-                        ("internal", bounded_validation_error(device, internal.pop())),
-                        (
-                            "validation",
-                            bounded_validation_error(device, validation.pop()),
-                        ),
-                    ] {
-                        match scope {
-                            Ok(None) => {}
-                            Ok(Some(error)) => {
-                                failed = true;
-                                log::warn!(
-                                    "LCD pipeline {kind} error; using grayscale pipeline: {error}"
-                                );
-                            }
-                            Err(()) => {
-                                failed = true;
-                                log::warn!(
-                                    "LCD pipeline {kind} validation did not complete within 250 ms; \
-                                     using grayscale pipeline"
-                                );
-                            }
-                        }
+            let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("egui_lcd"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
+            });
+            let pipeline = create_pipeline(
+                "egui_lcd_pipeline",
+                &module,
+                if linear_framebuffer {
+                    "fs_lcd_linear_framebuffer"
+                } else {
+                    "fs_lcd_gamma_framebuffer"
+                },
+                wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: alpha_blend,
+                },
+            );
+            let mut failed = false;
+            for (kind, scope) in [
+                (
+                    "out-of-memory",
+                    bounded_validation_error(device, out_of_memory.pop()),
+                ),
+                ("internal", bounded_validation_error(device, internal.pop())),
+                (
+                    "validation",
+                    bounded_validation_error(device, validation.pop()),
+                ),
+            ] {
+                match scope {
+                    Ok(None) => {}
+                    Ok(Some(error)) => {
+                        failed = true;
+                        log::warn!("LCD pipeline {kind} error; using grayscale pipeline: {error}");
                     }
-                    if failed { None } else { Some(pipeline) }
+                    Err(()) => {
+                        failed = true;
+                        log::warn!(
+                            "LCD pipeline {kind} validation did not complete within 250 ms; \
+                             using grayscale pipeline"
+                        );
+                    }
                 }
             }
+            if failed { None } else { Some(pipeline) }
         } else {
+            // Say why the pipeline was never attempted; the device feature alone no longer
+            // decides it.
+            if let Err(error) = lcd_shader_validation() {
+                log::warn!("LCD shader validation failed; using grayscale pipeline: {error}");
+            }
             None
         };
 
@@ -1601,9 +1633,9 @@ mod tests {
     use super::{
         BUFFER_SHRINK_AFTER_UPDATES, BUFFER_SHRINK_MIN_CAPACITY, UniformBuffer,
         capacity_after_sustained_underuse, enhanced_lcd_coverage, font_subpixel_after,
-        gamma_adjusted_lcd_coverage, lcd_shader_source, normalized_contrast, normalized_gamma,
-        subpixel_order_code, supports_subpixel_features, texel_mapping_is_one_to_one,
-        use_lcd_pipeline, validate_lcd_shader_source,
+        gamma_adjusted_lcd_coverage, lcd_shader_source, lcd_shader_validation, normalized_contrast,
+        normalized_gamma, subpixel_order_code, subpixel_text_supported, supports_subpixel_features,
+        texel_mapping_is_one_to_one, use_lcd_pipeline, validate_lcd_shader_source,
     };
     use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
 
@@ -1662,6 +1694,33 @@ mod tests {
         assert!(supports_subpixel_features(
             wgpu::Features::DUAL_SOURCE_BLENDING | wgpu::Features::DEPTH_CLIP_CONTROL
         ));
+    }
+
+    #[test]
+    fn subpixel_capability_fails_closed_on_an_invalidated_lcd_shader() {
+        let dual_source = wgpu::Features::DUAL_SOURCE_BLENDING;
+        assert!(subpixel_text_supported(dual_source, true));
+
+        // The device advertising the blend is not the whole answer: a renderer that cannot
+        // validate the dual-source shader never builds the LCD pipeline, so describing it as
+        // sub-pixel capable would leave LCD-rasterized texels drawn additively by the
+        // ordinary pipeline.
+        assert!(!subpixel_text_supported(dual_source, false));
+
+        assert!(!subpixel_text_supported(wgpu::Features::empty(), true));
+        assert!(!subpixel_text_supported(wgpu::Features::empty(), false));
+    }
+
+    #[test]
+    fn lcd_shader_validation_of_the_shipped_source_is_cached() {
+        let first = lcd_shader_validation();
+        if let Err(error) = first {
+            panic!("the shipped LCD shader must validate:\n{error}");
+        }
+
+        // The capability predicate runs on every query and in `Renderer::new`; the source is a
+        // constant, so its validation must not be repeated.
+        assert!(std::ptr::eq(first, lcd_shader_validation()));
     }
 
     #[test]

@@ -77,6 +77,25 @@ pub fn create_render_state(
     .expect("Failed to create render state")
 }
 
+/// Create a headless render state whose pipelines are still to be compiled.
+///
+/// `create_render_state_with_format` needs the target format settled before the pipelines are
+/// baked into a renderer, which eager creation does not allow.
+fn create_render_state_without_renderer(setup: WgpuSetup) -> egui_wgpu::RenderState {
+    // No display handle needed for headless testing — we don't present to a window.
+    let instance = pollster::block_on(setup.new_instance());
+
+    pollster::block_on(egui_wgpu::RenderState::create_without_renderer(
+        &egui_wgpu::WgpuConfiguration {
+            wgpu_setup: setup,
+            ..Default::default()
+        },
+        &instance,
+        None,
+    ))
+    .expect("Failed to create render state")
+}
+
 /// Create a headless renderer with an explicit target format.
 ///
 /// The default headless setup selects a gamma-unaware target. This variant exists so the
@@ -86,10 +105,11 @@ pub fn create_render_state_with_format(
     options: egui_wgpu::RendererOptions,
     target_format: wgpu::TextureFormat,
 ) -> egui_wgpu::RenderState {
-    let mut state = create_render_state(setup, options);
-    let renderer = egui_wgpu::Renderer::new(&state.device, target_format, options);
+    let mut state = create_render_state_without_renderer(setup);
+    // The pipelines bake the target format in, so it has to be selected before the renderer
+    // is compiled; the returned lock is all this helper needs.
     state.target_format = target_format;
-    state.renderer = Arc::new(egui::epaint::mutex::RwLock::new(renderer));
+    let _renderer = state.ensure_renderer(options);
     state
 }
 
@@ -145,7 +165,8 @@ impl WgpuTestRenderer {
     pub fn from_render_state(render_state: RenderState) -> Self {
         assert!(
             render_state
-                .renderer
+                .renderer()
+                .expect("a created RenderState has a renderer")
                 .read()
                 .texture(&egui::epaint::TextureId::Managed(0))
                 .is_none(),
@@ -170,7 +191,11 @@ impl crate::TestRenderer for WgpuTestRenderer {
     }
 
     fn handle_delta(&mut self, delta: &mut TexturesDelta) {
-        let mut renderer = self.render_state.renderer.write();
+        let mut renderer = self
+            .render_state
+            .renderer()
+            .expect("a created RenderState has a renderer")
+            .write();
         #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
         for (id, images) in delta.set.drain() {
             for image in images {
@@ -195,7 +220,11 @@ impl crate::TestRenderer for WgpuTestRenderer {
         ctx: &egui::Context,
         output: &egui::FullOutput,
     ) -> Result<RgbaImage, String> {
-        let mut renderer = self.render_state.renderer.write();
+        let mut renderer = self
+            .render_state
+            .renderer()
+            .expect("a created RenderState has a renderer")
+            .write();
         let (subpixel, gamma, contrast) = ctx.fonts(|fonts| {
             let options = fonts.options();
             (options.subpixel, options.text_gamma, options.text_contrast)

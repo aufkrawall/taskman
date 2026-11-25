@@ -86,8 +86,12 @@ impl Custom3d {
         // Because the graphics pipeline must have the same lifetime as the egui render pass,
         // instead of storing the pipeline in our `Custom3D` struct, we insert it into the
         // `paint_callback_resources` type map, which is stored alongside the render pass.
-        wgpu_render_state
-            .renderer
+        //
+        // Those resources live in the renderer, so the demo needs one: eframe compiles the
+        // pipelines with the first drawn frame, and a `CreationContext` taken before that has
+        // no renderer yet.
+        let renderer = wgpu_render_state.renderer()?;
+        renderer
             .write()
             .callback_resources
             .insert(TriangleRenderResources {

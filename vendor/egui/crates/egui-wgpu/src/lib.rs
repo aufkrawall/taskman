@@ -42,7 +42,7 @@ pub mod capture;
 #[cfg(feature = "winit")]
 pub mod winit;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use epaint::mutex::RwLock;
 
@@ -138,13 +138,20 @@ pub struct RenderState {
     /// The target texture format used for presenting to the window.
     pub target_format: wgpu::TextureFormat,
 
-    /// Egui renderer responsible for drawing the UI.
+    /// Egui renderer responsible for drawing the UI, once its pipelines exist.
     ///
-    /// `None` until the pipelines have been compiled by [`Self::ensure_renderer`] (or by
+    /// Empty until [`Self::ensure_renderer`] compiles them (directly, or through
     /// `Painter::ensure_renderer` on the winit path). Device creation has to happen before a
     /// window can present anything; pipeline compilation does not, so it is kept out of the
     /// path that ends in the window becoming visible.
-    pub renderer: Option<Arc<RwLock<Renderer>>>,
+    ///
+    /// The slot is shared with every clone rather than copied, because eframe hands a clone to
+    /// `CreationContext` (and to `Frame`) before the first paint: a long-lived clone has to see
+    /// the renderer that is built later, or the documented `PaintCallback` /
+    /// `callback_resources` path would silently do nothing. That sharing also means a clone
+    /// held by the application keeps whatever renderer exists alive, exactly as it already
+    /// keeps the device alive.
+    renderer: Arc<OnceLock<Arc<RwLock<Renderer>>>>,
 
     /// Runtime-mutable subset of the wgpu configuration.
     ///
@@ -228,13 +235,15 @@ impl RenderState {
         compatible_surface: Option<&wgpu::Surface<'static>>,
         options: RendererOptions,
     ) -> Result<Self, WgpuError> {
-        let mut render_state =
+        let render_state =
             Self::create_without_renderer(config, instance, compatible_surface).await?;
-        render_state.ensure_renderer(options);
+        // Eager by contract: the pipelines exist before this returns, and the lock is not
+        // needed here.
+        let _renderer = render_state.ensure_renderer(options);
         Ok(render_state)
     }
 
-    /// Like [`Self::create`], but leaves `renderer` unset.
+    /// Like [`Self::create`], but leaves the renderer unset.
     ///
     /// The instance, adapter, device, queue and target format are decided here; the pipelines
     /// are compiled on demand via [`Self::ensure_renderer`]. Callers that must present
@@ -329,42 +338,49 @@ impl RenderState {
             device,
             queue,
             target_format,
-            renderer: None,
+            renderer: Arc::new(OnceLock::new()),
             surface_config: config.surface,
         })
     }
 
     /// The renderer, if its pipelines have been compiled yet.
+    ///
+    /// Read through a clone of the returned lock; the slot behind it is shared by every clone
+    /// of this state, so a value obtained here is the same renderer [`Self::ensure_renderer`]
+    /// builds later.
     pub fn renderer(&self) -> Option<&Arc<RwLock<Renderer>>> {
-        self.renderer.as_ref()
+        self.renderer.get()
     }
 
     /// Compile the renderer's pipelines, unless that already happened.
     ///
     /// Returns the renderer's lock. Cloning the `Arc` is cheap and lets a caller write through
     /// it while the rest of this state stays borrowed immutably. Idempotent: calling it on
-    /// every frame costs one `Arc` clone.
+    /// every frame costs one `Arc` clone, and a clone of this state taken before the first
+    /// call observes the renderer it built.
     #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
-    pub fn ensure_renderer(&mut self, options: RendererOptions) -> Arc<RwLock<Renderer>> {
+    pub fn ensure_renderer(&self, options: RendererOptions) -> Arc<RwLock<Renderer>> {
         profiling::function_scope!();
 
-        if let Some(renderer) = &self.renderer {
-            return Arc::clone(renderer);
-        }
-
-        let renderer = Renderer::new(&self.device, self.target_format, options);
-        log::debug!("Created the egui-wgpu renderer");
-
-        let renderer = Arc::new(RwLock::new(renderer));
-        self.renderer = Some(Arc::clone(&renderer));
-        renderer
+        let renderer = self.renderer.get_or_init(|| {
+            let renderer = Renderer::new(&self.device, self.target_format, options);
+            log::debug!("Created the egui-wgpu renderer");
+            Arc::new(RwLock::new(renderer))
+        });
+        Arc::clone(renderer)
     }
 
-    /// Whether this device can draw sub-pixel text through dual-source blending.
+    /// Whether an LCD text pipeline can be built for this device: the pre-pipeline capability
+    /// answer.
     ///
-    /// A property of the device, so it is known before the renderer exists.
-    /// [`Renderer::has_subpixel_pipeline`] additionally reports that the pipeline really
-    /// validated and was created for this target format.
+    /// True only when the device advertises dual-source blending *and* the dual-source shader
+    /// passes the deterministic validation that [`Renderer::new`] performs before it asks the
+    /// backend to compile it, so this fails closed instead of promising text that a driver
+    /// cannot blend.
+    ///
+    /// This is not a substitute for [`Renderer::has_subpixel_pipeline`], which reports what the
+    /// backend actually built. Callers that must decide before any renderer exists use this
+    /// one; `Painter::ensure_renderer` logs an error when the two disagree.
     pub fn supports_subpixel_text(&self) -> bool {
         Renderer::supports_subpixel_text(&self.device)
     }
