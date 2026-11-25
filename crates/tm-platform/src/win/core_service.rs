@@ -2285,10 +2285,34 @@ fn start_file_trace(role: super::etw::TraceRole) -> Option<super::file_etw::File
 /// How a request starts a session; see [`start_file_trace`].
 type FileTraceStarter<'a> = dyn Fn(super::etw::TraceRole) -> Option<super::file_etw::FileEtw> + 'a;
 
+/// What one request got from a host's session.
+struct FileTraceAnswer {
+    /// The sample, when the host has a session at all. A session that stopped
+    /// is frozen and still answers: its state is
+    /// [`crate::actions::FileIoAccountingState::Unavailable`], so the dialog
+    /// reports a missing source instead of a stale number.
+    sample: Option<super::file_etw::FileIoSample>,
+    /// Whether this request tried to start a session and was refused — for a
+    /// dead session that needed replacing as much as for a missing one.
+    start_refused: bool,
+}
+
+impl FileTraceAnswer {
+    /// The start failure to remember after this request, if there was one.
+    ///
+    /// A refusal is recorded even when the answer still carries a frozen
+    /// sample: that sample says the source is gone, so the start WAS refused,
+    /// and forgetting it makes the throttle clear itself on every poll — a
+    /// session that keeps dying is then re-created at the poll rate.
+    fn failure_at(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.start_refused.then_some(now)
+    }
+}
+
 /// Cumulative per-file bytes for `pid` from `host`'s session, starting it on
 /// demand.
 ///
-/// `None` means no session could be started, which the caller must keep
+/// No sample means no session could be started, which the caller must keep
 /// rendering as [`crate::actions::FileIoAccountingState::Unavailable`]: a
 /// Kernel-File session needs elevation, and without one there is no source at
 /// all — that state has to keep meaning exactly that.
@@ -2300,11 +2324,12 @@ fn file_trace_sample(
     pid: u32,
     start_epoch_s: i64,
     start: &FileTraceStarter<'_>,
-) -> Option<super::file_etw::FileIoSample> {
+) -> FileTraceAnswer {
     let mut slot = match host.slot().lock() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
+    let mut refused = false;
     if slot.as_ref().is_some_and(|trace| !trace.usage.is_running()) {
         // Stopped underneath us: its counters are frozen. Replace the session
         // in place so the slot's one watchdog keeps covering it, then report
@@ -2319,10 +2344,13 @@ fn file_trace_sample(
                 tracing::warn!("app file trace ended unexpectedly; restarting it");
             }
         }
-        if let Some(usage) = start(host.role())
-            && let Some(trace) = slot.as_mut()
-        {
-            trace.usage = usage;
+        match start(host.role()) {
+            Some(usage) => {
+                if let Some(trace) = slot.as_mut() {
+                    trace.usage = usage;
+                }
+            }
+            None => refused = true,
         }
     }
     if slot.is_none() {
@@ -2348,14 +2376,25 @@ fn file_trace_sample(
                         );
                     }
                 }
-                return None;
+                return FileTraceAnswer {
+                    sample: None,
+                    start_refused: true,
+                };
             }
         }
     }
-    let trace = slot.as_mut()?;
+    let Some(trace) = slot.as_mut() else {
+        return FileTraceAnswer {
+            sample: None,
+            start_refused: refused,
+        };
+    };
     trace.last_request = std::time::Instant::now();
     let live = live_pids();
-    Some(trace.usage.sample(pid, start_epoch_s, &live))
+    FileTraceAnswer {
+        sample: Some(trace.usage.sample(pid, start_epoch_s, &live)),
+        start_refused: refused,
+    }
 }
 
 /// The broker's answer for one request: LocalSystem's own session.
@@ -2366,6 +2405,7 @@ fn file_io_accounting(pid: u32, start_epoch_s: i64) -> Option<super::file_etw::F
         start_epoch_s,
         &start_file_trace,
     )
+    .sample
 }
 
 /// How long an app-side trace start is given up for after it failed.
@@ -2395,6 +2435,9 @@ fn app_trace_last_failure() -> Option<std::time::Instant> {
 }
 
 /// Record — or, with `None`, clear — the last app-side start failure.
+///
+/// A caller records a refusal even when a dead session still answers it; see
+/// [`FileTraceAnswer::failure_at`].
 fn remember_app_trace_failure(at: Option<std::time::Instant>) {
     let mut failure = match app_file_trace_failed_at().lock() {
         Ok(failure) => failure,
@@ -2423,6 +2466,10 @@ fn app_trace_start_due(failed_at: Option<std::time::Instant>, now: std::time::In
 ///
 /// The start is throttled by [`APP_FILE_TRACE_RETRY`]; a running session is
 /// sampled on every request and idled out by its watchdog.
+///
+/// What sets the window is the refusal, not the absence of a sample: a session
+/// that already stopped still answers, so keying on the sample would clear the
+/// window on every poll and re-create a dying session at the poll rate.
 fn app_file_io_accounting(
     pid: u32,
     start_epoch_s: i64,
@@ -2432,9 +2479,9 @@ fn app_file_io_accounting(
     if !app_trace_start_due(app_trace_last_failure(), now) {
         return None;
     }
-    let sample = file_trace_sample(FileTraceHost::App, pid, start_epoch_s, start);
-    remember_app_trace_failure(sample.is_none().then_some(now));
-    sample
+    let answer = file_trace_sample(FileTraceHost::App, pid, start_epoch_s, start);
+    remember_app_trace_failure(answer.failure_at(now));
+    answer.sample
 }
 
 /// Attach the GUI's own per-file bytes to `snapshot`, when it can host them.
@@ -5284,11 +5331,15 @@ mod tests {
             None
         };
         assert!(
-            file_trace_sample(FileTraceHost::App, std::process::id(), 1, &record).is_none(),
+            file_trace_sample(FileTraceHost::App, std::process::id(), 1, &record)
+                .sample
+                .is_none(),
             "a refused start reports no sample"
         );
         assert!(
-            file_trace_sample(FileTraceHost::Service, std::process::id(), 1, &record).is_none(),
+            file_trace_sample(FileTraceHost::Service, std::process::id(), 1, &record)
+                .sample
+                .is_none(),
             "a refused start reports no sample"
         );
         assert_eq!(
@@ -5361,6 +5412,40 @@ mod tests {
             crate::actions::FileIoAccountingState::Unavailable
         );
         remember_app_trace_failure(None);
+    }
+
+    /// A refusal is a refusal even when a dead session still answers it.
+    ///
+    /// This is the persistent-restart case: the slot holds a session that
+    /// stopped, every request tries to replace it, and the replacement is
+    /// refused. Keying the window on "no sample came back" would read that as
+    /// success and clear the failure on every poll, so the throttle could not
+    /// cover a session that keeps dying.
+    #[test]
+    fn a_refused_replacement_is_recorded_even_though_a_dead_session_answers() {
+        let now = std::time::Instant::now();
+        let frozen = super::super::file_etw::FileIoSample {
+            running: false,
+            ..Default::default()
+        };
+        let refused = FileTraceAnswer {
+            sample: Some(frozen.clone()),
+            start_refused: true,
+        };
+        assert_eq!(
+            refused.failure_at(now),
+            Some(now),
+            "the dead session must not make the refusal look like a success"
+        );
+        let answered = FileTraceAnswer {
+            sample: Some(frozen),
+            start_refused: false,
+        };
+        assert_eq!(
+            answered.failure_at(now),
+            None,
+            "a live session clears the window"
+        );
     }
 
     /// A failed start is throttled: an unelevated GUI fails it forever, and the
