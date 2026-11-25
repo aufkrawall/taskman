@@ -1250,6 +1250,8 @@ impl Sampler {
                 total_bytes: members.iter().map(|&i| volumes[i].2).sum(),
                 free_bytes: members.iter().map(|&i| volumes[i].3).sum(),
                 active_pct: Some(perf.active_pct),
+                // The rates come from this PDH instance, so they are measured.
+                rates_measured: true,
                 read_bps: perf.read_bps,
                 write_bps: perf.write_bps,
                 avg_resp_ms: perf.avg_resp_ms,
@@ -1272,6 +1274,8 @@ impl Sampler {
                 // `None` while the PhysicalDisk PDH group is asleep or
                 // still warming: an unmeasured disk is not an idle one.
                 active_pct: None,
+                // No PDH instance, so the rates below are placeholders.
+                rates_measured: false,
                 read_bps: 0.0,
                 write_bps: 0.0,
                 avg_resp_ms: 0.0,

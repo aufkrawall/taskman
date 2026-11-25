@@ -940,8 +940,9 @@ mod tests {
 
         /// Paint the frame with the software painter, exactly as the CPU
         /// renderer does: upload the atlas the pass extracted, then rasterize
-        /// the untessellated shapes (the path the `Software` renderer uses, and
-        /// the only renderer this project ships).
+        /// the untessellated shapes (the path the `Software` renderer uses;
+        /// the GPU backends consume the tessellated primitives instead, so
+        /// both paths are kept).
         fn paint(&mut self, width: u32, height: u32) -> Vec<u32> {
             let mut painter = Painter::new();
             for (id, deltas) in &self.textures.set {

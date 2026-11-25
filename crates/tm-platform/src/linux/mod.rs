@@ -287,6 +287,10 @@ impl SystemCollector for LinuxCollector {
             let ds = diskstats
                 .iter()
                 .find(|s| s.device == block || parent.as_deref() == Some(s.device.as_str()));
+            // Both rates need the same previous sample, so they are measured
+            // together or not at all.
+            let read_bps = ds.and_then(|s| s.read_bps(interval_s));
+            let write_bps = ds.and_then(|s| s.write_bps(interval_s));
             disks.push(DiskInfo {
                 id: dev.clone(),
                 number: None,
@@ -296,11 +300,12 @@ impl SystemCollector for LinuxCollector {
                 total_bytes: d.total_space(),
                 free_bytes: d.available_space(),
                 active_pct: ds.and_then(|s| s.active_pct(interval_s)),
-                // The model has no "unknown" byte rate; an unmatched device
-                // or a first sample is reported as 0 B/s (active time above
-                // stays None, so the page still shows it as unmeasured).
-                read_bps: ds.and_then(|s| s.read_bps(interval_s)).unwrap_or(0.0),
-                write_bps: ds.and_then(|s| s.write_bps(interval_s)).unwrap_or(0.0),
+                // The model has no "unknown" byte rate, so an unmatched device
+                // or a first sample still writes 0 B/s below — but it says so
+                // here, and the page renders a gap and "—" instead.
+                rates_measured: read_bps.is_some() && write_bps.is_some(),
+                read_bps: read_bps.unwrap_or(0.0),
+                write_bps: write_bps.unwrap_or(0.0),
                 avg_resp_ms: 0.0,
                 total_read_bytes: ds.map(|s| s.read_sectors * 512).unwrap_or(0),
                 total_written_bytes: ds.map(|s| s.write_sectors * 512).unwrap_or(0),

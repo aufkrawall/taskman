@@ -40,8 +40,11 @@ pub struct HistoryPoint {
     pub commit_used_bytes: u64,
     #[allow(dead_code)] // kept for future committed-limit charts
     pub commit_limit_bytes: u64,
-    pub disks: Vec<(String, Option<f32>, f64, f64)>, // mount, active%, read bps, write bps
-    pub nets: Vec<(String, f64, f64)>,               // name, recv bps, sent bps
+    /// `(mount, active %, read bps, write bps, rates measured)`. The last flag
+    /// travels with the rates because it is not the same fact as the activity
+    /// percentage: macOS reports throughput with no busy-time source at all.
+    pub disks: Vec<(String, Option<f32>, f64, f64, bool)>,
+    pub nets: Vec<(String, f64, f64)>,
     /// Per-adapter GPU history. A named struct (not a tuple) because the
     /// memory split is what the GPU page plots: `mem_used_bytes` on Windows
     /// equals the dedicated total, and shared memory is its own series.
@@ -1078,8 +1081,12 @@ impl TaskManApp {
                 disks: latest
                     .disks
                     .iter()
-                    // Preserve unavailable activity as a gap in the chart.
-                    .map(|d| (d.mount.clone(), d.active_pct, d.read_bps, d.write_bps))
+                    // Preserve unavailable activity as a gap in the chart, and
+                    // the rates' own measurement state with them.
+                    .map(|d| {
+                        let mount = d.mount.clone();
+                        (mount, d.active_pct, d.read_bps, d.write_bps, d.rates_measured)
+                    })
                     .collect(),
                 nets: latest
                     .networks

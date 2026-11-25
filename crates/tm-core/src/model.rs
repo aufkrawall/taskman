@@ -195,6 +195,17 @@ pub struct DiskInfo {
     /// `None` where the platform's disk-time counters are not running: an
     /// idle disk and an unmeasured one must never read the same.
     pub active_pct: Option<f32>,
+    /// Whether [`Self::read_bps`]/[`Self::write_bps`] describe a measured
+    /// interval.
+    ///
+    /// The two are NOT the same fact as [`Self::active_pct`]: macOS fills its
+    /// byte counters from `IOBlockStorageDriver` while leaving `active_pct` at
+    /// `None` (it has no busy-time source), so inferring "no measurement" from
+    /// the missing percentage hides real throughput. `false` means the rates are
+    /// placeholders — no interval yet on a first sample, no counter source on
+    /// Windows — and must never be read as an idle disk.
+    #[serde(default)]
+    pub rates_measured: bool,
     pub read_bps: f64,
     pub write_bps: f64,
     /// Average time requests spend being serviced, ms (0 = unknown).

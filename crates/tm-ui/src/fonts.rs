@@ -148,10 +148,10 @@ pub fn poll_async_apply(ctx: &egui::Context) {
 #[derive(Clone, Copy)]
 struct LoadedFace {
     name: &'static str,
-    /// Process-lifetime raw font bytes leaked once inside `SYSTEM_FONTS`.
-    /// Sharing `&'static [u8]` lets multiple `FontData` instances (e.g.
-    /// Regular, Semibold, Display, Small of `SegUIVar.ttf`) and repeated
-    /// `fonts::reapply` calls share one allocation with zero copies.
+    /// Process-lifetime raw font bytes leaked once inside
+    /// [`system_font_cache`]. Sharing `&'static [u8]` lets multiple `FontData`
+    /// instances (e.g. Regular, Semibold, Display, Small of `SegUIVar.ttf`) and
+    /// repeated `fonts::reapply` calls share one allocation with zero copies.
     bytes: &'static [u8],
     index: u32,
     is_segoe_var: bool,
@@ -385,13 +385,17 @@ fn build_definitions() -> FontDefinitions {
     let cache = system_font_cache();
     let mut fonts = FontDefinitions::default();
 
-    // Remove bundled fallback faces once OS-native replacements are present so
-    // epaint does not keep unused font bytes and skrifa metadata in RAM.
+    // Drop a bundled face from the chain the system face replaces, so epaint
+    // does not keep parsing a font nothing draws with. One FAMILY at a time:
+    // epaint also lists `Ubuntu-Light` in the Monospace chain as its maths and
+    // symbol fallback ("fallback for √ etc"), which a system monospace face
+    // need not cover, so removing it from every family would trade a few KB of
+    // skrifa metadata for tofu in every monospace cell.
     if cache.proportional.is_some() {
-        remove_font(&mut fonts, "Ubuntu-Light");
+        remove_font_from(&mut fonts, FontFamily::Proportional, "Ubuntu-Light");
     }
     if cache.monospace.is_some() {
-        remove_font(&mut fonts, "Hack");
+        remove_font_from(&mut fonts, FontFamily::Monospace, "Hack");
     }
 
     if let Some(prop) = cache.proportional {
@@ -507,10 +511,19 @@ fn build_definitions() -> FontDefinitions {
     fonts
 }
 
-fn remove_font(fonts: &mut FontDefinitions, name: &str) {
-    fonts.font_data.remove(name);
-    for list in fonts.families.values_mut() {
+/// Drop `name` from ONE family's chain, and from the font table only once no
+/// chain still lists it.
+///
+/// The table entry is what epaint parses and holds, so it has to go for the
+/// RAM saving to be real — but only when nothing else still asks for it (see
+/// the caller for why one font file can serve two families).
+fn remove_font_from(fonts: &mut FontDefinitions, family: FontFamily, name: &str) {
+    if let Some(list) = fonts.families.get_mut(&family) {
         list.retain(|entry| entry != name);
+    }
+    let still_listed = fonts.families.values().flatten().any(|listed| listed == name);
+    if !still_listed {
+        fonts.font_data.remove(name);
     }
 }
 
@@ -677,9 +690,27 @@ mod tests {
                 .expect("semantic family must exist in build_definitions");
             assert!(!chain.is_empty());
         }
-        // System proportional/monospace faces should drop unused bundled defaults.
+        // A system proportional face replaces the bundled one — but Ubuntu-Light
+        // STAYS in the monospace chain, where epaint lists it as the maths and
+        // symbol fallback ("fallback for √ etc"), and a system monospace face
+        // need not cover those codepoints.
         if system_font_cache().proportional.is_some() {
-            assert!(!built.font_data.contains_key("Ubuntu-Light"));
+            let proportional = built
+                .families
+                .get(&FontFamily::Proportional)
+                .expect("proportional family must exist");
+            assert!(
+                !proportional.iter().any(|entry| entry == "Ubuntu-Light"),
+                "the bundled proportional face must leave the proportional chain"
+            );
+            let monospace = built
+                .families
+                .get(&FontFamily::Monospace)
+                .expect("monospace family must exist");
+            assert!(
+                monospace.iter().any(|entry| entry == "Ubuntu-Light"),
+                "the monospace maths fallback must survive"
+            );
         }
         if system_font_cache().monospace.is_some() {
             assert!(!built.font_data.contains_key("Hack"));

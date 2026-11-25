@@ -473,11 +473,11 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
         opts.text_gamma = gamma;
         opts.text_contrast = contrast;
     }
-    // High-DPI multi-face / sub-pixel / multilingual sessions easily exceed epaint's
-    // 2048 default atlas ceiling, whose overflow fallback restarts a third smaller.
-    // Raise the ceiling to 4096 unconditionally so grayscale and LCD atlases both
-    // avoid eviction churn; the atlas still starts small and grows lazily.
-    opts.max_texture_side = opts.max_texture_side.max(4096);
+    // The atlas ceiling is NOT set here. `Context::update_fonts_mut` overwrites
+    // `TextOptions::max_texture_side` with `RawInput::max_texture_side` on every
+    // pass before the `Fonts` object is built, so a value written into this
+    // style would be discarded; the renderer's own integration supplies it (16 K
+    // for the software renderer this app defaults to).
     // Respect Linux Fontconfig `hinting: false` / `hintstyle: hintnone` under Standard;
     // otherwise keep hinting on so stems stay crisp.
     opts.font_hinting = !(smoothing == TextSmoothing::Standard
@@ -815,10 +815,6 @@ mod tests {
                 font_semibold(15.5)
             );
             assert_eq!(style.text_styles[&egui::TextStyle::Small], font_small(11.0));
-            assert!(
-                style.visuals.text_options.max_texture_side >= 4096,
-                "atlas ceiling must be at least 4096 even in grayscale mode"
-            );
         }
         assert_eq!(light_visuals().override_text_color, Some(LIGHT.text));
         assert_eq!(dark_visuals().override_text_color, Some(DARK.text));

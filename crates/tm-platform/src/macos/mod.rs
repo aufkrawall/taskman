@@ -253,6 +253,10 @@ impl SystemCollector for MacCollector {
                         // No per-disk busy-time source is wired up here yet;
                         // "unknown" is the honest answer, not a flat 0 %.
                         active_pct: None,
+                        // The byte counters ARE measured once an interval
+                        // exists, even though the busy-time source above does
+                        // not exist at all.
+                        rates_measured: self.first_tick_done,
                         read_bps: rate(io.read_bytes),
                         write_bps: rate(io.written_bytes),
                         avg_resp_ms: 0.0,
