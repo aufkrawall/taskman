@@ -360,11 +360,12 @@ fn accept_outcome(result: io::Result<UnixStream>) -> AcceptOutcome {
 
 /// What the listener loop does with a failed `poll`.
 ///
-/// `poll(2)` documents `ENOMEM`, which is transient for a two-descriptor table
-/// and must not cost the session its endpoint: this process would keep the flock
-/// and unlink the socket, so every later launch would burn the whole handoff
-/// deadline and open a duplicate window. Only an error that names an unusable
-/// descriptor (`EBADF`, `EINVAL`, `EFAULT`) ends the listener.
+/// A transient failure must not cost the session its endpoint: this process would
+/// keep the flock and unlink the socket, so every later launch would burn the
+/// whole handoff deadline and open a duplicate window. `poll(2)` documents
+/// `ENOMEM`, and `EAGAIN`/`EINTR` and any errno this build does not name are
+/// treated the same way. Only an error that names an unusable descriptor
+/// (`EBADF`, `EINVAL`, `EFAULT`) ends the listener.
 #[derive(Debug, PartialEq, Eq)]
 enum PollFailure {
     RetryImmediately,
@@ -377,8 +378,9 @@ fn poll_failure(error: &io::Error) -> PollFailure {
         return PollFailure::RetryImmediately;
     }
     match error.raw_os_error() {
-        Some(libc::ENOMEM) => PollFailure::RetryAfterBackoff,
-        _ => PollFailure::TearDown,
+        // An allowlist on purpose: a missing case must retry, never tear down.
+        Some(libc::EBADF | libc::EINVAL | libc::EFAULT) => PollFailure::TearDown,
+        _ => PollFailure::RetryAfterBackoff,
     }
 }
 
@@ -390,10 +392,17 @@ fn serve_activation(
     socket_path: &Path,
     socket_identity: SocketIdentity,
 ) {
-    // One line per failure episode: a persistent fd or memory shortage would
-    // otherwise repeat the same warning every backoff period for the session.
-    let mut transient_failure_reported = false;
+    // One warning per failure episode, and one flag per route: a poll-failure
+    // warning must not swallow the first accept-failure warning of the same run.
+    let mut poll_failure_reported = false;
+    let mut accept_failure_reported = false;
     loop {
+        // Checked before every poll attempt, because both retry arms below jump
+        // back here: a persistently failing poll would otherwise keep the
+        // listener (and `ActivationOwner::drop`'s join) alive past shutdown.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let mut poll_fds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -418,12 +427,12 @@ fn serve_activation(
                 // every later launch retry the whole handoff deadline and open a
                 // duplicate window. Back off interruptibly and poll again.
                 PollFailure::RetryAfterBackoff => {
-                    if !transient_failure_reported {
+                    if !poll_failure_reported {
                         tracing::warn!(
                             %error,
                             "Linux activation listener poll failed; keeping the endpoint"
                         );
-                        transient_failure_reported = true;
+                        poll_failure_reported = true;
                     }
                     wait_for_stop(wake, RETRY_BACKOFF);
                     continue;
@@ -434,6 +443,9 @@ fn serve_activation(
                 }
             }
         }
+        // A poll that returned ends the poll-failure episode, so a later one
+        // warns again.
+        poll_failure_reported = false;
         if stop.load(Ordering::Acquire) {
             break;
         }
@@ -451,7 +463,7 @@ fn serve_activation(
                 }
                 match accept_outcome(listener.accept()) {
                     AcceptOutcome::Serve(stream) => {
-                        transient_failure_reported = false;
+                        accept_failure_reported = false;
                         serve_activation_connection(stream, &inbox, stop)
                     }
                     AcceptOutcome::NextPoll => break,
@@ -467,12 +479,12 @@ fn serve_activation(
                     // so a persistent shortage cannot spin, and let the stop
                     // wake-up end the wait immediately.
                     AcceptOutcome::RetryAfterBackoff(error) => {
-                        if !transient_failure_reported {
+                        if !accept_failure_reported {
                             tracing::warn!(
                                 %error,
                                 "Linux activation listener accept failed; keeping the endpoint"
                             );
-                            transient_failure_reported = true;
+                            accept_failure_reported = true;
                         }
                         wait_for_stop(wake, RETRY_BACKOFF);
                         break;
@@ -1239,14 +1251,17 @@ mod tests {
 
     #[test]
     fn transient_poll_failures_keep_the_listener_alive() {
-        // poll(2) documents ENOMEM, and the flock is held for the process
-        // lifetime, so ending the listener would strand every later launch the
-        // same way a torn-down accept path does. Only an error that names an
-        // unusable descriptor may tear down.
-        assert_eq!(
-            poll_failure(&io::Error::from_raw_os_error(libc::ENOMEM)),
-            PollFailure::RetryAfterBackoff
-        );
+        // The flock is held for the process lifetime, so ending the listener
+        // would strand every later launch the same way a torn-down accept path
+        // does. Teardown is an allowlist of descriptor errors; everything else,
+        // named here or not, has to retry.
+        for errno in [libc::ENOMEM, libc::EAGAIN, libc::EPERM] {
+            assert_eq!(
+                poll_failure(&io::Error::from_raw_os_error(errno)),
+                PollFailure::RetryAfterBackoff,
+                "errno {errno} must not end the listener"
+            );
+        }
         assert_eq!(
             poll_failure(&io::Error::from(io::ErrorKind::Interrupted)),
             PollFailure::RetryImmediately
