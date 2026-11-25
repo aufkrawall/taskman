@@ -397,7 +397,7 @@ mod tests {
     fn series_extractors_stay_aligned_with_window() {
         let mut hit = pt(500);
         hit.nets = vec![("eth".into(), 10.0, 20.0)];
-        hit.disks = vec![("C:".into(), Some(50.0), 1.0, 2.0)];
+        hit.disks = vec![("C:".into(), Some(50.0), 1.0, 2.0, true)];
         let win = vec![pt(0), hit, pt(1000)];
 
         let net = net_series(&win, "eth", 1);
@@ -419,19 +419,17 @@ mod tests {
     #[test]
     fn disk_activity_history_distinguishes_missing_from_measured_idle() {
         let mut missing = pt(1_000);
-        missing.disks = vec![("C:".into(), None, 0.0, 0.0)];
+        missing.disks = vec![("C:".into(), None, 0.0, 0.0, false)];
         let mut idle = pt(2_000);
-        idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0)];
+        idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0, true)];
         assert_eq!(
             disk_activity_series(&[pt(0), missing.clone(), idle.clone()], "C:"),
             vec![None, None, Some(0.0)]
         );
-        // The transfer series gaps on the SAME tick as the activity one: both
-        // rates and the activity percentage come from one counter source, and
-        // both backends write `active_pct: None` together with 0.0 rates when
-        // that source has nothing for the tick. So a listed mount with unknown
-        // activity has no measured rate either, and a `Some(0.0)` here would
-        // print "0 B/s" for a drive nobody measured.
+        // The transfer series gaps where the tick says its rates are
+        // placeholders (`rates_measured: false` — no counter source on Windows,
+        // no interval yet on Linux), so a `Some(0.0)` here would print "0 B/s"
+        // for a drive nobody measured. A measured idle stays a real zero.
         assert_eq!(
             disk_series(&[pt(0), missing, idle], "C:", |d| d.2),
             vec![None, None, Some(0.0)]
@@ -443,6 +441,41 @@ mod tests {
         assert_eq!(
             disk_activity_series(&[pt(0), pt(1_000)], "C:"),
             vec![None, None]
+        );
+    }
+
+    /// A measured rate does not need a busy-time percentage.
+    ///
+    /// Regression: the transfer series gapped on `active_pct.is_none()`, and
+    /// macOS leaves that at `None` for its whole life (it reports
+    /// `IOBlockStorageDriver` bytes and has no per-disk busy-time source), so
+    /// real throughput was hidden behind a permanent gap and two "—" cards —
+    /// the mirror image of the fabricated zero the gap was added to remove.
+    #[test]
+    fn a_measured_rate_charts_without_an_activity_percentage() {
+        let mut macos = pt(1_000);
+        macos.disks = vec![("disk1s1".into(), None, 2_048.0, 1_024.0, true)];
+        let mut windows_waiting = pt(2_000);
+        windows_waiting.disks = vec![("C:".into(), None, 0.0, 0.0, false)];
+
+        assert_eq!(
+            disk_activity_series(&[macos.clone(), windows_waiting.clone()], "disk1s1"),
+            vec![None, None],
+            "no busy-time source is still no percentage"
+        );
+        assert_eq!(
+            disk_series(&[macos.clone()], "disk1s1", |d| d.2),
+            vec![Some(2_048.0)],
+            "measured bytes must chart without an activity percentage"
+        );
+        assert_eq!(
+            disk_series(&[macos], "disk1s1", |d| d.3),
+            vec![Some(1_024.0)]
+        );
+        assert_eq!(
+            disk_series(&[windows_waiting], "C:", |d| d.2),
+            vec![None],
+            "a placeholder rate is a gap, not 0 B/s"
         );
     }
 
@@ -534,10 +567,10 @@ mod tests {
     #[test]
     fn an_absent_disk_or_adapter_is_a_gap_while_a_measured_idle_one_is_zero() {
         let mut absent = pt(1_000);
-        absent.disks = vec![("D:".into(), None, 0.0, 0.0)];
+        absent.disks = vec![("D:".into(), None, 0.0, 0.0, false)];
         absent.nets = vec![("wlan".into(), 0.0, 0.0)];
         let mut idle = pt(2_000);
-        idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0)];
+        idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0, true)];
         idle.nets = vec![("eth".into(), 0.0, 0.0)];
         let win = vec![pt(0), idle.clone(), absent, pt(3_000)];
 
@@ -567,7 +600,7 @@ mod tests {
 
         // Real traffic passes through unchanged on both direction slots.
         let mut busy = pt(4_000);
-        busy.disks = vec![("C:".into(), Some(50.0), 1_000.0, 500.0)];
+        busy.disks = vec![("C:".into(), Some(50.0), 1_000.0, 500.0, true)];
         busy.nets = vec![("eth".into(), 2_000.0, 300.0)];
         let win = vec![idle, busy];
         assert_eq!(
@@ -1589,25 +1622,24 @@ fn timestamps(win: &[HistoryPoint]) -> Vec<u64> {
 /// vertical jump into the graph next to the ticks that did measure, i.e. a
 /// stroke that belongs to no data run.
 ///
-/// The activity percentage and the byte rates come from ONE counter source on
-/// both backends (`PhysicalDisk` PDH on Windows, `diskstats` on Linux), and both
-/// write `active_pct: None` together with `0.0` rates when that source is asleep
-/// or still warming (see `win/sampler.rs` and `linux/mod.rs`). A present mount
-/// with no measured activity therefore has no measured rate either: plotting
-/// that `0.0` would state "0 B/s" for a drive nobody measured, which is exactly
-/// the fabricated reading the gap exists to avoid. A measured idle keeps
-/// `Some(0.0)`.
+/// "Measured" is the tick's own `DiskInfo::rates_measured` flag, NOT the
+/// presence of an activity percentage: macOS reports byte rates from
+/// `IOBlockStorageDriver` while it has no busy-time source at all, so keying the
+/// gap on `active_pct` would hide real throughput there. A local disk read
+/// carries the flag from the platform sample (see `HistoryPoint::disks`), and a
+/// tick whose rates are placeholders becomes a gap instead of a `0 B/s`
+/// reading. A measured zero still plots as zero.
 fn disk_series(
     win: &[HistoryPoint],
     key: &str,
-    pick: impl Fn(&(String, Option<f32>, f64, f64)) -> f64,
+    pick: impl Fn(&(String, Option<f32>, f64, f64, bool)) -> f64,
 ) -> Vec<Option<f64>> {
     win.iter()
         .map(|h| {
             h.disks
                 .iter()
                 .find(|entry| entry.0 == key)
-                .filter(|entry| entry.1.is_some())
+                .filter(|entry| entry.4)
                 .map(&pick)
         })
         .collect()
@@ -2861,10 +2893,11 @@ fn mem_bytes_or_dash(reported: bool, bytes: u64) -> String {
 /// A byte RATE that is only a reading once the tick measured the counter source
 /// it comes from.
 ///
-/// The disk backends write `0.0` into `read_bps`/`write_bps` when their counter
-/// source is asleep, still warming, or does not list the device, and mark that
-/// same tick with `active_pct: None` (see [`disk_series`]). Printing the
-/// placeholder would state an idle drive nobody measured.
+/// The disk backends write `0.0` into `read_bps`/`write_bps` when no interval
+/// exists yet or their counter source is not running, and say so in
+/// `DiskInfo::rates_measured` — which is NOT the same flag as `active_pct`, a
+/// percentage macOS never has (see [`disk_series`]). Printing the placeholder
+/// would state an idle drive nobody measured.
 fn rate_or_dash(measured: bool, bytes_per_s: f64) -> String {
     if measured {
         format::format_rate_mb(bytes_per_s)
@@ -3187,11 +3220,12 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         |ui| {
             ui.vertical(|ui| {
                 let w = 170.0;
-                // The byte rates share their counter source with the activity
-                // percentage above them (see `disk_series`): a tick with no
-                // measured activity has no measured rate either, so the
-                // platform's 0.0 placeholder must not print as "0 B/s".
-                let counters_measured = disk.active_pct.is_some();
+                // The rates' own measurement flag, not the activity percentage
+                // (see `disk_series`): macOS has throughput without a busy-time
+                // source, and Windows has neither while its PDH group is asleep.
+                // Either way the platform's 0.0 placeholder must not print as
+                // "0 B/s".
+                let counters_measured = disk.rates_measured;
                 big_stat(
                     ui,
                     pal,
