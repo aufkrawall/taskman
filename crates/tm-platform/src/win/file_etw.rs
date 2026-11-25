@@ -121,6 +121,40 @@
 //! * A `FileObject` used by a DIFFERENT process than the one that opened it (a
 //!   duplicated handle) keeps its bytes unnamed for that process.
 //!
+//! ## Lifetime
+//!
+//! The session is meant to run for as long as its host does — the service from
+//! its start, an elevated GUI from its start — not just while a page asks:
+//! per-file counts that start when a dialog opens and stop when it closes
+//! answer "what did this process do while I watched", which is not the
+//! question. Its measured cost is small (see the ignored
+//! `the_file_trace_costs_little`, which counts CPU cycles of the threads
+//! involved so other load on the machine cannot enter the numbers): ~900
+//! consumer cycles per record, ~0.2% of one core at an idle desktop's ~8.6k
+//! records/s; ~27k consumer cycles (~7 µs) per file in a create/write/read/
+//! delete storm; and no difference in the storm's own thread outside the ±4%
+//! its untraced runs vary by.
+//!
+//! Running for long changes three things:
+//!
+//! * **Process exit** ends a process's accounting at once: the session also
+//!   carries `EVENT_TRACE_FLAG_PROCESS`, and a `Process/End` record (opcode 2,
+//!   exiting pid at payload offset `P`) drops the process's buckets, names,
+//!   pending requests and waiting bytes. A reused pid therefore never
+//!   inherits a dead process's files, even between two samples.
+//! * **Coverage** is stated, not implied: a process created after the session
+//!   started has had its WHOLE life traced; an older one only since the
+//!   session started (Windows keeps no per-file history to recover the rest).
+//!   The process's own `IO_COUNTERS` are snapshotted just before the session
+//!   starts ([`super::process_file_io::snapshot_io_counters`]), so the page can
+//!   compare the process's total reads and writes over exactly the traced
+//!   window with what reached files — the rest went to pipes, devices or the
+//!   network, which the `FileIo` stream does not carry.
+//! * **Bounds evict instead of refusing**: when a process's (or the session's)
+//!   path budget is full, the least recently used paths that are no longer
+//!   open are folded into the omitted remainder, so a long-running process
+//!   keeps current rows instead of freezing on its first 8 192 files.
+//!
 //! ## States
 //!
 //! A session that never started is [`FileIoAccountingState::Unavailable`] (or
@@ -146,7 +180,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
-use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, FileIoGuid};
+use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, FileIoGuid, ProcessGuid};
 use windows::core::PCWSTR;
 
 use super::etw::{self, KERNEL_LOGGER, LoggerKind, Session, StartError, TraceContext, TraceRole};
@@ -263,6 +297,9 @@ const MAX_TRACKED_FILES: usize = 65_536;
 /// not trigger one per poll. A process's FIRST sample is never throttled.
 const SEED_INTERVAL: Duration = Duration::from_secs(2);
 
+/// `Process` class opcode of a process exit.
+const PROCESS_END: u8 = 2;
+
 /// How long a miss may reuse the drive list before it is rescanned. A miss is
 /// normal (`\Device\Mup\...` is a network share and never maps to a drive), and
 /// a scan costs one `QueryDosDeviceW` per drive letter.
@@ -355,6 +392,13 @@ pub struct FileIoSample {
     /// Cumulative events ETW reports as lost; counts are lower bounds when
     /// this is non-zero or unknown.
     pub events_lost: Option<u64>,
+    /// Whether the process was created after the session started, so its
+    /// whole life is in these counts.
+    pub traced_since_process_start: bool,
+    /// The process's own kernel read/write transfer counters at the start of
+    /// the traced window: zero for a process traced since its start, the
+    /// pre-session snapshot for an older one, `None` when unknown.
+    pub counter_baseline: Option<FileBytes>,
 }
 
 impl FileIoSample {
@@ -492,6 +536,18 @@ pub(super) fn attach_file_io(
         }
     }
     let accounting = &mut snapshot.accounting;
+    accounting.traced_since_process_start = sample.traced_since_process_start;
+    if let Some(baseline) = sample.counter_baseline {
+        // The process's own counters over the same window the per-file counts
+        // cover; a counter that went backwards is a different process and
+        // stays unknown.
+        accounting.counter_window_read_bytes = accounting
+            .counter_read_bytes
+            .and_then(|now| now.checked_sub(baseline.read_bytes));
+        accounting.counter_window_write_bytes = accounting
+            .counter_write_bytes
+            .and_then(|now| now.checked_sub(baseline.write_bytes));
+    }
     accounting.read_bytes = attributed.read_bytes;
     accounting.write_bytes = attributed.write_bytes;
     accounting.read_ops = sample.pid_read_transfers;
@@ -710,10 +766,30 @@ fn parse_event(
 /// The `FileObject -> name` correlation map.
 struct OpenFile {
     /// The process whose Create (or handle) produced this entry. A transfer
-    /// under another pid is not charged to this name; see
+    /// under another pid is only charged to this name when the handle table
+    /// showed that process holding the object too (`others`); see
     /// [`State::complete`].
     pid: u32,
     path: Arc<str>,
+    /// Further processes the handle table showed holding this same object —
+    /// an inherited or duplicated handle (a redirected stdout, a log handed to
+    /// a child). Without them a child's writes to its parent's file would stay
+    /// unnamed for good.
+    others: Vec<u32>,
+}
+
+impl OpenFile {
+    fn new(pid: u32, path: Arc<str>) -> Self {
+        Self {
+            pid,
+            path,
+            others: Vec::new(),
+        }
+    }
+
+    fn held_by(&self, pid: u32) -> bool {
+        self.pid == pid || self.others.contains(&pid)
+    }
 }
 
 /// A Read or Write waiting for its completion.
@@ -734,6 +810,14 @@ struct Unresolved {
     asked: bool,
 }
 
+/// One tracked path: its bytes, and when it last moved any (for eviction).
+#[derive(Default, Clone, Copy)]
+struct Tracked {
+    bytes: FileBytes,
+    /// [`State::clock`] at the last transfer.
+    touched: u64,
+}
+
 /// Per-process accumulators.
 #[derive(Default)]
 struct PidFiles {
@@ -745,7 +829,7 @@ struct PidFiles {
     /// handle table once in this session.
     handles_named: bool,
     /// Cumulative bytes per path, since the session started.
-    files: HashMap<Arc<str>, FileBytes>,
+    files: HashMap<Arc<str>, Tracked>,
     /// Completed Read and Write transfers decoded for this process.
     read_transfers: u64,
     write_transfers: u64,
@@ -765,7 +849,11 @@ struct State {
     rejected_payload_len: u32,
     open: HashMap<u64, OpenFile>,
     pending: HashMap<u64, Pending>,
-    unresolved: HashMap<u64, Unresolved>,
+    /// Bytes waiting for a name, per object and then per process (one object
+    /// can be used by several processes through inherited handles).
+    unresolved: HashMap<u64, Vec<Unresolved>>,
+    /// Entries across all of `unresolved`, for [`MAX_UNRESOLVED_OBJECTS`].
+    unresolved_count: usize,
     pids: HashMap<u32, PidFiles>,
     /// Distinct paths held across every bucket in `pids`. Rebuilt by
     /// [`State::prune_dead`] and [`State::bind_epoch`] after they drop buckets.
@@ -776,8 +864,11 @@ struct State {
     cleared_file_objects: u64,
     /// Creates whose name did not resolve to a DOS path.
     unnamed_creates: u64,
-    /// Paths never tracked because a capacity limit was full.
+    /// Paths never tracked because a capacity limit was full, or evicted to
+    /// make room once closed and least recently used.
     dropped_paths: u64,
+    /// Monotonic counter stamped on a path at each transfer; orders eviction.
+    clock: u64,
     // Diagnostics only: logged, never shown as numbers.
     /// Paging requests skipped (flushes, lazy writes, page faults).
     paging_skipped: u64,
@@ -795,12 +886,33 @@ impl State {
     /// entries would otherwise accumulate for the lifetime of the service.
     fn prune_dead(&mut self, live_pids: &HashSet<u32>) {
         self.pids.retain(|pid, _| live_pids.contains(pid));
-        self.open.retain(|_, file| live_pids.contains(&file.pid));
-        self.pending
-            .retain(|_, pending| live_pids.contains(&pending.pid));
-        self.unresolved
-            .retain(|_, unresolved| live_pids.contains(&unresolved.pid));
+        self.keep_pids(|pid| live_pids.contains(&pid));
         self.tracked_paths = self.pids.values().map(|files| files.files.len()).sum();
+    }
+
+    /// Drop every name, pending request and waiting byte of the processes
+    /// `keep` rejects. An object another live process also holds keeps its
+    /// name for that process.
+    fn keep_pids(&mut self, keep: impl Fn(u32) -> bool) {
+        self.open.retain(|_, file| {
+            file.others.retain(|pid| keep(*pid));
+            if keep(file.pid) {
+                return true;
+            }
+            match file.others.pop() {
+                Some(next) => {
+                    file.pid = next;
+                    true
+                }
+                None => false,
+            }
+        });
+        self.pending.retain(|_, pending| keep(pending.pid));
+        self.unresolved.retain(|_, waiting| {
+            waiting.retain(|entry| keep(entry.pid));
+            !waiting.is_empty()
+        });
+        self.unresolved_count = self.unresolved.values().map(Vec::len).sum();
     }
 
     /// Bind `pid`'s bucket to the process creation time the caller verified.
@@ -821,10 +933,7 @@ impl State {
             if let Some(files) = self.pids.remove(&pid) {
                 self.tracked_paths = self.tracked_paths.saturating_sub(files.files.len());
             }
-            self.open.retain(|_, file| file.pid != pid);
-            self.pending.retain(|_, pending| pending.pid != pid);
-            self.unresolved
-                .retain(|_, unresolved| unresolved.pid != pid);
+            self.keep_pids(|other| other != pid);
             tracing::debug!(
                 pid,
                 start_epoch_s,
@@ -847,32 +956,117 @@ impl State {
     /// a name under it belongs to an object that no longer exists, so its
     /// bytes become the process's unnamed remainder.
     fn forget_unresolved(&mut self, object: u64) {
-        if let Some(unresolved) = self.unresolved.remove(&object) {
-            self.pids
-                .entry(unresolved.pid)
-                .or_default()
-                .unnamed
-                .merge(unresolved.bytes);
+        if let Some(waiting) = self.unresolved.remove(&object) {
+            self.unresolved_count = self.unresolved_count.saturating_sub(waiting.len());
+            for entry in waiting {
+                self.pids
+                    .entry(entry.pid)
+                    .or_default()
+                    .unnamed
+                    .merge(entry.bytes);
+            }
         }
     }
 
-    /// Charge `bytes` on `path` to `pid`, inside the path budgets; past them
-    /// the bytes go to the omitted remainder and the drop is counted.
+    /// Charge `bytes` on `path` to `pid`, inside the path budgets.
+    ///
+    /// A new path at a full budget first evicts the least recently used closed
+    /// paths (this process's, or the largest process's for the session-wide
+    /// budget); only when nothing can be evicted are the bytes refused into
+    /// the omitted remainder. Either way the drop is counted.
     fn charge_path(&mut self, pid: u32, path: Arc<str>, bytes: FileBytes) {
-        let global_room = self.tracked_paths < MAX_TRACKED_FILES;
-        let files = self.pids.entry(pid).or_default();
-        let new_path = !files.files.contains_key(path.as_ref());
-        if new_path && (!global_room || files.files.len() >= MAX_TRACKED_FILES_PER_PID) {
-            // Charging them to a neighbouring file would be a made-up
-            // per-file number.
-            files.omitted.merge(bytes);
-            self.dropped_paths = self.dropped_paths.saturating_add(1);
-            return;
+        let new_path = !self
+            .pids
+            .get(&pid)
+            .is_some_and(|files| files.files.contains_key(path.as_ref()));
+        if new_path {
+            if self
+                .pids
+                .get(&pid)
+                .is_some_and(|files| files.files.len() >= MAX_TRACKED_FILES_PER_PID)
+            {
+                self.evict(pid);
+            }
+            if self.tracked_paths >= MAX_TRACKED_FILES
+                && let Some(largest) = self
+                    .pids
+                    .iter()
+                    .max_by_key(|(_, files)| files.files.len())
+                    .map(|(pid, _)| *pid)
+            {
+                self.evict(largest);
+            }
+            let pid_room = self
+                .pids
+                .get(&pid)
+                .is_none_or(|files| files.files.len() < MAX_TRACKED_FILES_PER_PID);
+            if !pid_room || self.tracked_paths >= MAX_TRACKED_FILES {
+                // Charging them to a neighbouring file would be a made-up
+                // per-file number.
+                self.pids.entry(pid).or_default().omitted.merge(bytes);
+                self.dropped_paths = self.dropped_paths.saturating_add(1);
+                return;
+            }
         }
-        files.files.entry(path).or_default().merge(bytes);
+        self.clock = self.clock.saturating_add(1);
+        let clock = self.clock;
+        let tracked = self
+            .pids
+            .entry(pid)
+            .or_default()
+            .files
+            .entry(path)
+            .or_default();
+        tracked.bytes.merge(bytes);
+        tracked.touched = clock;
         if new_path {
             self.tracked_paths = self.tracked_paths.saturating_add(1);
         }
+    }
+
+    /// Fold the least recently used quarter of `pid`'s CLOSED paths into its
+    /// omitted remainder.
+    ///
+    /// A quarter at a time so a process streaming through new files pays the
+    /// sort once per few thousand files, not per file. Open paths are never
+    /// evicted: their row is on screen and must keep counting.
+    fn evict(&mut self, pid: u32) {
+        let open: HashSet<Arc<str>> = self
+            .open
+            .values()
+            .filter(|file| file.pid == pid)
+            .map(|file| Arc::clone(&file.path))
+            .collect();
+        let Some(files) = self.pids.get_mut(&pid) else {
+            return;
+        };
+        let mut closed: Vec<(u64, Arc<str>)> = files
+            .files
+            .iter()
+            .filter(|(path, _)| !open.contains(path.as_ref()))
+            .map(|(path, tracked)| (tracked.touched, Arc::clone(path)))
+            .collect();
+        if closed.is_empty() {
+            return;
+        }
+        closed.sort_unstable_by_key(|(touched, _)| *touched);
+        let count = closed.len().div_ceil(4);
+        for (_, path) in closed.into_iter().take(count) {
+            if let Some(tracked) = files.files.remove(path.as_ref()) {
+                files.omitted.merge(tracked.bytes);
+            }
+        }
+        self.tracked_paths = self.tracked_paths.saturating_sub(count);
+        self.dropped_paths = self.dropped_paths.saturating_add(count as u64);
+    }
+
+    /// A process exited: everything it owned in the session goes, so a pid
+    /// reused later starts from nothing.
+    fn process_ended(&mut self, pid: u32) {
+        if let Some(files) = self.pids.remove(&pid) {
+            self.tracked_paths = self.tracked_paths.saturating_sub(files.files.len());
+        }
+        self.keep_pids(|other| other != pid);
     }
 
     /// A completed logical transfer of `bytes` by `pid` on `object`.
@@ -888,43 +1082,36 @@ impl State {
         }
         let mut amount = FileBytes::default();
         amount.add(write, bytes);
-        match self.open.get(&object) {
-            Some(open) if open.pid == pid => {
-                let path = Arc::clone(&open.path);
-                self.charge_path(pid, path, amount);
-                return;
-            }
-            Some(_) => {
-                // Another process opened this object: a duplicated handle, or
-                // a reused address after a missed Close. Either way that name
-                // is not this process's to use.
-                self.pids.entry(pid).or_default().unnamed.add(write, bytes);
-                return;
-            }
-            None => {}
-        }
-        // Nameless: hold the bytes under the object until the handle table
-        // can name it (see [`FileEtw::sample`]), within budget.
-        if let Some(unresolved) = self.unresolved.get_mut(&object) {
-            if unresolved.pid == pid {
-                unresolved.bytes.add(write, bytes);
-            } else {
-                self.pids.entry(pid).or_default().unnamed.add(write, bytes);
-            }
+        if let Some(open) = self.open.get(&object)
+            && open.held_by(pid)
+        {
+            let path = Arc::clone(&open.path);
+            self.charge_path(pid, path, amount);
             return;
         }
-        if self.unresolved.len() >= MAX_UNRESOLVED_OBJECTS {
+        // Nameless for THIS process — never seen, or named for another process
+        // (an inherited or duplicated handle, or a reused address after a
+        // missed Close). Hold the bytes under (object, process) until the
+        // handle table can say whether this process holds that object (see
+        // [`FileEtw::sample`]), within budget.
+        let waiting = self.unresolved.entry(object).or_default();
+        if let Some(entry) = waiting.iter_mut().find(|entry| entry.pid == pid) {
+            entry.bytes.add(write, bytes);
+            return;
+        }
+        if self.unresolved_count >= MAX_UNRESOLVED_OBJECTS {
+            if waiting.is_empty() {
+                self.unresolved.remove(&object);
+            }
             self.pids.entry(pid).or_default().unnamed.add(write, bytes);
             return;
         }
-        self.unresolved.insert(
-            object,
-            Unresolved {
-                pid,
-                bytes: amount,
-                asked: false,
-            },
-        );
+        waiting.push(Unresolved {
+            pid,
+            bytes: amount,
+            asked: false,
+        });
+        self.unresolved_count = self.unresolved_count.saturating_add(1);
     }
 
     /// Apply names the handle table gave for `pid`'s file objects: each one
@@ -933,21 +1120,38 @@ impl State {
     fn apply_names(&mut self, pid: u32, names: Vec<(u64, String)>) {
         for (object, path) in names {
             let path: Arc<str> = Arc::from(path);
-            if let Some(unresolved) = self.unresolved.remove(&object) {
-                if unresolved.pid == pid {
-                    self.charge_path(pid, Arc::clone(&path), unresolved.bytes);
-                } else {
-                    self.pids
-                        .entry(unresolved.pid)
-                        .or_default()
-                        .unnamed
-                        .merge(unresolved.bytes);
+            // A Create the trace saw is the better witness for the NAME; the
+            // table only adds this process as a holder of that object. Never
+            // clear the map for a name that is only a seed.
+            let name = match self.open.get_mut(&object) {
+                Some(open) => {
+                    if !open.held_by(pid) {
+                        open.others.push(pid);
+                    }
+                    Arc::clone(&open.path)
                 }
+                None => {
+                    if self.open.len() < MAX_OPEN_FILES {
+                        self.open
+                            .insert(object, OpenFile::new(pid, Arc::clone(&path)));
+                    }
+                    path
+                }
+            };
+            let waited = self.unresolved.get_mut(&object).and_then(|waiting| {
+                let index = waiting.iter().position(|entry| entry.pid == pid)?;
+                Some(waiting.swap_remove(index))
+            });
+            if self
+                .unresolved
+                .get(&object)
+                .is_some_and(|waiting| waiting.is_empty())
+            {
+                self.unresolved.remove(&object);
             }
-            // A Create the trace saw is the better witness; never overwrite
-            // it, and never clear the map for a name that is only a seed.
-            if !self.open.contains_key(&object) && self.open.len() < MAX_OPEN_FILES {
-                self.open.insert(object, OpenFile { pid, path });
+            if let Some(entry) = waited {
+                self.unresolved_count = self.unresolved_count.saturating_sub(1);
+                self.charge_path(pid, name, entry.bytes);
             }
         }
     }
@@ -1035,7 +1239,7 @@ impl Shared {
                         "file trace dropped its open-file map at the cap"
                     );
                 }
-                state.open.insert(object, OpenFile { pid, path });
+                state.open.insert(object, OpenFile::new(pid, path));
             }
             FileEvent::Close { irp, object } => {
                 state.retire(irp);
@@ -1088,6 +1292,14 @@ impl Shared {
                 state.complete(request.pid, request.object, request.write, moved);
             }
         }
+    }
+
+    /// A `Process/End` record: drop everything `pid` owned.
+    fn process_ended(&self, pid: u32) {
+        if !self.live.load(Ordering::Relaxed) {
+            return;
+        }
+        self.lock().process_ended(pid);
     }
 
     /// Another `FileIo` request on `irp`: retire what was pending on it.
@@ -1200,6 +1412,22 @@ pub struct FileEtw {
     source: FileSource,
     /// When unnamed objects were last named from the handle table.
     last_naming: Mutex<Option<Instant>>,
+    /// Wall clock at session start, in the 100-ns Unix ticks process
+    /// creation identities use: a process created later has had its whole
+    /// life traced.
+    started_unix_ticks: i64,
+    /// pid -> (creation ticks, read bytes, write bytes) of every process that
+    /// existed just before the session started; see the module docs.
+    baselines: HashMap<u32, (i64, u64, u64)>,
+}
+
+/// Now, in 100-ns ticks since the Unix epoch.
+fn unix_ticks_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            (since.as_nanos() / 100).min(i64::MAX as u128) as i64
+        })
 }
 
 impl FileEtw {
@@ -1228,6 +1456,10 @@ impl FileEtw {
             live: AtomicBool::new(true),
         });
         let mut refusal = FileTraceRefusal::Unavailable;
+        // Taken BEFORE the session starts, so a process's counter delta over
+        // the traced window can only include more than the trace saw, never
+        // less.
+        let baselines = super::process_file_io::snapshot_io_counters();
         for source in sources(role) {
             match Session::try_start(
                 source.name,
@@ -1248,6 +1480,10 @@ impl FileEtw {
                         started: Instant::now(),
                         source,
                         last_naming: Mutex::new(None),
+                        // After the start: "created later" must mean the
+                        // session saw the process's first request.
+                        started_unix_ticks: unix_ticks_now(),
+                        baselines,
                     });
                 }
                 Err(error) => {
@@ -1368,10 +1604,52 @@ impl FileEtw {
             orphaned_requests = diagnostics.5,
             "file trace sample"
         );
+        let coverage = self.coverage(pid, start_epoch_s);
+        sample.traced_since_process_start = coverage.0;
+        sample.counter_baseline = coverage.1;
         // Queried outside the lock: the session properties live in the kernel.
         sample.events_lost = self.session.events_lost();
         sample
     }
+
+    /// Whether `pid` (created at `start_epoch_s`) has been traced since its
+    /// start, and its counters at the start of the traced window.
+    fn coverage(&self, pid: u32, start_epoch_s: i64) -> (bool, Option<FileBytes>) {
+        coverage_of(pid, start_epoch_s, self.started_unix_ticks, &self.baselines)
+    }
+
+    /// Housekeeping for a long-running session: drop what belongs to
+    /// processes that no longer exist. Process exit records do this as they
+    /// arrive; this is the backstop for one ETW dropped. An EMPTY `live_pids`
+    /// means the caller could not enumerate processes and prunes nothing.
+    pub fn maintain(&self, live_pids: &HashSet<u32>) {
+        if live_pids.is_empty() {
+            return;
+        }
+        self.session.shared().lock().prune_dead(live_pids);
+    }
+}
+
+/// See [`FileEtw::coverage`]; free so it is testable without a session.
+fn coverage_of(
+    pid: u32,
+    start_epoch_s: i64,
+    started_unix_ticks: i64,
+    baselines: &HashMap<u32, (i64, u64, u64)>,
+) -> (bool, Option<FileBytes>) {
+    if start_epoch_s > started_unix_ticks {
+        return (true, Some(FileBytes::default()));
+    }
+    let baseline = baselines
+        .get(&pid)
+        .filter(|(created, _, _)| {
+            tm_core::model::creation_timestamps_match(start_epoch_s, *created)
+        })
+        .map(|(_, read_bytes, write_bytes)| FileBytes {
+            read_bytes: *read_bytes,
+            write_bytes: *write_bytes,
+        });
+    (false, baseline)
 }
 
 /// One process's view of the accumulators: its rows, its remainders and the
@@ -1383,7 +1661,7 @@ fn sample_from(state: &State, pid: u32, running: bool, since_ms: u64) -> FileIoS
             files
                 .files
                 .iter()
-                .map(|(path, bytes)| (path.to_string(), *bytes))
+                .map(|(path, tracked)| (path.to_string(), tracked.bytes))
                 .collect()
         })
         .unwrap_or_default();
@@ -1400,7 +1678,7 @@ fn sample_from(state: &State, pid: u32, running: bool, since_ms: u64) -> FileIoS
     drop(known);
     paths.extend(idle);
     let mut unnamed = files.map_or_else(Remainder::default, |files| files.unnamed);
-    for waiting in state.unresolved.values() {
+    for waiting in state.unresolved.values().flatten() {
         if waiting.pid == pid {
             unnamed.merge(waiting.bytes);
         }
@@ -1420,6 +1698,8 @@ fn sample_from(state: &State, pid: u32, running: bool, since_ms: u64) -> FileIoS
         unnamed_creates: state.unnamed_creates,
         dropped_paths: state.dropped_paths,
         events_lost: None,
+        traced_since_process_start: false,
+        counter_baseline: None,
     }
 }
 
@@ -1441,7 +1721,7 @@ fn naming_request(
     let files = state.pids.entry(pid).or_default();
     if !files.handles_named {
         files.handles_named = true;
-        for waiting in state.unresolved.values_mut() {
+        for waiting in state.unresolved.values_mut().flatten() {
             if waiting.pid == pid {
                 waiting.asked = true;
             }
@@ -1452,15 +1732,15 @@ fn naming_request(
     if last.is_some_and(|at| now.saturating_duration_since(at) < SEED_INTERVAL) {
         return None;
     }
-    let wanted: HashSet<u64> = state
-        .unresolved
-        .iter_mut()
-        .filter(|(_, waiting)| waiting.pid == pid && !waiting.asked)
-        .map(|(object, waiting)| {
-            waiting.asked = true;
-            *object
-        })
-        .collect();
+    let mut wanted = HashSet::new();
+    for (object, waiting) in &mut state.unresolved {
+        for entry in waiting.iter_mut() {
+            if entry.pid == pid && !entry.asked {
+                entry.asked = true;
+                wanted.insert(*object);
+            }
+        }
+    }
     if wanted.is_empty() {
         return None;
     }
@@ -1476,6 +1756,18 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let Some(shared) = (unsafe { etw::context_of::<Shared>(record) }) else {
         return;
     };
+    if record.EventHeader.ProviderId == ProcessGuid {
+        // Only exits matter; the start rundown and starts carry nothing the
+        // accounting needs (a new process's bucket is created by its first
+        // transfer, and its coverage comes from its creation time).
+        if record.EventHeader.EventDescriptor.Opcode == PROCESS_END
+            && let Some(pid) = unsafe { etw::payload_of(record) }
+                .and_then(|payload| read_u32(payload, KERNEL_FILE_POINTER_BYTES))
+        {
+            shared.process_ended(pid);
+        }
+        return;
+    }
     // Classic (MOF) identity: the class GUID in `ProviderId`, the operation in
     // the opcode. No manifest event id is filled in for these records.
     if record.EventHeader.ProviderId != FileIoGuid {
@@ -2543,6 +2835,263 @@ mod tests {
         }
     }
 
+    /// A `Process/End` record ends everything the process owned in the
+    /// session, so a pid reused before the next sample starts from nothing.
+    ///
+    /// Regression risk this pins: an always-on session lives far longer than
+    /// one dialog, and the epoch binding alone only resets a bucket once a
+    /// sample names the new process.
+    #[test]
+    fn a_process_exit_drops_its_whole_accounting() {
+        let shared = shared();
+        deliver(
+            &shared,
+            30,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\gone.bin"),
+        );
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x1000, 512));
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x7000, 64));
+        handle_payload(
+            &shared,
+            30,
+            EVENT_WRITE,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 8),
+        );
+        // Another process is untouched.
+        deliver(
+            &shared,
+            31,
+            EVENT_CREATE,
+            &create_payload(0x2000, r"\??\C:\data\kept.bin"),
+        );
+        deliver(&shared, 31, EVENT_READ, &request_payload(0x2000, 16));
+        // `Process/End` v4: UniqueProcessKey, then the exiting pid.
+        let mut end = Vec::new();
+        end.extend_from_slice(&0xffff_d007_0000_0040u64.to_le_bytes()[..P]);
+        end.extend_from_slice(&30u32.to_le_bytes());
+        end.extend_from_slice(&[0u8; 60]);
+        deliver_record_as(
+            &shared,
+            windows::Win32::System::Diagnostics::Etw::ProcessGuid,
+            PROCESS_END,
+            4,
+            30,
+            &end,
+        );
+        {
+            let state = shared.lock();
+            assert!(!state.pids.contains_key(&30));
+            assert!(state.open.values().all(|file| file.pid != 30));
+            assert!(state.pending.values().all(|pending| pending.pid != 30));
+            assert!(
+                state
+                    .unresolved
+                    .values()
+                    .flatten()
+                    .all(|waiting| waiting.pid != 30)
+            );
+            assert_eq!(state.tracked_paths, 1, "only pid 31's path is left");
+        }
+        assert_eq!(
+            bytes(&sample_of(&shared, 31), r"C:\data\kept.bin"),
+            read(16)
+        );
+        // The pid comes back as a new process: nothing is inherited.
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x1000, 4));
+        let reborn = sample_of(&shared, 30);
+        assert!(reborn.files.is_empty());
+        assert_eq!(reborn.pid_transfers(), 1);
+    }
+
+    /// An inherited handle — a parent's redirected output written by its child
+    /// — names one object for two processes. Once the handle table shows the
+    /// child holding it, the child's bytes (including those that arrived
+    /// first) land on that file for the child, later ones directly, and the
+    /// name outlives the parent's exit for as long as the child holds it.
+    ///
+    /// Regression: the live test's child wrote 186 bytes to its inherited
+    /// stdout file and they stayed unnamed, because the object was already
+    /// named for the parent.
+    #[test]
+    fn an_inherited_handle_is_named_for_every_process_that_holds_it() {
+        let shared = shared();
+        deliver(
+            &shared,
+            40,
+            EVENT_CREATE,
+            &create_payload(0x5000, r"\??\C:\logs\out.txt"),
+        );
+        deliver(&shared, 40, EVENT_WRITE, &request_payload(0x5000, 10));
+        deliver(&shared, 44, EVENT_WRITE, &request_payload(0x5000, 186));
+        assert_eq!(
+            sample_of(&shared, 44).unnamed.write_bytes,
+            186,
+            "unnamed until the table says the child holds it"
+        );
+        shared
+            .lock()
+            .apply_names(44, vec![(0x5000, r"C:\logs\out.txt".to_string())]);
+        deliver(&shared, 44, EVENT_WRITE, &request_payload(0x5000, 14));
+        let child = sample_of(&shared, 44);
+        assert_eq!(bytes(&child, r"C:\logs\out.txt"), written(200));
+        assert_eq!(child.unnamed, Remainder::default());
+        assert_eq!(
+            bytes(&sample_of(&shared, 40), r"C:\logs\out.txt"),
+            written(10),
+            "the parent keeps only its own bytes"
+        );
+        // The parent exits; the child still holds the object and its name.
+        shared.lock().process_ended(40);
+        deliver(&shared, 44, EVENT_WRITE, &request_payload(0x5000, 1));
+        assert_eq!(
+            bytes(&sample_of(&shared, 44), r"C:\logs\out.txt"),
+            written(201)
+        );
+        // A third process the table never named for it stays unnamed.
+        deliver(&shared, 48, EVENT_WRITE, &request_payload(0x5000, 5));
+        assert!(sample_of(&shared, 48).files.is_empty());
+    }
+
+    /// A long-running process at its path budget keeps counting new files by
+    /// evicting the least recently used CLOSED ones into the omitted
+    /// remainder; a file that is still open is never evicted, and nothing is
+    /// lost from the process total.
+    #[test]
+    fn a_full_path_budget_evicts_old_closed_paths() {
+        let shared = shared();
+        // An open file used first, so it is the oldest of all.
+        deliver(
+            &shared,
+            8,
+            EVENT_CREATE,
+            &create_payload(0x50_0000, r"\??\C:\db\open.db"),
+        );
+        deliver(&shared, 8, EVENT_WRITE, &request_payload(0x50_0000, 1));
+        for index in 0..MAX_TRACKED_FILES_PER_PID - 1 {
+            let object = 0x10_0000 + index as u64 * 8;
+            deliver(
+                &shared,
+                8,
+                EVENT_CREATE,
+                &create_payload(object, &format!(r"\??\C:\g{index}")),
+            );
+            deliver(&shared, 8, EVENT_WRITE, &request_payload(object, 2));
+            deliver(&shared, 8, EVENT_CLOSE, &close_payload(object));
+        }
+        assert_eq!(sample_of(&shared, 8).dropped_paths, 0, "exactly full");
+        deliver(
+            &shared,
+            8,
+            EVENT_CREATE,
+            &create_payload(0x90_0000, r"\??\C:\new.bin"),
+        );
+        deliver(&shared, 8, EVENT_READ, &request_payload(0x90_0000, 4_096));
+        let sample = sample_of(&shared, 8);
+        assert_eq!(
+            bytes(&sample, r"C:\new.bin"),
+            read(4_096),
+            "the new file has a row"
+        );
+        assert_eq!(
+            bytes(&sample, r"C:\db\open.db"),
+            written(1),
+            "the open file survives although it is the oldest"
+        );
+        assert_eq!(
+            bytes(&sample, r"C:\g0"),
+            None,
+            "the oldest closed file was evicted"
+        );
+        let evicted = (MAX_TRACKED_FILES_PER_PID - 1).div_ceil(4) as u64;
+        assert_eq!(sample.dropped_paths, evicted);
+        assert_eq!(sample.omitted.write_bytes, evicted * 2);
+        assert_eq!(
+            sample.attributed().write_bytes,
+            1 + (MAX_TRACKED_FILES_PER_PID as u64 - 1) * 2,
+            "evicted bytes stay in the process total"
+        );
+        assert_eq!(
+            shared.lock().tracked_paths,
+            MAX_TRACKED_FILES_PER_PID - evicted as usize + 1
+        );
+    }
+
+    /// Coverage: a process created after the session started has been traced
+    /// for its whole life and its counter window starts at zero; an older one
+    /// starts at its pre-session counters, but only when the snapshot is of
+    /// the SAME process (creation time), never of a pid's previous owner.
+    #[test]
+    fn coverage_follows_the_creation_time() {
+        let started = 1_000_000_000;
+        let baselines = HashMap::from([(30u32, (500_000_000i64, 4_000u64, 9_000u64))]);
+        assert_eq!(
+            coverage_of(31, started + 10, started, &baselines),
+            (true, Some(FileBytes::default()))
+        );
+        assert_eq!(
+            coverage_of(30, 500_000_000, started, &baselines),
+            (
+                false,
+                Some(FileBytes {
+                    read_bytes: 4_000,
+                    write_bytes: 9_000,
+                })
+            )
+        );
+        assert_eq!(
+            coverage_of(30, 600_000_000, started, &baselines),
+            (false, None),
+            "a reused pid must not take its predecessor's counters"
+        );
+        assert_eq!(
+            coverage_of(32, 500_000_000, started, &baselines),
+            (false, None)
+        );
+    }
+
+    /// The attach step turns the baseline into the process's counter window,
+    /// and a counter that went backwards (a different process) stays unknown.
+    #[test]
+    fn the_attach_step_states_the_counter_window() {
+        let mut sample = measured_sample();
+        sample.traced_since_process_start = false;
+        sample.counter_baseline = Some(FileBytes {
+            read_bytes: 1_000,
+            write_bytes: 50_000,
+        });
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![file_row(r"C:\Windows\System32\a.dll")],
+            accounting: crate::actions::FileIoAccounting {
+                counter_read_bytes: Some(5_000),
+                counter_write_bytes: Some(40_000),
+                ..Default::default()
+            },
+        };
+        attach_file_io(&mut snapshot, &sample);
+        let accounting = &snapshot.accounting;
+        assert_eq!(accounting.counter_window_read_bytes, Some(4_000));
+        assert_eq!(accounting.counter_window_write_bytes, None);
+        assert!(!accounting.traced_since_process_start);
+
+        let mut lifetime = measured_sample();
+        lifetime.traced_since_process_start = true;
+        lifetime.counter_baseline = Some(FileBytes::default());
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: crate::actions::FileIoAccounting {
+                counter_read_bytes: Some(5_000),
+                counter_write_bytes: Some(40_000),
+                ..Default::default()
+            },
+        };
+        attach_file_io(&mut snapshot, &lifetime);
+        assert!(snapshot.accounting.traced_since_process_start);
+        assert_eq!(snapshot.accounting.counter_window_read_bytes, Some(5_000));
+        assert_eq!(snapshot.accounting.counter_window_write_bytes, Some(40_000));
+    }
+
     /// The provider names files as device paths while the rows are DOS paths;
     /// without this translation no byte would ever reach a row.
     #[test]
@@ -2726,6 +3275,8 @@ mod tests {
             unnamed_creates: 3,
             dropped_paths: 4,
             events_lost: Some(1),
+            traced_since_process_start: false,
+            counter_baseline: None,
         }
     }
 
@@ -2749,6 +3300,18 @@ mod tests {
         deliver(&shared, pid, EVENT_WRITE, &request_payload(0x1000, 1_024));
         // A transfer on a file object whose Create was never seen: unnamed.
         deliver(&shared, pid, EVENT_READ, &request_payload(0x9000, 512));
+        // A file past the session's path budget, while nothing the process
+        // has is closed and evictable: omitted, and no row.
+        deliver(
+            &shared,
+            pid,
+            EVENT_CREATE,
+            &create_payload(0x2000, r"\??\C:\data\b.bin"),
+        );
+        let tracked = shared.lock().tracked_paths;
+        shared.lock().tracked_paths = MAX_TRACKED_FILES;
+        deliver(&shared, pid, EVENT_WRITE, &request_payload(0x2000, 2_048));
+        shared.lock().tracked_paths = tracked;
         // A file read and closed before the handle walk: a closed row.
         deliver(
             &shared,
@@ -2758,15 +3321,6 @@ mod tests {
         );
         deliver(&shared, pid, EVENT_READ, &request_payload(0x3000, 96_167));
         deliver(&shared, pid, EVENT_CLOSE, &close_payload(0x3000));
-        // A file past the session's path budget: omitted, and no row.
-        deliver(
-            &shared,
-            pid,
-            EVENT_CREATE,
-            &create_payload(0x2000, r"\??\C:\data\b.bin"),
-        );
-        shared.state.lock().unwrap().tracked_paths = MAX_TRACKED_FILES;
-        deliver(&shared, pid, EVENT_WRITE, &request_payload(0x2000, 2_048));
 
         let sample = sample_of(&shared, pid);
         assert_eq!(sample.state(), FileIoAccountingState::Measured);

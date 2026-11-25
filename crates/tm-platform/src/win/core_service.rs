@@ -73,8 +73,10 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // adds drained, identity-bound sampled instruction-pointer attribution for
 // the Modules page. v10 adds bounded, identity-bound process file I/O
 // enumeration (ProcessFileIo). v11 adds identity-bound parent process
-// evidence (ProcessParentInfo) in ProcessSecurityInfo.
-pub const PROTOCOL_VERSION: u16 = 12;
+// evidence (ProcessParentInfo) in ProcessSecurityInfo. v13 adds the per-file
+// trace's coverage to `FileIoAccounting`: whether it saw the process's whole
+// life, and the process counters over the same window.
+pub const PROTOCOL_VERSION: u16 = 13;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -1402,6 +1404,10 @@ impl PlatformActions for BrokeredActions {
         self.local.list_process_connections(pid)
     }
 
+    fn start_background_accounting(&self) {
+        self.local.start_background_accounting();
+    }
+
     fn list_process_file_io(
         &self,
         pid: u32,
@@ -2207,16 +2213,25 @@ fn spawn_net_trace_watchdog() {
 
 /// The per-file `FileIo` trace, hosted either by the broker or by the GUI.
 ///
-/// It is started on the first file-I/O request and stopped by the same idle
-/// watchdog as the disk and network traces, because a session that reports
-/// every read and write on the machine must not outlive the page that shows
-/// them. The GUI only gets one when its own token is elevated and the broker is
-/// not there, which is why the two hosts keep separate sessions under separate
-/// names: an elevated GUI must never join, stop, or double-count the service's.
+/// It runs for as long as its HOST does — started with the service, or with
+/// an elevated GUI that has no service — and is not idled out with the page:
+/// per-file counts that only accumulate while a dialog is open answer "what did
+/// this process do while I watched", which is not the question. Its measured
+/// cost is small (see `file_etw`'s lifetime docs). A first request still
+/// starts it when it is not running yet. The GUI only hosts one when its own
+/// token is elevated and the broker is not there, which is why the two hosts
+/// keep separate sessions under separate names: an elevated GUI must never
+/// join, stop, or double-count the service's.
 struct FileTrace {
     usage: super::file_etw::FileEtw,
-    last_request: std::time::Instant,
 }
+
+/// How often a running per-file trace is maintained: restarted when it was
+/// stopped underneath us, and pruned of processes whose exit record ETW
+/// dropped. Once a minute keeps a LocalSystem service from waking often for
+/// housekeeping that is only a backstop — exits arrive as records, and a
+/// request restarts a dead session at once.
+const FILE_TRACE_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Which process the trace runs in, and therefore which session it owns.
 #[derive(Clone, Copy)]
@@ -2254,27 +2269,116 @@ impl FileTraceHost {
 
     fn watchdog_thread(self) -> &'static str {
         match self {
-            Self::Service => "tm-file-idle",
-            Self::App => "tm-file-app-idle",
-        }
-    }
-
-    fn stopped_message(self) -> &'static str {
-        match self {
-            Self::Service => "per-file I/O trace stopped (idle)",
-            Self::App => "app per-file I/O trace stopped (idle)",
+            Self::Service => "tm-file-maint",
+            Self::App => "tm-file-app-maint",
         }
     }
 }
 
-/// Stop a host's trace once the GUI stops polling it.
-fn spawn_file_trace_watchdog(host: FileTraceHost) -> bool {
-    spawn_trace_watchdog(
-        host.watchdog_thread(),
-        host.slot(),
-        |trace| trace.last_request,
-        host.stopped_message(),
-    )
+/// Maintain a host's trace for as long as the slot holds it; see
+/// [`FILE_TRACE_MAINTENANCE`].
+///
+/// Returns whether the thread was started: a session is only kept with its
+/// maintenance ([`keep_watched`]), so one stopped underneath us is restarted
+/// even when no page asks.
+fn spawn_file_trace_maintenance(host: FileTraceHost) -> bool {
+    std::thread::Builder::new()
+        .name(host.watchdog_thread().into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(FILE_TRACE_MAINTENANCE);
+                let mut slot = match host.slot().lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let Some(trace) = slot.as_mut() else {
+                    return;
+                };
+                if trace.usage.is_running() {
+                    trace.usage.maintain(&live_pids());
+                    continue;
+                }
+                match start_file_trace(host.role()) {
+                    Ok(usage) => {
+                        tracing::warn!(
+                            host = host.watchdog_thread(),
+                            "per-file I/O trace was stopped underneath us; restarted"
+                        );
+                        trace.usage = usage;
+                    }
+                    Err(refusal) => tracing::debug!(
+                        host = host.watchdog_thread(),
+                        ?refusal,
+                        "per-file I/O trace restart refused; retrying at the next maintenance"
+                    ),
+                }
+            }
+        })
+        .is_ok()
+}
+
+/// Start `host`'s per-file trace if it is not running yet, and keep it.
+///
+/// What the service does as soon as it is ready, and what an elevated GUI with
+/// no service does at start-up, so per-file counts cover the host's whole
+/// lifetime instead of the time a dialog was open. Returns whether a session is
+/// now held. An app-side refusal is throttled like a request's.
+fn ensure_file_trace(host: FileTraceHost, start: &FileTraceStarter<'_>) -> bool {
+    if matches!(host, FileTraceHost::App)
+        && !app_trace_start_due(app_trace_last_failure(), std::time::Instant::now())
+    {
+        return false;
+    }
+    let mut slot = match host.slot().lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if slot.is_some() {
+        return true;
+    }
+    match start(host.role()) {
+        Ok(usage) => {
+            let kept = keep_watched(&mut slot, FileTrace { usage }, || {
+                spawn_file_trace_maintenance(host)
+            });
+            if !kept {
+                tracing::error!(
+                    host = host.watchdog_thread(),
+                    "could not start the per-file I/O maintenance thread; the session was not kept"
+                );
+            }
+            kept
+        }
+        Err(refusal) => {
+            if matches!(host, FileTraceHost::App) {
+                remember_app_trace_failure(Some(std::time::Instant::now()));
+            }
+            tracing::debug!(
+                host = host.watchdog_thread(),
+                ?refusal,
+                "per-file I/O trace could not be started"
+            );
+            false
+        }
+    }
+}
+
+/// Start the GUI's own per-file trace for the rest of its run, when it can
+/// host one (elevated) and the service is not there to host it instead.
+///
+/// Called once, off the UI thread, after start-up: probing the broker is a
+/// pipe round trip, and starting a session is a few kernel calls plus a
+/// process-table snapshot.
+pub(super) fn ensure_app_file_trace_unless_served() {
+    if !super::process_ops::is_elevated() {
+        return;
+    }
+    if BrokerClient.call(BrokerRequest::Ping).is_ok() {
+        // The service runs its own always-on session and answers the
+        // requests; a second one here would double the machine-wide cost.
+        return;
+    }
+    let _ = ensure_file_trace(FileTraceHost::App, &start_file_trace);
 }
 
 /// Put `session` in `slot` and start the watchdog that will stop it, or leave
@@ -2398,21 +2502,16 @@ fn file_trace_sample(
     if slot.is_none() {
         match start(host.role()) {
             Ok(usage) => {
-                let kept = keep_watched(
-                    &mut slot,
-                    FileTrace {
-                        usage,
-                        last_request: std::time::Instant::now(),
-                    },
-                    || spawn_file_trace_watchdog(host),
-                );
+                let kept = keep_watched(&mut slot, FileTrace { usage }, || {
+                    spawn_file_trace_maintenance(host)
+                });
                 if !kept {
                     // Nothing would stop this session, and a per-file
                     // session left running traces the machine for the life of
                     // the process. Report no source instead of a leak.
                     tracing::error!(
                         host = host.watchdog_thread(),
-                        "could not start the per-file I/O idle watchdog; the session was not kept"
+                        "could not start the per-file I/O maintenance thread; the session was not kept"
                     );
                     return FileTraceAnswer {
                         sample: None,
@@ -2453,7 +2552,6 @@ fn file_trace_sample(
             refusal,
         };
     };
-    trace.last_request = std::time::Instant::now();
     let live = live_pids();
     FileTraceAnswer {
         sample: Some(trace.usage.sample(pid, start_epoch_s, &live)),
@@ -3080,6 +3178,17 @@ pub fn run_broker(
     // listening pipe have all been established.
     let mut listener = Some(create_pipe_instance(PIPE_NAME, &sddl, true)?);
     on_ready()?;
+    // The per-file trace runs for the service's whole life, so a process's
+    // per-file counts do not depend on when a dialog was first opened. Off the
+    // accept loop: starting it snapshots the process table.
+    if let Err(error) = std::thread::Builder::new()
+        .name("tm-file-start".into())
+        .spawn(|| {
+            let _ = ensure_file_trace(FileTraceHost::Service, &start_file_trace);
+        })
+    {
+        tracing::warn!(%error, "could not start the per-file I/O trace thread");
+    }
     let mut consecutive_failures = 0u32;
     while !stopped.load(std::sync::atomic::Ordering::Acquire) {
         let pipe = match listener.take() {
@@ -4996,6 +5105,10 @@ mod tests {
                         unnamed_creates: 0,
                         dropped_paths: 0,
                         handles_complete: true,
+                        // v13: the trace's coverage crosses the pipe intact.
+                        traced_since_process_start: true,
+                        counter_window_read_bytes: Some(512),
+                        counter_window_write_bytes: None,
                     },
                 },
             )),
@@ -5008,6 +5121,9 @@ mod tests {
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].path, r"C:\Windows\System32\kernel32.dll");
         assert_eq!(snapshot.accounting.counter_read_bytes, Some(1024));
+        assert!(snapshot.accounting.traced_since_process_start);
+        assert_eq!(snapshot.accounting.counter_window_read_bytes, Some(512));
+        assert_eq!(snapshot.accounting.counter_window_write_bytes, None);
     }
 
     #[test]
@@ -5552,6 +5668,36 @@ mod tests {
         assert_eq!(accounting.write_bytes, 0);
         assert_eq!(accounting.since_ms, 0);
         assert_eq!(accounting.events_lost, None, "no session, no loss count");
+        remember_app_trace_failure(None);
+    }
+
+    /// The always-on start: a refusal leaves no session and, on the app side,
+    /// sets the same retry window a request's refusal does, so an unelevated
+    /// GUI asks the kernel once rather than on every start-up path; inside the
+    /// window nothing is attempted at all.
+    #[test]
+    fn an_always_on_start_that_is_refused_keeps_nothing_and_is_throttled() {
+        let _serial = TEST_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        remember_app_trace_failure(None);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let refuse = |_role: super::super::etw::TraceRole| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(super::super::file_etw::FileTraceRefusal::Unavailable)
+        };
+        assert!(!ensure_file_trace(FileTraceHost::App, &refuse));
+        assert!(FileTraceHost::App.slot().lock().unwrap().is_none());
+        assert!(
+            app_trace_last_failure().is_some(),
+            "the refusal opens the retry window"
+        );
+        assert!(!ensure_file_trace(FileTraceHost::App, &refuse));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "inside the window the kernel is not asked again"
+        );
         remember_app_trace_failure(None);
     }
 

@@ -779,6 +779,11 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   the request itself (cross-CPU delivery order) is dropped and counted in the
   `orphaned_requests` trace log, not shown; naming objects from the handle
   table needs `SeDebugPrivilege` for object addresses (LocalSystem and an
-  elevated admin have it). Linux has no per-file source at all (would need
+  elevated admin have it). The always-on session's memory is bounded by the
+  maps' caps (worst case tens of MB in the service on a machine that fills
+  them); not measured over days of uptime. Per-file history before the session
+  started does not exist anywhere in Windows, so processes older than the
+  service are counted from its start (stated on the page). Linux has no
+  per-file source at all (would need
   eBPF on `vfs_read`/`vfs_write` with root) and keeps the columns
   `Unavailable`.

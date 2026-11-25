@@ -462,6 +462,46 @@ fn per_file_accounting_note(
     }
 }
 
+/// How much of the process's own I/O over the traced window went to files, or
+/// `None` when that cannot be said.
+///
+/// The I/O graphs plot the process's kernel counters, which count EVERY read
+/// and write call — files, pipes, devices, consoles, the network stack. The
+/// file table only ever sees files, so a process that talks to its GUI over a
+/// pipe shows busy graphs over a table of zeros. This line says so with
+/// numbers, over exactly the window the per-file counts cover: the process's
+/// whole life when the trace saw it start, otherwise since tracing began.
+/// Only for a measured answer whose counter window is known; a count larger
+/// than the counter (records of a request still in flight) is shown as all of
+/// it rather than as more than everything.
+fn file_share_note(accounting: Option<&FileIoAccounting>, lang: i18n::Lang) -> Option<String> {
+    let accounting = accounting?;
+    if accounting.state != FileIoAccountingState::Measured {
+        return None;
+    }
+    let read_total = accounting.counter_window_read_bytes?;
+    let write_total = accounting.counter_window_write_bytes?;
+    let scope = if accounting.traced_since_process_start {
+        i18n::tr_in(lang, K::PropIoCoverageSinceStart).to_string()
+    } else {
+        format!(
+            "{} ({})",
+            i18n::tr_in(lang, K::PropIoCoverageSinceTrace),
+            format::format_uptime(accounting.since_ms / 1_000)
+        )
+    };
+    let mut share = i18n::tr_in(lang, K::PropIoFileShare).to_string();
+    for value in [
+        accounting.read_bytes.min(read_total),
+        read_total,
+        accounting.write_bytes.min(write_total),
+        write_total,
+    ] {
+        share = share.replacen("{}", &format::format_bytes_loc(value), 1);
+    }
+    Some(format!("{scope}: {share}"))
+}
+
 /// The non-zero loss and cap counters of one answer as one phrase.
 ///
 /// Each of them makes the counts on screen lower bounds: events ETW reports as
@@ -954,6 +994,10 @@ pub fn show(
         ELEVATION_IS_A_REMEDY,
         i18n::lang(),
     ) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(note).small().color(pal.text_dim));
+    }
+    if let Some(note) = file_share_note(state.accounting.as_ref(), i18n::lang()) {
         ui.add_space(4.0);
         ui.label(egui::RichText::new(note).small().color(pal.text_dim));
     }
@@ -1457,6 +1501,71 @@ mod tests {
         let half = files_summary(Some(1024), None).expect("a measured read total is stated");
         assert!(half.contains(read_bytes.as_str()));
         assert!(half.contains('\u{2014}'));
+    }
+
+    /// The page says how much of the process's own I/O over the traced window
+    /// went to files — the case of a service that talks to its GUI over a pipe
+    /// and shows busy graphs over a table of zeros. Text pinned literally.
+    #[test]
+    fn the_file_share_line_compares_files_with_the_process_counters() {
+        use tm_core::i18n::Lang;
+
+        let measured = FileIoAccounting {
+            state: FileIoAccountingState::Measured,
+            since_ms: 3_723_000,
+            read_bytes: 1_000,
+            write_bytes: 0,
+            counter_window_read_bytes: Some(4_000),
+            counter_window_write_bytes: Some(98_480),
+            ..Default::default()
+        };
+        let line = file_share_note(Some(&measured), Lang::En).expect("a line");
+        assert_eq!(
+            line,
+            format!(
+                "Since tracing began (0:01:02:03): files got {} of {} read and {} of {} \
+                 written, the rest went to pipes, devices or the network",
+                format::format_bytes_loc(1_000),
+                format::format_bytes_loc(4_000),
+                format::format_bytes_loc(0),
+                format::format_bytes_loc(98_480),
+            )
+        );
+        let lifetime = FileIoAccounting {
+            traced_since_process_start: true,
+            ..measured.clone()
+        };
+        assert!(
+            file_share_note(Some(&lifetime), Lang::En)
+                .expect("a line")
+                .starts_with("Since process start: ")
+        );
+        // More file bytes than the counter says (a request still in flight)
+        // reads as all of it, never as more than everything.
+        let ahead = FileIoAccounting {
+            read_bytes: 9_000,
+            ..measured.clone()
+        };
+        let ahead_line = file_share_note(Some(&ahead), Lang::En).expect("a line");
+        assert!(ahead_line.contains(&format!(
+            "{} of {} read",
+            format::format_bytes_loc(4_000),
+            format::format_bytes_loc(4_000)
+        )));
+        // No line without a measurement or without a known counter window.
+        for unknown in [
+            FileIoAccounting {
+                counter_window_write_bytes: None,
+                ..measured.clone()
+            },
+            FileIoAccounting {
+                state: FileIoAccountingState::Undelivered,
+                ..measured.clone()
+            },
+        ] {
+            assert_eq!(file_share_note(Some(&unknown), Lang::En), None);
+        }
+        assert_eq!(file_share_note(None, Lang::En), None);
     }
 
     /// Every accounting state the file table can be in renders one exact line,

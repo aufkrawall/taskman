@@ -96,6 +96,9 @@ fn snapshot(
             unnamed_creates: 0,
             dropped_paths: 0,
             handles_complete,
+            traced_since_process_start: false,
+            counter_window_read_bytes: None,
+            counter_window_write_bytes: None,
         },
     }
 }

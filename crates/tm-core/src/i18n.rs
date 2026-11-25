@@ -493,6 +493,16 @@ keys! {
         "another application is using the NT Kernel Logger, so per-file I/O cannot be traced"
     ],
     PropIoEventsLost => ["Ereignisse verloren", "events lost"],
+    PropIoCoverageSinceStart => ["Seit Prozessstart", "Since process start"],
+    PropIoCoverageSinceTrace => [
+        "Seit Beginn der Ablaufverfolgung",
+        "Since tracing began"
+    ],
+    // `{}` are filled in order: files read, all read, files written, all written.
+    PropIoFileShare => [
+        "an Dateien {} von {} gelesen und {} von {} geschrieben, der Rest ging an Pipes, Geräte oder das Netzwerk",
+        "files got {} of {} read and {} of {} written, the rest went to pipes, devices or the network"
+    ],
     PropIoPathsDropped => ["Pfade verworfen", "paths dropped"],
     PropIoFileNamesCleared => ["Dateinamen verworfen", "file names cleared"],
     PropNetworkReceive => ["Netzwerk empfangen", "Network receive"],

@@ -142,6 +142,61 @@ fn query_kernel_process_io(
     Err(TmError::ProcessNotFound { pid })
 }
 
+/// Every process's creation time (100-ns Unix ticks) and kernel read/write
+/// transfer counters, from one `SystemProcessInformation` snapshot.
+///
+/// The per-file trace takes this just before its session starts, so that for
+/// a process that already existed it knows what the process's own counters
+/// said when tracing began — the start of the window its per-file counts
+/// cover. One kernel query for the whole machine, no handle per process.
+/// A process whose counters cannot be read is simply absent.
+pub(super) fn snapshot_io_counters() -> HashMap<u32, (i64, u64, u64)> {
+    let mut counters = HashMap::new();
+    let mut buf = vec![0u8; 512 * 1024];
+    let Some(written) =
+        crate::win::cpu_load::CpuLoadAccountant::nt_query(&mut buf, SystemProcessInformation)
+    else {
+        return counters;
+    };
+    let off = crate::win::cpu_load::Offsets::get();
+    let mut pos = 0usize;
+    loop {
+        if pos
+            .checked_add(off.min_size)
+            .is_none_or(|end| end > written)
+        {
+            break;
+        }
+        let pid = crate::win::cpu_load::read_usize(&buf, pos + off.pid) as u32;
+        let next = crate::win::cpu_load::read_u32(&buf, pos) as usize;
+        let record_end = if next == 0 {
+            written
+        } else if next >= off.min_size {
+            match pos.checked_add(next) {
+                Some(end) if end <= written => end,
+                _ => break,
+            }
+        } else {
+            break;
+        };
+        let created = crate::win::cpu_load::filetime_to_unix_ticks(crate::win::cpu_load::read_i64(
+            &buf,
+            pos + off.create_time,
+        ));
+        if let (Some(created), Some(io)) = (
+            created,
+            crate::win::cpu_load::read_raw_io_counters(&buf, pos, record_end, &off),
+        ) {
+            counters.insert(pid, (created, io.read_bytes, io.write_bytes));
+        }
+        if next == 0 {
+            break;
+        }
+        pos += next;
+    }
+    counters
+}
+
 fn query_process_io_fallback(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
@@ -235,6 +290,9 @@ pub fn list_process_file_io(
         unnamed_creates: 0,
         dropped_paths: 0,
         handles_complete,
+        traced_since_process_start: false,
+        counter_window_read_bytes: None,
+        counter_window_write_bytes: None,
     };
     Ok(ProcessFileIoSnapshot { files, accounting })
 }
@@ -833,6 +891,28 @@ mod tests {
             ]
         );
         assert_eq!(parse_handle_objects(&buf[..8]), None, "no whole header");
+    }
+
+    /// The counter snapshot sees this process, with the creation time the
+    /// identity checks use and counters that only grow.
+    #[test]
+    fn the_counter_snapshot_includes_this_process() {
+        use std::io::Write as _;
+        let pid = std::process::id();
+        let before = snapshot_io_counters();
+        let (created, _, written_before) = *before.get(&pid).expect("this process is listed");
+        let own = super::super::own_start_epoch_for_test();
+        assert!(
+            tm_core::model::creation_timestamps_match(own, created),
+            "{own} vs {created}"
+        );
+        let path = std::env::temp_dir().join(format!("tm_counter_snapshot_{pid}.bin"));
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(&[1u8; 4_096]))
+            .expect("write");
+        let _ = std::fs::remove_file(&path);
+        let after = snapshot_io_counters();
+        assert!(after.get(&pid).expect("still listed").2 >= written_before + 4_096);
     }
 
     /// Naming asks nothing of a process it was told nothing about, and never

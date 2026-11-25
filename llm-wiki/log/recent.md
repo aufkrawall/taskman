@@ -1,3 +1,27 @@
+## 2026-11-25 - Per-file I/O for the host's whole life, and what the graphs hold beyond files
+
+- Asked: per-file counts accumulated only while the I/O page was open (the
+  trace idled out with it); they should cover TaskMan's runtime or, better, the
+  process's whole life — without noteworthy overhead — and the page should say
+  how much of the graphs' I/O went to files.
+- Cost measured first, in CPU cycles of the involved threads (the user has
+  background load; wall time and `GetThreadTimes` were too noisy): ~900
+  consumer cycles per record, 0.2% of one core idle (~8.6k records/s), ~27k
+  consumer cycles per file in a create/write/read/delete storm, no measurable
+  change in the storm's own thread (untraced runs vary ±4%).
+- Change: the service starts the trace at readiness and never idle-stops it;
+  an elevated GUI without the service starts its own at start-up. 60 s
+  maintenance (restart + prune). `EVENT_TRACE_FLAG_PROCESS` added; `Process/End`
+  (opcode 2, v4, pid at offset `P`, probed live) drops a process's state.
+  Coverage: creation after session start = whole life; otherwise counters
+  snapshotted before the session start give `counter_window_*` (protocol v13).
+  LRU eviction of closed paths at the budgets. Objects named for several
+  processes (inherited handles) — found when a live test's child wrote to its
+  inherited stdout file and the bytes stayed unnamed.
+- Live elevated: a child started under the trace reports
+  `traced_since_process_start`, its file row (19/19 B) and a counter window of
+  38 B written (19 to the file, 19 to `NUL`).
+
 ## 2026-11-25 - The per-file trace, measured: wrong flag, wrong opcodes, now by completion
 
 - Reported as "per process per file read/write attribution sucks and is broken with

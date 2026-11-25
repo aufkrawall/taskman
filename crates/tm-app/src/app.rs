@@ -1463,6 +1463,17 @@ impl TaskManApp {
             });
             self.engine.start();
             tracing::info!("engine started");
+            // Per-file I/O accounting that must cover the GUI's whole run (an
+            // elevated GUI without the service hosts the trace itself). Off
+            // this thread: it probes the service pipe and may start an ETW
+            // session.
+            let actions = self.actions.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("tm-accounting-start".into())
+                .spawn(move || actions.start_background_accounting())
+            {
+                tracing::warn!(%error, "cannot start background accounting");
+            }
         }
     }
 

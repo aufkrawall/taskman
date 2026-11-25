@@ -481,6 +481,19 @@ pub struct FileIoAccounting {
     /// the snapshot was truncated, when the process could not be opened, or when
     /// a caller dropped entries from `files`.
     pub handles_complete: bool,
+    /// Whether the per-file trace has seen this process's WHOLE life: it was
+    /// created after the trace started. Otherwise the per-file counts cover
+    /// only the time since the trace started (`since_ms`).
+    pub traced_since_process_start: bool,
+    /// The process's own kernel `IO_COUNTERS` read/write bytes over exactly the
+    /// window the per-file trace covers (since process start, or since the
+    /// trace started). Those counters count EVERY read and write call —
+    /// files, pipes, devices, consoles — so this minus `read_bytes` /
+    /// `write_bytes` is what went anywhere but a file. `None` when the counter
+    /// at the start of the window is unknown (the trace restarted, or the
+    /// process could not be read then), never a guessed zero.
+    pub counter_window_read_bytes: Option<u64>,
+    pub counter_window_write_bytes: Option<u64>,
 }
 
 /// Files of one process plus the accounting scope they were measured under.
@@ -767,6 +780,11 @@ pub trait PlatformActions: Send + Sync {
     fn core_service_state(&self) -> CoreServiceState {
         CoreServiceState::Unsupported
     }
+    /// Start whatever accounting must run for the GUI's whole lifetime rather
+    /// than only while a page asks — today the per-file I/O trace, on a
+    /// Windows GUI that is elevated and has no service to host it. Called
+    /// once, off the UI thread, after start-up. A no-op where nothing applies.
+    fn start_background_accounting(&self) {}
     fn set_core_service_installed(&self, _installed: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("core service"))
     }

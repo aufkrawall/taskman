@@ -1476,6 +1476,197 @@ fn the_file_trace_measures_exact_bytes_per_file() {
     );
 }
 
+/// A process started after the trace has its whole life covered: the
+/// production request path reports `traced_since_process_start`, its file
+/// write on a row, and the process counters over the same window — which
+/// also hold what it wrote to a device (`NUL`), which no file row carries.
+#[test]
+#[ignore = "starts a machine-wide ETW session; needs elevation"]
+fn the_file_trace_covers_a_process_from_its_start() {
+    use tm_platform::actions::PlatformActions;
+    let actions = tm_platform::win::WinActions;
+    let own = std::process::id();
+    // Starts this process's own trace (no service is asked on this path).
+    let _ = actions.list_process_file_io(own, Some(tm_platform::win::own_start_epoch_for_test()));
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("tm_cov_{own}.txt"));
+    let script = format!(
+        "echo 0123456789abcdef> \"{}\" & type \"{}\" > nul & ping -n 4 127.0.0.1 > nul",
+        path.display(),
+        path.display()
+    );
+    // `raw_arg`: cmd parses its own command line, and the quoting `args`
+    // applies for ordinary programs breaks it.
+    let mut child = {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("cmd.exe")
+            .raw_arg(format!("/d /c \"{script}\""))
+            .spawn()
+            .expect("spawn")
+    };
+    let pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(2_000));
+    let epoch = tm_platform::win::process_start_epoch_for_test(pid);
+    let snapshot = actions.list_process_file_io(pid, Some(epoch));
+    let _ = child.wait();
+    let length = std::fs::metadata(&path)
+        .map(|meta| meta.len())
+        .expect("written");
+    let _ = std::fs::remove_file(&path);
+    let snapshot = snapshot.expect("answered");
+    let accounting = &snapshot.accounting;
+    eprintln!(
+        "state={:?} since_start={} file r/w={}/{} counter window r/w={:?}/{:?}",
+        accounting.state,
+        accounting.traced_since_process_start,
+        accounting.read_bytes,
+        accounting.write_bytes,
+        accounting.counter_window_read_bytes,
+        accounting.counter_window_write_bytes
+    );
+    for file in &snapshot.files {
+        eprintln!(
+            "  {} handles={} read={:?} written={:?}",
+            file.path, file.open_handles, file.read_bytes, file.write_bytes
+        );
+    }
+    assert_eq!(
+        accounting.state,
+        tm_platform::actions::FileIoAccountingState::Measured
+    );
+    assert!(accounting.traced_since_process_start);
+    let wanted = path.to_string_lossy().to_lowercase();
+    let row = snapshot
+        .files
+        .iter()
+        .find(|file| file.path.to_lowercase() == wanted)
+        .expect("the file the child wrote has a row");
+    assert_eq!(row.write_bytes, Some(length), "what echo wrote");
+    assert_eq!(row.read_bytes, Some(length), "what type read back");
+    // `type ... > nul` wrote the same bytes again, to a device: the process
+    // counters hold both, the file row only the first.
+    let window = accounting
+        .counter_window_write_bytes
+        .expect("a counter window");
+    assert_eq!(window, 2 * length);
+    assert_eq!(accounting.counter_window_read_bytes, Some(length));
+}
+
+/// What the always-on per-file trace costs, in CPU cycles of this process
+/// rather than wall time, so background load on the machine does not enter
+/// the numbers:
+///
+/// * the workload thread's own kernel+user time for a small-file storm with
+///   and without the session — ETW records are written in the issuing
+///   thread's context, so that is where the per-request cost lands;
+/// * the rest of this process's CPU while the session runs — the consumer
+///   thread decoding and accounting every file record on the machine — both
+///   under the storm and while the machine idles.
+///
+/// Prints numbers; asserts only that a session ran.
+#[test]
+#[ignore = "starts a machine-wide ETW session; needs elevation; a measurement"]
+fn the_file_trace_costs_little() {
+    use std::io::{Read, Write};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+    use windows::Win32::System::WindowsProgramming::{QueryProcessCycleTime, QueryThreadCycleTime};
+
+    /// CPU cycles of this process and of the calling thread: exact, unlike
+    /// the 15.6 ms ticks `GetThreadTimes` reports, and blind to every other
+    /// process's load.
+    fn cycles() -> (u64, u64) {
+        let (mut process, mut thread) = (0u64, 0u64);
+        unsafe {
+            let _ = QueryProcessCycleTime(GetCurrentProcess(), &mut process);
+            let _ = QueryThreadCycleTime(GetCurrentThread(), &mut thread);
+        }
+        (process, thread)
+    }
+    /// The storm; returns (thread cycles, rest-of-process cycles during it).
+    fn workload(dir: &std::path::Path, files: usize) -> (u64, u64) {
+        let (process_before, thread_before) = cycles();
+        let payload = [0x42u8; 4_096];
+        let mut back = Vec::with_capacity(4_096);
+        for index in 0..files {
+            let path = dir.join(format!("w{index}.bin"));
+            std::fs::File::create(&path)
+                .and_then(|mut file| file.write_all(&payload))
+                .expect("write");
+            back.clear();
+            std::fs::File::open(&path)
+                .and_then(|mut file| file.read_to_end(&mut back))
+                .expect("read");
+            std::fs::remove_file(&path).expect("remove");
+        }
+        let (process_after, thread_after) = cycles();
+        let thread = thread_after - thread_before;
+        (
+            thread,
+            (process_after - process_before).saturating_sub(thread),
+        )
+    }
+    fn median(mut values: Vec<u64>) -> u64 {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+    let dir = std::env::temp_dir().join(format!("tm_file_cost_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    const FILES: usize = 4_000;
+    let _ = workload(&dir, 500);
+    let (mut off, mut on, mut consumer_busy) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut consumer_idle_cycles, mut idle_events) = (0u64, 0u64);
+    for _ in 0..6 {
+        off.push(workload(&dir, FILES).0);
+        let (trace, _) = match tm_platform::win::file_etw_test_start() {
+            Ok(started) => started,
+            Err(refusal) => {
+                eprintln!("no session: {refusal:?}");
+                return;
+            }
+        };
+        let pid = std::process::id();
+        let epoch = tm_platform::win::own_start_epoch_for_test();
+        let live = tm_platform::win::live_pids_for_test();
+        let _ = trace.sample(pid, epoch, &live);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let (process_before, _) = cycles();
+        let (thread, _) = workload(&dir, FILES);
+        on.push(thread);
+        // The consumer drains the storm's records within its flush window;
+        // everything this process spent besides the storm thread is its cost.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        consumer_busy.push((cycles().0 - process_before).saturating_sub(thread));
+        let (idle_before, _) = cycles();
+        let seen_before = trace.sample(pid, epoch, &live).events_seen;
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let seen_after = trace.sample(pid, epoch, &live).events_seen;
+        consumer_idle_cycles += cycles().0 - idle_before;
+        idle_events += seen_after - seen_before;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let (off_cycles, on_cycles) = (median(off.clone()), median(on.clone()));
+    eprintln!("workload thread CPU (cycles) off {off:?} on {on:?}");
+    eprintln!(
+        "storm of {FILES} create/write/read/delete: thread CPU median off {off_cycles} cycles, \
+         on {on_cycles} ({:+.1}%, {:+.0} cycles per file)",
+        (on_cycles as f64 / off_cycles as f64 - 1.0) * 100.0,
+        (on_cycles as f64 - off_cycles as f64) / FILES as f64
+    );
+    eprintln!(
+        "consumer CPU during the storm (cycles): {consumer_busy:?}, median {} = {:.0} cycles per file",
+        median(consumer_busy.clone()),
+        median(consumer_busy.clone()) as f64 / FILES as f64
+    );
+    eprintln!(
+        "idle: {idle_events} file records in 30 s ({:.0}/s machine-wide), consumer {} Mcycles \
+         ({:.0} cycles per record; {:.2}% of one 4 GHz core)",
+        idle_events as f64 / 30.0,
+        consumer_idle_cycles / 1_000_000,
+        consumer_idle_cycles as f64 / idle_events.max(1) as f64,
+        consumer_idle_cycles as f64 / (30.0 * 4.0e9) * 100.0
+    );
+}
+
 /// Follow a live process through the production trace for 15 s and print
 /// what each step saw: the handle-table names, then the sample. Set
 /// `TASKMAN_FILE_TRACE_PID`; skipped without it.
@@ -1539,7 +1730,8 @@ fn the_file_trace_follows_a_live_process() {
         Ok(snapshot) => {
             let accounting = &snapshot.accounting;
             eprintln!(
-                "request path: state={:?} since={} ms r/w={}/{} bytes r/w={}/{} unnamed r/w={}/{}",
+                "request path: state={:?} since={} ms r/w={}/{} bytes r/w={}/{} unnamed r/w={}/{} \
+                 since_start={} counter window r/w={:?}/{:?}",
                 accounting.state,
                 accounting.since_ms,
                 accounting.read_ops,
@@ -1547,7 +1739,10 @@ fn the_file_trace_follows_a_live_process() {
                 accounting.read_bytes,
                 accounting.write_bytes,
                 accounting.unnamed_read_bytes,
-                accounting.unnamed_write_bytes
+                accounting.unnamed_write_bytes,
+                accounting.traced_since_process_start,
+                accounting.counter_window_read_bytes,
+                accounting.counter_window_write_bytes
             );
             for file in &snapshot.files {
                 eprintln!(

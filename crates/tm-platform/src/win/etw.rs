@@ -30,10 +30,11 @@ use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG,
     EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_FILE_IO_INIT, EVENT_TRACE_FLAG_IMAGE_LOAD,
-    EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
-    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE,
-    EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
-    PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD,
+    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+    EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
+    SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -183,8 +184,11 @@ pub(crate) enum LoggerKind {
     /// (Create, Cleanup, Close, Read, Write and the rest of the request
     /// family, opcodes 64 and up) plus `EVENT_TRACE_FLAG_FILE_IO`, which adds
     /// the `OpEnd` completion (opcode 76) carrying the bytes a request really
-    /// transferred. Both were measured live on Windows 11 build 26300: the
-    /// `FILE_IO` flag ALONE delivers nothing but `OpEnd`, and the SystemIo
+    /// transferred, plus `EVENT_TRACE_FLAG_PROCESS` for process exits (one
+    /// record per process start/exit) so a long-running session forgets an
+    /// exited process at once. The file flags were measured live on Windows
+    /// 11 build 26300: the `FILE_IO` flag ALONE delivers nothing but `OpEnd`,
+    /// and the SystemIo
     /// provider's `SYSTEM_IO_KW_FILE` keyword delivers the same `OpEnd`-only
     /// stream — which is what earlier builds subscribed with, and why they never
     /// saw a single Read or Write. No provider is enabled on this kind.
@@ -586,15 +590,15 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         // the logger. Request the corresponding legacy flags up front so a
         // loader/sample session reliably receives that initial state.
         // Both file kinds subscribe through these flags and nothing else: the
-        // request family (`FILE_IO_INIT`) plus its completions (`FILE_IO`);
-        // see [`LoggerKind::SystemFile`].
+        // request family (`FILE_IO_INIT`), its completions (`FILE_IO`), and
+        // process start/exit (`PROCESS`, one record per process) so a long
+        // session drops an exited process's accounting at once; see
+        // [`LoggerKind::SystemFile`].
         (*properties).EnableFlags = match kind {
             LoggerKind::Manifest | LoggerKind::System => EVENT_TRACE_FLAG::default(),
             LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
             LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
-            LoggerKind::SystemFile | LoggerKind::KernelFile => {
-                EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO
-            }
+            LoggerKind::SystemFile | LoggerKind::KernelFile => FILE_SESSION_FLAGS,
         };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
@@ -617,6 +621,11 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
     }
     buffer
 }
+
+/// What both per-file session kinds subscribe to; see [`LoggerKind::SystemFile`].
+pub(crate) const FILE_SESSION_FLAGS: EVENT_TRACE_FLAG = EVENT_TRACE_FLAG(
+    EVENT_TRACE_FLAG_FILE_IO_INIT.0 | EVENT_TRACE_FLAG_FILE_IO.0 | EVENT_TRACE_FLAG_PROCESS.0,
+);
 
 /// Start the session, retrying once after clearing a stale session of the
 /// same name (left behind by a crash).
@@ -789,9 +798,16 @@ mod tests {
                 (*properties).LogFileMode,
                 EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
             );
-            assert_eq!(
-                (*properties).EnableFlags,
-                EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO
+            assert_eq!((*properties).EnableFlags, FILE_SESSION_FLAGS);
+            assert!(
+                (*properties)
+                    .EnableFlags
+                    .contains(EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO),
+                "requests and their completions"
+            );
+            assert!(
+                (*properties).EnableFlags.contains(EVENT_TRACE_FLAG_PROCESS),
+                "process exits end a process's accounting"
             );
             // Every request and completion on the machine.
             assert_eq!((*properties).BufferSize, 256);
@@ -843,9 +859,16 @@ mod tests {
             // Only the file class: the kernel logger is shared, so asking for
             // more would multiply the rate for every other consumer's session
             // as well as ours.
-            assert_eq!(
-                (*properties).EnableFlags,
-                EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO
+            assert_eq!((*properties).EnableFlags, FILE_SESSION_FLAGS);
+            assert!(
+                (*properties)
+                    .EnableFlags
+                    .contains(EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO),
+                "requests and their completions"
+            );
+            assert!(
+                (*properties).EnableFlags.contains(EVENT_TRACE_FLAG_PROCESS),
+                "process exits end a process's accounting"
             );
             assert_eq!(
                 (*properties).LogFileMode,

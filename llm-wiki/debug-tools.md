@@ -89,6 +89,14 @@ rights. The per-file probe prints which of the ordered attempts actually started
 the refusal that stopped both, then checks exact (read, written) bytes for a file
 opened before the trace started (named from the handle table) and one opened
 after it (named by its Create), with cache-flush paging writes excluded.
+`the_file_trace_covers_a_process_from_its_start` (ignored) spawns a child
+after the trace started and checks `traced_since_process_start`, its exact file
+row and a counter window that also holds its writes to `NUL`.
+`the_file_trace_costs_little` (ignored; build it with `--release`) measures the
+trace's cost in CPU CYCLES of the issuing thread and of the consumer
+(`QueryThreadCycleTime`/`QueryProcessCycleTime`), so other load on the machine
+does not enter the numbers — wall-clock timing did, and `GetThreadTimes` is
+quantized to 15.6 ms.
 `the_file_trace_follows_a_live_process` (also ignored) follows another process:
 set `TASKMAN_FILE_TRACE_PID`, and it prints the handle-table names, the trace's
 own 15 s sample and then 20 s of the GUI's request path (`WinActions`, broker

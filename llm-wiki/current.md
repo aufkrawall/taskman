@@ -973,8 +973,34 @@ rebase runbook.
   stay `None`; `/proc/<pid>/io` fills only the explicit process-wide counter
   fields and leaves the accounting state unavailable.
   Per-file read and written bytes (2026-11-25) come from an elevated kernel
-  `FileIo` trace (`win/file_etw.rs`), started on demand and stopped by the same
-  idle watchdog as the disk and network traces. Two hosts exist and keep
+  `FileIo` trace (`win/file_etw.rs`) that runs for its HOST's whole life: the
+  service starts it when it becomes ready, and an elevated GUI with no service
+  starts its own once after start-up (`PlatformActions::
+  start_background_accounting`, off the UI thread, after a broker `Ping`
+  fails). It is no longer idle-stopped with the page: a 60 s maintenance
+  thread restarts a session stopped underneath it and prunes exited
+  processes. The session also carries `EVENT_TRACE_FLAG_PROCESS`; a
+  `Process/End` record (opcode 2, pid at payload offset `P`) drops the
+  process's buckets, names, pending requests and waiting bytes at once, so a
+  reused pid inherits nothing. Coverage is stated: a process created after the
+  session started (creation ticks > session start) has its whole life traced
+  (`traced_since_process_start`); for older ones the session snapshots every
+  process's `IO_COUNTERS` just before it starts
+  (`process_file_io::snapshot_io_counters`), and `attach_file_io` turns the
+  baseline into `counter_window_*` — the process's own counters over exactly
+  the traced window. The page's second line compares them with the file
+  bytes ("files got X of Y read and … written, the rest went to pipes,
+  devices or the network"), which is what explains busy I/O graphs over a
+  table of zeros (greencurve-service's IPC). Path budgets now EVICT the least
+  recently used closed paths (a quarter at a time, never an open one) into the
+  omitted remainder instead of refusing new files. One file object can be
+  named for several processes (`OpenFile::others`): an inherited or
+  duplicated handle — a parent's redirected stdout written by its child — is
+  charged to every process the handle table shows holding it; waiting bytes
+  are kept per (object, process). Measured cost (CPU cycles of the threads
+  involved, `the_file_trace_costs_little`): ~900 consumer cycles per record,
+  0.2% of one core at an idle desktop's ~8.6k records/s; no measurable change
+  in an issuing thread's own CPU. Two hosts exist and keep
   separate fixed session names (`FileTraceHost` in `core_service.rs`): the
   installed LocalSystem service (`TaskMan-File-Service`) answers `ProcessFileIo`
   requests from its own session, and the GUI (`TaskMan-File-App`) hosts the same
@@ -1035,15 +1061,16 @@ rebase runbook.
   `events_lost`, `dropped_paths` and `cleared_file_objects` are appended to the
   note; the note is suppressed while a displayed row still carries a count.
   An app-side start that fails (the ordinary unelevated GUI) is throttled for
-  `APP_FILE_TRACE_RETRY`, and a session is only kept while its idle watchdog
-  runs. Bounds: `MAX_OPEN_FILES`, `MAX_PENDING_REQUESTS`,
+  `APP_FILE_TRACE_RETRY`, and a session is only kept while its maintenance
+  thread runs. Bounds: `MAX_OPEN_FILES`, `MAX_PENDING_REQUESTS`,
   `MAX_UNRESOLVED_OBJECTS` (bytes waiting for a name; past it they are unnamed)
   and the per-process/session path budgets (past them bytes go to the omitted
   remainder, counted). Rows plus the unnamed and omitted remainders are the
   process total. Limits: a handle duplicated into another process keeps that
   process's bytes unnamed; an object closed before it could be named stays
   unnamed; `events_lost` makes every count a lower bound; totals restart when
-  the idle watchdog stops the session; the payloads carry only the object
+  a session is restarted (service restart, an external stop); the payloads
+  carry only the object
   address, so a missed Close plus Create pair within one process can still
   charge a reused address to the earlier name.
   Threads come from one

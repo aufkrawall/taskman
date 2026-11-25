@@ -38,7 +38,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v12 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v13 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected. v12 makes the creation-time identity token explicit
   100-ns ticks; a GUI and service from different versions fail at the
@@ -203,7 +203,14 @@ and elevated targets without requiring elevated GUI tokens. Protocol v12 makes
 the creation-time token 100-ns ticks (previously Unix seconds) and bumps the
 version so a new GUI against an older running service fails at the handshake
 with "unsupported broker protocol version" instead of reporting every
-protected target as exited. The counter
+protected target as exited. Protocol v13 adds the per-file trace's coverage
+to `FileIoAccounting` (`traced_since_process_start`,
+`counter_window_read_bytes`/`counter_window_write_bytes`). The per-file trace
+itself is NOT idle-stopped any more: the service starts it right after
+`on_ready` (thread `tm-file-start`) and keeps it for its whole life, with a
+60 s maintenance thread (`tm-file-maint`) that restarts a session stopped
+underneath it and prunes exited processes (exit records do this first). The
+counter
 endpoints take no parameters, can change nothing, drain or prune server-side
 against the service's own idea of which PIDs are live, are capped per
 response, and stop their trace on an idle watchdog once the GUI stops polling.

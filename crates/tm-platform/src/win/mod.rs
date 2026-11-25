@@ -641,6 +641,9 @@ impl PlatformActions for WinActions {
     fn is_elevated(&self) -> bool {
         process_ops::is_elevated()
     }
+    fn start_background_accounting(&self) {
+        core_service::ensure_app_file_trace_unless_served();
+    }
     fn elevation_status(&self) -> Option<bool> {
         process_ops::elevation_status()
     }
