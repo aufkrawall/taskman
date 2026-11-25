@@ -647,7 +647,13 @@ impl WgpuWinitRunning<'_> {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
-            let SharedState { egui_ctx, viewports, painter, residency, .. } = &mut *shared_lock;
+            let SharedState {
+                egui_ctx,
+                viewports,
+                painter,
+                residency,
+                ..
+            } = &mut *shared_lock;
 
             if viewport_id != ViewportId::ROOT {
                 let Some(viewport) = viewports.get(&viewport_id) else {
@@ -801,7 +807,12 @@ impl WgpuWinitRunning<'_> {
 
             {
                 let mut shared_mut = shared.borrow_mut();
-                let SharedState { egui_ctx, painter, residency, .. } = &mut *shared_mut;
+                let SharedState {
+                    egui_ctx,
+                    painter,
+                    residency,
+                    ..
+                } = &mut *shared_mut;
                 apply_residency(
                     &mut integration.frame.wgpu_render_state,
                     painter,
@@ -1761,9 +1772,24 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!effective_viewport_visible(minimized.visible(), None, Some(true), true));
-        assert!(!effective_viewport_visible(occluded.visible(), None, Some(true), true));
-        assert!(effective_viewport_visible(shown.visible(), None, Some(true), false));
+        assert!(!effective_viewport_visible(
+            minimized.visible(),
+            None,
+            Some(true),
+            true
+        ));
+        assert!(!effective_viewport_visible(
+            occluded.visible(),
+            None,
+            Some(true),
+            true
+        ));
+        assert!(effective_viewport_visible(
+            shown.visible(),
+            None,
+            Some(true),
+            false
+        ));
 
         // A viewport without a window cannot paint, whatever its info claims.
         let mut viewport = test_viewport(ViewportId::ROOT, ViewportId::ROOT);

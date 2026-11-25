@@ -111,7 +111,9 @@ impl ResidencyTimer {
     /// repaint with [`Self::remaining_grace`], so a hidden window leaves this loop and comes
     /// back once, when the device can go.
     pub fn observe(&mut self, now: Instant, visible: bool) -> ResidencyAction {
-        let hidden_for = self.hidden_since.map(|since| now.saturating_duration_since(since));
+        let hidden_for = self
+            .hidden_since
+            .map(|since| now.saturating_duration_since(since));
         let action = residency_action(visible, hidden_for, self.paused, HIDDEN_RESIDENCY_GRACE);
 
         match action {

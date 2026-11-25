@@ -645,7 +645,8 @@ impl Painter {
                 let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
                 self.ensured.record(has_lcd_pipeline);
                 report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
-                self.texture_snapshots.replay_into(&self.context, render_state);
+                self.texture_snapshots
+                    .replay_into(&self.context, render_state);
             }
             return;
         }
@@ -660,7 +661,8 @@ impl Painter {
         let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
         self.ensured.record(has_lcd_pipeline);
         report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
-        self.texture_snapshots.replay_into(&self.context, render_state);
+        self.texture_snapshots
+            .replay_into(&self.context, render_state);
     }
 
     /// Inserts a freshly created surface into [`Self::surfaces`] and configures it.
@@ -932,7 +934,9 @@ impl Painter {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("egui_clear_encoder"),
                 });
-        let target_view = output_frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let target_view = output_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         {
             profiling::scope!("clear_render_pass");
             // No MSAA and no depth attachment: nothing is drawn, so there is nothing to
@@ -1689,7 +1693,10 @@ mod tests {
         primer.mark_new_surface(second_viewport());
 
         primer.mark_presented(ViewportId::ROOT);
-        assert!(!primer.needs_primer(ViewportId::ROOT), "the root viewport presented");
+        assert!(
+            !primer.needs_primer(ViewportId::ROOT),
+            "the root viewport presented"
+        );
         assert!(
             primer.needs_primer(second_viewport()),
             "the second viewport has not presented yet, whatever the root did"
@@ -1769,7 +1776,9 @@ mod tests {
         assert!(timings.late_renderer_message().is_none());
 
         timings.renderer_ms = Some(13.5);
-        let message = timings.late_renderer_message().expect("late phase reported");
+        let message = timings
+            .late_renderer_message()
+            .expect("late phase reported");
         assert!(message.contains("pipelines compiled 13.5 ms"), "{message}");
     }
 
@@ -1785,6 +1794,9 @@ mod tests {
         assert_eq!(timings.device_ms, Some(first_device_ms));
 
         assert!(timings.first_present_message().is_some());
-        assert!(timings.first_present_message().is_none(), "reported only once");
+        assert!(
+            timings.first_present_message().is_none(),
+            "reported only once"
+        );
     }
 }

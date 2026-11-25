@@ -700,12 +700,7 @@ fn run_gui(mock: bool, args: &[String]) {
             fonts::install_async(cc.egui_ctx.clone());
             StartupTrace::mark("visuals_installed");
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
-            let shell = NativeApp::new(
-                application,
-                &cc.egui_ctx,
-                start_hidden,
-                native_activation,
-            );
+            let shell = NativeApp::new(application, &cc.egui_ctx, start_hidden, native_activation);
             StartupTrace::mark("native_shell_ready");
             Ok(Box::new(shell) as Box<dyn eframe::App>)
         };

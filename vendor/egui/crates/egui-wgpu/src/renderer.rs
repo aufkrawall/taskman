@@ -1733,9 +1733,16 @@ mod tests {
         // The second is a source that parses but does not validate: `@blend_src` may only be
         // 0 or 1.
         let broken = lcd_shader_source().replace("@blend_src(1)", "@blend_src(2)");
-        assert_ne!(broken, lcd_shader_source(), "the shader must use @blend_src(1)");
+        assert_ne!(
+            broken,
+            lcd_shader_source(),
+            "the shader must use @blend_src(1)"
+        );
         let validation = validate_lcd_shader_source(&broken);
-        assert!(validation.is_err(), "an out-of-range blend source must fail");
+        assert!(
+            validation.is_err(),
+            "an out-of-range blend source must fail"
+        );
 
         // End to end: the same device, with this source's validation outcome, is not capable.
         assert!(!subpixel_text_supported(

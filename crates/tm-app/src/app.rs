@@ -2337,7 +2337,10 @@ pub(crate) enum StartupTask {
 
 /// The order [`TaskManApp::new`] hands its deferred work over in.
 pub(crate) fn startup_tasks(impact_path: Option<std::path::PathBuf>) -> Vec<StartupTask> {
-    vec![StartupTask::LoadStartupImpact(impact_path), StartupTask::StartSampling]
+    vec![
+        StartupTask::LoadStartupImpact(impact_path),
+        StartupTask::StartSampling,
+    ]
 }
 
 /// What the deferred startup work should do in one data pass.
@@ -3731,7 +3734,10 @@ mod tests {
     fn the_impact_store_loads_before_sampling_starts() {
         let path = std::path::PathBuf::from("startup-impact.json");
         let load = StartupTask::LoadStartupImpact(Some(path.clone()));
-        assert_eq!(startup_tasks(Some(path)), vec![load, StartupTask::StartSampling]);
+        assert_eq!(
+            startup_tasks(Some(path)),
+            vec![load, StartupTask::StartSampling]
+        );
         // A mock session keeps the store in memory and touches no file.
         let mock = StartupTask::LoadStartupImpact(None);
         assert_eq!(startup_tasks(None), vec![mock, StartupTask::StartSampling]);
