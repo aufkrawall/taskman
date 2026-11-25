@@ -25,6 +25,7 @@
 //! item's command line can be resolved to the process it launched.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -220,15 +221,47 @@ pub struct ImpactStore {
     dirty: bool,
 }
 
+/// Cap on the store read, the same one the app-history store uses: the file is
+/// a map of small records, and this load runs on the deferred startup path in
+/// the GUI process, so a corrupt or hostile multi-gigabyte file must fail like a
+/// corrupt one instead of being allocated whole.
+const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The store's text, at most [`MAX_STORE_BYTES`].
+///
+/// A file over the cap is an `InvalidData` error rather than an unbounded
+/// allocation, so [`ImpactStore::open`] handles it through the same arm that
+/// keeps a structurally corrupt file aside: it is real bytes the user may
+/// still want to recover, not something to delete.
+fn read_store_text(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    file.take((MAX_STORE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the {MAX_STORE_BYTES}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 impl ImpactStore {
     /// Load from `path`; a missing or corrupt file yields an empty store
     /// rather than an error — losing measurements must never block startup.
     /// A corrupt file with bytes in it is kept aside rather than overwritten;
     /// one that says nothing — no bytes, whitespace only, or NUL-filled — is
     /// removed instead, since moving it aside would only take the `.bad` name
-    /// from a copy that still has measurements.
+    /// from a copy that still has measurements. A file larger than
+    /// [`MAX_STORE_BYTES`] counts as corrupt: it is kept aside, never read
+    /// whole.
     pub fn open(path: PathBuf) -> Self {
-        let entries = match std::fs::read_to_string(&path) {
+        let entries = match read_store_text(&path) {
             Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
                 Ok(file) => file.entries,
                 Err(_) => {
@@ -524,6 +557,44 @@ mod tests {
             std::fs::read_to_string(&aside).unwrap(),
             "the last recoverable copy",
             "a store that says nothing must not replace the copy kept aside earlier"
+        );
+    }
+
+    /// A file over the read cap takes the same "kept aside" path as a
+    /// structurally corrupt one. It was read with `read_to_string`, i.e.
+    /// allocated whole on the GUI's deferred startup path, so a runaway or
+    /// hostile file could exhaust memory before this branch was ever reached.
+    #[test]
+    fn an_oversized_store_is_kept_aside_instead_of_allocated() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup-impact.json");
+        let aside = dir.path().join("startup-impact.json.bad");
+        let written = {
+            let mut file = std::fs::File::create(&path).unwrap();
+            // In chunks: what matters is the size on disk, not this process's
+            // heap. One byte over the cap is what the reader must refuse.
+            let chunk = [b'x'; 64 * 1024];
+            let mut written = 0usize;
+            while written <= MAX_STORE_BYTES {
+                file.write_all(&chunk).unwrap();
+                written += chunk.len();
+            }
+            written
+        };
+
+        let store = ImpactStore::open(path.clone());
+
+        assert!(store.is_empty());
+        assert!(
+            !path.exists(),
+            "a file the loader refuses must not stay where the next save writes"
+        );
+        assert_eq!(
+            std::fs::metadata(&aside).unwrap().len() as usize,
+            written,
+            "real bytes are kept for recovery, not deleted"
         );
     }
 }
