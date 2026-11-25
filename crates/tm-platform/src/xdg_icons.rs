@@ -653,7 +653,17 @@ fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    let paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    sorted(paths)
+}
+
+/// `paths` sorted by name — the one rule that decides a shared icon name.
+///
+/// Kept apart from the directory walk so the order itself can be pinned: a walk
+/// can only be tested through the filesystem, and a host whose `read_dir`
+/// already lists directories in name order (NTFS collates names) makes a sorted
+/// and an unsorted walk indistinguishable.
+fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.sort();
     paths
 }
@@ -2339,6 +2349,21 @@ mod tests {
     /// The `<context>` directory a resolved icon file lives in.
     fn context_dir_of(path: &Path) -> Option<&str> {
         path.parent()?.file_name()?.to_str()
+    }
+
+    /// The sort that decides a shared icon name, pinned without the filesystem.
+    ///
+    /// `read_dir` cannot be trusted to expose an unsorted order here: NTFS
+    /// collates names, so a walk-based test would pass with the sort removed.
+    #[test]
+    fn the_context_sort_orders_by_name() {
+        let size_dir = Path::new("/icons/32x32");
+        let mimetypes = size_dir.join("mimetypes");
+        let apps = size_dir.join("apps");
+        assert_eq!(
+            sorted(vec![mimetypes.clone(), apps.clone()]),
+            vec![apps, mimetypes]
+        );
     }
 
     /// One icon name can exist in several contexts of the same size dir, so the
