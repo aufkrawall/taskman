@@ -130,8 +130,14 @@ impl DibSurface {
                 ..Default::default()
             };
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let bitmap =
-                CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let created =
+                CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+            let Ok(bitmap) = created else {
+                // The device context is ours to release, and this exit does not
+                // go through `Drop`.
+                let _ = DeleteDC(hdc);
+                return None;
+            };
             if bitmap.is_invalid() || bits.is_null() {
                 if !bitmap.is_invalid() {
                     let _ = DeleteObject(HGDIOBJ(bitmap.0));
@@ -1025,6 +1031,47 @@ mod tests {
     use crate::win::taskbar_monitor::placement::solve_taskbar_placement;
     use crate::win::taskbar_monitor::test_support::rect;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+
+    /// Regression: `CreateDIBSection` failing is the one exit of `DibSurface::new`
+    /// that does not go through `Drop`, and it used to return before the device
+    /// context was released, leaving one GDI object behind per refusal.
+    #[test]
+    fn a_refused_dib_section_does_not_leak_its_device_context() {
+        use windows::Win32::System::Threading::{
+            GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
+        };
+
+        let gdi_objects = || unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
+
+        // Control: a live `DibSurface` owns a device context and a bitmap, so
+        // the counter must move. Without this the check below would also pass
+        // on a build where the query answers nothing at all.
+        let baseline = gdi_objects();
+        let held = DibSurface::new(8, 8).expect("small DIB section");
+        let with_surface = gdi_objects();
+        drop(held);
+        assert!(
+            with_surface > baseline,
+            "GetGuiResources(GR_GDIOBJECTS) must count GDI objects"
+        );
+
+        // A DIB section larger than any address space is refused by
+        // `CreateDIBSection`, which is the exit that leaked. Other tests run in
+        // parallel and may hold GDI objects of their own, so the count is
+        // allowed to drift; 32 leaks are not drift.
+        let before = gdi_objects();
+        for _ in 0..32 {
+            assert!(
+                DibSurface::new(i32::MAX / 2, i32::MAX / 2).is_none(),
+                "a DIB section larger than any address space must be refused"
+            );
+        }
+        let leaked = gdi_objects().saturating_sub(before);
+        assert!(
+            leaked < 16,
+            "refusing 32 DIB sections leaked {leaked} GDI object(s)"
+        );
+    }
 
     #[test]
     fn rendered_text_pixels_fall_inside_layered_bitmap_bounds() {

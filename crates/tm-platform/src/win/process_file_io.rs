@@ -289,7 +289,14 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
         });
     }
 
-    let header = unsafe { &*buf.as_ptr().cast::<ProcessHandleSnapshotInformation>() };
+    // The snapshot arrives in a byte buffer, so its records are only
+    // byte-aligned: they are read out unaligned instead of by reference, which
+    // would require an alignment `Vec<u8>` does not guarantee.
+    let header = unsafe {
+        buf.as_ptr()
+            .cast::<ProcessHandleSnapshotInformation>()
+            .read_unaligned()
+    };
     let max_entries = (buf.len() - header_size) / entry_size;
     let count = header.number_of_handles.min(max_entries);
 
@@ -299,18 +306,29 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
             .cast::<ProcessHandleTableEntryInfo>()
     };
     let current_proc = unsafe { th::GetCurrentProcess() };
+    // `inspect_handle` may only ask `GetFileType` about the handle when the
+    // table being walked is this process's own; see `may_probe_local_handle_table`.
+    let probe_locally = may_probe_local_handle_table(
+        unsafe { th::GetProcessId(h_process) },
+        unsafe { th::GetCurrentProcessId() },
+    );
 
     let mut map: HashMap<String, ProcessFileIo> = HashMap::new();
     let mut path_buf = vec![0u16; 1024];
     let mut complete = count == header.number_of_handles;
 
     for i in 0..count {
-        let entry = unsafe { *entries_ptr.add(i) };
+        let entry = unsafe { entries_ptr.add(i).read_unaligned() };
         if entry.handle_value == 0 || entry.handle_attributes & OBJ_KERNEL_HANDLE != 0 {
             continue;
         }
-        let facts = match inspect_handle(h_process, current_proc, entry.handle_value, &mut path_buf)
-        {
+        let facts = match inspect_handle(
+            h_process,
+            current_proc,
+            entry.handle_value,
+            probe_locally,
+            &mut path_buf,
+        ) {
             Ok(Some(facts)) => facts,
             Ok(None) => continue,
             Err(()) => {
@@ -386,21 +404,37 @@ fn access_flags(granted_access: Option<u32>) -> (bool, bool) {
     )
 }
 
+/// Whether a handle taken from the enumerated process may be type-probed with
+/// `GetFileType` in this process's own handle table.
+///
+/// `GetFileType` resolves its argument in the CALLING process's table, so the
+/// answer only describes the enumerated process when that process is this one.
+/// For any other process the same numeric value names nothing here, or names an
+/// unrelated local object, and using that answer as the type of the target's
+/// handle silently drops the file. An unknown PID (0) is never this process.
+fn may_probe_local_handle_table(enumerated_pid: u32, self_pid: u32) -> bool {
+    enumerated_pid != 0 && enumerated_pid == self_pid
+}
+
 /// Duplicates `handle_value` out of `h_process` and inspects the duplicate
 /// read-only. Returns `None` for handles that are gone, are not disk files,
 /// are directories, or have no resolvable path.
+///
+/// `probe_locally` is [`may_probe_local_handle_table`]: it enables a cheap
+/// pre-copy type probe that is only valid for this process's own handles.
 fn inspect_handle(
     h_process: HANDLE,
     current_proc: HANDLE,
     handle_value: usize,
+    probe_locally: bool,
     path_buf: &mut [u16],
 ) -> HandleInspection<Option<HandleFacts>> {
     let source = HANDLE(handle_value as *mut core::ffi::c_void);
-    // Query the local handle table entry before asking PROCESS_DUP_HANDLE to
-    // copy it. Most of a real process's table is non-files; protected or
-    // non-duplicable special handles must not turn a complete file walk into
-    // an incomplete one.
-    if unsafe { GetFileType(source) } != FILE_TYPE_DISK {
+    // Most of a real process's table is non-files, and a protected or
+    // non-duplicable special handle must not turn a complete file walk into an
+    // incomplete one, so skip what is already known not to be a disk file.
+    // Only this process's table can answer that (see the doc above).
+    if probe_locally && unsafe { GetFileType(source) } != FILE_TYPE_DISK {
         return Ok(None);
     }
     let mut dup = HANDLE::default();
@@ -580,6 +614,7 @@ mod tests {
             current,
             current,
             file.as_raw_handle() as usize,
+            true,
             &mut path_buf,
         )
         .expect("open disk file inspection")
@@ -595,6 +630,7 @@ mod tests {
             current,
             current,
             file.as_raw_handle() as usize,
+            true,
             &mut path_buf,
         )
         .expect("open disk file inspection")
@@ -610,6 +646,28 @@ mod tests {
         assert_eq!(access_flags(None), (false, false));
         assert_eq!(access_flags(Some(GENERIC_READ)), (true, false));
         assert_eq!(access_flags(Some(FILE_APPEND_DATA)), (false, true));
+    }
+
+    /// Regression: the pre-copy `GetFileType` short-circuit used to run against
+    /// the target's handle values in THIS process's table, so every file of a
+    /// foreign process was dropped unless a local handle happened to sit at the
+    /// same value and be a disk file. The probe may only ever describe our own
+    /// table. A second process is needed to observe the end-to-end effect; it
+    /// belongs in `tests/integration.rs`, which this module cannot reach.
+    #[test]
+    fn only_own_process_handles_are_type_probed_locally() {
+        assert!(
+            may_probe_local_handle_table(4242, 4242),
+            "the enumerated process's own handles may be probed in our table"
+        );
+        assert!(
+            !may_probe_local_handle_table(4241, 4242),
+            "another process's handle value names nothing in our table"
+        );
+        assert!(
+            !may_probe_local_handle_table(0, 4242),
+            "an unknown PID must not be treated as this process"
+        );
     }
 
     #[test]
