@@ -91,6 +91,7 @@
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetUpdateRect, HBRUSH, HDC, HGDIOBJ,
 };
@@ -357,22 +358,18 @@ pub fn install_present_gate(hwnd: isize, background: [u8; 3], wake: Arc<dyn Fn()
         gate.hold();
     }
     // Cloak outside the lock: this is a DWM call, and holding the gate's mutex
-    // across it buys nothing.
-    if cloak_window(hwnd) {
-        tracing::debug!(
-            hwnd,
-            ?background,
-            subclassed,
-            "presentation gate installed and holding the window cloaked"
-        );
-    } else {
-        tracing::debug!(
-            hwnd,
-            ?background,
-            subclassed,
-            "presentation gate installed; gate held, cloak refused"
-        );
-    }
+    // across it buys nothing. The hold is recorded above and stands even when
+    // DWM refuses the write, so this reports the mask the window carries rather
+    // than the state the gate asked for: `Some(0)` next to the refusal warning
+    // says the write did not land, and a nonzero mask names whichever party
+    // cloaks the window.
+    tracing::debug!(
+        hwnd,
+        ?background,
+        subclassed,
+        cloak_bits = ?cloak_window(hwnd),
+        "presentation gate installed; gate holding the window"
+    );
 }
 
 /// Take the gate down: uncloak if it was holding, remove the subclass, hand the
@@ -460,19 +457,20 @@ pub fn present_gate_hold(hwnd: isize) {
     };
     let target = if hwnd != 0 { hwnd } else { held_hwnd };
     // The hold is recorded before the cloak and stands even when DWM refuses
-    // the write, so this reports what the window carries rather than what the
-    // gate asked for.
+    // the write, so this reports the mask the window carries rather than what
+    // the gate asked for: `Some(0)` is a window nothing cloaks, `None` a state
+    // DWM would not read, and a nonzero mask may be the shell's
+    // virtual-desktop cloak rather than this gate's.
     if target == 0 {
         tracing::debug!(
             hwnd = target,
             "presentation gate holding the window; no handle to cloak"
         );
-    } else if cloak_window(target) {
-        tracing::debug!(hwnd = target, "presentation gate holding the window cloaked");
     } else {
         tracing::debug!(
             hwnd = target,
-            "presentation gate holding the window; cloak refused"
+            cloak_bits = ?cloak_window(target),
+            "presentation gate holding the window"
         );
     }
 }
@@ -579,17 +577,42 @@ fn decide(hwnd: HWND, message: u32, wparam: usize, lparam: LPARAM) -> Option<Dec
     })
 }
 
-/// Cloak `hwnd` through the shared helper and report whether the window now
-/// carries the cloak.
+/// The `DWMWA_CLOAKED` mask DWM reports for `hwnd`, or `None` when the query
+/// fails.
+///
+/// The value is a mask over every party cloaking the window, not only this
+/// gate: `DWM_CLOAKED_APP` (1) is this process's own cloak, `DWM_CLOAKED_SHELL`
+/// (2) a virtual-desktop switch, and `DWM_CLOAKED_INHERITED` (4) a cloak
+/// inherited from a cloaked owner. Reading the mask is what lets a gate log
+/// report what the window carries instead of what the gate asked for, and what
+/// keeps a failed read from reading as "not cloaked".
+fn read_cloak_bits(hwnd: isize) -> Option<u32> {
+    let mut value: u32 = 0;
+    // SAFETY: `value` is a live `u32` of the size the call is told to write,
+    // and DWM reports a handle it cannot read as an error instead of writing.
+    let read = unsafe {
+        DwmGetWindowAttribute(
+            HWND(hwnd as *mut std::ffi::c_void),
+            DWMWA_CLOAKED,
+            (&raw mut value).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    read.is_ok().then_some(value)
+}
+
+/// Cloak `hwnd` through the shared helper and report the cloak state the
+/// compositor holds afterwards.
 ///
 /// `window_chrome::set_cloaked_raw` can only warn about a refused attribute
 /// write, so a gate log that repeated its own intent would sit next to that
-/// warning contradicting it. Reading the state back costs one
+/// warning contradicting it. Reading the mask back costs one
 /// `DwmGetWindowAttribute` per reveal and reports what the compositor holds,
-/// not what the gate asked for.
-fn cloak_window(hwnd: isize) -> bool {
+/// not what the gate asked for: `None` the read failed, `Some(bits)` the raw
+/// mask.
+fn cloak_window(hwnd: isize) -> Option<u32> {
     super::window_chrome::set_cloaked_raw(hwnd, true);
-    super::window_chrome::is_cloaked(hwnd)
+    read_cloak_bits(hwnd)
 }
 
 /// Re-cloak before Windows can compose the window, then ask for a frame.
@@ -601,14 +624,14 @@ fn unmask(hwnd: HWND, message: u32, decision: Decision) {
     // Re-cloaking BEFORE returning from the WndProc is the whole point: the
     // compositor must see a cloaked window at the moment Windows decides it is
     // shown, not one frame later.
-    let cloak_applied = cloak_window(raw);
+    let cloak_bits = cloak_window(raw);
     tracing::debug!(
         hwnd = raw,
         message,
         cause = ?decision.transition,
         held_before = decision.held_before,
         held_after = true,
-        cloak_applied,
+        ?cloak_bits,
         "presentation gate re-cloaked the window"
     );
     wake_app();
