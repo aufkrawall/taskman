@@ -12,6 +12,26 @@ use std::time::{Duration, Instant};
 /// what those providers actually measured instead of their warm-up state.
 const REQUIRED_TICKS: u64 = 4;
 
+/// Byte count in GB, rounded to the one decimal the summary has always shown.
+fn gb(bytes: u64) -> f64 {
+    (bytes as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0
+}
+
+/// Used and total memory in GB, or a pair of `None`s while the platform reports
+/// no memory at all.
+///
+/// A headless run reads this line to answer "did the memory provider work?".
+/// Publishing `0.0` for an unreported total made an unmeasured machine
+/// indistinguishable from an idle one; the neighbouring CPU and disk figures
+/// already answer `null` for exactly this reason, and the UI renders the same
+/// state as "\u{2014}".
+fn memory_gb(mem: &tm_core::model::MemoryInfo) -> (Option<f64>, Option<f64>) {
+    if mem.total_bytes == 0 {
+        return (None, None);
+    }
+    (Some(gb(mem.used_bytes)), Some(gb(mem.total_bytes)))
+}
+
 pub fn run(mock: bool) -> i32 {
     let t0 = Instant::now();
     let interval = Duration::from_millis(250);
@@ -56,6 +76,7 @@ pub fn run(mock: bool) -> i32 {
     } else {
         tm_platform::create_actions().capabilities().users_sessions
     };
+    let (memory_used_gb, memory_total_gb) = memory_gb(&snap.memory);
     let summary = serde_json::json!({
         "ok": true,
         "backend": if mock { "mock".to_string() } else { "platform".to_string() },
@@ -74,8 +95,8 @@ pub fn run(mock: bool) -> i32 {
             // Measured current frequency; only the CPU_SPEED provider fills it.
             "freq_mhz": snap.cpu.freq_mhz,
         },
-        "memory_used_gb": (snap.memory.used_bytes as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-        "memory_total_gb": (snap.memory.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+        "memory_used_gb": memory_used_gb,
+        "memory_total_gb": memory_total_gb,
         "processes": snap.processes.len(),
         "disks": snap.disks.len(),
         // The busiest disk's active time — the machine total both disk
@@ -309,4 +330,25 @@ pub fn run_code_samples() -> i32 {
     }
     println!("{summary}");
     if ok { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: an unreported memory figure was published as `0.0`, so a
+    /// headless run could not tell "no memory telemetry" from "idle machine".
+    /// The CPU and disk figures in the same summary already answer `null`.
+    #[test]
+    fn unreported_memory_publishes_null_not_zero() {
+        let unmeasured = tm_core::model::MemoryInfo::default();
+        assert_eq!(memory_gb(&unmeasured), (None, None));
+
+        let measured = tm_core::model::MemoryInfo {
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            used_bytes: 3 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(memory_gb(&measured), (Some(3.0), Some(16.0)));
+    }
 }

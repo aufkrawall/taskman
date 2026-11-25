@@ -659,6 +659,16 @@ struct Layout {
     cols: Vec<(f32, f32)>,
 }
 
+/// Column guide width in points: one PHYSICAL pixel at any display scale.
+///
+/// The header and the body paint the two halves of the same column boundary,
+/// so both ask for the width through this one function — two literals would
+/// drift apart at the first scale where `1.0` is not one pixel, and the seam
+/// between them is exactly where that shows.
+fn guide_width(ppp: f32) -> f32 {
+    if ppp > 0.0 { 1.0 / ppp } else { 1.0 }
+}
+
 /// One value cell: its heat intensity and the text it shows.
 ///
 /// The text BORROWS by default because a table paints its visible cells on
@@ -921,6 +931,23 @@ impl TmTable {
         rect.left() + off
     }
 
+    /// Left edge of the header cell for column `i`, accumulated from the live
+    /// column widths the way the header walks its cells.
+    ///
+    /// Deliberately computed from `col_width` instead of read out of the cached
+    /// [`Self::boundary_x`] layout: the header guide and the body divider draw
+    /// the same column boundary, and any future stretch/fit inside
+    /// `ensure_layout` would move the body's edge away from the header's
+    /// silently. Kept as its own function so a test can pin the two against
+    /// each other without painting a frame.
+    fn header_column_x(&self, rect: Rect, i: usize) -> f32 {
+        let mut x = rect.left();
+        for index in 0..i {
+            x += self.col_width(index);
+        }
+        x
+    }
+
     pub fn header(
         &mut self,
         ui: &mut egui::Ui,
@@ -1056,7 +1083,6 @@ impl TmTable {
                 node.set_column_index(active);
             });
         }
-        let mut x = rect.left();
         let mut agg_idx = 0usize;
 
         let mut bounds: Vec<f32> = (0..self.cols.len())
@@ -1087,6 +1113,7 @@ impl TmTable {
 
         for (i, col) in self.cols.iter().enumerate() {
             let w = self.col_width(i);
+            let x = self.header_column_x(rect, i);
             let cell =
                 Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + w, rect.bottom()));
 
@@ -1142,7 +1169,7 @@ impl TmTable {
                         Pos2::new(gx, rect.top() + 4.0),
                         Pos2::new(gx, rect.bottom() - 4.0),
                     ],
-                    Stroke::new(1.0 / ppp, pal.stroke),
+                    Stroke::new(guide_width(ppp), pal.stroke),
                 );
             }
 
@@ -1209,7 +1236,6 @@ impl TmTable {
                 .anchor_size(Pos2::new(tx, label_y), label_galley.size())
                 .min;
             label_painter.galley(label_pos, label_galley, pal.text_dim);
-            x += w;
         }
 
         for (i, &bx) in bounds.iter().enumerate().skip(1) {
@@ -1408,7 +1434,7 @@ impl TmTable {
             let x = self.boundary_x(rect, i).round_to_pixel_center(ppp);
             painter.line_segment(
                 [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                Stroke::new(1.0 / ppp, pal.stroke.gamma_multiply(0.72)),
+                Stroke::new(guide_width(ppp), pal.stroke.gamma_multiply(0.72)),
             );
         }
         (rect, resp)
@@ -2513,6 +2539,35 @@ mod tests {
         assert_eq!(t.col_width(2), 100.0);
         assert_eq!(t.total_width(), 640.0);
         assert_eq!(t.total_width(), t.total_width());
+    }
+
+    /// The header walks its own accumulated x while the body asks the cached
+    /// layout for `boundary_x`. Both paint the same column boundary, so they
+    /// must agree: a stretch/fit added to `ensure_layout`, or a header that
+    /// stopped accumulating its widths, would move one of them and reopen the
+    /// seam the previous fix closed — a guide hanging beside the body divider
+    /// underneath it.
+    #[test]
+    fn the_header_boundaries_match_the_body_layout() {
+        let t = table();
+        let rect = Rect::from_min_size(Pos2::new(37.0, 10.0), egui::vec2(t.total_width(), 32.0));
+        for i in 0..t.cols.len() {
+            assert_eq!(t.header_column_x(rect, i), t.boundary_x(rect, i));
+        }
+        // The end of the last column is the table's own right edge on both
+        // sides, which is what keeps the row dividers inside the header.
+        assert_eq!(t.header_column_x(rect, t.cols.len()), rect.left() + t.total_width());
+
+        // One PHYSICAL pixel at every scale: the header guide and the body
+        // divider may never be different widths, or the same boundary kinks at
+        // the seam between them.
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            assert!(
+                (guide_width(ppp) * ppp - 1.0).abs() < 1e-6,
+                "guide width at {ppp} is not one physical pixel"
+            );
+        }
+        assert_eq!(guide_width(0.0), 1.0, "a degenerate scale stays finite");
     }
 
     #[test]
