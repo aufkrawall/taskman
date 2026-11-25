@@ -313,6 +313,103 @@ fn font_subpixel_after(was: bool, delta: &epaint::ImageDelta) -> bool {
         .any(epaint::text::subpixel::is_lcd_texel)
 }
 
+/// Whether this upload has to be converted to grayscale coverage.
+///
+/// "The atlas is rasterized for per-channel coverage" and "this renderer can blend that" are
+/// two independent facts. The second is decided from a prediction ([`Renderer::new`] only builds
+/// the LCD pipeline when `supports_subpixel_text` allows it) and the backend can still refuse
+/// it, so an LCD atlas can arrive at a renderer that will draw it with the ordinary
+/// premultiplied blend. There its alpha of zero makes glyph texels invisible on a dark
+/// background and additive on a light one, so the upload is converted instead: degraded
+/// antialiased text, never corrupted text.
+fn atlas_upload_needs_grayscale(
+    texture_id: epaint::TextureId,
+    lcd_pipeline_present: bool,
+    font_atlas_has_subpixel: bool,
+) -> bool {
+    !lcd_pipeline_present && texture_id == epaint::TextureId::default() && font_atlas_has_subpixel
+}
+
+/// The grayscale form of one atlas texel, for a renderer without the LCD pipeline.
+///
+/// An LCD-tagged texel stores one coverage per channel and alpha zero; the mean of the three
+/// is its coverage, stored premultiplied — the same rule `egui_software`'s transformed-text
+/// fallback uses, so degraded WGPU text weighs like degraded CPU text. Every other texel
+/// (grayscale glyph, color glyph, zero coverage) is already what the ordinary blend expects and
+/// is returned unchanged.
+fn lcd_texel_as_grayscale(texel: epaint::Color32) -> epaint::Color32 {
+    if !epaint::text::subpixel::is_lcd_texel(texel) {
+        return texel;
+    }
+    let [r, g, b, _] = texel.to_array();
+    let gray = ((u32::from(r) + u32::from(g) + u32::from(b) + 1) / 3) as u8;
+    epaint::Color32::from_rgba_premultiplied(gray, gray, gray, gray)
+}
+
+#[cfg(test)]
+mod lcd_degradation_tests {
+    use super::{atlas_upload_needs_grayscale, lcd_texel_as_grayscale};
+    use epaint::{Color32, TextureId};
+
+    #[test]
+    fn an_lcd_atlas_is_degraded_only_without_the_pipeline() {
+        // The pipeline exists: the atlas is blended per channel, so nothing is converted.
+        assert!(!atlas_upload_needs_grayscale(
+            TextureId::default(),
+            true,
+            true
+        ));
+        // No pipeline and an LCD atlas: the case the prediction got wrong. Convert.
+        assert!(atlas_upload_needs_grayscale(
+            TextureId::default(),
+            false,
+            true
+        ));
+        // No pipeline but a grayscale atlas: the ordinary blend is correct already.
+        assert!(!atlas_upload_needs_grayscale(
+            TextureId::default(),
+            false,
+            false
+        ));
+        // A user texture is never LCD-tagged (premultiplied alpha zero implies RGB zero), so it
+        // must never be rewritten.
+        assert!(!atlas_upload_needs_grayscale(
+            TextureId::Managed(1),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn degraded_lcd_texels_become_mean_premultiplied_gray() {
+        // Per-channel coverage with the LCD tag: the mean of the three coverages, premultiplied,
+        // is the same rule `egui_software`'s transformed-text fallback uses.
+        let tinted = Color32::from_rgba_premultiplied(120, 90, 60, 0);
+        assert_eq!(
+            lcd_texel_as_grayscale(tinted).to_array(),
+            [90, 90, 90, 90],
+            "(120 + 90 + 60 + 1) / 3 == 90"
+        );
+        let neutral = Color32::from_rgba_premultiplied(128, 128, 128, 0);
+        let neutral_gray = lcd_texel_as_grayscale(neutral).to_array();
+        assert_eq!(neutral_gray, [128, 128, 128, 128]);
+        let full = Color32::from_rgba_premultiplied(255, 255, 255, 0);
+        assert_eq!(
+            lcd_texel_as_grayscale(full).to_array(),
+            [255, 255, 255, 255]
+        );
+
+        // Everything the ordinary blend already understands is left alone: grayscale glyphs,
+        // premultiplied color glyphs and zero coverage (which must stay invisible).
+        let grayscale = Color32::from_rgba_premultiplied(90, 90, 90, 90);
+        assert_eq!(lcd_texel_as_grayscale(grayscale), grayscale);
+        let color_glyph = Color32::from_rgba_premultiplied(100, 30, 20, 200);
+        assert_eq!(lcd_texel_as_grayscale(color_glyph), color_glyph);
+        let nothing = lcd_texel_as_grayscale(Color32::TRANSPARENT);
+        assert_eq!(nothing, Color32::TRANSPARENT);
+    }
+}
+
 #[expect(clippy::fn_params_excessive_bools)]
 fn use_lcd_pipeline(
     texture_id: epaint::TextureId,
@@ -468,10 +565,20 @@ pub struct Renderer {
     /// device, atlas contents and active text mode all allow it.
     lcd_pipeline: Option<wgpu::RenderPipeline>,
 
-    /// Whether the managed font atlas currently contains the zero-alpha LCD tag used by
-    /// sub-pixel coverage. A full replacement recomputes this; partial glyph additions
+    /// Whether the managed font atlas this renderer was handed contains the zero-alpha LCD tag
+    /// used by sub-pixel coverage. A full replacement recomputes this; partial glyph additions
     /// retain it or turn it on.
+    ///
+    /// This describes what egui rasterized, not what the pipeline can blend: when `lcd_pipeline`
+    /// is `None`, `update_texture` uploads these texels converted to premultiplied grayscale
+    /// coverage (see `atlas_upload_needs_grayscale`).
     font_atlas_has_subpixel: bool,
+
+    /// Whether the "LCD atlas without an LCD pipeline" line was already logged.
+    ///
+    /// The atlas is re-uploaded whenever a glyph is added, so this is one warning per
+    /// renderer rather than one per upload.
+    lcd_atlas_degraded_warned: bool,
 
     /// Current atlas contract and weight. These are uploaded through the uniform buffer;
     /// the renderer never guesses them from colors.
@@ -835,6 +942,7 @@ impl Renderer {
             pipeline,
             lcd_pipeline,
             font_atlas_has_subpixel: false,
+            lcd_atlas_degraded_warned: false,
             subpixel_mode: epaint::text::SubpixelMode::Off,
             subpixel_gamma: 1.8,
             subpixel_contrast: 0.5,
@@ -1047,25 +1155,52 @@ impl Renderer {
             depth_or_array_layers: 1,
         };
 
-        let data_color32 = match &image_delta.image {
-            epaint::ImageData::Color(image) => {
-                assert_eq!(
-                    width as usize * height as usize,
-                    image.pixels.len(),
-                    "Mismatch between texture size and texel count"
-                );
-                Cow::Borrowed(&image.pixels)
-            }
-        };
-        let data_bytes: &[u8] = bytemuck::cast_slice(data_color32.as_slice());
+        let epaint::ImageData::Color(image) = &image_delta.image;
+        assert_eq!(
+            width as usize * height as usize,
+            image.pixels.len(),
+            "Mismatch between texture size and texel count"
+        );
 
+        // Track the atlas contract from what is uploaded, before converting anything: whether the
+        // atlas carries per-channel coverage is a fact about egui's rasterizer, and `render`
+        // needs it to pick the LCD pipeline. It must not depend on this renderer having one —
+        // that is a prediction the backend can still reject (see `supports_subpixel_text`).
         if id == epaint::TextureId::default()
-            && self.lcd_pipeline.is_some()
             && (!self.font_atlas_has_subpixel || image_delta.pos.is_none())
         {
             self.font_atlas_has_subpixel =
                 font_subpixel_after(self.font_atlas_has_subpixel, image_delta);
         }
+
+        // The atlas has LCD texels but this renderer has no pipeline that blends them per
+        // channel, so uploading them as they are would draw their zero alpha with the ordinary
+        // premultiplied blend: invisible on a dark background, additive on a light one. Upload
+        // mean coverage instead, so unsupported devices get ordinary antialiased text.
+        let lcd_pipeline_present = self.lcd_pipeline.is_some();
+        let degrade_lcd =
+            atlas_upload_needs_grayscale(id, lcd_pipeline_present, self.font_atlas_has_subpixel);
+        let data_color32: Cow<'_, Vec<epaint::Color32>> = if degrade_lcd {
+            if !self.lcd_atlas_degraded_warned {
+                self.lcd_atlas_degraded_warned = true;
+                log::warn!(
+                    "The font atlas is rasterized for per-channel coverage but this renderer has \
+                     no dual-source pipeline; uploading it as grayscale coverage so text stays \
+                     readable instead of invisible or additive (see the pipeline error above)"
+                );
+            }
+            Cow::Owned(
+                image
+                    .pixels
+                    .iter()
+                    .copied()
+                    .map(lcd_texel_as_grayscale)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            Cow::Borrowed(&image.pixels)
+        };
+        let data_bytes: &[u8] = bytemuck::cast_slice(data_color32.as_slice());
 
         let queue_write_data_to_texture = |texture, origin| {
             profiling::scope!("write_texture");

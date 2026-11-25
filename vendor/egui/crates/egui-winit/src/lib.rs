@@ -447,15 +447,36 @@ fn invalidates_interval_cache(event: &winit::event::WindowEvent) -> bool {
     )
 }
 
+/// TASKMAN-FORK (#10/#14): lowest monitor refresh rate treated as a frame cadence, in
+/// millihertz.
+///
+/// Win32 reports `dmDisplayFrequency == 1` for "use the hardware default" (RDP sessions,
+/// virtual displays, some projectors) and winit passes that through as 1 000 mHz. One second
+/// is not a frame period: `#14` paces wheel repaints with this interval, so scrolling would
+/// advance one notch per second, and it also reaches `RawInput::predicted_dt`, where
+/// `Context::request_repaint_after` subtracts one predicted frame from *every* widget delay
+/// and collapses them all to zero — an immediate-repaint loop. 20 Hz is below any real panel
+/// and above the sentinel.
+const MIN_PLAUSIBLE_REFRESH_MILLIHERTZ: u32 = 20_000;
+
+/// The display cadence `millihertz` describes, or `None` when it is not a plausible one.
+///
+/// Pure so the plausibility floor stays testable without a window.
+fn refresh_interval(millihertz: Option<u32>) -> Option<web_time::Duration> {
+    millihertz
+        .filter(|millihertz| *millihertz >= MIN_PLAUSIBLE_REFRESH_MILLIHERTZ)
+        .map(|millihertz| web_time::Duration::from_secs_f64(1000.0 / f64::from(millihertz)))
+}
+
 /// TASKMAN-FORK (#10/#14): minimum interval between input-driven repaints —
 /// one display refresh period, falling back to 60 Hz and clamped to at least
 /// 2 ms.
 fn input_repaint_min_interval(window: &Window) -> web_time::Duration {
-    let from_refresh = window
-        .current_monitor()
-        .and_then(|monitor| monitor.refresh_rate_millihertz())
-        .filter(|millihertz| *millihertz > 0)
-        .map(|millihertz| web_time::Duration::from_secs_f64(1000.0 / f64::from(millihertz)));
+    let from_refresh = refresh_interval(
+        window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz()),
+    );
     from_refresh
         .unwrap_or_else(|| web_time::Duration::from_secs_f64(1.0 / 60.0))
         .max(web_time::Duration::from_millis(2))
@@ -4066,5 +4087,33 @@ mod pointer_move_throttle_tests {
         // Win32 capture during a press) would be wrong.
         assert!(!ctx.input(|i| i.pointer.primary_clicked()));
         assert!(!ctx.input(|i| i.pointer.any_click()));
+    }
+}
+
+#[cfg(test)]
+mod repaint_interval_tests {
+    use super::{MIN_PLAUSIBLE_REFRESH_MILLIHERTZ, refresh_interval};
+    use web_time::Duration;
+
+    #[test]
+    fn implausible_monitor_rates_fall_back_to_the_nominal_cadence() {
+        // Win32's `dmDisplayFrequency == 1` sentinel ("use the hardware default", seen on RDP
+        // and virtual displays) reaches us as 1 000 mHz. Accepting it would throttle wheel and
+        // pointer repaints to one per second and set a one-second `predicted_dt`, which
+        // collapses every widget repaint delay to zero.
+        assert_eq!(refresh_interval(Some(1_000)), None);
+        assert_eq!(refresh_interval(Some(0)), None);
+        assert_eq!(refresh_interval(None), None);
+        let below_floor = refresh_interval(Some(MIN_PLAUSIBLE_REFRESH_MILLIHERTZ - 1));
+        assert_eq!(below_floor, None);
+
+        // Real cadences pass through unchanged, and the floor itself is the slowest accepted.
+        let sixty = refresh_interval(Some(60_000));
+        assert_eq!(sixty, Some(Duration::from_secs_f64(1.0 / 60.0)));
+        let floor = refresh_interval(Some(MIN_PLAUSIBLE_REFRESH_MILLIHERTZ));
+        assert_eq!(floor, Some(Duration::from_secs_f64(1.0 / 20.0)));
+        // The high-refresh end is inside what `Duration::from_secs_f64` represents.
+        let fast = refresh_interval(Some(1_000_000));
+        assert_eq!(fast, Some(Duration::from_millis(1)));
     }
 }

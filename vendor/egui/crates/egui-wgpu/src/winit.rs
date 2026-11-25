@@ -197,6 +197,11 @@ impl PrimerState {
         self.unprimed.clear();
     }
 
+    /// `viewport_id`'s surface is gone, so it no longer owes (or can receive) a primer.
+    fn forget(&mut self, viewport_id: ViewportId) {
+        self.unprimed.remove(&viewport_id);
+    }
+
     fn retain(&mut self, active_viewports: &ViewportIdSet) {
         self.unprimed.retain(|id| active_viewports.contains(id));
     }
@@ -599,8 +604,8 @@ impl Painter {
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            log::warn!("No window for {viewport_id:?} - dropping its surface");
+            self.drop_surface(viewport_id);
         }
         Ok(())
     }
@@ -628,8 +633,8 @@ impl Painter {
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
-            log::warn!("No window - clearing all surfaces");
-            self.surfaces.clear();
+            log::warn!("No window for {viewport_id:?} - dropping its surface");
+            self.drop_surface(viewport_id);
         }
         Ok(())
     }
@@ -850,12 +855,30 @@ impl Painter {
         self.primer.needs_primer(viewport_id)
     }
 
+    /// Drop every per-surface object of one viewport.
+    ///
+    /// `set_window(viewport_id, None)` is a per-viewport call — eframe makes it when it throws one
+    /// viewport's window away on a recreate — so it must not touch the other windows' surfaces.
+    /// The primer requirement belongs to the surface: once this viewport's surface is gone there
+    /// is nothing left whose pixels are undefined, and [`Self::install_surface`] marks it again
+    /// when a replacement arrives. Keeping the surface map and the primer in one place is what
+    /// stops a teardown path from leaving a stale primer request behind.
+    fn drop_surface(&mut self, viewport_id: ViewportId) {
+        self.surfaces.remove(&viewport_id);
+        self.depth_texture_view.remove(&viewport_id);
+        self.msaa_texture_view.remove(&viewport_id);
+        // One capture target serves whichever viewport is capturing, so it cannot be attributed
+        // to this viewport: drop it rather than let it keep the size of a surface that is gone.
+        // The next capture re-creates it.
+        self.screen_capture_state = None;
+        self.primer.forget(viewport_id);
+    }
+
     /// Drop every per-surface object, including which surfaces still owe a primer.
     ///
-    /// The primer requirement belongs to the surface: once the surface is gone there is
-    /// nothing left whose pixels are undefined, and the re-created surface is marked again by
-    /// [`Self::install_surface`]. Keeping both in one place is what stops one teardown path
-    /// from clearing the surfaces and leaving a stale primer request behind.
+    /// The whole-window teardowns ([`Self::pause`], [`Self::suspend`]) use this; a single
+    /// viewport going away uses [`Self::drop_surface`], which applies the same rules to one
+    /// entry.
     fn drop_all_surfaces(&mut self) {
         self.surfaces.clear();
         self.depth_texture_view.clear();

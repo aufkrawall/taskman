@@ -173,6 +173,22 @@ fn suspended_state_changed(old: Option<XdgWindowState>, new: XdgWindowState) -> 
     old.is_some_and(|old| is_suspended_state(old) != is_suspended_state(new))
 }
 
+/// The xdg-shell version that introduced the `suspended` toplevel state.
+///
+/// sctk binds no higher than this, and a compositor speaking an older version never sends the
+/// state, so on such a compositor "the bit is clear" does not mean "the window is visible".
+const SUSPENDED_VERSION: u32 = 6;
+
+/// What [`WindowState::is_suspended`] reports, given the window's configure and toplevel version.
+///
+/// Pure so the two "cannot say" cases stay testable without a compositor: no configure yet, and
+/// an xdg-shell too old to carry the state. In both the answer is `None` — unknown — and never a
+/// fabricated `Some(false)`.
+fn reported_suspended(last_configure: Option<XdgWindowState>, version: u32) -> Option<bool> {
+    let state = last_configure?;
+    (version >= SUSPENDED_VERSION).then_some(is_suspended_state(state))
+}
+
 impl WindowState {
     /// Create new window state.
     pub fn new(
@@ -603,15 +619,21 @@ impl WindowState {
         self.last_configure.is_some()
     }
 
-    /// Whether the compositor marked this toplevel as suspended.
+    /// Whether the compositor marked this toplevel as suspended, when it can report it.
     ///
     /// xdg-shell's suspended state is the standardized repaint hint available when a
     /// Wayland toplevel is hidden or minimized; clients have no direct visibility query.
+    ///
+    /// `None` is winit's contract for this platform and stays the answer whenever the state is
+    /// unknown: before the first configure, and on an xdg-shell older than v6, which cannot send
+    /// the state at all. Claiming `Some(false)` there would fabricate a measurement — every
+    /// hidden window on a v5 compositor would report itself visible.
     #[inline]
-    pub fn is_suspended(&self) -> bool {
-        self.last_configure
-            .as_ref()
-            .is_some_and(|configure| is_suspended_state(configure.state))
+    pub fn is_suspended(&self) -> Option<bool> {
+        reported_suspended(
+            self.last_configure.as_ref().map(|configure| configure.state),
+            self.window.xdg_toplevel().version(),
+        )
     }
 
     #[inline]
@@ -1277,5 +1299,28 @@ mod tests {
             Some(XdgWindowState::SUSPENDED | XdgWindowState::ACTIVATED),
             XdgWindowState::SUSPENDED
         ));
+    }
+
+    #[test]
+    fn suspension_is_reported_only_when_the_compositor_can_say() {
+        let suspended = Some(XdgWindowState::SUSPENDED);
+        let activated = Some(XdgWindowState::ACTIVATED);
+
+        // No configure yet: the compositor has not described the window at all.
+        assert_eq!(reported_suspended(None, SUSPENDED_VERSION), None);
+        // An xdg-shell before v6 cannot send the state, so the clear bit means nothing.
+        assert_eq!(reported_suspended(suspended, SUSPENDED_VERSION - 1), None);
+        assert_eq!(reported_suspended(activated, SUSPENDED_VERSION - 1), None);
+
+        // v6 and later report it, and only then is `false` a measurement.
+        assert_eq!(reported_suspended(suspended, SUSPENDED_VERSION), Some(true));
+        assert_eq!(
+            reported_suspended(activated, SUSPENDED_VERSION),
+            Some(false)
+        );
+        assert_eq!(
+            reported_suspended(activated, SUSPENDED_VERSION + 1),
+            Some(false)
+        );
     }
 }

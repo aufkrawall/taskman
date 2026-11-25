@@ -366,12 +366,15 @@ impl Window {
 
     /// Wayland has no direct visibility query or compositor-level minimize query.
     ///
-    /// The xdg-shell `SUSPENDED` repaint hint is the available hidden/minimized signal.
+    /// The xdg-shell `SUSPENDED` repaint hint is the available hidden signal; it is also set for
+    /// occlusion and screen locking, so `Some(true)` means "not visible" rather than strictly
+    /// "minimized". `None` stays the answer when the compositor cannot report it at all (no
+    /// configure yet, xdg-shell older than v6), which is winit's documented contract here.
     ///
-    /// TaskMan fork: upstream always returned `None` here. See `TASKMAN-FORK.md` §4.
+    /// TaskMan fork: upstream always returned `None`. See `TASKMAN-FORK.md` §4.
     #[inline]
     pub fn is_minimized(&self) -> Option<bool> {
-        Some(self.window_state.lock().unwrap().is_suspended())
+        self.window_state.lock().unwrap().is_suspended()
     }
 
     #[inline]
