@@ -779,8 +779,12 @@ fn paint_runs_fill(painter: &egui::Painter, runs: &[Vec<Pos2>], baseline_y: f32,
 fn paint_runs_line(painter: &egui::Painter, runs: &[Vec<Pos2>], width: f32, color: Color32) {
     for run in runs {
         match run.as_slice() {
-            [dot] => painter.circle_filled(*dot, width.max(1.25), color),
-            points => painter.add(Shape::line(points.to_vec(), Stroke::new(width, color))),
+            [dot] => {
+                painter.circle_filled(*dot, width.max(1.25), color);
+            }
+            points => {
+                painter.add(Shape::line(points.to_vec(), Stroke::new(width, color)));
+            }
         }
     }
 }
