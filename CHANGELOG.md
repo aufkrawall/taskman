@@ -5,6 +5,7 @@
 ### New
 
 - **Per-file read and written bytes:** the I/O page of Process Properties shows how many bytes a process read from and wrote to each open file, measured by a `Microsoft-Windows-Kernel-File` trace (Create names the file object, its Read and Write events carry the size, and the sizes are summed per process and path). The trace is hosted by the elevated service when it is installed, and by the GUI's own elevated process otherwise, so a direct run as administrator measures the same numbers without the service; a running GUI session is started on first use and stopped once the page stops asking. The column stays "—" for a file the trace saw nothing of, and an unelevated process still reports per-file accounting as unavailable, so without elevation the numbers are absent rather than zero.
+- **`--selfcheck` reports whether the per-file file trace is alive.** The headless JSON summary gained a `file_io` block for the sampled process: the accounting state (`unavailable`, `undelivered`, `undecodable` or `measured`), how long accounting has been running, and the session's loss and cap counters — events ETW reports as dropped, unnamed file creates, paths dropped at a capacity limit and file names cleared from the trace's map. A run without a GUI can now tell a trace that started and delivered nothing from one that measured nothing, instead of comparing two runs that both printed dashes. A question that could not be asked reports `null`, and an unqueried counter stays `null` rather than becoming a zero.
 
 ### Improved
 

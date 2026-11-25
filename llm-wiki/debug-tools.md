@@ -54,6 +54,17 @@ signature of an accountant that stopped reporting while the header stayed correc
 `process_cpu_unknown` equal to the process count is the opposite failure, every row
 blanked.
 
+`file_io` reports the per-file byte accounting of the binary's own process, which
+is the headless equivalent of the I/O page's state line: `state`
+(`unavailable`/`undelivered`/`undecodable`/`measured`), `since_ms`, and the
+session's `events_lost`, `unnamed_creates`, `dropped_paths` and
+`cleared_file_objects`. `unavailable` on an unelevated run is the expected answer
+— a `Microsoft-Windows-Kernel-File` session needs administrator rights or the
+installed service — while `undelivered`/`undecodable` mean a session started and
+delivered nothing usable. `null` means the question could not be asked (no
+verified process identity, or `--mock`), and an unqueried `events_lost` stays
+`null` instead of a zero.
+
 Three ignored ETW diagnostics validate real Windows payloads rather than only
 synthetic records: `disk_trace_attributes_real_requests_to_the_issuing_process`,
 `protected_process_modules_include_csrss_images`, and

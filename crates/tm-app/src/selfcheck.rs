@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use tm_platform::actions::{FileIoAccounting, FileIoAccountingState, ProcessFileIoSnapshot};
+
 /// Ticks to wait for before summarizing.
 ///
 /// The PDH groups (GPU engines, GPU memory, disk rates, CPU speed) are
@@ -30,6 +32,82 @@ fn memory_gb(mem: &tm_core::model::MemoryInfo) -> (Option<f64>, Option<f64>) {
         return (None, None);
     }
     (Some(gb(mem.used_bytes)), Some(gb(mem.total_bytes)))
+}
+
+/// Wire name of one per-file accounting state.
+fn file_io_state_name(state: FileIoAccountingState) -> &'static str {
+    match state {
+        FileIoAccountingState::Unavailable => "unavailable",
+        FileIoAccountingState::Undelivered => "undelivered",
+        FileIoAccountingState::Undecodable => "undecodable",
+        FileIoAccountingState::Measured => "measured",
+    }
+}
+
+/// The `file_io` block of the summary: whether per-file accounting has a live
+/// source, and how much that source has lost or capped.
+///
+/// The I/O page reports the same thing as one line above the file table. A
+/// headless run has no table, so without this block a trace that starts and
+/// delivers nothing is indistinguishable from one that measured nothing —
+/// which is the failure the page's state line exists for.
+///
+/// `state` is `null` when the question could not be asked at all (no verified
+/// process identity, or a platform refusing the request), and that stays
+/// distinct from `"unavailable"` — no source — exactly as the page keeps them
+/// apart. A counter that could not be queried is `null`, never a fabricated
+/// zero.
+fn file_io_summary(
+    pid: Option<u32>,
+    accounting: Option<&FileIoAccounting>,
+    error: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pid": pid,
+        "state": accounting.map(|accounting| file_io_state_name(accounting.state)),
+        "since_ms": accounting.map(|accounting| accounting.since_ms),
+        "events_lost": accounting.and_then(|accounting| accounting.events_lost),
+        "unnamed_creates": accounting.map(|accounting| accounting.unnamed_creates),
+        "dropped_paths": accounting.map(|accounting| accounting.dropped_paths),
+        "cleared_file_objects": accounting.map(|accounting| accounting.cleared_file_objects),
+        "error": error,
+    })
+}
+
+/// Ask the platform for per-file accounting of this process.
+///
+/// The GUI asks the same question about the process its dialog shows. A
+/// headless run can only be sure of its own identity, and the accounting state
+/// is a fact about the file trace session rather than about one target, so this
+/// process is the sampled one. `--mock` has no trace at all and reports no
+/// answer instead of an invented state.
+fn probe_file_io(
+    mock: bool,
+    snapshot: &tm_core::model::Snapshot,
+) -> (Option<u32>, Result<ProcessFileIoSnapshot, String>) {
+    if mock {
+        return (None, Err("mock collector: no per-file trace".to_string()));
+    }
+    let pid = std::process::id();
+    let Some(start_epoch_s) = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.creation_identity())
+        .filter(|start| *start > 0)
+    else {
+        return (
+            Some(pid),
+            Err("own process creation time is unavailable".to_string()),
+        );
+    };
+    let actions = tm_platform::create_actions();
+    (
+        Some(pid),
+        actions
+            .list_process_file_io(pid, Some(start_epoch_s))
+            .map_err(|error| error.to_string()),
+    )
 }
 
 pub fn run(mock: bool) -> i32 {
@@ -77,6 +155,7 @@ pub fn run(mock: bool) -> i32 {
         tm_platform::create_actions().capabilities().users_sessions
     };
     let (memory_used_gb, memory_total_gb) = memory_gb(&snap.memory);
+    let (file_io_pid, file_io_answer) = probe_file_io(mock, &snap);
     let summary = serde_json::json!({
         "ok": true,
         "backend": if mock { "mock".to_string() } else { "platform".to_string() },
@@ -178,6 +257,17 @@ pub fn run(mock: bool) -> i32 {
             .iter()
             .filter(|p| p.io_ops_per_s.is_some())
             .count(),
+        // Whether per-file byte accounting has a live source for the sampled
+        // process, and what that source lost: the headless answer to "is the
+        // file trace alive", which the I/O page only answers in a GUI.
+        "file_io": file_io_summary(
+            file_io_pid,
+            file_io_answer
+                .as_ref()
+                .ok()
+                .map(|snapshot: &ProcessFileIoSnapshot| &snapshot.accounting),
+            file_io_answer.as_ref().err().map(String::as_str),
+        ),
         "uptime_s": snap.system.uptime_s,
     });
     println!("{summary}");
@@ -350,5 +440,109 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(memory_gb(&measured), (Some(3.0), Some(16.0)));
+    }
+
+    /// The summary states the per-file accounting of the sampled process, and
+    /// every state keeps its own name instead of collapsing into "unavailable".
+    ///
+    /// Regression: the summary carried no per-file accounting at all, so a run
+    /// without a GUI could not tell a trace that started and delivered nothing
+    /// from one that measured nothing — the same blindness the I/O page's state
+    /// line fixes in the dialog.
+    #[test]
+    fn the_summary_states_the_per_file_accounting() {
+        for (state, name) in [
+            (FileIoAccountingState::Unavailable, "unavailable"),
+            (FileIoAccountingState::Undelivered, "undelivered"),
+            (FileIoAccountingState::Undecodable, "undecodable"),
+            (FileIoAccountingState::Measured, "measured"),
+        ] {
+            let accounting = FileIoAccounting {
+                state,
+                ..Default::default()
+            };
+            let summary = file_io_summary(Some(4242), Some(&accounting), None);
+            assert_eq!(summary["pid"], serde_json::json!(4242));
+            assert_eq!(summary["state"], serde_json::json!(name), "{state:?}");
+        }
+
+        // The counters a lossy or capped session is recognised by, plus the
+        // span they cover.
+        let accounting = FileIoAccounting {
+            state: FileIoAccountingState::Undelivered,
+            since_ms: 1500,
+            events_lost: Some(12),
+            unnamed_creates: 17,
+            dropped_paths: 3,
+            cleared_file_objects: 5,
+            ..Default::default()
+        };
+        let summary = file_io_summary(Some(4242), Some(&accounting), None);
+        assert_eq!(summary["since_ms"], serde_json::json!(1500));
+        assert_eq!(summary["events_lost"], serde_json::json!(12));
+        assert_eq!(summary["unnamed_creates"], serde_json::json!(17));
+        assert_eq!(summary["dropped_paths"], serde_json::json!(3));
+        assert_eq!(summary["cleared_file_objects"], serde_json::json!(5));
+        assert_eq!(summary["error"], serde_json::Value::Null);
+
+        // The block goes into the summary under `file_io`; its own field set is
+        // pinned here, so dropping or renaming one fails rather than silently
+        // shrinking what a headless run can read.
+        let mut fields: Vec<&str> = summary
+            .as_object()
+            .expect("the file_io block is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "cleared_file_objects",
+                "dropped_paths",
+                "error",
+                "events_lost",
+                "pid",
+                "since_ms",
+                "state",
+                "unnamed_creates",
+            ]
+        );
+    }
+
+    /// A question that could not be asked reports no state, not a fabricated
+    /// one: an unlost and an unasked session must not read alike.
+    #[test]
+    fn an_unasked_file_io_reports_null_rather_than_a_state() {
+        let summary = file_io_summary(None, None, Some("mock collector: no per-file trace"));
+        assert_eq!(summary["pid"], serde_json::Value::Null);
+        assert_eq!(summary["state"], serde_json::Value::Null);
+        assert_eq!(summary["events_lost"], serde_json::Value::Null);
+        assert_eq!(summary["unnamed_creates"], serde_json::Value::Null);
+        assert_eq!(summary["dropped_paths"], serde_json::Value::Null);
+        assert_eq!(summary["cleared_file_objects"], serde_json::Value::Null);
+        assert_eq!(
+            summary["error"],
+            serde_json::json!("mock collector: no per-file trace")
+        );
+
+        // An unqueried loss count inside a real answer stays unknown as well: a
+        // `null` here means "could not be read", never "nothing was lost".
+        let accounting = FileIoAccounting {
+            events_lost: None,
+            ..Default::default()
+        };
+        let summary = file_io_summary(Some(4242), Some(&accounting), None);
+        assert_eq!(summary["events_lost"], serde_json::Value::Null);
+        assert_eq!(summary["state"], serde_json::json!("unavailable"));
+    }
+
+    /// A mock run has no trace, so it reports that it could not ask instead of
+    /// a state the run never observed.
+    #[test]
+    fn a_mock_run_reports_no_file_io_answer() {
+        let (pid, answer) = probe_file_io(true, &tm_core::model::Snapshot::default());
+        assert_eq!(pid, None);
+        assert!(answer.is_err());
     }
 }
