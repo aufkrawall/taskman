@@ -124,11 +124,18 @@ impl Tracker {
                     .kernel_time_100ns
                     .saturating_add(thread.user_time_100ns);
                 // A TID names the same thread only while its creation time
-                // matches; a recycled TID starts a fresh history.
-                let previous = self.tracks.remove(&thread.tid).filter(|track| {
-                    track.created_epoch_s.is_some()
-                        && track.created_epoch_s == thread.created_epoch_s
-                });
+                // matches; a recycled TID starts a fresh history. Two UNKNOWN
+                // creation times are not a mismatch: Windows returns none for
+                // a protected thread's create time and Linux for a missing
+                // `btime`, and dropping the track on every tick would throw
+                // away the CPU-time delta that was measured perfectly well
+                // (reporting "—" forever) and restart the observation window.
+                // A known time on one side only IS a new identity: it either
+                // appeared or was lost, so the pair proves nothing.
+                let previous = self
+                    .tracks
+                    .remove(&thread.tid)
+                    .filter(|track| track.created_epoch_s == thread.created_epoch_s);
                 let running = thread.state == ThreadState::Running;
                 let (
                     first_seen,
@@ -1051,6 +1058,33 @@ mod tests {
         let rows = tracker.apply(vec![replaced], t0 + Duration::from_secs(1), 4);
         assert_eq!(rows[0].cpu_pct, None);
         assert!(matches!(rows[0].activity, Activity::Observing { .. }));
+    }
+
+    /// Two unknown creation times are not a mismatch.
+    ///
+    /// Regression: the identity guard required the STORED time to be known, so
+    /// on a host that never reports one (a protected Windows thread, a Linux
+    /// kernel without `btime`) every tick started a fresh history — the
+    /// measured CPU delta was thrown away and every row went back to
+    /// "observing" forever.
+    #[test]
+    fn two_unknown_thread_identities_keep_their_measured_history() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        let mut first = thread(1, 5, 0, WAITING);
+        first.created_epoch_s = None;
+        tracker.apply(vec![first.clone()], t0, 4);
+        let mut second = first;
+        // One second of CPU over one second on 4 processors.
+        second.kernel_time_100ns = 10_000_000;
+        second.context_switches = Some(6);
+        let rows = tracker.apply(vec![second], t0 + Duration::from_secs(1), 4);
+        assert_eq!(
+            rows[0].cpu_pct,
+            Some(25.0),
+            "the measured CPU delta must survive an unknown start time"
+        );
+        assert_eq!(rows[0].activity, Activity::Recent);
     }
 
     #[test]

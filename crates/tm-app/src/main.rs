@@ -332,6 +332,11 @@ fn run_gui(mock: bool, args: &[String]) {
                 return;
             }
             tm_platform::linux::activation::ActivationAcquisition::Primary { owner, inbox } => {
+                // Marked here, not after the match: the other two outcomes
+                // acquired nothing (mock) or failed (uncoordinated), and a
+                // phase the trace claims but nobody performed is worse than a
+                // missing one.
+                StartupTrace::mark("linux_instance_acquired");
                 (Some(owner), NativeActivation { inbox: Some(inbox) })
             }
             tm_platform::linux::activation::ActivationAcquisition::Uncoordinated { detail } => {
@@ -340,8 +345,6 @@ fn run_gui(mock: bool, args: &[String]) {
             }
         }
     };
-    #[cfg(target_os = "linux")]
-    StartupTrace::mark("linux_instance_acquired");
     #[cfg(not(target_os = "linux"))]
     let native_activation = NativeActivation::default();
 

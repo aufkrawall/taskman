@@ -835,7 +835,7 @@ keys! {
     ],
     RestartElevated => ["Mit erhöhten Rechten neu starten", "Restart with elevated privileges"],
     ElevatedUnknown => [
-        "Status der erhÃ¶hten Rechte unbekannt.",
+        "Status der erhöhten Rechte unbekannt.",
         "Elevation status unknown."
     ],
     StartElevated => [
@@ -929,12 +929,12 @@ keys! {
         "Measured during the last system start: {} CPU time, {} disk I/O"
     ],
     ImpactUnknown => ["Nicht gemessen", "Not measured"],
-    StartupUnavailable => ["Autostart nicht verfügbar:", "Startup apps unavailable:"],
+    StartupUnavailable => ["Autostart nicht verfügbar: {}", "Startup apps unavailable: {}"],
     PropCommand => ["Befehl:", "Command:"],
     PropLocation => ["Speicherort:", "Location:"],
 
     // ------------------------------------------------ services tab
-    ServicesUnavailable => ["Dienste nicht verfügbar:", "Services unavailable:"],
+    ServicesUnavailable => ["Dienste nicht verfügbar: {}", "Services unavailable: {}"],
     ServiceDoneToast => ["ausgeführt", "action completed for"],
     ServiceStopConfirm => [
         "Dienst \"{}\" wirklich anhalten? Abhängige Dienste und Funktionen können dadurch ausfallen.",
@@ -953,7 +953,7 @@ keys! {
     ActionFailed => ["Aktion fehlgeschlagen", "Action failed"],
 
     // ------------------------------------------------ users tab
-    SessionsUnavailable => ["Sitzungen nicht verfügbar:", "Sessions unavailable:"],
+    SessionsUnavailable => ["Sitzungen nicht verfügbar: {}", "Sessions unavailable: {}"],
     SessionDisconnected => ["Sitzung getrennt", "Session disconnected"],
     UserSignedOut => ["Benutzer abgemeldet", "User signed out"],
     UserControlUnavailable => [
@@ -1290,6 +1290,31 @@ pub fn unit_gbit_per_s() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three "unavailable" banners carry the platform's own reason as
+    /// their only detail, and `trf` drops an argument a key has no `{}` for.
+    ///
+    /// Regression: these keys ended in a bare colon, so the Services, Startup
+    /// and Users pages said something was unavailable and threw away the very
+    /// error they had formatted.
+    #[test]
+    fn unavailable_banners_keep_the_platform_reason() {
+        for key in [
+            K::ServicesUnavailable,
+            K::StartupUnavailable,
+            K::SessionsUnavailable,
+        ] {
+            let rendered = trf(key, &["the platform reason"]);
+            assert!(
+                rendered.contains("the platform reason"),
+                "{key:?} dropped the reason it was handed: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains("{}"),
+                "{key:?} left a placeholder behind: {rendered:?}"
+            );
+        }
+    }
 
     /// Every key must carry BOTH languages, and `trf` substitutes `{}`
     /// positionally — so a German/English placeholder-count mismatch would

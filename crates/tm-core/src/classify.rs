@@ -5,10 +5,13 @@
 //! The native rule is deliberately conservative (Raymond Chen, "How does
 //! Task Manager categorize processes as App, Background Process, or Windows
 //! Process?"): a visible window makes an App, a *critical* process or one of
-//! a short list of core OS images is a Windows process, and everything else
-//! is Background. Microsoft-signed background machinery (WMI Provider Host,
-//! SmartScreen, shell brokers, windowless PowerShell) is therefore a
-//! Background process on a stock system, not a Windows process.
+//! a short list of core OS images is a Windows process, and a process the
+//! platform OBSERVED to be windowless is a Background process. What the
+//! platform cannot answer for is [`ProcCategory::Unknown`], never a
+//! Background made up from a missing observation. Microsoft-signed background
+//! machinery (WMI Provider Host, SmartScreen, shell brokers, windowless
+//! PowerShell) is therefore a Background process on a stock system, not a
+//! Windows process.
 
 use crate::model::ProcCategory;
 use serde::{Deserialize, Serialize};
@@ -168,10 +171,17 @@ pub struct ClassifyInput<'a> {
     /// unknown must never be read as "critical".
     pub critical: Option<bool>,
     /// Positive signal that the executable is Microsoft-published from a
-    /// Windows-owned path. Used ONLY to reject a spoofed core image name
-    /// (a third-party `svchost.exe` in a user directory must not become a
-    /// Windows process). `None` = metadata unavailable, so a known core name
-    /// is trusted; `Some(false)` rejects the name match.
+    /// Windows-owned path. Rejects BOTH of [`classify`]'s name matches: a
+    /// spoofed core image name (a third-party `svchost.exe` in a user directory
+    /// must not become a Windows process) and a file that merely carries a
+    /// kernel pseudo-process's bare name.
+    ///
+    /// `None` = metadata unavailable, so a known core image name is trusted and
+    /// a bare kernel pseudo-name stays System. `Some(false)` therefore MEANS the
+    /// caller proved the executable is a real file outside a Windows-owned
+    /// location — a caller that cannot tell "no image at all" from "an image
+    /// that is not under `%SystemRoot%`" must pass `None` for the kernel names,
+    /// or the kernel's own rows stop being System.
     pub windows_owned: Option<bool>,
     /// Desktop-session role evidence. `None` means the platform supplied no
     /// authoritative marker; [`DesktopRoleEvidence::Unknown`] means collection

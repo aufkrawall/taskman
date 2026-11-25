@@ -320,6 +320,20 @@ mod tests {
         assert_eq!(memory_share_series(&[idle]), vec![Some(0.0)]);
     }
 
+    /// Regression: with `total_bytes == 0` — the model's "nothing reported"
+    /// signal — the title already read "\u{2014}" while the stats block stated
+    /// "In use 0 B"/"Total 0 B" and the read/write cards stated "0 MB/s" for a
+    /// disk whose counter source was asleep. A measured zero must still be a
+    /// number in both cases, so the predicates take the answer, not the value.
+    #[test]
+    fn unreported_figures_read_unavailable_but_a_measured_zero_does_not() {
+        assert_eq!(mem_bytes_or_dash(false, 0), "\u{2014}");
+        assert_eq!(mem_bytes_or_dash(false, 8 * 1024 * 1024), "\u{2014}");
+        assert_eq!(mem_bytes_or_dash(true, 0), format::format_bytes_loc(0));
+        assert_eq!(rate_or_dash(false, 0.0), "\u{2014}");
+        assert_eq!(rate_or_dash(true, 0.0), format::format_rate_mb(0.0));
+    }
+
     /// Regression: the Committed chart built its series with `series(..)` and
     /// `MultiSeries::new`, so a platform that reports no commit charge plotted
     /// a measured-looking flat 0 GiB line with a "0 B" hover readout — under a
@@ -412,17 +426,16 @@ mod tests {
             disk_activity_series(&[pt(0), missing.clone(), idle.clone()], "C:"),
             vec![None, None, Some(0.0)]
         );
-        // The transfer series gap on a different field, and this is the part
-        // that is easy to get wrong: the mount's ACTIVITY percentage is the
-        // optional one, while read/write throughput is always reported for a
-        // mount that is present. So a tick that lists the mount with unknown
-        // activity still has a measured 0 B/s transfer, and only a tick that
-        // does not list the mount at all is a gap there.
+        // The transfer series gaps on the SAME tick as the activity one: both
+        // rates and the activity percentage come from one counter source, and
+        // both backends write `active_pct: None` together with 0.0 rates when
+        // that source has nothing for the tick. So a listed mount with unknown
+        // activity has no measured rate either, and a `Some(0.0)` here would
+        // print "0 B/s" for a drive nobody measured.
         assert_eq!(
             disk_series(&[pt(0), missing, idle], "C:", |d| d.2),
-            vec![None, Some(0.0), Some(0.0)]
+            vec![None, None, Some(0.0)]
         );
-        // ...and a tick without the mount is a gap in both.
         assert_eq!(
             disk_series(&[pt(0), pt(1_000)], "C:", |d| d.2),
             vec![None, None]
@@ -1545,18 +1558,17 @@ fn window(app: &TaskManApp) -> &[HistoryPoint] {
     visible_slice(&app.history, app.shared.settings.graph_seconds)
 }
 
-fn series(win: &[HistoryPoint], f: impl Fn(&HistoryPoint) -> f64) -> Vec<f64> {
-    win.iter().map(f).collect()
-}
-
-/// Gap-aware sibling of [`series`]: one sample per window point, `None` where
-/// that point carries no measurement for this series.
+/// One sample per window point, `None` where that point carries no measurement
+/// for this series.
 ///
 /// `None` is not interchangeable with `0.0`. A fabricated zero is a reading the
 /// user can act on ("the drive is idle", "the adapter is silent") when the
 /// truth is "this tick has no sample". The charts split their geometry on gaps,
 /// so a missing sample breaks the line instead of drawing the fill-less
-/// straight stroke a sentinel value used to produce across the plot.
+/// straight stroke a sentinel value used to produce across the plot. Every
+/// series on this page goes through here; the plain `Vec<f64>` form this used
+/// to sit next to is gone, because a series that cannot say "no sample" is how
+/// those zeros got in.
 fn gap_series(win: &[HistoryPoint], f: impl Fn(&HistoryPoint) -> Option<f64>) -> Vec<Option<f64>> {
     win.iter().map(f).collect()
 }
@@ -1566,7 +1578,8 @@ fn timestamps(win: &[HistoryPoint]) -> Vec<u64> {
 }
 
 /// Read or write history of one mounted volume, `None` where that mount is not
-/// in the tick's snapshot at all.
+/// in the tick's snapshot at all — or where its counters came from a source
+/// that was not running for that tick.
 ///
 /// The series is still exactly as long as the window — indices must stay
 /// aligned with the shared timestamps, otherwise samples plot at wrong x
@@ -1575,13 +1588,28 @@ fn timestamps(win: &[HistoryPoint]) -> Vec<u64> {
 /// ..)` made an unmounted or unenumerated drive look idle AND dropped a hard
 /// vertical jump into the graph next to the ticks that did measure, i.e. a
 /// stroke that belongs to no data run.
+///
+/// The activity percentage and the byte rates come from ONE counter source on
+/// both backends (`PhysicalDisk` PDH on Windows, `diskstats` on Linux), and both
+/// write `active_pct: None` together with `0.0` rates when that source is asleep
+/// or still warming (see `win/sampler.rs` and `linux/mod.rs`). A present mount
+/// with no measured activity therefore has no measured rate either: plotting
+/// that `0.0` would state "0 B/s" for a drive nobody measured, which is exactly
+/// the fabricated reading the gap exists to avoid. A measured idle keeps
+/// `Some(0.0)`.
 fn disk_series(
     win: &[HistoryPoint],
     key: &str,
     pick: impl Fn(&(String, Option<f32>, f64, f64)) -> f64,
 ) -> Vec<Option<f64>> {
     win.iter()
-        .map(|h| h.disks.iter().find(|(m, ..)| m == key).map(&pick))
+        .map(|h| {
+            h.disks
+                .iter()
+                .find(|entry| entry.0 == key)
+                .filter(|entry| entry.1.is_some())
+                .map(&pick)
+        })
         .collect()
 }
 
@@ -2813,6 +2841,38 @@ fn gpu_graph_dropdown_menu(
 
 // ---------------------------------------------------------------- Memory page
 
+/// A byte reading that is only a reading once the platform reported a RAM
+/// total.
+///
+/// `total_bytes == 0` is the model's "nothing reported" signal, and the header
+/// above these rows already reads "\u{2014}" for it (see
+/// [`memory_usage_text`]): In use, Total and Available are equally unmeasured
+/// in that state, so printing their zeros would contradict the line right above
+/// them. A MEASURED zero (an empty cache, a full machine) stays a number,
+/// which is why this takes the answer rather than testing the value.
+fn mem_bytes_or_dash(reported: bool, bytes: u64) -> String {
+    if reported {
+        format::format_bytes_loc(bytes)
+    } else {
+        "\u{2014}".to_string()
+    }
+}
+
+/// A byte RATE that is only a reading once the tick measured the counter source
+/// it comes from.
+///
+/// The disk backends write `0.0` into `read_bps`/`write_bps` when their counter
+/// source is asleep, still warming, or does not list the device, and mark that
+/// same tick with `active_pct: None` (see [`disk_series`]). Printing the
+/// placeholder would state an idle drive nobody measured.
+fn rate_or_dash(measured: bool, bytes_per_s: f64) -> String {
+    if measured {
+        format::format_rate_mb(bytes_per_s)
+    } else {
+        "\u{2014}".to_string()
+    }
+}
+
 /// Commit charge, cache and the pools are Windows figures: macOS leaves them
 /// all at 0 and a Linux kernel without `CommitLimit` reports no commit charge
 /// either, so 0 means "not reported", not "measured zero". A row gated on one
@@ -2820,8 +2880,9 @@ fn gpu_graph_dropdown_menu(
 /// swap, so the page never states a value nobody measured (see
 /// [`commit_series`] for the same rule on the Committed chart).
 ///
-/// The other figures stay ungated: In use, Total and Available are readings on
-/// every platform, a measured zero included.
+/// In use, Total and Available stay ungated on their OWN value — a measured
+/// zero is a reading — but not on the RAM total, which is what
+/// `MemoryInfo::used_pct` keys on as well.
 fn commit_reported(m: &tm_core::model::MemoryInfo) -> bool {
     m.commit_total_bytes > 0
 }
@@ -2867,14 +2928,18 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let ts = timestamps(win);
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
-    let used: Vec<f64> = series(win, |h| h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+    let used: Vec<Option<f64>> = gap_series(win, |h| {
+        // Same predicate as the header: no RAM total reported is no reading,
+        // so the plot breaks instead of drawing a flat 0 GiB line.
+        (h.mem_total_bytes > 0).then(|| h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    });
     let in_use_chart = page_chart(
         ui,
         "memory-in-use-chart",
         i18n::tr(K::StatInUse),
         width,
         180.0,
-        &[MultiSeries::new(
+        &[MultiSeries::with_gaps(
             i18n::tr(K::StatInUse),
             used,
             pal.memory_graph,
@@ -2924,7 +2989,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     ui,
                     pal,
                     i18n::tr(K::StatInUse),
-                    &format::format_bytes_loc(m.used_bytes),
+                    &mem_bytes_or_dash(m.total_bytes > 0, m.used_bytes),
                     w + 20.0,
                 );
                 if commit_reported(m) {
@@ -2979,13 +3044,13 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     ui,
                     pal,
                     i18n::tr(K::KvTotal),
-                    &format::format_bytes_loc(m.total_bytes),
+                    &mem_bytes_or_dash(m.total_bytes > 0, m.total_bytes),
                 );
                 kv_row(
                     ui,
                     pal,
                     i18n::tr(K::KvAvailable),
-                    &format::format_bytes_loc(m.available_bytes),
+                    &mem_bytes_or_dash(m.total_bytes > 0, m.available_bytes),
                 );
                 if commit_reported(m) {
                     kv_row(
@@ -3122,6 +3187,11 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         |ui| {
             ui.vertical(|ui| {
                 let w = 170.0;
+                // The byte rates share their counter source with the activity
+                // percentage above them (see `disk_series`): a tick with no
+                // measured activity has no measured rate either, so the
+                // platform's 0.0 placeholder must not print as "0 B/s".
+                let counters_measured = disk.active_pct.is_some();
                 big_stat(
                     ui,
                     pal,
@@ -3135,14 +3205,14 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
                     ui,
                     pal,
                     i18n::tr(K::StatRead),
-                    &format::format_rate_mb(disk.read_bps),
+                    &rate_or_dash(counters_measured, disk.read_bps),
                     w,
                 );
                 big_stat(
                     ui,
                     pal,
                     i18n::tr(K::StatWrite),
-                    &format::format_rate_mb(disk.write_bps),
+                    &rate_or_dash(counters_measured, disk.write_bps),
                     w,
                 );
             });

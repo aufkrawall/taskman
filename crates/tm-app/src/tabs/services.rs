@@ -116,8 +116,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let frame_ctx = ui.ctx().clone();
     let capabilities = app.actions.capabilities();
     if !capabilities.services_list {
+        // No such concept on this platform, so there is no error to quote —
+        // the banner would otherwise read "Services unavailable: " and claim a
+        // failure that never happened.
         ui.centered_and_justified(|ui| {
-            ui.label(i18n::trf(K::ServicesUnavailable, &[""]));
+            ui.label(i18n::tr(K::ModuleThreadsUnavailable));
         });
         return;
     }

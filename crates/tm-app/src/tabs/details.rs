@@ -3590,10 +3590,13 @@ fn option_bytes(value: Option<u64>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-/// Why this column reads "—" on rows whose telemetry source is not running.
+/// Why this column reads "—" on a row where that column could not be measured.
+///
+/// Not all of them are a source that is down: the per-process CPU accountant
+/// runs, it just attributed no share to this process in the sampled window.
 /// `None` means the same dash would be a bug, not a limitation — the same
-/// contract `value_columns::unavailable_tip` documents for the shared
-/// numeric catalogue (this page's typed columns are a separate catalogue).
+/// contract `value_columns::unavailable_tip` documents for the shared numeric
+/// catalogue (this page's typed columns are a separate catalogue).
 fn unavailable_column_tip(cid: ColumnId) -> Option<&'static str> {
     match cid {
         ColumnId::Cpu => Some(i18n::tr(K::CpuPerProcessUnavailable)),
