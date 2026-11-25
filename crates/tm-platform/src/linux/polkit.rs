@@ -125,13 +125,22 @@ pub(super) fn run_privileged_action(action: &PrivilegedAction) -> Result<()> {
         | PrivilegedAction::Suspend { .. }
         | PrivilegedAction::Resume { .. }
         | PrivilegedAction::SetPriority { .. }
-        | PrivilegedAction::SetAffinity { .. } => Err(TmError::Unsupported(
-            "privileged process action in a portable installation; run TaskMan from a protected install",
-        )),
-        PrivilegedAction::Relaunch { .. } => Err(TmError::Unsupported(
-            "elevated GUI relaunch from a portable installation",
-        )),
+        | PrivilegedAction::SetAffinity { .. } => Err(unsupported_process_action()),
+        PrivilegedAction::Relaunch { .. } => Err(unsupported_relaunch()),
     }
+}
+
+/// The one request-side and root-side policy for actions this installation
+/// cannot elevate. Both halves call these so the hidden helper entry point
+/// cannot perform what the GUI refuses to ask for.
+fn unsupported_process_action() -> TmError {
+    TmError::Unsupported(
+        "privileged process action in a portable installation; run TaskMan from a protected install",
+    )
+}
+
+fn unsupported_relaunch() -> TmError {
+    TmError::Unsupported("elevated GUI relaunch from a portable installation")
 }
 
 /// Escalate only a permission failure. Every other error is returned intact,
@@ -242,6 +251,10 @@ fn first_diagnostic(stdout: &[u8], stderr: &[u8]) -> Option<String> {
         .find(|line| !line.is_empty())
 }
 
+/// Execute the action this process was entered as root for. The process
+/// controls are the protected-helper half of the design and stay unreachable
+/// from the GUI, which refuses them at request time; a relaunch is refused here
+/// as well, because it would run this user-writable image as root.
 fn execute_privileged_action(action: PrivilegedAction) -> Result<()> {
     match action {
         PrivilegedAction::Service { unit, action } => services::control_unit_direct(&unit, action),
@@ -273,21 +286,11 @@ fn execute_privileged_action(action: PrivilegedAction) -> Result<()> {
             validate_privileged_target(pid)?;
             super::set_affinity_direct(pid, Some(start_ticks), mask)
         }
-        PrivilegedAction::Relaunch {
-            arguments,
-            environment,
-        } => {
-            if arguments.iter().any(|arg| is_privileged_helper_arg(arg)) {
-                return Err(TmError::platform(
-                    "elevated relaunch",
-                    "refusing a relaunch argument that re-enters the privileged helper",
-                ));
-            }
-            let executable = std::env::current_exe()
-                .map_err(|error| TmError::platform("current_exe", error.to_string()))?;
-            let arguments: Vec<OsString> = arguments.into_iter().map(OsString::from).collect();
-            launch::spawn_detached(executable.as_os_str(), &arguments, &environment)
-        }
+        // The root side of the same policy: being entered as root does not make
+        // this image a protected one. Re-executing the portable, user-writable
+        // TaskMan as root is exactly what the request side refuses, so the
+        // hidden entry point must not do it either.
+        PrivilegedAction::Relaunch { .. } => Err(unsupported_relaunch()),
     }
 }
 
@@ -341,6 +344,17 @@ mod tests {
         assert!(validate_privileged_target(1).is_err());
         assert!(validate_privileged_target(std::process::id()).is_err());
         assert!(validate_privileged_target(123_456_789).is_ok());
+    }
+
+    #[test]
+    fn the_helper_refuses_to_execute_its_own_image_as_root() {
+        let error = execute_privileged_action(PrivilegedAction::Relaunch {
+            arguments: vec!["--tab=services".into()],
+            environment: vec![("DISPLAY".into(), ":0".into())],
+        })
+        .expect_err("a portable image must never be re-executed as root");
+        assert!(matches!(error, TmError::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("relaunch"), "{error}");
     }
 
     #[test]
