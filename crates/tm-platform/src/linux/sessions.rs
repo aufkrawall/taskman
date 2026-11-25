@@ -16,7 +16,20 @@ use tm_core::model::{UserSession, UserSessionState};
 
 const LOGINCTL_DEADLINE: Duration = Duration::from_secs(3);
 const LISTING_RETRY: Duration = Duration::from_secs(30);
-static LISTING_RETRY_AFTER: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The retry deadline of the last failed listing and the diagnostic that
+/// caused it. Keeping the detail with the deadline lets the retry window report
+/// the real failure instead of only that it is still cooling down.
+#[derive(Debug)]
+struct ListingState {
+    retry_after: Option<Instant>,
+    last_failure: Option<String>,
+}
+
+static LISTING_STATE: Mutex<ListingState> = Mutex::new(ListingState {
+    retry_after: None,
+    last_failure: None,
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionListRow {
@@ -48,9 +61,10 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
         return Err(TmError::Unsupported("user sessions (systemd/loginctl)"));
     }
     if !listing_available(Instant::now()) {
+        let last_failure = lock_listing_state().last_failure.clone();
         return Err(TmError::platform(
             "loginctl list-sessions",
-            "a recent loginctl failure is still cooling down",
+            cooldown_message(last_failure.as_deref()),
         ));
     }
     let loginctl =
@@ -62,15 +76,14 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
         deadline,
     )
     .map_err(|error| {
-        note_listing_failure();
-        TmError::platform("loginctl list-sessions", error.to_string())
+        let detail = error.to_string();
+        note_listing_failure(&detail);
+        TmError::platform("loginctl list-sessions", detail)
     })?;
     if !output.status.success() {
-        note_listing_failure();
-        return Err(TmError::platform(
-            "loginctl list-sessions",
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        note_listing_failure(&detail);
+        return Err(TmError::platform("loginctl list-sessions", detail));
     }
     note_listing_success();
 
@@ -203,29 +216,42 @@ fn wait_pidfd(fd: libc::c_int, deadline: Instant) -> std::io::Result<()> {
     }
 }
 
+fn lock_listing_state() -> std::sync::MutexGuard<'static, ListingState> {
+    LISTING_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn listing_available(now: Instant) -> bool {
-    listing_retry_available(
-        *LISTING_RETRY_AFTER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        now,
-    )
+    listing_retry_available(lock_listing_state().retry_after, now)
 }
 
 fn listing_retry_available(retry_after: Option<Instant>, now: Instant) -> bool {
     retry_after.is_none_or(|retry_after| now >= retry_after)
 }
 
-fn note_listing_failure() {
-    *LISTING_RETRY_AFTER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + LISTING_RETRY);
+/// The error a request inside the retry window answers with. The last real
+/// diagnostic is appended when there is one: the whole point of the window is
+/// to stop respawning a failing `loginctl`, not to hide why it failed.
+fn cooldown_message(last_failure: Option<&str>) -> String {
+    match last_failure.map(str::trim).filter(|detail| !detail.is_empty()) {
+        Some(detail) => format!(
+            "a recent loginctl failure is still cooling down; last failure: {detail}"
+        ),
+        None => "a recent loginctl failure is still cooling down".to_string(),
+    }
+}
+
+fn note_listing_failure(detail: &str) {
+    let mut state = lock_listing_state();
+    state.retry_after = Some(Instant::now() + LISTING_RETRY);
+    state.last_failure = Some(detail.to_string());
 }
 
 fn note_listing_success() {
-    *LISTING_RETRY_AFTER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    let mut state = lock_listing_state();
+    state.retry_after = None;
+    state.last_failure = None;
 }
 
 fn parse_session_list(text: &str) -> Vec<SessionListRow> {
@@ -374,6 +400,20 @@ TimestampMonotonic=1234567890
         assert!(listing_retry_available(None, now));
         assert!(!listing_retry_available(Some(now + LISTING_RETRY), now));
         assert!(listing_retry_available(Some(now), now));
+        assert_eq!(
+            cooldown_message(None),
+            "a recent loginctl failure is still cooling down"
+        );
+        assert_eq!(
+            cooldown_message(Some("Failed to connect to bus: No such file")),
+            "a recent loginctl failure is still cooling down; last failure: \
+             Failed to connect to bus: No such file"
+        );
+        assert_eq!(
+            cooldown_message(Some("   ")),
+            cooldown_message(None),
+            "a blank diagnostic must not add an empty suffix"
+        );
     }
 
     #[test]
