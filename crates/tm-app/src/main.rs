@@ -1101,11 +1101,17 @@ struct NativeApp {
     /// frame that never comes cannot leave the waiting launch unanswered.
     #[cfg(target_os = "windows")]
     show_ack_started: std::time::Instant,
-    /// Frames whose `ui` really ran, i.e. that painted into a window which was
-    /// on screen. A wait records this counter when it starts and is over once
-    /// the counter has moved past it: one frame's paint has been presented by
-    /// the time the next frame begins, so "a later frame painted" is exactly
-    /// "a presented frame exists".
+    /// Passes whose `ui` really ran, i.e. that painted into the window. eframe
+    /// runs no `ui` at all for a root viewport the app marked invisible or that
+    /// is minimized (it calls `update_logic_only` instead), so a pass counted
+    /// here painted something. The one exception is the very first pass, which
+    /// eframe runs before it reveals the window
+    /// (`EpiIntegration::is_first_frame`): its paint lands in a still hidden
+    /// window, which is why the gate is not adopted until the counter has
+    /// moved — see `adoptable` in `finish_reveal`. A wait records this counter
+    /// when it starts and is over once the counter has moved past it: one
+    /// frame's paint has been presented by the time the next frame begins, so
+    /// "a later frame painted" is exactly "a presented frame exists".
     #[cfg(target_os = "windows")]
     frames_painted: u32,
     /// The present gate holds the window cloaked after a show, an un-minimize,
@@ -1486,10 +1492,11 @@ impl eframe::App for NativeApp {
                 tray.set_visible(tray_enabled);
                 tray.sync_menu_theme(ui.ctx().theme());
             }
-            // Reaching `ui` means eframe ran a whole pass for a window that is
-            // on screen and not minimized, so this frame really painted into
-            // it. Every wait below is over once this counter has moved past
-            // the value it started at.
+            // eframe runs `ui` only for a viewport that is on screen and not
+            // minimized (apart from the first pass, which it runs before the
+            // first reveal), so this pass really painted into the window.
+            // Every wait below is over once this counter has moved past the
+            // value it started at.
             self.frames_painted = self.frames_painted.saturating_add(1);
             // A changed monitor size means the display layout changed under
             // the window (resolution switch by a game, monitor unplugged or
@@ -2057,8 +2064,13 @@ impl NativeApp {
         // a monitor that went away can leave it at its old off-screen place.
         tm_platform::ensure_window_on_screen(hwnd);
         // Only a show someone asked for has to fight for the foreground; the
-        // initial reveal and a taskbar click already have it.
-        if self.show_ack_pending {
+        // initial reveal and a taskbar click already have it. It also has to
+        // be a window that is still meant to be on screen: `force_foreground`
+        // ends in `ShowWindow(SW_SHOW)` and `SWP_SHOWWINDOW`, so doing it for
+        // a window the app has since put back in the tray would show it again
+        // with no frame behind it — `ui` does not run for a viewport the app
+        // marked invisible, so nothing would repaint it either.
+        if self.show_ack_pending && !self.hidden_to_tray && !self.initial_hide_pending {
             tm_platform::force_foreground(hwnd);
         }
         if painted {
