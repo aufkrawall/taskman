@@ -94,11 +94,24 @@ impl CpuStatSampler {
         let previous = previous?;
 
         let aggregate = percentages(previous.aggregate?, current.aggregate?)?;
+        // The aggregate is a measurement even when one core's counters reset or
+        // did not move inside this window. Losing the whole sample over one core
+        // blanked the CPU page, and it also blanked every process' `cpu_pct`,
+        // which divides by the aggregate capacity this window carries. Only the
+        // per-core vectors go unavailable — an empty vector is how the platform
+        // says "no per-core split here".
         let mut per_core_pct = Vec::with_capacity(current.cores.len());
         let mut per_core_kernel_pct = Vec::with_capacity(current.cores.len());
         for (id, times) in &current.cores {
-            let old = previous.cores.get(id)?;
-            let core = percentages(*old, *times)?;
+            let Some(core) = previous
+                .cores
+                .get(id)
+                .and_then(|old| percentages(*old, *times))
+            else {
+                per_core_pct.clear();
+                per_core_kernel_pct.clear();
+                break;
+            };
             per_core_pct.push(core.busy_pct);
             per_core_kernel_pct.push(core.kernel_pct);
         }
@@ -167,21 +180,23 @@ fn parse_proc_stat(text: &str) -> Option<ProcStat> {
             .map(str::parse)
             .collect::<std::result::Result<_, _>>()
             .ok()?;
-        // Kernels before Linux 2.6.11 exposed only user/nice/system/idle.
-        // Missing newer counters are unknown zeroes for those fields.
-        if values.len() < 4 {
+        // A line this build cannot read completely is not a partial sample: the
+        // counters it lacks are unknown, not zeroes, and inventing `0` for
+        // `iowait`/`irq`/`softirq`/`steal` reports a machine that spent the
+        // whole window in user time. Ignoring the line leaves the core out of
+        // the map, and the CPU-set check above reports the window unavailable.
+        if values.len() < 8 {
             continue;
         }
-        let value = |index: usize| values.get(index).copied().unwrap_or(0);
         let times = CpuTimes {
-            user: value(0),
-            nice: value(1),
-            system: value(2),
-            idle: value(3),
-            iowait: value(4),
-            irq: value(5),
-            softirq: value(6),
-            steal: value(7),
+            user: values[0],
+            nice: values[1],
+            system: values[2],
+            idle: values[3],
+            iowait: values[4],
+            irq: values[5],
+            softirq: values[6],
+            steal: values[7],
         };
         match cpu {
             Some(id) => {
@@ -265,5 +280,59 @@ cpu2 70 10 75 1045 0 0 0 0 0 0
         // The guest fields are already included in user/nice.
         assert_eq!(sample.utilization_pct, 60.0);
         assert_eq!(sample.kernel_pct, 20.0);
+    }
+
+    /// One core whose counters did not move covers zero jiffies, so its share is
+    /// unknown. That must not discard the machine-wide measurement, which is
+    /// also what every process share is divided by: only the per-core split goes
+    /// unavailable.
+    #[test]
+    fn one_unmeasurable_core_keeps_the_aggregate_measurement() {
+        let first = "\
+cpu 100 10 50 840 0 0 0 0 0 0
+cpu0 60 0 10 930 0 0 0 0 0 0
+cpu1 40 10 40 910 0 0 0 0 0 0
+";
+        // cpu1's counters are unchanged, so its delta covers no jiffies.
+        let second = "\
+cpu 120 10 70 1000 0 0 0 0 0 0
+cpu0 80 0 15 1005 0 0 0 0 0 0
+cpu1 40 10 40 910 0 0 0 0 0 0
+";
+        let mut sampler = CpuStatSampler::default();
+        assert!(sampler.sample(first).is_none());
+        let sample = sampler.sample(second).expect("the aggregate is measured");
+        assert_eq!(sample.utilization_pct, 20.0);
+        assert_eq!(sample.kernel_pct, 10.0);
+        assert_eq!(sample.window_total_ticks, 200);
+        assert!(
+            sample.per_core_pct.is_empty() && sample.per_core_kernel_pct.is_empty(),
+            "an unmeasurable core leaves the per-core split unavailable"
+        );
+    }
+
+    /// A truncated `cpuN` line is not a partial sample: the counters it lacks
+    /// are unknown, and reading them as zeroes reports a machine that spent the
+    /// whole window in user time. Dropping the line makes the CPU-set check
+    /// report the window unavailable instead.
+    #[test]
+    fn a_truncated_core_line_is_not_read_as_zero_counters() {
+        let first = "\
+cpu 100 10 50 840 0 0 0 0 0 0
+cpu0 60 0 10 930 0 0 0 0 0 0
+cpu1 40 10 40 910 0 0 0 0 0 0
+";
+        // cpu1 lost its iowait/irq/softirq/steal counters.
+        let second = "\
+cpu 120 10 70 1000 0 0 0 0 0 0
+cpu0 80 0 15 1005 0 0 0 0 0 0
+cpu1 45 10 45
+";
+        let mut sampler = CpuStatSampler::default();
+        assert!(sampler.sample(first).is_none());
+        assert!(
+            sampler.sample(second).is_none(),
+            "a core this build cannot read makes the window unmeasurable"
+        );
     }
 }
