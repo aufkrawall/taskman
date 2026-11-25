@@ -429,6 +429,25 @@ fn fmt_optional_bytes(value: Option<u64>) -> String {
     value.map_or_else(|| "\u{2014}".into(), format::format_bytes_loc)
 }
 
+/// Summary totals beside the file-list title, or `None` while nothing was
+/// measured (an empty list, or every row's counters unknown).
+///
+/// A measured zero is a number and prints "0 B"; the summary disappears only
+/// when there is nothing to state, never to hide a zero. A list measured on
+/// one side only states that side and "\u{2014}" for the other.
+fn files_summary(read: Option<u64>, written: Option<u64>) -> Option<String> {
+    if read.is_none() && written.is_none() {
+        return None;
+    }
+    Some(format!(
+        "({}: {}, {}: {})",
+        i18n::tr(K::PropIoColRead),
+        fmt_optional_bytes(read),
+        i18n::tr(K::PropIoColWritten),
+        fmt_optional_bytes(written),
+    ))
+}
+
 /// Paint one rolling I/O graph section matching the Performance page disk theming.
 #[allow(clippy::too_many_arguments)]
 fn paint_io_graph_section(
@@ -739,15 +758,8 @@ pub fn show(
 
         let total_read = measured_sum(state.files.iter().map(|f| f.read_bytes));
         let total_written = measured_sum(state.files.iter().map(|f| f.write_bytes));
-        if total_read.is_some() || total_written.is_some() {
+        if let Some(summary) = files_summary(total_read, total_written) {
             ui.add_space(8.0);
-            let summary = format!(
-                "({}: {}, {}: {})",
-                i18n::tr(K::PropIoColRead),
-                fmt_optional_bytes(total_read),
-                i18n::tr(K::PropIoColWritten),
-                fmt_optional_bytes(total_written),
-            );
             ui.label(egui::RichText::new(summary).color(pal.text_dim).size(12.0));
         }
 
@@ -1292,6 +1304,35 @@ mod tests {
             None,
             "an overflowing sum is unknown, never saturated"
         );
+    }
+
+    /// The summary beside the file-list title renders only when at least one
+    /// total was measured: a measured zero prints "0 B", a list with nothing
+    /// measured prints no summary at all (the list body states the
+    /// unavailable form).
+    ///
+    /// Pins both ends of that condition. The rule used to be `total > 0`,
+    /// which hid a measured zero; it is now "any total known", which shows
+    /// it — a visible change that has to stay deliberate.
+    #[test]
+    fn the_file_summary_states_measured_totals_and_skips_an_unmeasured_list() {
+        use std::iter;
+
+        // An empty list and an all-unknown list have nothing to state.
+        assert_eq!(files_summary(measured_sum(iter::empty()), None), None);
+        assert_eq!(files_summary(None, None), None);
+
+        // Measured zeros are numbers, so both totals print.
+        let zero_bytes = fmt_optional_bytes(Some(0));
+        let zero = files_summary(Some(0), Some(0)).expect("a measured zero states its totals");
+        assert_eq!(zero.matches(zero_bytes.as_str()).count(), 2);
+        assert!(!zero.contains('\u{2014}'));
+
+        // One side unknown still states the other, and marks the gap.
+        let read_bytes = fmt_optional_bytes(Some(1024));
+        let half = files_summary(Some(1024), None).expect("a measured read total is stated");
+        assert!(half.contains(read_bytes.as_str()));
+        assert!(half.contains('\u{2014}'));
     }
 
     #[test]
