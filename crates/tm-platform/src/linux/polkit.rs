@@ -6,8 +6,11 @@
 //! process actions and GUI relaunch fail closed until a protected helper ships.
 
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use tm_core::error::{Result, TmError};
 
@@ -26,6 +29,9 @@ const PKEXEC_CANDIDATES: [&str; 5] = [
     "/run/current-system/sw/bin/pkexec",
 ];
 const MAX_PKEXEC_DIAGNOSTIC_CHARS: usize = 4 * 1024;
+/// Generous on purpose: a human answers the Polkit prompt. The bound only
+/// exists so a wedged agent or an unanswered dialog cannot park an action lane.
+const PKEXEC_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn is_elevated() -> bool {
     unsafe { libc::geteuid() == 0 }
@@ -186,35 +192,81 @@ pub(super) fn is_permission_denied(error: &TmError) -> bool {
 
 fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<()> {
     let pkexec = pkexec_path()?;
-    let output = Command::new(&pkexec)
+    let mut child = Command::new(&pkexec)
         .arg(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|error| {
             TmError::platform(
                 "pkexec",
                 format!("Polkit's pkexec is unavailable or could not start: {error}"),
             )
         })?;
-    if output.status.success() {
+    // Neither pipe may wait for the exit: `pkexec` writes its diagnostics while
+    // it authenticates, and a full pipe would block the helper we are timing.
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TmError::platform(
+            "pkexec",
+            "could not capture the authorization helper's output",
+        ));
+    };
+    let stdout = drain_pipe(stdout);
+    let stderr = drain_pipe(stderr);
+    // An interactive prompt is expected to take a while, but a hung agent or an
+    // unanswered dialog must not park one of the two action lanes (and then its
+    // queue) for the rest of the session.
+    if let Err(error) =
+        launch::wait_for_exit(&mut child, Instant::now() + PKEXEC_DEADLINE, "pkexec")
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TmError::platform(
+            action,
+            format!(
+                "Polkit authorization did not complete within {} seconds and was cancelled: {error}",
+                PKEXEC_DEADLINE.as_secs()
+            ),
+        ));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| TmError::platform("pkexec", error.to_string()))?;
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
         return Ok(());
     }
 
-    let mut detail = first_diagnostic(&output.stdout, &output.stderr)
-        .unwrap_or_else(|| output.status.to_string());
+    let mut detail = first_diagnostic(&stdout, &stderr).unwrap_or_else(|| status.to_string());
     if let Some((index, _)) = detail.char_indices().nth(MAX_PKEXEC_DIAGNOSTIC_CHARS) {
         detail.truncate(index);
     }
-    let guidance = match output.status.code() {
+    let guidance = match status.code() {
         Some(126) => "Polkit authorization was dismissed",
         Some(127) => "Polkit denied authorization",
         Some(125) => "Polkit authentication failed or no authentication agent was available",
         _ => "Polkit authorization or the requested privileged action failed",
     };
     Err(TmError::platform(action, format!("{guidance}: {detail}")))
+}
+
+/// Read one of the helper's pipes to its end on its own thread, so the deadline
+/// wait and a chatty helper cannot block each other. The handle is deliberately
+/// dropped, never joined, on the timeout path: a descendant that inherited the
+/// pipe would make the join unbounded, which is the failure this bound exists
+/// to prevent.
+fn drain_pipe(pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
 }
 
 fn pkexec_path() -> Result<PathBuf> {
