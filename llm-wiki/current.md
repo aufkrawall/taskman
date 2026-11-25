@@ -1145,9 +1145,13 @@ rebase runbook.
   oldest sample INSIDE the window can be up to one interval short of that
   edge — a fixed fraction of the chart, so a visible notch once the window
   is wide. `visible_slice` therefore carries the one point just BEFORE the
-  window and `chart::x_on_axis` places it, with a SIGNED offset, left of the
-  rect; the painter clips the overhang and the hover readout clamps to
-  `first_on_axis` so it never locks onto it. See `log/recent.md` 2026-09-11.
+  window and `chart::ChartGeometry` places it, with a SIGNED offset, left of
+  the rect; the painter clips the overhang and the hover readout clamps to
+  `first_on_axis` so it never locks onto it. A lead-in MORE than one window
+  old (a resume after a suspend, not a normal tick) is not a plausible entry
+  slope and is dropped, because clamping it onto the edge and joining it to
+  the first in-window sample draws the bridging stroke that looked like graph
+  garbage. See `log/recent.md` 2026-09-11.
 - Build: `build.py` release driver (host + Linux by default), profiles
   tuned for compile speed (thin LTO, parallel codegen, line-tables-only
   debuginfo).
