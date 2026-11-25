@@ -224,14 +224,19 @@ impl ImpactStore {
     /// Load from `path`; a missing or corrupt file yields an empty store
     /// rather than an error — losing measurements must never block startup.
     /// A corrupt file with bytes in it is kept aside rather than overwritten;
-    /// one that holds no bytes is removed instead, since moving it aside would
-    /// only take the `.bad` name from a copy that still has measurements.
+    /// one that says nothing — no bytes, whitespace only, or NUL-filled — is
+    /// removed instead, since moving it aside would only take the `.bad` name
+    /// from a copy that still has measurements.
     pub fn open(path: PathBuf) -> Self {
         let entries = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
                 Ok(file) => file.entries,
                 Err(_) => {
-                    crate::persist::set_aside(&path, "startup-impact store");
+                    if crate::persist::says_nothing(&text) {
+                        crate::persist::discard_contentless(&path, "startup-impact store");
+                    } else {
+                        crate::persist::set_aside(&path, "startup-impact store");
+                    }
                     BTreeMap::new()
                 }
             },
@@ -494,6 +499,28 @@ mod tests {
         assert_eq!(
             store.get(r"c:\apps\launcher.exe").map(|s| s.cpu_ms),
             Some(50.0)
+        );
+    }
+
+    /// The store's own load decides this, not the size: whitespace has no
+    /// entries to recover, so the file is removed where it lies and the copy an
+    /// earlier failure kept stays byte-identical.
+    #[test]
+    fn a_whitespace_only_store_leaves_an_existing_aside_copy_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup-impact.json");
+        let aside = dir.path().join("startup-impact.json.bad");
+        std::fs::write(&aside, b"the last recoverable copy").unwrap();
+        std::fs::write(&path, " \r\n\t \r\n").unwrap();
+
+        let store = ImpactStore::open(path.clone());
+
+        assert!(store.is_empty());
+        assert!(!path.exists(), "the unusable file must not be left for the next load");
+        assert_eq!(
+            std::fs::read_to_string(&aside).unwrap(),
+            "the last recoverable copy",
+            "a store that says nothing must not replace the copy kept aside earlier"
         );
     }
 }

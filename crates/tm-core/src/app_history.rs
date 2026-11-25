@@ -333,7 +333,14 @@ impl AppHistoryDb {
             }
             Err(e) => {
                 tracing::warn!(error = %e, path = %path.display(), "app-history db corrupt");
-                crate::persist::set_aside(path, "app-history db");
+                // Whitespace or NULs parse to no entries at all, so this file
+                // is removed instead of taking the `.bad` copy that an earlier
+                // failure kept.
+                if crate::persist::says_nothing(text) {
+                    crate::persist::discard_contentless(path, "app-history db");
+                } else {
+                    crate::persist::set_aside(path, "app-history db");
+                }
             }
         }
     }
@@ -839,6 +846,28 @@ mod tests {
         assert_eq!(e.network_bytes, 2048);
         assert!(e.network_available);
         assert!(db2.since_epoch_s() > 0);
+    }
+
+    /// The loader's own verdict decides this, not the size: NULs read as UTF-8
+    /// but parse to no entries, so the db is removed where it lies and the copy
+    /// an earlier failure kept stays byte-identical.
+    #[test]
+    fn a_nul_filled_db_leaves_an_existing_aside_copy_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let aside = dir.path().join("history.json.bad");
+        std::fs::write(&aside, b"the last recoverable copy").unwrap();
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+
+        let db = AppHistoryDb::open(path.clone());
+
+        assert!(db.entries().is_empty());
+        assert!(!path.exists(), "the unusable file must not be left for the next load");
+        assert_eq!(
+            std::fs::read_to_string(&aside).unwrap(),
+            "the last recoverable copy",
+            "a db that says nothing must not replace the copy kept aside earlier"
+        );
     }
 
     /// Generations through the real writer channel: a burst of saves where

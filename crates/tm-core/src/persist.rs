@@ -112,13 +112,29 @@ pub(crate) fn replace_file(
     write_result
 }
 
+/// A character that carries nothing a loader could use: whitespace, a NUL left
+/// by a write that never reached the disk, or a byte-order mark.
+fn is_contentless(c: char) -> bool {
+    c.is_whitespace() || c == '\0' || c == '\u{feff}'
+}
+
+/// Whether the text of a file says nothing: every character of it is
+/// contentless, so the file holds no settings, history or entries to recover
+/// even though it has bytes. Useful in the `Err` arm of a parser, the first
+/// point where the caller knows both that the file failed and that nothing in
+/// it is worth keeping.
+pub(crate) fn says_nothing(text: &str) -> bool {
+    text.chars().all(is_contentless)
+}
+
 /// Remove a file the caller has read and found empty of anything usable: no
 /// settings, no history, no entries.
 ///
 /// Zero bytes is only the crudest form of that — a write that never reached
 /// the disk. A NUL-filled file, a bare byte-order mark, whitespace, or pairs
 /// that sit before the first section all say just as little, and only the
-/// caller can tell because only the caller reads the contents. Such a file is
+/// caller can tell because only the caller reads the contents; a caller that
+/// decides on the text alone asks [`says_nothing`] first. Such a file is
 /// removed rather than moved aside, so it cannot take the `.bad` name from
 /// the copy that an earlier, real failure kept: that copy is the last file
 /// the user can still restore from. Best effort: a failed removal is logged,
@@ -142,16 +158,19 @@ pub(crate) fn discard_contentless(path: &Path, what: &str) {
 ///
 /// Starting over means the next save replaces that file name; the caller may
 /// also build its state from another source instead (the settings loader falls
-/// back to the legacy `settings.json`). A file that is oversized, corrupt, not
-/// UTF-8 or merely unreadable right now still holds the user's settings or
-/// history, so it is kept for recovery instead of being overwritten, and it
-/// takes the `.bad` name from any older copy: the newest recoverable bytes
-/// win. Best effort: failing to move it is logged, never fatal.
+/// back to the legacy `settings.json`). A file that is oversized, not UTF-8 or
+/// merely unreadable right now still holds the user's settings or history, so
+/// it is kept for recovery instead of being overwritten, and it takes the
+/// `.bad` name from any older copy: the newest bytes win, because nothing here
+/// reads them. Best effort: failing to move it is logged, never fatal.
 ///
 /// A zero-byte source goes to [`discard_contentless`] instead: it holds
-/// nothing to recover, so it must not take the `.bad` name. Callers that can
-/// prove a non-empty file says nothing, by parsing it, call that function
-/// directly; the size check here is only for callers that cannot look inside.
+/// nothing to recover, so it must not take the `.bad` name. That size check is
+/// the only test available to a caller that cannot look inside the file — a
+/// failed read, an oversized file, one that is not UTF-8 — so those callers use
+/// this function and accept that bytes which say nothing still take the name. A
+/// caller that parses the text knows better: it asks [`says_nothing`] and sends
+/// the file to [`discard_contentless`] itself.
 ///
 /// A source that was moved or removed no longer sits where the next load
 /// would re-read it. When either step fails the warning is logged and the file
@@ -272,6 +291,19 @@ mod tests {
             "a file that says nothing must not replace the copy kept aside earlier"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The forms a write that never landed takes, and the bound that keeps a
+    /// real payload out: every character must be contentless, so one byte-order
+    /// mark in front of actual content makes the whole text content.
+    #[test]
+    fn says_nothing_covers_whitespace_nuls_and_a_bare_byte_order_mark() {
+        assert!(says_nothing(""), "empty text says nothing");
+        assert!(says_nothing(" \t\r\n"), "whitespace says nothing");
+        assert!(says_nothing("\0\0\0"), "a NUL hole says nothing");
+        assert!(says_nothing("\u{feff}"), "a bare BOM says nothing");
+        assert!(!says_nothing("\u{feff}{}"), "a BOM in front of content is content");
+        assert!(!says_nothing("{}"), "an empty JSON object is content");
     }
 
     #[test]
