@@ -389,6 +389,16 @@ fn measured_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     measured.then_some(total)
 }
 
+/// Whether raising the token can give the per-file byte columns a source.
+///
+/// The line explains a privilege gap, so it is only true where that remedy
+/// exists. Windows has two hosts for the Kernel-File trace — the installed
+/// service and an elevated GUI. The Linux backend reports per-file bytes as
+/// [`FileIoAccountingState::Unavailable`] for every snapshot by construction
+/// and has no elevated host at all, so the line there would name a remedy that
+/// does not exist on a table that is not broken.
+const ELEVATION_IS_A_REMEDY: bool = cfg!(windows);
+
 /// Whether the per-file byte columns have no source AT ALL, as opposed to a
 /// source that has measured nothing for this process yet.
 ///
@@ -397,8 +407,21 @@ fn measured_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
 /// service or an elevated process, so without them the Read and Written columns
 /// are not a gap in time but a gap in privilege. Left unexplained, a table full
 /// of "—" reads as a broken feature.
-fn per_file_bytes_need_a_source(accounting: Option<&FileIoAccounting>) -> bool {
-    accounting.is_some_and(|accounting| accounting.state == FileIoAccountingState::Unavailable)
+///
+/// `rows_measured` suppresses the line when a row still carries a count.
+/// [`State::merge_files`] replaces the accounting wholesale while keeping the
+/// larger of two row counts, so a snapshot without a source can arrive over
+/// rows measured a moment earlier; the rows are the measurement then, and a
+/// "no source" line under them would contradict what the table shows.
+fn per_file_bytes_need_a_source(
+    accounting: Option<&FileIoAccounting>,
+    rows_measured: bool,
+    elevation_is_a_remedy: bool,
+) -> bool {
+    elevation_is_a_remedy
+        && !rows_measured
+        && accounting
+            .is_some_and(|accounting| accounting.state == FileIoAccountingState::Unavailable)
 }
 
 fn cmp_known_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::cmp::Ordering {
@@ -849,7 +872,14 @@ pub fn show(
     // Above the table, so the Read and Written columns are explained rather
     // than left to look broken: without a trace there is nothing to show in
     // them for any row, however open the files are.
-    if per_file_bytes_need_a_source(state.accounting.as_ref()) {
+    let rows_measured = display_files
+        .iter()
+        .any(|file| file.read_bytes.is_some() || file.write_bytes.is_some());
+    if per_file_bytes_need_a_source(
+        state.accounting.as_ref(),
+        rows_measured,
+        ELEVATION_IS_A_REMEDY,
+    ) {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(i18n::tr(K::PropIoPerFileNeedsSource))
@@ -1360,32 +1390,48 @@ mod tests {
     }
 
     /// The table's Read and Written columns can be empty for two different
-    /// reasons and only one of them is actionable. "No trace at all" (an
-    /// unelevated run without the service) is explained above the table as a
-    /// privilege requirement; "nothing measured yet" is a gap in time and gets
-    /// no such line, or the page would blame the token for a quiet process.
+    /// reasons and only one of them is actionable. "No trace at all" on a
+    /// platform where elevation can create one is explained above the table as
+    /// a privilege requirement; "nothing measured yet" is a gap in time and
+    /// gets no such line, or the page would blame the token for a quiet
+    /// process. A row that still carries a count is a source as well, however
+    /// the accounting of the moment reads.
     #[test]
     fn only_a_missing_trace_needs_the_elevation_note() {
         let accounting = |state| FileIoAccounting {
             state,
             ..Default::default()
         };
-        assert!(per_file_bytes_need_a_source(Some(&accounting(
-            FileIoAccountingState::Unavailable
-        ))));
+        let unavailable = accounting(FileIoAccountingState::Unavailable);
+        assert!(
+            per_file_bytes_need_a_source(Some(&unavailable), false, true),
+            "an unelevated Windows run is the state the line is written for"
+        );
         for state in [
             FileIoAccountingState::Measured,
             FileIoAccountingState::Undelivered,
             FileIoAccountingState::Undecodable,
         ] {
             assert!(
-                !per_file_bytes_need_a_source(Some(&accounting(state))),
+                !per_file_bytes_need_a_source(Some(&accounting(state)), false, true),
                 "{state:?} has a source and must not claim it needs elevation"
             );
         }
         assert!(
-            !per_file_bytes_need_a_source(None),
+            !per_file_bytes_need_a_source(None, false, true),
             "no answer yet is not the same as no source"
+        );
+        // Linux reports Unavailable for every snapshot and has no elevated
+        // host, so the line would name a remedy the platform does not have.
+        assert!(
+            !per_file_bytes_need_a_source(Some(&unavailable), false, false),
+            "a platform without an elevation remedy must never see this line"
+        );
+        // merge_files keeps the larger of two row counts while replacing the
+        // accounting, so an unmeasured snapshot can arrive over measured rows.
+        assert!(
+            !per_file_bytes_need_a_source(Some(&unavailable), true, true),
+            "rows that still carry bytes ARE the source; the line would deny them"
         );
     }
 

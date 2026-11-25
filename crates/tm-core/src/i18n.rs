@@ -477,8 +477,8 @@ keys! {
     PropIoNoFiles => ["Keine Datei-Aktivität für diesen Prozess erkannt", "No file activity detected for this process"],
     PropIoFilesUnavailable => ["Datei-Informationen nicht verfügbar", "File information unavailable"],
     PropIoPerFileNeedsSource => [
-        "Bytes pro Datei erfordern Administratorrechte oder den installierten Dienst",
-        "Per-file bytes require administrator rights or the installed service"
+        "Bytes pro Datei erfordern Administratorrechte oder den installierten Dienst; es läuft keine Ablaufverfolgung",
+        "Bytes per file need administrator rights or the installed service; no trace is running"
     ],
     PropNetworkReceive => ["Netzwerk empfangen", "Network receive"],
     PropNetworkSend => ["Netzwerk senden", "Network send"],
