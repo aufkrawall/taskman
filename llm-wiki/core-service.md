@@ -249,7 +249,10 @@ Constraints that keep it honest:
   no additional worker threads are created while it is stuck.
 - The service owns the trace lifecycle: started on the first request, stopped
   by a watchdog after `NET_TRACE_IDLE` (30 s) without one, so it is not
-  tracing when no window is showing the column.
+  tracing when no window is showing the column. That watchdog is the only
+  thing that ever stops a network or disk session, so a session is kept only
+  when the watchdog thread actually started; otherwise it is dropped and the
+  answer is unknown, never a live session nothing can stop.
 - Counters are pruned to processes that still exist, using the SERVICE's own
   ToolHelp snapshot. A pid list supplied by the client would let the client
   shape the answer.

@@ -1983,7 +1983,17 @@ fn process_network_sample() -> ProcessNetworkSample {
                     usage,
                     last_request: std::time::Instant::now(),
                 });
-                spawn_net_trace_watchdog();
+                if !spawn_net_trace_watchdog() {
+                    // Nothing else stops this session. Keeping it would trace
+                    // every process's network traffic on the machine for the
+                    // life of the service, so it is dropped and the answer
+                    // stays unknown.
+                    tracing::error!(
+                        "could not start the network-trace watchdog; the session was not kept"
+                    );
+                    *slot = None;
+                    return ProcessNetworkSample::default();
+                }
             }
             None => {
                 // LocalSystem should always be able to start a session; if it
@@ -2071,7 +2081,16 @@ fn process_disk_sample() -> ProcessDiskSample {
                     usage,
                     last_request: std::time::Instant::now(),
                 });
-                spawn_disk_trace_watchdog();
+                if !spawn_disk_trace_watchdog() {
+                    // Same rule as the network trace: the watchdog is the only
+                    // thing that ever stops this session, so a session without
+                    // one would trace disk I/O for the life of the service.
+                    tracing::error!(
+                        "could not start the disk-trace watchdog; the session was not kept"
+                    );
+                    *slot = None;
+                    return ProcessDiskSample::default();
+                }
                 // The first answer would cover the microseconds since the
                 // session started, which is not a window anyone can divide by.
                 return ProcessDiskSample::default();
@@ -2191,24 +2210,28 @@ fn spawn_trace_watchdog<T: Send + 'static>(
 
 /// Stop the disk trace once the GUI stops polling, exactly like the network
 /// one. Its own thread because the two traces idle out independently.
-fn spawn_disk_trace_watchdog() {
-    let _ = spawn_trace_watchdog(
+///
+/// Returns whether the thread was started: this watchdog is the only thing
+/// that ever stops the session, so the caller must not keep one without it.
+fn spawn_disk_trace_watchdog() -> bool {
+    spawn_trace_watchdog(
         "tm-disk-idle",
         disk_trace(),
         |trace| trace.last_request,
         "per-process disk trace stopped (idle)",
-    );
+    )
 }
 
 /// Stop the trace once the GUI stops polling. Without this the session would
-/// outlive the last interested window and trace forever.
-fn spawn_net_trace_watchdog() {
-    let _ = spawn_trace_watchdog(
+/// outlive the last interested window and trace forever, which is why the
+/// caller drops the session when the thread could not be started.
+fn spawn_net_trace_watchdog() -> bool {
+    spawn_trace_watchdog(
         "tm-net-idle",
         net_trace(),
         |trace| trace.last_request,
         "per-process network trace stopped (idle)",
-    );
+    )
 }
 
 /// The per-file `FileIo` trace, hosted either by the broker or by the GUI.
