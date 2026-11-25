@@ -310,13 +310,24 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) {
 
 /// [`set_cloaked`] without the gate's veto, for the gate's own cloak calls and
 /// for callers that have already consulted `present_gate::present_gate_held`.
+///
+/// Reports a refused attribute write instead of discarding it: a caller that
+/// believed the window was cloaked would otherwise log a hold that DWM never
+/// applied, and wait for a frame the compositor is not withholding.
 pub(super) fn set_cloaked_raw(hwnd: isize, cloaked: bool) {
     let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-    set_attr(
+    let applied = set_attr(
         hwnd,
         DWMWA_CLOAK,
         &windows::core::BOOL::from(cloaked).0.cast_unsigned(),
     );
+    if !applied {
+        tracing::warn!(
+            hwnd = hwnd.0 as isize,
+            cloaked,
+            "DWM refused the window cloak state"
+        );
+    }
 }
 
 /// Whether DWM currently cloaks `hwnd` (by any party: this process's restore
