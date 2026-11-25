@@ -27,6 +27,7 @@
 //!   header must reserve the SAME space (`prev_bar_use`) or the two end at
 //!   different x and clamp the shared offset at different maxima.
 
+use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Rect, Sense, Stroke,
 };
@@ -1386,14 +1387,20 @@ impl TmTable {
         }
         // Carry the header's column boundaries through the body. Native
         // Task Manager keeps these guides very quiet, but without them wide
-        // text tables are unnecessarily hard to scan horizontally. Snap stroke
-        // width to 1 physical pixel so dividers stay crisp at 100%-200% DPI.
-        let divider_w = 1.0 / ui.ctx().pixels_per_point().max(1.0);
+        // text tables are unnecessarily hard to scan horizontally. One
+        // physical pixel wide, on a pixel CENTRE: the boundary is a sum of
+        // fractional column widths, and a stroke centred on such a value
+        // splits its coverage between the two pixels it straddles, so the
+        // dividers read as 2 px smudges instead of crisp lines (the rule the
+        // chart hairlines follow). The guard only keeps a degenerate scale
+        // from producing a non-finite coordinate.
+        let ppp = ui.ctx().pixels_per_point();
+        let ppp = if ppp > 0.0 { ppp } else { 1.0 };
         for i in 1..self.cols.len() {
-            let x = self.boundary_x(rect, i);
+            let x = self.boundary_x(rect, i).round_to_pixel_center(ppp);
             painter.line_segment(
                 [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                Stroke::new(divider_w, pal.stroke.gamma_multiply(0.72)),
+                Stroke::new(1.0 / ppp, pal.stroke.gamma_multiply(0.72)),
             );
         }
         (rect, resp)
@@ -2192,6 +2199,54 @@ mod tests {
             galley.x > clip.width(),
             "the test string must overflow its cell ({galley:?} vs {clip:?})"
         );
+    }
+
+    /// Column dividers must sit on a physical pixel CENTRE at one pixel wide.
+    ///
+    /// Regression: the stroke WIDTH was already one physical pixel, but its x
+    /// was the raw sum of the column widths. A 1 px stroke centred on an
+    /// integer or otherwise gridless x splits its coverage between the two
+    /// pixels it straddles, so every divider painted as a two-pixel smudge —
+    /// the wider the table, the more visible the hatching.
+    #[test]
+    fn column_dividers_snap_to_a_physical_pixel_centre() {
+        let ctx = egui::Context::default();
+        let table = table();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 160.0))),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    let _ = table.row(ui, &crate::theme::DARK, false, "t");
+                });
+            },
+        );
+        out.textures_delta.clear();
+        let ppp = out.pixels_per_point;
+        let dividers: Vec<f32> = out
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::LineSegment { points, .. } if points[0].x == points[1].x => {
+                    Some(points[0].x)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dividers.len(),
+            table.cols.len() - 1,
+            "one divider between each pair of columns: {dividers:?}"
+        );
+        for x in dividers {
+            let pixel = x * ppp;
+            assert!(
+                (pixel - pixel.round()).abs() > 0.4,
+                "divider at {x} is not on a pixel centre (ppp {ppp}): it straddles two pixels"
+            );
+        }
     }
 
     /// The disk headers must never invent a zero.
