@@ -230,6 +230,20 @@ fn bgr_swaps_the_colored_channel_order() {
         mode: SubpixelMode::Bgr,
         ..Default::default()
     });
+
+    // Without these the assertion below also holds for two identical grayscale images, so it
+    // would go green in exactly the failure this suite exists to catch: a device that
+    // advertises dual-source blending but draws the atlas through the ordinary pipeline.
+    assert!(
+        chromatic_pixels(&rgb) > 0 && chromatic_pixels(&bgr) > 0,
+        "both renders must actually be sub-pixel rendered"
+    );
+    assert_ne!(
+        rgb.as_raw(),
+        bgr.as_raw(),
+        "BGR must not produce the RGB image"
+    );
+
     let red: u64 = rgb.pixels().map(|pixel| u64::from(pixel.0[0])).sum();
     let blue_of_bgr: u64 = bgr.pixels().map(|pixel| u64::from(pixel.0[2])).sum();
     assert_eq!(red, blue_of_bgr);
