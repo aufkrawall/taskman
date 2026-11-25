@@ -2053,6 +2053,18 @@ impl NativeApp {
         let released = tm_platform::present_gate_release(hwnd);
         self.present_gate_held = false;
         self.present_gate_started = None;
+        // Everything below repairs the window itself, which needs its handle;
+        // the release above already uncloaked it through the gate's own copy.
+        if hwnd == 0 {
+            tracing::debug!(
+                ticks,
+                released,
+                painted,
+                waited_ms = waited.as_millis() as u64,
+                "present gate: released through the gate's own handle"
+            );
+            return;
+        }
         // A window another party (virtual desktops, the shell) left cloaked
         // would be "shown" yet invisible: repair that before anything is
         // answered. A cloak that outlived the gate would leave the window
@@ -2104,9 +2116,13 @@ impl NativeApp {
     /// [`RESTORE_ACK_DEADLINE`]) mean a frame that never comes can neither
     /// leave the window invisible nor leave a waiting launch unanswered.
     fn finish_reveal(&mut self, ctx: &eframe::egui::Context) {
-        let Some(hwnd) = self.hwnd else {
-            return;
-        };
+        // A missing cached handle must not stop the reveal loop: the gate
+        // holds the window cloaked and knows the handle it was installed on, so
+        // zero means "ask the gate". Returning here instead would let a hold
+        // outlive every bound and leave an invisible window, which is the one
+        // failure worse than the flash. The window repairs below are the only
+        // things that need the handle here, and they are skipped without it.
+        let hwnd = self.hwnd.unwrap_or(0);
         // The platform re-cloaks on every show and un-minimize, including the
         // ones nobody here asked for, and it is still holding the cloak it
         // installed at creation. Either way the window is invisible until a

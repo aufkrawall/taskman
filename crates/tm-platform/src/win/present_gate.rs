@@ -437,12 +437,27 @@ fn teardown(window_live: bool) {
 ///
 /// For a reveal the app drives itself: call this before asking the window to
 /// appear, then [`present_gate_release`] once a frame has been presented.
+/// Cloak the window and mark the gate as holding it.
+///
+/// For a reveal the app drives itself: call this before asking the window to
+/// appear, then [`present_gate_release`] once a frame has been presented. A
+/// zero `hwnd` falls back to the handle the gate was installed on, mirroring
+/// [`present_gate_release`], so a hold taken without a cached handle is still
+/// a cloak and not just a flag.
 pub fn present_gate_hold(hwnd: isize) {
-    tm_core::sync::lock(&GATE).hold();
-    if hwnd != 0 {
-        super::window_chrome::set_cloaked_raw(hwnd, true);
+    let held_hwnd = {
+        let mut gate = tm_core::sync::lock(&GATE);
+        gate.hold();
+        gate.hwnd
+    };
+    let target = if hwnd != 0 { hwnd } else { held_hwnd };
+    if target != 0 {
+        super::window_chrome::set_cloaked_raw(target, true);
     }
-    tracing::debug!(hwnd, "presentation gate holding the window cloaked");
+    tracing::debug!(
+        hwnd = target,
+        "presentation gate holding the window cloaked"
+    );
 }
 
 /// Uncloak `hwnd`, clear the hold and report whether a hold was released.
@@ -450,15 +465,25 @@ pub fn present_gate_hold(hwnd: isize) {
 /// Refuses to act without a hold: see [`Gate::release`]. This is the only
 /// uncloak the gate allows, so an app that calls it once per presented frame
 /// can never reveal an unpainted window.
+///
+/// A zero `hwnd` falls back to the handle the gate was installed on. The gate
+/// already owns that handle, and clearing the hold without uncloaking would
+/// leave the window invisible with nothing left to reveal it: a caller that
+/// lost its cached handle must still be able to let the window out.
 pub fn present_gate_release(hwnd: isize) -> bool {
-    let released = tm_core::sync::lock(&GATE).release();
+    let (released, held_hwnd) = {
+        let mut gate = tm_core::sync::lock(&GATE);
+        let released = gate.release();
+        (released, gate.hwnd)
+    };
     if !released {
         return false;
     }
-    if hwnd != 0 {
-        super::window_chrome::set_cloaked_raw(hwnd, false);
+    let target = if hwnd != 0 { hwnd } else { held_hwnd };
+    if target != 0 {
+        super::window_chrome::set_cloaked_raw(target, false);
     }
-    tracing::debug!(hwnd, "presentation gate released the window");
+    tracing::debug!(hwnd = target, "presentation gate released the window");
     true
 }
 
