@@ -983,17 +983,18 @@ rebase runbook.
   served answer — no service installed, the broker unavailable, or the broker
   rejecting the request — which still requires elevation, and attaches its
   sample through the one shared `file_etw::attach_file_io`. The session is a
-  system logger carrying `EVENT_TRACE_FLAG_FILE_IO` — one of the eight slots
-  the SystemTraceProvider multiplexes, never the single NT Kernel Logger and
-  never the disk session, so the disk graphs keep their own flags and lifetime.
-  The kernel's per-file hooks are classic `FileIo` records (class GUID in
+  system logger that enables the SystemIo provider with `SYSTEM_IO_KW_FILE`
+  (`file_etw::PROVIDERS`) — one of the eight slots the SystemTraceProvider
+  multiplexes, never the single NT Kernel Logger and never the disk session, so
+  the disk graphs keep their own flags and lifetime. That enable is a PROVIDER
+  call, not an `EnableFlags` flag: both the manifest `EnableTraceEx2` for
+  `Microsoft-Windows-Kernel-File` and the legacy `EVENT_TRACE_FLAG_FILE_IO` are
+  accepted and deliver no record — the live elevated selfcheck that reported
+  `undelivered` with `events_lost` 0 came from them, not from an idle machine.
+  The delivered records are still classic `FileIo` ones (class GUID in
   `ProviderId`, operation in the opcode: 12–16 for Create/Cleanup/Close/Read/
-  Write), and a manifest `EnableTraceEx2` for `Microsoft-Windows-Kernel-File`
-  is accepted and then delivers nothing at all — the live elevated selfcheck
-  that reported `undelivered` with `events_lost` 0 was that defect, not an idle
-  machine. `SystemIoProviderGuid` + `SYSTEM_IO_KW_FILE` is the documented
-  equivalent of the flag (same legacy group) if the flag alone ever proves
-  insufficient on some build. An app-side start
+  Write), the same enable-then-class split `disk_etw` uses for `DiskIo`. An
+  app-side start
   that fails (the ordinary unelevated GUI) is throttled for
   `APP_FILE_TRACE_RETRY` so the once-per-second poll does not spin on a kernel
   refusal, and the snapshot then stays `Unavailable`. A session is only kept

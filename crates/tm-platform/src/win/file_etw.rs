@@ -19,42 +19,45 @@
 //!
 //! ## What is subscribed, and how it is decoded
 //!
-//! The events come from the KERNEL's file I/O hooks, which are classic (MOF)
-//! events and are delivered only to a system logger whose `EnableFlags` ask for
-//! `EVENT_TRACE_FLAG_FILE_IO` — [`LoggerKind::SystemFile`], and no provider to
-//! enable. `Microsoft-Windows-Kernel-File` also has a manifest GUID, and
-//! enabling THAT on an ordinary manifest session was what this module used to
-//! do: `EnableTraceEx2` returns success, the session starts, `events_lost`
-//! stays at zero, and not one record ever arrives, because a manifest provider
-//! enable does not turn on the kernel's per-file logging at all. A live
-//! elevated selfcheck reported exactly that (`undelivered`, `events_lost` 0).
+//! The events come from the KERNEL's file I/O hooks and arrive as classic
+//! (MOF) `FileIo` records. They are subscribed to through the SystemIo
+//! provider: an `EnableTraceEx2` of `SystemIoProviderGuid` with the
+//! `SYSTEM_IO_KW_FILE` keyword against a system logger
+//! ([`LoggerKind::SystemFile`]) — see [`PROVIDERS`]. That is the documented
+//! SystemIo keyword set, and the same shape [`super::disk_etw`] already uses
+//! live for `SYSTEM_IO_KW_DISK`.
 //!
-//! Records therefore arrive the way every classic kernel record does, and are
-//! identified that way: the MOF class GUID in `EventHeader.ProviderId`
-//! ([`FileIoGuid`]) and the operation in `EventHeader.EventDescriptor.Opcode`.
-//! Those opcodes are the numbers the provider's manifest lists as event ids
-//! (`Create` 12, `Cleanup` 13, `Close` 14, `Read` 15, `Write` 16 — the same
-//! kernel hooks, so the id-to-operation mapping is unchanged). Every other
-//! operation is ignored, but the flag cannot select a subset the way keywords
-//! could: directory enumeration, flush, information classes and deletes are
-//! delivered too and discarded in the callback, which is why this session gets
-//! the largest buffer set in [`super::etw`].
+//! Two shapes that look equivalent deliver nothing, and a live elevated
+//! selfcheck reported `undelivered` with `events_lost` at 0 on each of them:
+//! enabling the MANIFEST GUID of `Microsoft-Windows-Kernel-File` on an ordinary
+//! manifest session (what this module originally did), and asking the system
+//! logger for `EVENT_TRACE_FLAG_FILE_IO` through `EnableFlags` (the legacy flag
+//! of the same group). `EnableTraceEx2` returns success both ways, the session
+//! runs, and not one record ever arrives. The enable therefore has to be the
+//! provider call, and this session's `EnableFlags` are empty.
 //!
-//! The flag rides its own system logger rather than the single global "NT
-//! Kernel Logger" or the disk session's: Windows multiplexes the
+//! Records are identified the way every classic kernel record is — the enable
+//! names a GROUP, each record names its class: the MOF class GUID in
+//! `EventHeader.ProviderId` ([`FileIoGuid`]) and the operation in
+//! `EventHeader.EventDescriptor.Opcode`. Those opcodes are the numbers the
+//! provider's manifest lists as event ids (`Create` 12, `Cleanup` 13,
+//! `Close` 14, `Read` 15, `Write` 16 — the same kernel hooks, so the
+//! id-to-operation mapping is unchanged). Every other operation is ignored, but
+//! the FILE keyword cannot select a subset of the class: directory enumeration,
+//! flush, information classes and deletes are delivered too and discarded in
+//! the callback, which is why this session gets the largest buffer set in
+//! [`super::etw`].
+//!
+//! The subscription rides its own system logger rather than the single global
+//! "NT Kernel Logger" or the disk session's: Windows multiplexes the
 //! SystemTraceProvider over up to eight logger sessions and reserves only the
 //! first two for the NT Kernel Logger and the Circular Kernel Context Logger
 //! (SystemTraceProvider session documentation), so the disk, loader, profile
 //! and file traces each host one of the remaining slots without taking the
 //! global one from anything else on the machine. One session per feature is
 //! also what lets this trace live exactly as long as the I/O page needs it:
-//! adding the flag to the disk session would trace every file on the machine
-//! for as long as the Performance page samples disks. `EVENT_TRACE_FLAG_FILE_IO`
-//! is the legacy flag of a group the System IO provider also exposes as
-//! `SYSTEM_IO_KW_FILE` (System Providers documentation), so the same events
-//! could be requested through `EnableTraceEx2`; the flag is used because it is
-//! the shape the loader and profile traces already start with, and because it
-//! cannot half-succeed the way a provider enable accepted-then-ignored did.
+//! adding the FILE keyword to the disk session would trace every file on the
+//! machine for as long as the Performance page samples disks.
 //!
 //! Payloads are decoded by hand, at offsets taken from the provider's manifest
 //! templates — `wevtutil gp Microsoft-Windows-Kernel-File /ge:true` lists the
@@ -137,12 +140,11 @@
 //! ## What is verified here, and what is not
 //!
 //! The ids, versions and field offsets above were read from the installed
-//! provider manifest; the subscription is the one the other kernel traces
-//! already use for classic records ([`super::module_etw`] receives the
-//! `ImageLoad` class through `EnableFlags` on a system logger, decoded live on
-//! 2026-10-26), and the decode/accounting path is covered by tests with
-//! synthetic records, including a record driven through the real callback under
-//! the classic identity.
+//! provider manifest; the enable is the one [`super::disk_etw`] already uses
+//! live for the `DiskIo` class (`SystemIoProviderGuid` with a keyword, records
+//! decoded by their class GUID, on a system logger), and the decode/accounting
+//! path is covered by tests with synthetic records, including records driven
+//! through the real callback under the classic identity.
 //!
 //! What a synthetic record cannot prove is that the kernel accepts this session
 //! shape on a given build, that names really arrive as device paths, and that
@@ -169,17 +171,38 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
-use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, FileIoGuid};
+use windows::Win32::System::Diagnostics::Etw::{
+    EVENT_RECORD, FileIoGuid, SYSTEM_IO_KW_FILE, SystemIoProviderGuid,
+};
 use windows::core::PCWSTR;
 
-use super::etw::{self, LoggerKind, Session, TraceContext, TraceRole};
+use super::etw::{self, LoggerKind, Provider, Session, TraceContext, TraceRole};
 use crate::actions::FileIoAccountingState;
 
 /// The session shape this module needs; see the module docs.
 ///
-/// Named so a test can pin the wiring: the kind is the subscription, and the
-/// manifest kind this module used before delivers nothing at all.
+/// Named so a test can pin the wiring: the kind is the system logger half of
+/// the subscription, and the manifest kind this module used before delivers
+/// nothing at all.
 pub(super) const LOGGER_KIND: LoggerKind = LoggerKind::SystemFile;
+
+/// What the session enables: the SystemIo provider with the FILE keyword.
+///
+/// This is a PROVIDER call, not a legacy `EnableFlags` flag — `EnableTraceEx2`
+/// with `SystemIoProviderGuid` and `SYSTEM_IO_KW_FILE` against a system logger
+/// (System Providers documentation). Both other shapes are accepted and deliver
+/// no record: the manifest GUID of `Microsoft-Windows-Kernel-File`, and the
+/// `EVENT_TRACE_FLAG_FILE_IO` flag (a live elevated selfcheck reported
+/// `undelivered` with `events_lost` 0 on them). The enable is therefore the
+/// shape [`super::disk_etw`] already uses live, one keyword bit at a time so the
+/// FILE class is the only thing this stream carries.
+///
+/// The keyword names the GROUP; the records still arrive under their classic
+/// class GUID ([`FileIoGuid`]) — see [`on_event`].
+pub(super) const PROVIDERS: [Provider; 1] = [Provider {
+    guid: SystemIoProviderGuid,
+    match_any_keyword: SYSTEM_IO_KW_FILE,
+}];
 
 /// Opcodes of the five operations this module reads, in the classic `FileIo`
 /// class. They are the provider's task values too, which is why the manifest
@@ -965,11 +988,11 @@ impl FileEtw {
         });
         let session = Session::start(
             session_name(role),
-            // No provider to enable: the kernel's file flag IS the
-            // subscription, and the manifest GUID's enable call is the one
-            // that delivered nothing. See the module docs.
+            // The subscription is the provider enable below: this session's
+            // EnableFlags are empty, because neither the manifest GUID's enable
+            // nor the legacy file flag delivered a record. See the module docs.
             LOGGER_KIND,
-            &[],
+            &PROVIDERS,
             shared,
             on_event,
             "tm-file-etw",
@@ -1069,8 +1092,11 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         return;
     };
     // Classic (MOF) identity: the class GUID in `ProviderId`, the operation in
-    // the opcode. The kernel fills in no manifest event id for these records,
-    // so matching on one discarded every file event that did arrive.
+    // the opcode. The `SYSTEM_IO_KW_FILE` enable names the SystemIo GROUP, and
+    // each record it delivers still carries its own class here — the same
+    // split [`super::disk_etw`] relies on for the `DiskIo` class. The kernel
+    // fills in no manifest event id for these records, so matching on one
+    // discarded every file event that did arrive.
     if record.EventHeader.ProviderId != FileIoGuid {
         return;
     }
@@ -1320,6 +1346,72 @@ mod tests {
         );
     }
 
+    /// The four operations the decoder keeps, driven by records carrying the
+    /// identity the `SYSTEM_IO_KW_FILE` enable delivers: the `FileIo` class
+    /// GUID plus the classic opcode. Create names the object, Read and Write
+    /// add their sizes, Close forgets it — and every one of them counts as
+    /// DECODED, so a session that delivers them is measured, not undecodable.
+    #[test]
+    fn a_system_io_file_record_decodes_create_read_write_close() {
+        let shared = shared();
+        let pid = 88;
+        let object = 0x9000;
+        deliver_kernel_record(
+            &shared,
+            EVENT_CREATE,
+            1,
+            pid,
+            &create_payload(KERNEL_FILE_POINTER_BYTES, object, r"\??\C:\data\d.bin"),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_READ,
+            1,
+            pid,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 1_024),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_WRITE,
+            1,
+            pid,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 2_048),
+        );
+        let sample = sample_of(&shared, pid);
+        assert_eq!(sample.events_seen, 3);
+        assert_eq!(sample.events_decoded, 3);
+        assert_eq!(
+            bytes(&sample, r"C:\data\d.bin"),
+            Some(FileBytes {
+                read_bytes: 1_024,
+                write_bytes: 2_048,
+            })
+        );
+        assert_eq!(sample.state(), FileIoAccountingState::Measured);
+        deliver_kernel_record(
+            &shared,
+            EVENT_CLOSE,
+            1,
+            pid,
+            &close_payload(KERNEL_FILE_POINTER_BYTES, object),
+        );
+        let sample = sample_of(&shared, pid);
+        assert_eq!(sample.events_seen, 4);
+        assert_eq!(sample.events_decoded, 4, "Close decodes too");
+        assert!(
+            !shared.state.lock().unwrap().open.contains_key(&object),
+            "Close forgets the file object"
+        );
+        assert_eq!(
+            bytes(&sample, r"C:\data\d.bin"),
+            Some(FileBytes {
+                read_bytes: 1_024,
+                write_bytes: 2_048,
+            }),
+            "closing does not erase what was measured"
+        );
+    }
+
     /// The defect this replaces: a live elevated session reported `undelivered`
     /// with `events_lost` at zero because no record ever arrived. Once one does,
     /// the state must move on — and only a decoded read or write may make it
@@ -1368,12 +1460,26 @@ mod tests {
         assert_eq!(sample_of(&shared, 20), sample);
     }
 
-    /// The session kind is the subscription: a manifest session delivers no
-    /// `FileIo` record however it is enabled, which is how the trace ran for a
-    /// day and reported nothing.
+    /// The session kind plus the provider enable ARE the subscription: a
+    /// manifest session delivers no `FileIo` record however it is enabled, and
+    /// the legacy `EVENT_TRACE_FLAG_FILE_IO` shape delivered none either — a
+    /// live elevated selfcheck reported `undelivered` with `events_lost` at 0
+    /// on both. What is left is the documented SystemIo provider path: the
+    /// group GUID with the FILE keyword alone, on a system logger.
     #[test]
-    fn the_file_session_uses_the_kernel_file_io_logger() {
+    fn the_file_session_enables_the_system_io_provider_with_the_file_keyword() {
         assert_eq!(LOGGER_KIND, LoggerKind::SystemFile);
+        assert_eq!(PROVIDERS.len(), 1, "one keyword set, not a broad enable");
+        assert_eq!(PROVIDERS[0].guid, SystemIoProviderGuid);
+        assert_eq!(PROVIDERS[0].match_any_keyword, SYSTEM_IO_KW_FILE);
+        assert_eq!(
+            PROVIDERS[0].match_any_keyword & !SYSTEM_IO_KW_FILE,
+            0,
+            "no other SystemIo keyword may ride this session"
+        );
+        // The class the decoder accepts is the FILE class, not the group's
+        // disk class: the enable and the record identity are different GUIDs.
+        assert_ne!(PROVIDERS[0].guid, FileIoGuid);
     }
 
     /// A read-only handle reports bytes in Read and none in Write, and the

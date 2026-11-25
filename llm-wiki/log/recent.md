@@ -1,3 +1,23 @@
+## 2026-11-25 - The per-file trace, second attempt: the SystemIo FILE keyword
+
+- A live elevated `--selfcheck` after `c9acb05` still printed
+  `{"state":"undelivered","since_ms":…,"events_lost":0}`: the `TaskMan-File-*`
+  session started as a system logger carrying `EVENT_TRACE_FLAG_FILE_IO`, ran, lost
+  nothing, and delivered no `FileIo` record.
+- The enable is now the documented SystemIo provider call
+  (`EnableTraceEx2(SystemIoProviderGuid, SYSTEM_IO_KW_FILE)`, `file_etw::PROVIDERS`)
+  on the same `LoggerKind::SystemFile` session, whose `EnableFlags` are now empty. The
+  enable names the GROUP; each record still carries the `FileIo` class GUID in
+  `ProviderId` — the split `disk_etw` already uses live for `DiskIo`.
+- Not yet proven on live events; the next elevated `--selfcheck` decides. If it still
+  says `undelivered` with the session running, `SYSTEM_IO_KW_FILENAME` is the
+  remaining keyword to try. See `known-debt.md`.
+- A GUID worth not confusing again: `{3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c}` is the
+  classic `DiskIo` CLASS GUID, not `SystemIoProviderGuid`
+  (`{3d5c43e3-0f1c-4202-b817-174c0070dc79}` in evntrace.h and in the `windows`
+  crate). Enabling a class GUID as if it were the group is not a documented
+  subscription.
+
 ## 2026-11-25 - Why the D3D12 window arrived after the CPU one
 
 - Reported as "with d3d12, our window appears later after start / unminimize vs cpu rendering".

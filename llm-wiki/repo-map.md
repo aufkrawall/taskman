@@ -120,8 +120,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
     `file_etw.rs` (per-file read/written bytes from the kernel's file I/O
-    hooks: the session is a system logger carrying
-    `EVENT_TRACE_FLAG_FILE_IO`, and the records are classic `FileIo` ones —
+    hooks: the session is a system logger that enables the SystemIo provider
+    with `SYSTEM_IO_KW_FILE`, a provider call rather than the legacy
+    `EVENT_TRACE_FLAG_FILE_IO` flag, and the records are classic `FileIo` ones —
     class GUID in `ProviderId`, operation in the opcode 12–16 — because a
     manifest `EnableTraceEx2` for `Microsoft-Windows-Kernel-File` is accepted
     and delivers nothing; Create correlates a `FileObject` with its
