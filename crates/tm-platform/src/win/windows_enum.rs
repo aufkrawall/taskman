@@ -2,6 +2,7 @@
 //! mirroring Task Manager's "Apps" grouping).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,10 @@ struct Scan {
 /// Cached result refreshed once per sampling tick by the collector.
 static CACHE: Mutex<Option<WindowOwners>> = Mutex::new(None);
 
+/// Counts scans so each one starts probing at a different candidate; see
+/// [`resolve_hung_candidates`].
+static SCAN_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 pub fn window_owners() -> WindowOwners {
     let mut scan = Scan::default();
     scan.owners.complete = unsafe {
@@ -48,6 +53,7 @@ pub fn window_owners() -> WindowOwners {
     scan.owners.not_responding = resolve_hung_candidates(
         &scan.hung_candidates,
         MAX_PROBE_BUDGET_PER_SCAN,
+        SCAN_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         probe_window_responds,
     );
     let out = scan.owners;
@@ -82,7 +88,8 @@ const ZBID_SYSTEM_TOOLS: u32 = 16;
 /// game responds within ~33 ms) while returning quickly when truly wedged.
 const WM_NULL_PROBE_TIMEOUT_MS: u32 = 200;
 /// Cap total `WM_NULL` probe wait per scan so multiple simultaneously frozen
-/// apps cannot stall the sampler tick.
+/// apps cannot stall the sampler tick. The probe order rotates per scan, so a
+/// budget this small does not starve the candidates at the back of the list.
 const MAX_PROBE_BUDGET_PER_SCAN: Duration = Duration::from_millis(600);
 
 /// What one enumerated top-level window contributes to the App grouping.
@@ -394,9 +401,14 @@ fn probe_window_responds(hwnd: HWND, timeout_ms: u32) -> ProbeOutcome {
 /// stays unresolved: the set is debounced for 10 s by
 /// `sampler::NotRespondingHold`, so an unprobed pid would label a responsive
 /// app as hung long after the scan that guessed.
+///
+/// `start_offset` is the caller's scan counter: probing starts at that candidate
+/// and wraps around, so the candidates the budget cuts off are the ones the next
+/// scan probes first.
 fn resolve_hung_candidates(
     candidates: &[(u32, u32, HWND)],
     budget: Duration,
+    start_offset: usize,
     mut probe: impl FnMut(HWND, u32) -> ProbeOutcome,
 ) -> HashSet<u32> {
     let mut not_responding = HashSet::new();
@@ -406,7 +418,9 @@ fn resolve_hung_candidates(
     let start = Instant::now();
     let mut probed_threads: HashSet<u32> = HashSet::new();
 
-    for &(pid, tid, hwnd) in candidates {
+    let first = start_offset % candidates.len();
+    for step in 0..candidates.len() {
+        let &(pid, tid, hwnd) = &candidates[(first + step) % candidates.len()];
         if not_responding.contains(&pid) {
             continue;
         }
@@ -748,6 +762,7 @@ mod tests {
         let out = resolve_hung_candidates(
             &[(42, 100, hwnd(1)), (42, 100, hwnd(2))],
             budget,
+            0,
             |h, _ms| {
                 probed.push(h.0 as usize);
                 ProbeOutcome::Responded
@@ -763,6 +778,7 @@ mod tests {
             let out = resolve_hung_candidates(
                 &[(77, 10, hwnd(1)), (77, 11, hwnd(2))],
                 budget,
+                0,
                 |_h, _ms| {
                     count += 1;
                     outcome
@@ -776,6 +792,7 @@ mod tests {
         let out = resolve_hung_candidates(
             &[(88, 1, hwnd(1)), (88, 2, hwnd(2))],
             budget,
+            0,
             |h, _ms| {
                 if h == hwnd(1) {
                     ProbeOutcome::Responded
@@ -790,6 +807,7 @@ mod tests {
         let out = resolve_hung_candidates(
             &[(99, 5, hwnd(1))],
             budget,
+            0,
             |_, _| ProbeOutcome::InvalidWindow,
         );
         assert!(out.is_empty());
@@ -804,6 +822,7 @@ mod tests {
         let out = resolve_hung_candidates(
             &[(11, 1, hwnd(1)), (12, 2, hwnd(2)), (13, 3, hwnd(3))],
             Duration::ZERO,
+            0,
             |_h, _ms| {
                 count += 1;
                 ProbeOutcome::TimedOut
@@ -813,6 +832,47 @@ mod tests {
         assert!(
             out.is_empty(),
             "an unprobed candidate must not be reported as hung"
+        );
+    }
+
+    /// Regression: three 200 ms probes exhaust the per-scan budget and the
+    /// candidate order is stable, so a genuinely hung app that always sorted
+    /// behind three hung ones was never labelled. Each scan now starts at a
+    /// different candidate, so a budget that only covers the first probe still
+    /// reaches every candidate over consecutive scans.
+    #[test]
+    fn the_probe_rotation_reaches_a_candidate_the_budget_cuts_off() {
+        let candidates = [(11, 1, hwnd(1)), (12, 2, hwnd(2)), (13, 3, hwnd(3))];
+        let pid_of = |raw: usize| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.2.0 as usize == raw)
+                .map(|candidate| candidate.0)
+                .expect("the probed handle is one of the candidates")
+        };
+        // Each probe outlasts the whole budget, so one probe fits per scan.
+        let one_probe_budget = Duration::from_millis(5);
+        let mut probed_first = Vec::new();
+        for scan in 0..candidates.len() {
+            let mut probed = Vec::new();
+            let out = resolve_hung_candidates(&candidates, one_probe_budget, scan, |h, _ms| {
+                probed.push(h.0 as usize);
+                std::thread::sleep(Duration::from_millis(40));
+                ProbeOutcome::TimedOut
+            });
+            assert_eq!(probed.len(), 1, "the budget covers a single probe");
+            assert_eq!(
+                out,
+                [pid_of(probed[0])].into_iter().collect::<HashSet<u32>>(),
+                "only the candidate that was probed is labelled"
+            );
+            probed_first.push(probed[0]);
+        }
+        probed_first.sort_unstable();
+        assert_eq!(
+            probed_first,
+            vec![1, 2, 3],
+            "every candidate is the one probed first on exactly one scan"
         );
     }
 
