@@ -2329,10 +2329,20 @@ impl NativeApp {
     }
 }
 
+/// Parse `--size=<width>x<height>`.
+///
+/// The result becomes the window's client rect before the first frame, so it is
+/// bounded the way the persisted size is: a size below the app's minimum is not
+/// a size at all (the flag is ignored and the saved size stands), a finite size
+/// above the storable maximum is clamped into it, and a non-finite one — `inf`,
+/// which used to reach the window as an infinite rect — is rejected.
 fn parse_size_arg(s: &str) -> Option<[f32; 2]> {
     let (w, h) = s.split_once(['x', 'X'])?;
     let (w, h) = (w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?);
-    (w >= 200.0 && h >= 150.0).then_some([w, h])
+    if !w.is_finite() || !h.is_finite() || w < 200.0 || h < 150.0 {
+        return None;
+    }
+    Some([w.clamp(200.0, 16384.0), h.clamp(150.0, 16384.0)])
 }
 
 fn icon_data() -> eframe::egui::IconData {
@@ -2360,6 +2370,28 @@ fn attach_parent_console() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--size=` reaches the window rect before anything else runs, so it is a
+    /// hostile-input surface: the parse only checked the minimum, which `inf`
+    /// passes, so `--size=infxinf` created an infinite window.
+    #[test]
+    fn a_command_line_size_is_bounded_and_must_be_finite() {
+        assert_eq!(parse_size_arg("1280x800"), Some([1280.0, 800.0]));
+        assert_eq!(parse_size_arg(" 900 x 700 "), Some([900.0, 700.0]));
+        assert_eq!(parse_size_arg("1024X768"), Some([1024.0, 768.0]));
+        // Below the minimum: not a size this app creates, so the saved one stands.
+        assert_eq!(parse_size_arg("199x700"), None);
+        assert_eq!(parse_size_arg("900x149"), None);
+        // Non-finite: rejected rather than clamped into the window.
+        assert_eq!(parse_size_arg("infxinf"), None);
+        assert_eq!(parse_size_arg("nanxnan"), None);
+        assert_eq!(parse_size_arg("-infx600"), None);
+        // Finite but absurd: clamped to what the settings file can also hold.
+        assert_eq!(parse_size_arg("99999x99999"), Some([16384.0, 16384.0]));
+        assert_eq!(parse_size_arg("900"), None);
+        assert_eq!(parse_size_arg("x800"), None);
+    }
+
     #[test]
     fn renderer_choices_start_with_their_backend() {
         for &mode in renderer_choices() {

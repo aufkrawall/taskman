@@ -72,6 +72,30 @@ fn elapsed_ms(since: Instant) -> u64 {
     since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// Why a platform snapshot is not plausible enough to report, or `None` when it
+/// is.
+///
+/// This is the sanity gate, and both the summary's `ok` and the process exit
+/// code come from it: one decision, so the JSON line cannot claim a success the
+/// run does not stand behind. `--mock` skips it — the mock snapshot is not
+/// meant to describe a real machine.
+fn snapshot_implausibility(snap: &tm_core::model::Snapshot, mock: bool) -> Option<String> {
+    if mock {
+        return None;
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if snap.processes.len() < 5 {
+        reasons.push(format!("only {} processes", snap.processes.len()));
+    }
+    if snap.cpu.logical_count == 0 {
+        reasons.push("no logical processors".to_string());
+    }
+    if !snap.cpu.utilization_pct_available {
+        reasons.push("no measured CPU share".to_string());
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
 /// One sample of the per-file trace, and how long the check waited for it.
 #[derive(Debug)]
 struct FileIoWait {
@@ -325,57 +349,29 @@ fn probe_file_io(mock: bool, snapshot: &tm_core::model::Snapshot) -> FileIoProbe
     }
 }
 
-pub fn run(mock: bool) -> i32 {
-    let t0 = Instant::now();
-    let interval = Duration::from_millis(250);
-
-    let mut collector: Box<dyn tm_core::engine::SystemCollector> = if mock {
-        Box::new(tm_core::mock::MockCollector::new())
-    } else {
-        tm_platform::create_collector()
-    };
-    // A diagnostic run must exercise every provider, not just the ones the
-    // default Processes page keeps warm. Sampling at `core()` left the GPU,
-    // disk-rate, per-process-network and CPU-speed paths completely untouched
-    // and printed `"gpus":[]` on machines that have a GPU — a smoke test that
-    // silently skips the most fragile collectors is not a smoke test.
-    collector.set_demand(tm_core::demand::TelemetryDemand::all());
-
-    let (handle, join) = match tm_core::engine::spawn(collector, interval) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!(r#"{{"ok":false,"error":"engine spawn failed: {e}"}}"#);
-            return 1;
-        }
-    };
-
-    // Wait for enough ticks that the two-sample providers have real readings.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while handle.tick_count() < REQUIRED_TICKS && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-
-    let Some(snap) = handle.latest() else {
-        eprintln!(r#"{{"ok":false,"error":"no snapshot produced in 15s"}}"#);
-        handle.shutdown();
-        let _ = join.join();
-        return 1;
-    };
-
-    // Unknown telemetry is reported as null, never as a fabricated zero — the
-    // same invariant the UI renders as "—".
-    let session_capability = if mock {
-        false
-    } else {
-        tm_platform::create_actions().capabilities().users_sessions
-    };
+/// The printed summary and the gate verdict it publishes as `ok`.
+///
+/// Both come out of one call so the JSON line and the exit code cannot
+/// drift apart: `ok` is `verdict.is_none()`, `error` carries the verdict's
+/// reason, and the caller decides the status from the same value. Building
+/// the line where it is printed is what let `ok` stay a literal `true`
+/// beside a gate that could fail.
+fn build_summary(
+    snap: &tm_core::model::Snapshot,
+    mock: bool,
+    startup_to_snapshot_ms: u64,
+    ticks: u64,
+    users_sessions: bool,
+    file_io: &FileIoProbe,
+) -> (serde_json::Value, Option<String>) {
+    let verdict = snapshot_implausibility(snap, mock);
     let (memory_used_gb, memory_total_gb) = memory_gb(&snap.memory);
-    let file_io = probe_file_io(mock, &snap);
     let summary = serde_json::json!({
-        "ok": true,
+        "ok": verdict.is_none(),
+        "error": verdict.as_deref(),
         "backend": if mock { "mock".to_string() } else { "platform".to_string() },
-        "startup_to_snapshot_ms": t0.elapsed().as_millis() as u64,
-        "ticks": handle.tick_count(),
+        "startup_to_snapshot_ms": startup_to_snapshot_ms,
+        "ticks": ticks,
         "sample_duration_ms": snap.sample_duration_ms,
         "cpu": {
             "util_pct": snap
@@ -415,7 +411,7 @@ pub fn run(mock: bool) -> i32 {
             "shared_available": g.shared_mem_available,
             "engine_count": g.engines.len(),
         })).collect::<Vec<_>>(),
-        "users_sessions_capable": session_capability,
+        "users_sessions_capable": users_sessions,
         // How many rows carry a measured CPU share, and how many real
         // processes show the honest dash. A healthy tick measures every
         // process except one it has only seen once, so `readings: 0` with
@@ -477,21 +473,77 @@ pub fn run(mock: bool) -> i32 {
         // to "is the file trace alive", which the I/O page only answers in a
         // GUI. Read it with `waited_ms`: the same state means different things
         // four milliseconds and three seconds into a session.
-        "file_io": file_io_summary(&file_io),
+        "file_io": file_io_summary(file_io),
         "uptime_s": snap.system.uptime_s,
     });
+    (summary, verdict)
+}
+
+pub fn run(mock: bool) -> i32 {
+    let t0 = Instant::now();
+    let interval = Duration::from_millis(250);
+
+    let mut collector: Box<dyn tm_core::engine::SystemCollector> = if mock {
+        Box::new(tm_core::mock::MockCollector::new())
+    } else {
+        tm_platform::create_collector()
+    };
+    // A diagnostic run must exercise every provider, not just the ones the
+    // default Processes page keeps warm. Sampling at `core()` left the GPU,
+    // disk-rate, per-process-network and CPU-speed paths completely untouched
+    // and printed `"gpus":[]` on machines that have a GPU — a smoke test that
+    // silently skips the most fragile collectors is not a smoke test.
+    collector.set_demand(tm_core::demand::TelemetryDemand::all());
+
+    let (handle, join) = match tm_core::engine::spawn(collector, interval) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!(r#"{{"ok":false,"error":"engine spawn failed: {e}"}}"#);
+            return 1;
+        }
+    };
+
+    // Wait for enough ticks that the two-sample providers have real readings.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while handle.tick_count() < REQUIRED_TICKS && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let Some(snap) = handle.latest() else {
+        eprintln!(r#"{{"ok":false,"error":"no snapshot produced in 15s"}}"#);
+        handle.shutdown();
+        let _ = join.join();
+        return 1;
+    };
+    // Taken here, not at the print: the file-I/O probe below waits up to
+    // `FILE_IO_DELIVERY_BUDGET` for a trace to deliver, and timing the summary
+    // instead reported that wait as startup time.
+    let startup_to_snapshot_ms = elapsed_ms(t0);
+
+    // Unknown telemetry is reported as null, never as a fabricated zero — the
+    // same invariant the UI renders as "—".
+    let session_capability = if mock {
+        false
+    } else {
+        tm_platform::create_actions().capabilities().users_sessions
+    };
+    let file_io = probe_file_io(mock, &snap);
+    let (summary, implausible) = build_summary(
+        &snap,
+        mock,
+        startup_to_snapshot_ms,
+        handle.tick_count(),
+        session_capability,
+        &file_io,
+    );
     println!("{summary}");
 
     handle.shutdown();
     let _ = join.join();
 
-    // Basic sanity gates.
-    if !mock
-        && (snap.processes.len() < 5
-            || snap.cpu.logical_count == 0
-            || !snap.cpu.utilization_pct_available)
-    {
-        eprintln!("selfcheck: implausible snapshot; failing");
+    // Basic sanity gates, already reflected in the summary's `ok`.
+    if let Some(reason) = implausible {
+        eprintln!("selfcheck: implausible snapshot ({reason}); failing");
         return 1;
     }
     0
@@ -650,6 +702,84 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(memory_gb(&measured), (Some(3.0), Some(16.0)));
+    }
+
+    /// One platform snapshot carrying `processes` real rows and a `logical`
+    /// core count whose CPU share is (un)measured.
+    fn snapshot_with(
+        processes: usize,
+        logical: usize,
+        cpu_available: bool,
+    ) -> tm_core::model::Snapshot {
+        tm_core::model::Snapshot {
+            processes: (0..processes)
+                .map(|i| tm_core::model::ProcessEntry::new(1000 + i as u32, "probe.exe"))
+                .collect(),
+            cpu: tm_core::model::CpuInfo {
+                logical_count: logical,
+                utilization_pct_available: cpu_available,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The summary's `ok` and the exit code come from one gate, so a snapshot
+    /// the run rejects cannot be published as a success. Regression: `ok` was
+    /// hard-coded `true` in the printed JSON and the gate only ran afterwards,
+    /// so a run that failed it still wrote a success line.
+    ///
+    /// Asserted on the built summary, not on the gate: putting `"ok": true`
+    /// back beside the gate leaves `snapshot_implausibility` unchanged, so only
+    /// the printed line can pin the thing that broke.
+    #[test]
+    fn the_published_summary_carries_the_gate_verdict() {
+        let file_io = probe_with(Ok(snapshot_in(FileIoAccountingState::Unavailable)), 0);
+
+        let (summary, verdict) =
+            build_summary(&snapshot_with(40, 8, true), false, 812, 4, true, &file_io);
+        assert_eq!(verdict, None, "a plausible snapshot passes the gate");
+        assert_eq!(summary["ok"], serde_json::json!(true));
+        assert_eq!(summary["error"], serde_json::Value::Null);
+        // The timing and the counter stay the caller's, not the gate's.
+        assert_eq!(summary["startup_to_snapshot_ms"], serde_json::json!(812));
+        assert_eq!(summary["ticks"], serde_json::json!(4));
+        assert_eq!(summary["users_sessions_capable"], serde_json::json!(true));
+
+        // A rejected snapshot: the line says so, in `ok` and in `error`, and
+        // the verdict the caller exits on is the same decision.
+        let (summary, verdict) =
+            build_summary(&snapshot_with(0, 8, false), false, 900, 1, false, &file_io);
+        let reason = verdict.expect("an empty, unmeasured snapshot is not plausible");
+        assert_eq!(summary["ok"], serde_json::json!(false));
+        assert_eq!(summary["error"], serde_json::json!(reason));
+        assert!(
+            summary["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("processes"))
+        );
+
+        // A mock run publishes the same shape and is never rejected.
+        let (summary, verdict) =
+            build_summary(&snapshot_with(0, 0, false), true, 40, 1, false, &file_io);
+        assert_eq!(verdict, None);
+        assert_eq!(summary["ok"], serde_json::json!(true));
+        assert_eq!(summary["backend"], serde_json::json!("mock"));
+    }
+
+    /// Each reason the gate can give is distinct, so a headless run's `error`
+    /// names what was missing instead of a generic "implausible".
+    #[test]
+    fn the_gate_names_what_it_rejected() {
+        let empty = snapshot_implausibility(&snapshot_with(0, 8, true), false)
+            .expect("no processes is not plausible");
+        assert!(empty.contains("processes"), "{empty}");
+        let no_cores = snapshot_implausibility(&snapshot_with(40, 0, true), false)
+            .expect("no logical processors is not plausible");
+        assert!(no_cores.contains("logical processors"), "{no_cores}");
+        let no_share = snapshot_implausibility(&snapshot_with(40, 8, false), false)
+            .expect("an unmeasured CPU share is not plausible");
+        assert!(no_share.contains("CPU share"), "{no_share}");
     }
 
     /// One answer of the sampled process in `state`.

@@ -21,6 +21,7 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -37,6 +38,34 @@ const MAX_ICON_SOURCE_EDGE: u32 = 2048;
 const MAX_ICON_DECODE_BYTES: usize = 32 * 1024 * 1024;
 /// The GUI paints icons at ~18 px; 32 is the size desktop shells hand out.
 const TARGET_SIZE: u32 = 32;
+
+/// Longest text file this module parses: a theme's `index.theme`, a `.desktop`
+/// entry, GTK's `settings.ini` or KDE's `kdeglobals`.
+///
+/// Every one of them lives in a directory the user — or an app they installed —
+/// can write, and `build_desktop_index` parses every entry under
+/// `applications/`, on the icon worker. Such a file holds tens of lines in
+/// practice, so a larger one is not one this module can use, and it must not be
+/// read whole into memory to find that out.
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Read `path` as UTF-8 text, at most [`MAX_TEXT_BYTES`].
+///
+/// `None` covers everything a caller cannot act on — absent, unreadable,
+/// oversized, not UTF-8 — the same set of outcomes these call sites used to
+/// fold to nothing, so an unusable theme or desktop file stays a missing icon
+/// rather than an error the icon worker would have to distinguish.
+fn read_text_capped(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    file.take((MAX_TEXT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_TEXT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 /// Bounds for the caches of a lookup's per-process static answers: a theme's
 /// layout, an icon name's file and a decoded PNG do not change while the
@@ -325,7 +354,7 @@ fn current_icon_theme(home: Option<&Path>) -> Option<String> {
         config_home.join("gtk-4.0").join("settings.ini"),
         config_home.join("gtk-3.0").join("settings.ini"),
     ] {
-        let Ok(text) = std::fs::read_to_string(&settings) else {
+        let Some(text) = read_text_capped(&settings) else {
             continue;
         };
         for line in text.lines() {
@@ -341,7 +370,7 @@ fn current_icon_theme(home: Option<&Path>) -> Option<String> {
             }
         }
     }
-    let kdeglobals = std::fs::read_to_string(config_home.join("kdeglobals")).ok();
+    let kdeglobals = read_text_capped(&config_home.join("kdeglobals"));
     kdeglobals.as_deref().and_then(parse_kde_icon_theme)
 }
 
@@ -748,7 +777,7 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
 /// Parse a `.desktop` file's `[Desktop Entry]` for `Icon=` (plain key first,
 /// then any localized `Icon[..]=`).
 fn desktop_file_icon(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_text_capped(path)?;
     let mut in_entry = false;
     let mut icon: Option<String> = None;
     let mut localized: Option<String> = None;
@@ -833,7 +862,7 @@ fn push_try_exec(names: &mut Vec<String>, try_exec: Option<&str>) {
 /// Parse a `.desktop` file's `[Desktop Entry]` for `Exec=`, `TryExec=` and
 /// `Icon=`.
 fn desktop_file_entry(path: &Path) -> Option<DesktopEntry> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_text_capped(path)?;
     let mut in_entry = false;
     let mut entry = DesktopEntry {
         exec: None,
@@ -974,7 +1003,7 @@ fn exec_first_binary(exec: &str) -> Option<String> {
 fn theme_inherits(icon_dirs: &[PathBuf], theme: &str) -> Vec<String> {
     for dir in icon_dirs {
         let index = dir.join(theme).join("index.theme");
-        let Ok(text) = std::fs::read_to_string(&index) else {
+        let Some(text) = read_text_capped(&index) else {
             continue;
         };
         let mut in_theme = false;
@@ -1178,7 +1207,7 @@ fn index_theme_list(value: &str) -> impl Iterator<Item = String> + '_ {
 /// the directory name. `Size` is kept next to the pixel size so a same-pixel
 /// tie can prefer the directory that is native at that size.
 fn theme_directories(theme_dir: &Path) -> Option<Vec<ThemeDir>> {
-    let text = std::fs::read_to_string(theme_dir.join("index.theme")).ok()?;
+    let text = read_text_capped(&theme_dir.join("index.theme"))?;
     let mut dirs: Vec<String> = Vec::new();
     let mut scaled_dirs: Vec<String> = Vec::new();
     let mut sizes: HashMap<String, u32> = HashMap::new();
@@ -1493,6 +1522,53 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The text parsers are capped, not only the icon decoders: every one of
+    /// these files lives in the user's own XDG tree and is parsed on the icon
+    /// worker, so one of them must not be able to make that thread read it whole.
+    ///
+    /// The cap is exact on both sides — a file of exactly `MAX_TEXT_BYTES` is
+    /// still a text file, one byte more is not — so a future `>=` slip fails
+    /// here instead of rejecting every full-size theme.
+    #[test]
+    fn an_oversized_text_file_is_unusable_instead_of_allocated() {
+        let sb = Sandbox::new("text-cap");
+        let small = sb.root.join("small.desktop");
+        write_desktop(&small, "[Desktop Entry]\nName=Small\nIcon=small\n");
+        assert!(
+            read_text_capped(&small).is_some_and(|text| text.contains("Icon=small")),
+            "a normal entry is still read"
+        );
+
+        let exact = sb.root.join("exact.desktop");
+        let head = "[Desktop Entry]\nName=Exact\nIcon=exact\n";
+        let mut body = String::from(head);
+        body.push_str(&"#".repeat(MAX_TEXT_BYTES - head.len() - 1));
+        body.push('\n');
+        assert_eq!(body.len(), MAX_TEXT_BYTES);
+        std::fs::write(&exact, &body).unwrap();
+        assert!(
+            read_text_capped(&exact).is_some_and(|text| text.contains("Icon=exact")),
+            "exactly the cap is still a text file"
+        );
+
+        let big = sb.root.join("big.desktop");
+        body.push('\n');
+        std::fs::write(&big, &body).unwrap();
+        assert_eq!(
+            read_text_capped(&big),
+            None,
+            "one byte over the cap is unusable, not an allocation"
+        );
+        // Over the cap resolves to no icon, the same answer a parse failure
+        // gives, rather than to an error the worker would have to report.
+        assert_eq!(desktop_file_entry(&big).map(|entry| entry.icon), None);
+
+        // Not UTF-8 keeps behaving as it did: no text, so no icon.
+        let binary = sb.root.join("binary.desktop");
+        std::fs::write(&binary, [0xff_u8, 0xfe, 0x00]).unwrap();
+        assert_eq!(read_text_capped(&binary), None);
     }
 
     const HICOLOR_INDEX: &str = "[Icon Theme]\nName=Hicolor\nDirectories=48x48/apps,32x32/apps\n\n[48x48/apps]\nSize=48\nContext=Applications\nType=Threshold\n\n[32x32/apps]\nSize=32\nContext=Applications\nType=Threshold\n";
