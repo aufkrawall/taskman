@@ -35,9 +35,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     shell extraction — on Linux a bare name is a legitimate XDG lookup key),
     `demand.rs` (TelemetryDemand bitmask),
     `persist.rs` (crate-private: synced temp-file-then-rename replacement
-    for every persisted file, and `set_aside` — an existing file that cannot
-    be used is renamed to `<name>.bad` instead of being overwritten by
-    defaults),
+    for every persisted file, plus `set_aside`/`discard_contentless` — a file
+    that cannot be used is kept as `<name>.bad` instead of being overwritten
+    by defaults, except a file that says nothing, which is removed so it can
+    never take that name from a real copy),
     `startup_impact.rs` (measured startup cost per image: per-tick CPU-time
     and I/O deltas folded across the boot window, Microsoft's documented
     Low/Medium/High thresholds, and the persisted store — see the module doc
