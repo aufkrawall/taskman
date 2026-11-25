@@ -2332,13 +2332,24 @@ unsafe fn public_window_callback_inner(
                 // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
             }
 
-            // TaskMan fork: a failed `GetWindowRect` returns without panicking inside the
-            // window procedure. The scale factor stored above is put back first: the
-            // `ScaleFactorChanged` event that would tell the application about it is never
-            // sent on this path, so keeping it would leave winit and the toolkit disagreeing
-            // about the DPI for the rest of the session.
+            // TaskMan fork: a failed `GetWindowRect` logs and returns instead of panicking inside
+            // the window procedure, and it puts the scale factor stored above back first. Nothing
+            // that announces or applies the change happens on this path — no
+            // `ScaleFactorChanged`, no `InnerSizeWriter` resize, no `SetWindowPos` on the
+            // suggested rect — so publishing the new value alone would half-apply a DPI change:
+            // egui-winit re-reads `Window::scale_factor()` every frame, so the toolkit would move
+            // to the new point scale while the client area kept its old pixel size. Leaving the
+            // old value in place also lets the next `WM_DPICHANGED` retry — with the new value
+            // stored, its `new_scale_factor == old_scale_factor` check would return early and the
+            // change would never be applied at all. The cost is that this one change is skipped:
+            // the window keeps the previous scale, visibly stale on the new-DPI monitor, until
+            // the next event.
             let Ok(old_physical_inner_rect) = util::WindowArea::Inner.get_rect(window) else {
                 userdata.window_state_lock().scale_factor = old_scale_factor;
+                tracing::warn!(
+                    "Failed to read the window rect while applying a DPI change; keeping the \
+                     previous scale factor and skipping the resize"
+                );
                 result = ProcResult::Value(0);
                 return;
             };
