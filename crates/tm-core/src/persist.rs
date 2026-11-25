@@ -257,7 +257,10 @@ mod tests {
 
         set_aside(&dest, "test store");
 
-        assert!(!dest.exists(), "the unusable file must not be left for the next load");
+        assert!(
+            !dest.exists(),
+            "the unusable file must not be left for the next load"
+        );
         assert_eq!(
             std::fs::read_to_string(&aside).unwrap(),
             "the last recoverable copy",
@@ -284,7 +287,10 @@ mod tests {
 
         discard_contentless(&dest, "test store");
 
-        assert!(!dest.exists(), "the unusable file must not be left for the next load");
+        assert!(
+            !dest.exists(),
+            "the unusable file must not be left for the next load"
+        );
         assert_eq!(
             std::fs::read_to_string(&aside).unwrap(),
             "the last recoverable copy",
@@ -302,7 +308,10 @@ mod tests {
         assert!(says_nothing(" \t\r\n"), "whitespace says nothing");
         assert!(says_nothing("\0\0\0"), "a NUL hole says nothing");
         assert!(says_nothing("\u{feff}"), "a bare BOM says nothing");
-        assert!(!says_nothing("\u{feff}{}"), "a BOM in front of content is content");
+        assert!(
+            !says_nothing("\u{feff}{}"),
+            "a BOM in front of content is content"
+        );
         assert!(!says_nothing("{}"), "an empty JSON object is content");
     }
 

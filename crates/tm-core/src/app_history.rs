@@ -862,7 +862,10 @@ mod tests {
         let db = AppHistoryDb::open(path.clone());
 
         assert!(db.entries().is_empty());
-        assert!(!path.exists(), "the unusable file must not be left for the next load");
+        assert!(
+            !path.exists(),
+            "the unusable file must not be left for the next load"
+        );
         assert_eq!(
             std::fs::read_to_string(&aside).unwrap(),
             "the last recoverable copy",

@@ -1751,8 +1751,14 @@ text_smoothing=banana
             let (loaded, usable) = Settings::load_from_checked(&path);
 
             assert_eq!(loaded, Settings::default(), "{name}");
-            assert!(!usable, "{name}: a file that holds no settings is not usable");
-            assert!(!path.exists(), "{name}: the contentless INI must leave the load path");
+            assert!(
+                !usable,
+                "{name}: a file that holds no settings is not usable"
+            );
+            assert!(
+                !path.exists(),
+                "{name}: the contentless INI must leave the load path"
+            );
             assert_eq!(
                 std::fs::read_to_string(&aside).unwrap(),
                 recoverable,
@@ -1780,7 +1786,10 @@ text_smoothing=banana
             Settings::default().theme,
             "the pair before the header belongs to no section"
         );
-        assert!(path.exists(), "a usable INI stays where the next save writes it");
+        assert!(
+            path.exists(),
+            "a usable INI stays where the next save writes it"
+        );
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "stale");
     }
 

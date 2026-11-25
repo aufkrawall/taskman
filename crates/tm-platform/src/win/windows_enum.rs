@@ -804,12 +804,9 @@ mod tests {
         assert_eq!(out, [88u32].into_iter().collect::<HashSet<u32>>());
 
         // Destroyed window during scan is ignored.
-        let out = resolve_hung_candidates(
-            &[(99, 5, hwnd(1))],
-            budget,
-            0,
-            |_, _| ProbeOutcome::InvalidWindow,
-        );
+        let out = resolve_hung_candidates(&[(99, 5, hwnd(1))], budget, 0, |_, _| {
+            ProbeOutcome::InvalidWindow
+        });
         assert!(out.is_empty());
     }
 

@@ -130,8 +130,7 @@ impl DibSurface {
                 ..Default::default()
             };
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let created =
-                CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+            let created = CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
             let Ok(bitmap) = created else {
                 // The device context is ours to release, and this exit does not
                 // go through `Drop`.

@@ -516,7 +516,10 @@ mod tests {
         let store = ImpactStore::open(path.clone());
 
         assert!(store.is_empty());
-        assert!(!path.exists(), "the unusable file must not be left for the next load");
+        assert!(
+            !path.exists(),
+            "the unusable file must not be left for the next load"
+        );
         assert_eq!(
             std::fs::read_to_string(&aside).unwrap(),
             "the last recoverable copy",

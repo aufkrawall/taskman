@@ -2378,7 +2378,12 @@ mod tests {
         let sb = Sandbox::new("context-order");
         let size_dir = sb.root.join("share/icons/custom/32x32");
         write_png(&size_dir.join("apps/ctxapp.png"), 32, 32, [0, 200, 0, 255]);
-        write_png(&size_dir.join("mimetypes/ctxapp.png"), 32, 32, [200, 0, 0, 255]);
+        write_png(
+            &size_dir.join("mimetypes/ctxapp.png"),
+            32,
+            32,
+            [200, 0, 0, 255],
+        );
         let apps = size_dir.join("apps");
         let mimetypes = size_dir.join("mimetypes");
 

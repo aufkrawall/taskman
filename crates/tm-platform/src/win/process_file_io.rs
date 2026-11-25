@@ -308,10 +308,10 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
     let current_proc = unsafe { th::GetCurrentProcess() };
     // `inspect_handle` may only ask `GetFileType` about the handle when the
     // table being walked is this process's own; see `may_probe_local_handle_table`.
-    let probe_locally = may_probe_local_handle_table(
-        unsafe { th::GetProcessId(h_process) },
-        unsafe { th::GetCurrentProcessId() },
-    );
+    let probe_locally =
+        may_probe_local_handle_table(unsafe { th::GetProcessId(h_process) }, unsafe {
+            th::GetCurrentProcessId()
+        });
 
     let mut map: HashMap<String, ProcessFileIo> = HashMap::new();
     let mut path_buf = vec![0u16; 1024];
