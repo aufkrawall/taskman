@@ -246,9 +246,12 @@ window at all. Two costs sat in that gap.
   `egui-wgpu` now builds the device and the surface only, and
   `Painter::present_clear` presents one frame cleared to `App::clear_color`
   with no pipeline involved. eframe reveals on that frame — gated on
-  `is_first_frame && reveal_first_frame && needs_primer(ROOT)`, so the primer
-  runs once before the first reveal and a restore of an already-visible window
-  paints the real ui in its own frame. `Renderer` is created lazily inside the
+  `is_first_frame && reveal_first_frame && needs_primer(ROOT)` and on
+  `present_clear` returning `true`, i.e. only when the frame really reached the
+  screen (a zero-sized, occluded, outdated or lost surface presents nothing and
+  keeps the primer owed) — so the primer runs once before the first reveal and a
+  restore of an already-visible window paints the real ui in its own frame.
+  `Renderer` is created lazily inside the
   first `paint_and_update_textures`, and `RenderState.renderer` is a
   clone-shared `Arc<OnceLock<..>>` because the `CreationContext` copy is made
   before that paint (a `None` snapshot there silences `PaintCallback`).

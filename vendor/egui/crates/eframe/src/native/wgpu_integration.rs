@@ -902,16 +902,23 @@ impl WgpuWinitRunning<'_> {
             // A cleared frame can only reveal a window that is not on screen yet, so it is
             // gated on that reveal itself: it runs once, before the first reveal, and never
             // again. A restore of an already-visible window paints the real ui in this frame,
-            // even when the device was torn down and rebuilt while it was hidden. A failed
-            // primer only costs this frame's head start.
+            // even when the device was torn down and rebuilt while it was hidden. A failed or
+            // skipped primer only costs this frame's head start.
             if is_first_reveal && painter.needs_primer(egui::ViewportId::ROOT) {
                 profiling::scope!("reveal_primer");
                 let clear_color = app.clear_color(&egui_ctx.global_style().visuals);
-                if let Err(err) = painter.present_clear(viewport_id, clear_color, window) {
+                match painter.present_clear(viewport_id, clear_color, window) {
+                    // Only a frame that actually reached the screen may reveal the window.
+                    // Anything else would show the uninitialised backbuffer this cleared
+                    // frame exists to replace, and the reveal is a one-time decision.
+                    Ok(true) => integration.post_rendering(window, reveal_first_frame),
+                    Ok(false) => {
+                        log::debug!(
+                            "The cleared primer frame was not presented; revealing with content"
+                        );
+                    }
                     // No cleared frame on screen, so the paint below reveals with content.
-                    log::debug!("Presenting the cleared primer frame failed: {err}");
-                } else {
-                    integration.post_rendering(window, reveal_first_frame);
+                    Err(err) => log::debug!("Presenting the cleared primer frame failed: {err}"),
                 }
             }
 

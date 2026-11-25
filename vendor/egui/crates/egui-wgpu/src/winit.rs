@@ -975,7 +975,13 @@ impl Painter {
     ///
     /// Marks the viewport as primed (see [`Self::needs_primer`]) and reports the one start-up
     /// timing line on the first present. Correct on the first frame and after a full surface
-    /// re-create; a zero-sized surface presents nothing and returns `Ok`.
+    /// re-create.
+    ///
+    /// Returns whether a frame actually reached the screen. `false` covers every case in which
+    /// nothing was presented — a zero-sized surface, or a surface that was occluded, outdated or
+    /// lost when the frame was acquired — and the viewport then still owes its primer. A caller
+    /// that reveals the window on this call must reveal only on `true`, or it shows an
+    /// uninitialised backbuffer, which is the flash the primer exists to prevent.
     ///
     /// # Errors
     /// [`crate::WgpuError::NoRenderState`] before [`Self::set_window`] created a device, and
@@ -985,7 +991,7 @@ impl Painter {
         viewport_id: ViewportId,
         clear_color: [f32; 4],
         window: &Arc<winit::window::Window>,
-    ) -> Result<(), crate::WgpuError> {
+    ) -> Result<bool, crate::WgpuError> {
         profiling::function_scope!();
 
         // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action taken in
@@ -1020,7 +1026,8 @@ impl Painter {
             return Err(crate::WgpuError::NoSurface);
         };
         if surface_state.width == 0 || surface_state.height == 0 {
-            return Ok(());
+            // Nothing to define: no backbuffer was acquired, so the viewport still owes a primer.
+            return Ok(false);
         }
 
         if surface_state.needs_reconfigure {
@@ -1048,7 +1055,9 @@ impl Painter {
                     }
                     SurfaceErrorAction::SkipFrame => {}
                 }
-                return Ok(());
+                // No frame was acquired, so nothing was cleared: the surface keeps its
+                // undefined pixels and the viewport still owes a primer.
+                return Ok(false);
             }
         };
 
@@ -1105,7 +1114,7 @@ impl Painter {
             log::info!("{message}");
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn resize_and_generate_depth_texture_view_and_msaa_view(
