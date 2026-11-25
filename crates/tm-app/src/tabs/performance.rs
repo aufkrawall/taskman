@@ -180,6 +180,9 @@ mod tests {
     /// the requested device (and net_series even dropped zero-traffic
     /// samples). The shortened series then desynchronized from the shared
     /// timestamp vector, plotting samples at wrong x positions.
+    ///
+    /// A point without the device is still one sample — a GAP — so the length
+    /// contract survives the gap-aware series.
     #[test]
     fn series_extractors_stay_aligned_with_window() {
         let mut hit = pt(500);
@@ -188,11 +191,17 @@ mod tests {
         let win = vec![pt(0), hit, pt(1000)];
 
         let net = net_series(&win, "eth", 1);
-        assert_eq!(net, vec![0.0, 10.0, 0.0], "len must equal window len");
+        assert_eq!(
+            net,
+            vec![None, Some(10.0), None],
+            "len must equal window len"
+        );
         let sent = net_series(&win, "eth", 2);
-        assert_eq!(sent, vec![0.0, 20.0, 0.0]);
+        assert_eq!(sent, vec![None, Some(20.0), None]);
         let disk = disk_activity_series(&win, "C:");
         assert_eq!(disk, vec![None, Some(50.0), None]);
+        let read = disk_series(&win, "C:", |d| d.2);
+        assert_eq!(read, vec![None, Some(1.0), None]);
         let gpu = gpu_series(&win, "0", GpuField::Util);
         assert!(gpu.iter().all(|value| value.is_nan()));
     }
@@ -204,8 +213,205 @@ mod tests {
         let mut idle = pt(2_000);
         idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0)];
         assert_eq!(
-            disk_activity_series(&[pt(0), missing, idle], "C:"),
+            disk_activity_series(&[pt(0), missing.clone(), idle.clone()], "C:"),
             vec![None, None, Some(0.0)]
+        );
+        // The transfer series keep the same contract: a tick without the mount
+        // is a gap, a present mount reports what it measured (0 B/s included).
+        assert_eq!(
+            disk_series(&[pt(0), missing, idle], "C:", |d| d.2),
+            vec![None, None, Some(0.0)]
+        );
+    }
+
+    /// Regression: a tick without per-core data flipped the whole CPU page to
+    /// the aggregate chart.
+    ///
+    /// Both platform backends can publish a CPU snapshot whose per-core vector
+    /// is empty (Windows when its two-sample load delta is missing, Linux when
+    /// `/proc/stat` could not be read). Sizing the grid from
+    /// `snap.cpu.per_core_pct.len()` made that tick report zero cores, so the
+    /// logical-processor tiles vanished and came back one tick later. The count
+    /// is a property of the machine: it now comes from the newest per-core
+    /// MEASUREMENT, and the tick that has none is unavailable in every tile.
+    #[test]
+    fn the_logical_grid_keeps_its_tiles_while_per_core_data_is_unavailable() {
+        let mut measured = pt(1_000);
+        measured.per_core = vec![10.0, 20.0, 30.0, 40.0];
+        measured.per_core_kernel = vec![1.0, 2.0, 3.0, 4.0];
+        let blind_tick = pt(2_000);
+        let win = [measured, blind_tick];
+
+        // The snapshot behind `blind_tick` carries no per-core data at all.
+        let cores = grid_core_count(&win, 0);
+        assert_eq!(cores, 4, "the grid must keep the 4 tiles it measured");
+
+        let hist = per_core_series(&win, cores, |point| Some(point.per_core.as_slice()));
+        assert_eq!(hist.len(), cores, "one series per tile");
+        assert_eq!(hist[0], vec![Some(10.0), None]);
+        assert_eq!(hist[3], vec![Some(40.0), None]);
+        assert!(
+            hist.iter().all(|tile| tile[1].is_none()),
+            "the blind tick is unavailable in every tile, never 0 %"
+        );
+
+        // The painter's convention is NaN for exactly those samples.
+        let tile = tile_samples(&hist[1]);
+        assert_eq!(tile[0], 20.0);
+        assert!(tile[1].is_nan(), "a gap must reach the tile as NaN");
+
+        // Nothing measured anywhere yet: the snapshot's own count is the only
+        // thing left to go on.
+        assert_eq!(grid_core_count(&[pt(0)], 16), 16);
+        assert_eq!(grid_core_count(&[], 0), 0);
+    }
+
+    /// A topology change (a VM grows or shrinks its vCPU count, a core is
+    /// offlined) makes the older per-core vectors describe a DIFFERENT grid:
+    /// they are gaps, not a value for whatever core happens to sit at that
+    /// index. The newest measurement decides how many tiles there are.
+    #[test]
+    fn a_topology_change_gaps_the_tiles_instead_of_mapping_cores_by_index() {
+        let mut eight = pt(1_000);
+        eight.per_core = vec![5.0; 8];
+        eight.per_core_kernel = vec![0.5; 8];
+        let mut sixteen = pt(2_000);
+        sixteen.per_core = vec![7.0; 16];
+        sixteen.per_core_kernel = vec![0.7; 16];
+        let win = [eight.clone(), sixteen.clone()];
+
+        let cores = grid_core_count(&win, 0);
+        assert_eq!(cores, 16, "the newest measurement owns the topology");
+        let hist = per_core_series(&win, cores, |point| Some(point.per_core.as_slice()));
+        assert_eq!(hist.len(), 16);
+        assert!(
+            hist.iter().all(|tile| tile[0].is_none()),
+            "an 8-core tick says nothing about a 16-tile grid"
+        );
+        assert!(hist.iter().all(|tile| tile[1] == Some(7.0)));
+
+        // Shrinking back is the same rule in the other direction: the 16-core
+        // tick is not squeezed into 8 tiles by index.
+        let mut back = pt(3_000);
+        back.per_core = vec![3.0; 8];
+        let win = [eight, sixteen, back];
+        let cores = grid_core_count(&win, 0);
+        assert_eq!(cores, 8);
+        let hist = per_core_series(&win, cores, |point| Some(point.per_core.as_slice()));
+        assert!(hist.iter().all(|tile| tile[1].is_none()));
+        assert!(hist.iter().all(|tile| tile[2] == Some(3.0)));
+    }
+
+    /// A mount or adapter that is MISSING at that instant is a gap; a drive
+    /// that is present and idle is a measured 0.
+    ///
+    /// `disk_series`/`net_series` used `map_or(0.0, ..)`, so an unmounted
+    /// volume or an adapter that had dropped out of the snapshot charted as
+    /// real 0 B/s readings — a fabricated value, and a hard vertical jump
+    /// next to the ticks that DID measure.
+    #[test]
+    fn an_absent_disk_or_adapter_is_a_gap_while_a_measured_idle_one_is_zero() {
+        let mut absent = pt(1_000);
+        absent.disks = vec![("D:".into(), None, 0.0, 0.0)];
+        absent.nets = vec![("wlan".into(), 0.0, 0.0)];
+        let mut idle = pt(2_000);
+        idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0)];
+        idle.nets = vec![("eth".into(), 0.0, 0.0)];
+        let win = vec![pt(0), idle.clone(), absent, pt(3_000)];
+
+        assert_eq!(
+            disk_series(&win, "C:", |d| d.2),
+            vec![None, Some(0.0), None, None],
+            "len must equal window len"
+        );
+        assert_eq!(
+            disk_series(&win, "C:", |d| d.3),
+            vec![None, Some(0.0), None, None]
+        );
+        assert_eq!(
+            net_series(&win, "eth", 1),
+            vec![None, Some(0.0), None, None],
+            "an absent adapter is not 0 B/s"
+        );
+        assert_eq!(
+            net_series(&win, "eth", 2),
+            vec![None, Some(0.0), None, None]
+        );
+        // The device that IS in the snapshot keeps reporting its own value.
+        assert_eq!(
+            net_series(&win, "wlan", 1),
+            vec![None, None, Some(0.0), None]
+        );
+
+        // Real traffic passes through unchanged on both direction slots.
+        let mut busy = pt(4_000);
+        busy.disks = vec![("C:".into(), Some(50.0), 1_000.0, 500.0)];
+        busy.nets = vec![("eth".into(), 2_000.0, 300.0)];
+        let win = vec![idle, busy];
+        assert_eq!(
+            disk_series(&win, "C:", |d| d.2),
+            vec![Some(0.0), Some(1_000.0)]
+        );
+        assert_eq!(
+            disk_series(&win, "C:", |d| d.3),
+            vec![Some(0.0), Some(500.0)]
+        );
+        assert_eq!(net_series(&win, "eth", 1), vec![Some(0.0), Some(2_000.0)]);
+        assert_eq!(net_series(&win, "eth", 2), vec![Some(0.0), Some(300.0)]);
+
+        // The chart scale ignores gaps instead of counting them as zero.
+        let peaks: [Option<f64>; 4] = [Some(4.0), None, Some(9.0), None];
+        assert_eq!(peak_measured(peaks.iter()), 9.0);
+        let all_gaps: [Option<f64>; 2] = [None, None];
+        assert_eq!(peak_measured(all_gaps.iter()), 0.0);
+    }
+
+    /// The aggregate kernel band and the per-core kernel tiles must agree on
+    /// WHICH ticks have a kernel sample.
+    ///
+    /// A truncated or stale `per_core_kernel` (a backend that dropped a core
+    /// between the two vectors) cannot be vouched for: charting `cpu_kernel`
+    /// beside it, or tile `i` of a shorter vector, paints a band that describes
+    /// a core set the values do not come from.
+    #[test]
+    fn the_kernel_band_is_only_charted_where_it_matches_the_per_core_values() {
+        let mut matched = pt(1_000);
+        matched.cpu_available = true;
+        matched.cpu_kernel = 12.0;
+        matched.per_core = vec![10.0, 20.0, 30.0, 40.0];
+        matched.per_core_kernel = vec![1.0, 2.0, 3.0, 4.0];
+        let mut truncated = pt(2_000);
+        truncated.cpu_available = true;
+        truncated.cpu_kernel = 9.0;
+        truncated.per_core = vec![10.0, 20.0, 30.0, 40.0];
+        truncated.per_core_kernel = vec![1.0, 2.0];
+        let mut no_window = pt(3_000);
+        no_window.cpu_kernel = 5.0;
+        no_window.per_core = vec![10.0, 20.0, 30.0, 40.0];
+        no_window.per_core_kernel = vec![1.0, 2.0, 3.0, 4.0];
+        let win = [matched, truncated, no_window];
+
+        assert_eq!(
+            cpu_kernel_series(&win),
+            vec![Some(12.0), None, None],
+            "no CPU window, or a kernel vector that does not describe the cores"
+        );
+        let cores = grid_core_count(&win, 0);
+        assert_eq!(cores, 4);
+        let kern = per_core_series(&win, cores, |point| {
+            if kernel_sample_usable(point) {
+                Some(point.per_core_kernel.as_slice())
+            } else {
+                None
+            }
+        });
+        // Same ticks, tile by tile: 1 and 2 are gaps in every tile, so no tile
+        // charts a kernel band the aggregate band would not.
+        assert!(kern.iter().all(|tile| tile[0] == Some(1.0)));
+        assert!(
+            kern.iter()
+                .all(|tile| tile[1].is_none() && tile[2].is_none()),
+            "an unusable kernel vector must not be charted per core either"
         );
     }
 
@@ -643,26 +849,20 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     let win = window(app);
                     let card_series: Vec<Vec<Option<f64>>> = entries
                         .iter()
-                        .map(|e| {
-                            if e.kind == ResourceKind::Disk {
-                                return disk_activity_series(win, &e.key);
+                        .map(|e| match e.kind {
+                            ResourceKind::Cpu => cpu_total_series(win),
+                            ResourceKind::Memory => {
+                                series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
+                                    .into_iter()
+                                    .map(Some)
+                                    .collect()
                             }
-                            let values = match e.kind {
-                                ResourceKind::Cpu => series(win, |h| {
-                                    if h.cpu_available {
-                                        h.cpu_total as f64
-                                    } else {
-                                        f64::NAN
-                                    }
-                                }),
-                                ResourceKind::Memory => {
-                                    series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
-                                }
-                                ResourceKind::Disk => unreachable!("handled above"),
-                                ResourceKind::Network => net_series(win, &e.key, 1),
-                                ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util),
-                            };
-                            values.into_iter().map(Some).collect()
+                            ResourceKind::Disk => disk_activity_series(win, &e.key),
+                            ResourceKind::Network => net_series(win, &e.key, 1),
+                            ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util)
+                                .into_iter()
+                                .map(Some)
+                                .collect(),
                         })
                         .collect();
                     for (index, (e, samples)) in entries.iter().zip(card_series.iter()).enumerate()
@@ -1104,20 +1304,39 @@ fn series(win: &[HistoryPoint], f: impl Fn(&HistoryPoint) -> f64) -> Vec<f64> {
     win.iter().map(f).collect()
 }
 
+/// Gap-aware sibling of [`series`]: one sample per window point, `None` where
+/// that point carries no measurement for this series.
+///
+/// `None` is not interchangeable with `0.0`. A fabricated zero is a reading the
+/// user can act on ("the drive is idle", "the adapter is silent") when the
+/// truth is "this tick has no sample". The charts split their geometry on gaps,
+/// so a missing sample breaks the line instead of drawing the fill-less
+/// straight stroke a sentinel value used to produce across the plot.
+fn gap_series(win: &[HistoryPoint], f: impl Fn(&HistoryPoint) -> Option<f64>) -> Vec<Option<f64>> {
+    win.iter().map(f).collect()
+}
+
 fn timestamps(win: &[HistoryPoint]) -> Vec<u64> {
     win.iter().map(|h| h.t_ms).collect()
 }
 
+/// Read or write history of one mounted volume, `None` where that mount is not
+/// in the tick's snapshot at all.
+///
+/// The series is still exactly as long as the window — indices must stay
+/// aligned with the shared timestamps, otherwise samples plot at wrong x
+/// positions (cliffs and shifted curves). What changed is the value for a tick
+/// that does not list the mount: it is a gap, not a 0 B/s reading. `map_or(0.0,
+/// ..)` made an unmounted or unenumerated drive look idle AND dropped a hard
+/// vertical jump into the graph next to the ticks that did measure, i.e. a
+/// stroke that belongs to no data run.
 fn disk_series(
     win: &[HistoryPoint],
     key: &str,
     pick: impl Fn(&(String, Option<f32>, f64, f64)) -> f64,
-) -> Vec<f64> {
-    // One value PER window point (0.0 when absent): series indices must stay
-    // aligned with the shared timestamps, otherwise samples plot at wrong
-    // x positions (cliffs and shifted curves).
+) -> Vec<Option<f64>> {
     win.iter()
-        .map(|h| h.disks.iter().find(|(m, ..)| m == key).map_or(0.0, &pick))
+        .map(|h| h.disks.iter().find(|(m, ..)| m == key).map(&pick))
         .collect()
 }
 
@@ -1133,18 +1352,40 @@ fn disk_activity_series(win: &[HistoryPoint], key: &str) -> Vec<Option<f64>> {
         .collect()
 }
 
-fn net_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
-    // No zero-filtering here either: dropping samples shortens the series
-    // and desynchronizes it from `timestamps_ms`. Zero traffic plots as
-    // zero — honest and aligned.
+/// Receive (`idx == 1`) or send (`idx == 2`) history of one adapter.
+///
+/// Same contract as [`disk_series`]: one sample per window point, and `None`
+/// where the adapter is not in the tick's snapshot at all (unplugged, disabled,
+/// or not enumerated that tick). That used to be a fabricated 0 B/s, which both
+/// invented a reading and drew a cliff down to it. Zero traffic from an adapter
+/// that IS there stays a measured `Some(0.0)`.
+fn net_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<Option<f64>> {
+    // No zero-filtering either: dropping samples shortens the series and
+    // desynchronizes it from `timestamps_ms`. Measured zero plots as zero —
+    // honest and aligned.
     win.iter()
         .map(|h| {
             h.nets
                 .iter()
                 .find(|(m, ..)| m == key)
-                .map_or(0.0, |t| if idx == 1 { t.1 } else { t.2 })
+                .map(|(_, recv, sent)| if idx == 1 { *recv } else { *sent })
         })
         .collect()
+}
+
+/// Highest MEASURED value across some gap series, for a chart's y scale.
+///
+/// Gaps are skipped rather than counted as a zero reading. A non-finite sample
+/// is skipped as well: `f64::max` would ignore it, but the scale would then be
+/// decided by whatever `nice_rate_max` makes of the remaining peak - and a
+/// non-finite peak of its own would silently collapse a rate chart to its
+/// 1 KB/s floor, which reads as "nothing happened" on a chart that is in fact
+/// reporting bytes. Filtering here keeps the scale a function of real readings.
+fn peak_measured<'a>(samples: impl Iterator<Item = &'a Option<f64>>) -> f64 {
+    samples
+        .filter_map(|sample| *sample)
+        .filter(|value| value.is_finite())
+        .fold(0.0f64, f64::max)
 }
 
 /// Utilization history of ONE engine type on one adapter.
@@ -1698,6 +1939,117 @@ fn logical_grid_layout(width: f32, cores: usize) -> (usize, f32, f32) {
     (cols, cell_width, cell_height)
 }
 
+/// Number of tiles the logical-processor grid keeps: the newest per-core
+/// measurement in the visible window, else the newest snapshot's own count.
+///
+/// The grid used to be sized from `snap.cpu.per_core_pct.len()` alone. A tick
+/// where the sampler had no CPU window (Windows publishes an empty vector when
+/// its two-sample load delta is missing, Linux when `/proc/stat` could not be
+/// read) therefore reported zero cores, and the whole page flipped to the
+/// aggregate chart — and back again one tick later. The count is a property of
+/// the machine, not of a single tick, so it is taken from the newest point that
+/// actually measured per-core load; a tick without per-core data keeps the grid
+/// and shows unavailable samples in every tile (see [`per_core_series`]).
+fn grid_core_count(win: &[HistoryPoint], snapshot_len: usize) -> usize {
+    win.iter()
+        .rev()
+        .find_map(|point| (!point.per_core.is_empty()).then_some(point.per_core.len()))
+        .unwrap_or(snapshot_len)
+}
+
+/// `true` when a point's kernel sample belongs to the same tick AND the same
+/// core set as its per-core values.
+///
+/// The aggregate CPU band and the per-core kernel tiles share this one rule (see
+/// [`cpu_kernel_series`] and [`per_core_series`]) so a page can never chart a
+/// kernel band it cannot vouch for: a truncated or stale kernel vector would
+/// otherwise be paired with per-core values it does not describe, and the band
+/// would be drawn against a different core set than the tile underneath it.
+///
+/// The tick's own CPU window belongs in the rule, not beside it. It used to be
+/// an `&&` at the aggregate call site only, which left the per-core tiles
+/// charting a kernel band on a blind tick while the aggregate chart showed a
+/// gap for the very same instant — one page, two answers.
+fn kernel_sample_usable(point: &HistoryPoint) -> bool {
+    point.cpu_available
+        && !point.per_core_kernel.is_empty()
+        && point.per_core_kernel.len() == point.per_core.len()
+}
+
+/// Aggregate utilization history, `None` where the tick had no usable CPU
+/// window. Shared by the CPU card sparkline and the aggregate chart so both read
+/// a missing sample the same way.
+fn cpu_total_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
+    gap_series(win, |point| {
+        point.cpu_available.then_some(f64::from(point.cpu_total))
+    })
+}
+
+/// Aggregate kernel-time history, `None` unless the tick has a CPU window and a
+/// per-core kernel sample that lines up with its per-core values.
+fn cpu_kernel_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
+    gap_series(win, |point| {
+        kernel_sample_usable(point).then_some(f64::from(point.cpu_kernel))
+    })
+}
+
+/// One gap series per tile of the logical-processor grid.
+///
+/// `values` selects the per-core vector of one history point and answers `None`
+/// when that point has no usable measurement for the grid at all. A point whose
+/// vector is missing, or does not describe `cores` tiles (a topology change, a
+/// tick without per-core data), has NO measurement for any tile: every series
+/// gets a `None` at that instant. Pushing a sentinel instead is what put a
+/// stroke that belongs to no data run across the tiles — a gap read as a value
+/// drew a straight line that bridged the missing region — and a fabricated 0 %
+/// would additionally claim that a busy core was idle.
+fn per_core_series<'a>(
+    win: &'a [HistoryPoint],
+    cores: usize,
+    values: impl Fn(&'a HistoryPoint) -> Option<&'a [f32]>,
+) -> Vec<Vec<Option<f64>>> {
+    let mut out: Vec<Vec<Option<f64>>> =
+        (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
+    for point in win {
+        match values(point).filter(|measured| measured.len() == cores) {
+            Some(measured) => {
+                for (tile, value) in out.iter_mut().zip(measured) {
+                    // A non-finite per-core sample is a backend's "no value" too.
+                    tile.push(value.is_finite().then_some(f64::from(*value)));
+                }
+            }
+            None => {
+                for tile in &mut out {
+                    tile.push(None);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One tile's samples in the painter's convention: `f64` with NaN for "this
+/// tile has no measurement at that instant".
+///
+/// `core_chart*` takes `&[f64]` and splits its geometry on non-finite samples.
+/// The series themselves stay `Option<f64>` so that "no measurement" is stated
+/// once, where the data is extracted, instead of being re-derived from a
+/// sentinel by every consumer.
+fn tile_samples(samples: &[Option<f64>]) -> Vec<f64> {
+    samples
+        .iter()
+        .map(|sample| sample.unwrap_or(f64::NAN))
+        .collect()
+}
+
+/// Percentage readout for a gap-aware sample: the value, or the same dash the
+/// charts show for a sample they have no measurement for.
+fn fmt_sample_percent(sample: Option<f64>) -> String {
+    sample
+        .filter(|value| value.is_finite())
+        .map_or_else(|| "\u{2014}".to_string(), fmt_percent)
+}
+
 fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let Some(snap) = app.latest_snapshot() else {
         return;
@@ -1707,46 +2059,23 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let win = window(app);
     let ts = timestamps(win);
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
-    let total_series = series(win, |h| {
-        if h.cpu_available {
-            h.cpu_total as f64
+    let total_series = cpu_total_series(win);
+    let kernel_series = cpu_kernel_series(win);
+    // The grid's tile count comes from the newest per-core MEASUREMENT, not
+    // from the newest snapshot, so a tick without per-core data cannot flip the
+    // page to the aggregate chart (see `grid_core_count`).
+    let cores = grid_core_count(win, snap.cpu.per_core_pct.len());
+    let core_hist = per_core_series(win, cores, |point| Some(point.per_core.as_slice()));
+    // Kernel tiles follow the aggregate band's usability rule exactly
+    // (`kernel_sample_usable`): a tick that fails it has no kernel sample for
+    // any tile either.
+    let core_kern = per_core_series(win, cores, |point| {
+        if kernel_sample_usable(point) {
+            Some(point.per_core_kernel.as_slice())
         } else {
-            f64::NAN
+            None
         }
     });
-    let kernel_series = series(win, |h| {
-        if h.cpu_available
-            && !h.per_core_kernel.is_empty()
-            && h.per_core_kernel.len() == h.per_core.len()
-        {
-            h.cpu_kernel as f64
-        } else {
-            f64::NAN
-        }
-    });
-    let cores = snap.cpu.per_core_pct.len();
-    let mut core_hist: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
-    let mut core_kern: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
-    for h in win {
-        if h.per_core.len() == cores {
-            for (dst, value) in core_hist.iter_mut().zip(&h.per_core) {
-                dst.push(*value as f64);
-            }
-        } else {
-            for dst in &mut core_hist {
-                dst.push(f64::NAN);
-            }
-        }
-        if h.per_core_kernel.len() == cores {
-            for (dst, value) in core_kern.iter_mut().zip(&h.per_core_kernel) {
-                dst.push(*value as f64);
-            }
-        } else {
-            for dst in &mut core_kern {
-                dst.push(f64::NAN);
-            }
-        }
-    }
     let logical_mode = app.shared.settings.cpu_graph_mode == "logical";
     let kernels = app.shared.settings.show_kernel_times;
 
@@ -1831,7 +2160,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     format!(
                         "CPU {selected_core}, {}: {}",
                         crate::widgets::chart::sample_age(Some(axis), sample_index),
-                        fmt_percent(*value)
+                        fmt_sample_percent(*value)
                     ),
                     changed || core_key.is_some(),
                 );
@@ -1841,11 +2170,22 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                 .start_row(0)
                 .show(ui, |ui| {
                     for i in 0..cores {
+                        // The tiles speak the painter's convention (NaN = no
+                        // measurement); the series above state the same thing
+                        // as `None` where it is known.
+                        let tile = tile_samples(&core_hist[i]);
+                        let tile_kernel = if kernels {
+                            Some(tile_samples(&core_kern[i]))
+                        } else {
+                            None
+                        };
                         let response = core_chart_grouped(
                             ui,
                             egui::vec2(cell_w, cell_h),
-                            &core_hist[i],
-                            kernels.then(|| (core_kern[i].as_slice(), kernel_color(pal))),
+                            &tile,
+                            tile_kernel
+                                .as_deref()
+                                .map(|kernel| (kernel, kernel_color(pal))),
                             pal.cpu_graph,
                             &format!("CPU {i}"),
                             Some(axis),
@@ -1874,13 +2214,13 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         // Kernel first so the primary total series paints on top.
         let mut chart_series = Vec::with_capacity(2);
         if kernels {
-            chart_series.push(MultiSeries::new(
+            chart_series.push(MultiSeries::with_gaps(
                 i18n::tr(K::ShowKernelTimesShort),
                 kernel_series,
                 kernel_color(pal),
             ));
         }
-        chart_series.push(MultiSeries::new(
+        chart_series.push(MultiSeries::with_gaps(
             i18n::tr(K::SeriesTotal),
             total_series,
             pal.cpu_graph,
@@ -2436,13 +2776,10 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     // but nothing on screen said so. Plot bytes per second and label the peak.
     // A ROUNDED scale, not the raw peak: with the peak as the y max the top
     // label and the whole curve rescale on every tick, which makes two
-    // consecutive frames impossible to compare.
-    let peak = format::nice_rate_max(
-        read.iter()
-            .chain(write.iter())
-            .cloned()
-            .fold(0.0f64, f64::max),
-    );
+    // consecutive frames impossible to compare. The peak comes from the
+    // MEASURED samples only — a gap is not a reading — and `nice_rate_max`
+    // keeps its own floor, so an all-gap window still yields a usable scale.
+    let peak = format::nice_rate_max(peak_measured(read.iter().chain(write.iter())));
     caption(
         ui,
         pal,
@@ -2456,8 +2793,8 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         width,
         160.0,
         &[
-            MultiSeries::new(i18n::tr(K::StatRead), read, pal.disk_graph),
-            MultiSeries::new(i18n::tr(K::StatWrite), write, pal.disk_write_graph),
+            MultiSeries::with_gaps(i18n::tr(K::StatRead), read, pal.disk_graph),
+            MultiSeries::with_gaps(i18n::tr(K::StatWrite), write, pal.disk_write_graph),
         ],
         peak,
         Some(axis),
@@ -2560,12 +2897,9 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
 
     let recv = net_series(win, &entry.key, 1);
     let sent = net_series(win, &entry.key, 2);
-    let peak = format::nice_rate_max(
-        recv.iter()
-            .chain(sent.iter())
-            .copied()
-            .fold(0.0f64, f64::max),
-    );
+    // Measured samples only, exactly as on the disk transfer chart: an adapter
+    // that is not in this tick's snapshot must not set the scale either.
+    let peak = format::nice_rate_max(peak_measured(recv.iter().chain(sent.iter())));
     let window_text = window_label(app.shared.settings.graph_seconds);
     caption(
         ui,
@@ -2580,8 +2914,8 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
         width,
         230.0,
         &[
-            MultiSeries::new(i18n::tr(K::StatReceive), recv, pal.network_graph),
-            MultiSeries::new(i18n::tr(K::StatSend), sent, pal.network_send_graph),
+            MultiSeries::with_gaps(i18n::tr(K::StatReceive), recv, pal.network_graph),
+            MultiSeries::with_gaps(i18n::tr(K::StatSend), sent, pal.network_send_graph),
         ],
         peak,
         Some(axis),
