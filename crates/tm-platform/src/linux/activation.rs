@@ -31,6 +31,10 @@ const MAX_MESSAGE_BYTES: usize = 128;
 const HANDOFF_DEADLINE: Duration = Duration::from_secs(5);
 const PER_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+/// Pause after a transient `accept` failure. Long enough that a persistent fd or
+/// memory shortage does not spin, short enough that a freed descriptor is picked
+/// up within one launch's handoff deadline.
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The process that owns activation coordination for this user session.
 ///
@@ -329,6 +333,31 @@ fn establish_primary(
     })
 }
 
+/// What the listener loop does with one `accept` result.
+///
+/// There is deliberately no outcome that ends the loop: the advisory lock keeps
+/// this process the session's coordinator until it exits, so a listener that
+/// gave up would leave the socket gone (or unanswered) while the lock still
+/// blocked every successor. Only a dead descriptor, which `poll` reports as
+/// `POLLNVAL`, tears the listener down.
+enum AcceptOutcome {
+    Serve(UnixStream),
+    NextPoll,
+    RetryImmediately,
+    RetryAfterBackoff(io::Error),
+}
+
+fn accept_outcome(result: io::Result<UnixStream>) -> AcceptOutcome {
+    match result {
+        Ok(stream) => AcceptOutcome::Serve(stream),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => AcceptOutcome::NextPoll,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => AcceptOutcome::RetryImmediately,
+        // EMFILE, ENFILE, ENOMEM, ENOBUFS, ECONNABORTED and anything else the
+        // kernel reports here leave the listener intact.
+        Err(error) => AcceptOutcome::RetryAfterBackoff(error),
+    }
+}
+
 fn serve_activation(
     listener: UnixListener,
     inbox: ActivationInbox,
@@ -337,6 +366,9 @@ fn serve_activation(
     socket_path: &Path,
     socket_identity: SocketIdentity,
 ) {
+    // One line per failure episode: a persistent fd shortage would otherwise
+    // repeat the same warning every backoff period for the rest of the session.
+    let mut accept_failure_reported = false;
     loop {
         let mut poll_fds = [
             libc::pollfd {
@@ -376,14 +408,33 @@ fn serve_activation(
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                match listener.accept() {
-                    Ok((stream, _)) => serve_activation_connection(stream, &inbox, stop),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        tracing::warn!(%error, "Linux activation listener accept failed");
-                        remove_socket_if_owned(socket_path, socket_identity);
-                        return;
+                match accept_outcome(listener.accept()) {
+                    AcceptOutcome::Serve(stream) => {
+                        accept_failure_reported = false;
+                        serve_activation_connection(stream, &inbox, stop)
+                    }
+                    AcceptOutcome::NextPoll => break,
+                    AcceptOutcome::RetryImmediately => continue,
+                    // A transient failure (EMFILE/ENFILE/ENOMEM/ENOBUFS, an
+                    // aborted pending connection) must not end coordination:
+                    // this process keeps the advisory lock for its whole
+                    // lifetime, so a listener that unlinked its own socket
+                    // would make every later launch retry the full handoff
+                    // deadline and open a duplicate window. A genuinely dead
+                    // listener is reported by `poll` as POLLNVAL above, which is
+                    // where the loop tears down. Back off so a persistent
+                    // shortage cannot spin, and let the stop wake-up end the
+                    // wait immediately.
+                    AcceptOutcome::RetryAfterBackoff(error) => {
+                        if !accept_failure_reported {
+                            tracing::warn!(
+                                %error,
+                                "Linux activation listener accept failed; keeping the endpoint"
+                            );
+                            accept_failure_reported = true;
+                        }
+                        wait_for_stop(wake, ACCEPT_RETRY_BACKOFF);
+                        break;
                     }
                 }
             }
@@ -771,6 +822,21 @@ fn signal_wake(fd: &OwnedFd) {
     }
 }
 
+/// Wait out a retry backoff, ending early when the owner asks the listener to
+/// stop. The same eventfd that interrupts accept polling ends this wait, so a
+/// backoff can never delay GUI shutdown by more than one scheduler wake-up.
+fn wait_for_stop(wake: &OwnedFd, delay: Duration) {
+    let millis = delay.as_millis().min(i32::MAX as u128).max(1) as libc::c_int;
+    let mut poll_fd = libc::pollfd {
+        fd: wake.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll_fd` is a live initialized descriptor entry; the result only
+    // decides whether the wait ended early.
+    let _ = unsafe { libc::poll(&mut poll_fd, 1, millis) };
+}
+
 fn runtime_dir() -> io::Result<PathBuf> {
     let uid = effective_uid();
     if let Some(configured) = std::env::var_os("XDG_RUNTIME_DIR")
@@ -1097,6 +1163,37 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn transient_accept_failures_keep_the_listener_alive() {
+        // The lock outlives the listener, so a torn-down endpoint would block
+        // every later launch for the whole handoff deadline and then open a
+        // duplicate window. Only a dead descriptor may end the loop, and `poll`
+        // reports that as POLLNVAL before `accept` is ever reached.
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::ECONNABORTED,
+        ] {
+            assert!(
+                matches!(
+                    accept_outcome(Err(io::Error::from_raw_os_error(errno))),
+                    AcceptOutcome::RetryAfterBackoff(_)
+                ),
+                "errno {errno} must not end the listener"
+            );
+        }
+        assert!(matches!(
+            accept_outcome(Err(io::Error::from(io::ErrorKind::Interrupted))),
+            AcceptOutcome::RetryImmediately
+        ));
+        assert!(matches!(
+            accept_outcome(Err(io::Error::from(io::ErrorKind::WouldBlock))),
+            AcceptOutcome::NextPoll
+        ));
     }
 
     #[test]
