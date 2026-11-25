@@ -147,7 +147,16 @@ mod tests {
         replace_file(&path, "json.tmp", |out| out.write_all(b"first")).unwrap();
         replace_file(&path, "json.tmp", |out| out.write_all(b"second")).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
-        assert!(!path.with_extension("json.tmp").exists());
+        // The temp file is `<name>.<pid>-<seq>.<ext>`, not `<name>.<ext>`, so
+        // `path.with_extension("json.tmp")` never names what a save creates.
+        // The directory is the only place that proves none was left behind.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "a completed save left {leftovers:?} behind");
 
         set_aside(&path, "test store");
         assert!(!path.exists());
