@@ -476,8 +476,11 @@ fn per_file_accounting_note(
 /// (`elevation_is_a_remedy` is false there): the handle list IS the whole
 /// feature there, so nothing that could have been shown is missing.
 ///
-/// The filter wins over all of that: it, not the process, is why nothing is
-/// listed.
+/// **Availability outranks the filter.** A list that could not be enumerated
+/// (or was trimmed) is not a filtered list, so "no matches" would blame the
+/// search box for a gap the enumeration caused. `filter_active` also has to
+/// mean "a filter is set over a list that HAD candidates": with nothing to
+/// filter, an empty list says the same thing it would without the filter.
 fn empty_file_list_message(
     accounting: Option<&FileIoAccounting>,
     handles_complete: bool,
@@ -485,12 +488,12 @@ fn empty_file_list_message(
     elevation_is_a_remedy: bool,
     lang: i18n::Lang,
 ) -> Option<String> {
-    if filter_active {
-        return Some(i18n::tr_in(lang, K::NoMatches).to_string());
-    }
     let Some(accounting) = accounting.filter(|_| handles_complete) else {
         return Some(i18n::tr_in(lang, K::PropIoFilesUnavailable).to_string());
     };
+    if filter_active {
+        return Some(i18n::tr_in(lang, K::NoMatches).to_string());
+    }
     if accounting.state == FileIoAccountingState::Measured || !elevation_is_a_remedy {
         return Some(i18n::tr_in(lang, K::PropIoNoFiles).to_string());
     }
@@ -1000,7 +1003,9 @@ pub fn show(
         if let Some(msg) = empty_file_list_message(
             state.accounting.as_ref(),
             !handles_incomplete,
-            !state.file_filter.trim().is_empty(),
+            // "No matches" only over a list that HAD candidates: with nothing
+            // to filter, the search box is not why the table is empty.
+            !state.file_filter.trim().is_empty() && !state.files.is_empty(),
             ELEVATION_IS_A_REMEDY,
             i18n::lang(),
         ) {
@@ -1724,6 +1729,19 @@ mod tests {
             empty_file_list_message(Some(&no_trace), true, true, true, Lang::En),
             Some(i18n::tr_in(Lang::En, K::NoMatches).to_string()),
             "a filter that matches nothing is its own answer"
+        );
+        // ...but availability outranks it: a list that could not be
+        // enumerated is not a filtered list, and blaming the search box for
+        // that gap would name the wrong cause.
+        assert_eq!(
+            empty_file_list_message(Some(&measured), false, true, true, Lang::En),
+            unavailable,
+            "an un-enumerated list is not a filtered list"
+        );
+        assert_eq!(
+            empty_file_list_message(None, true, true, true, Lang::En),
+            unavailable,
+            "an un-enumerated list is not a filtered list"
         );
     }
 
