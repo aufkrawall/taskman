@@ -88,7 +88,17 @@ error surfacing. All of it is Windows-only and marked with a `TaskMan fork:` com
     eligible to register as a click (and a synthetic Left release during a
     middle-button drag could activate the control under the cursor).
   - `WM_DPICHANGED` no longer `expect`s the old inner rect; a failed
-    `GetWindowRect` leaves the window as it was instead of panicking.
+    `GetWindowRect` logs a `tracing::warn!`, restores the previous scale factor
+    and skips the resize instead of panicking. Nothing that announces or applies
+    the change happens on that path — no `ScaleFactorChanged`, no `InnerSizeWriter`
+    resize, no `SetWindowPos` on the suggested rect — so publishing the new value
+    alone would half-apply a DPI change (egui-winit re-reads
+    `Window::scale_factor()` every frame, so the toolkit would move to the new
+    point scale while the client area kept its old pixel size). Restoring also
+    keeps the retry alive: with the new value stored, the next `WM_DPICHANGED`
+    would take its `new_scale_factor == old_scale_factor` early return and never
+    apply the change at all. The window keeps the previous scale — visibly stale
+    on the new-DPI monitor — until the next event.
 - `src/platform_impl/windows/window.rs`
   - `outer_position`, `inner_position`, `inner_size` and `outer_size` return
     `NotSupportedError`/zero sizes instead of panicking when
@@ -114,17 +124,24 @@ repaint is suspended; SCTK already records it in `WindowConfigure.state`.
 
 - `src/platform_impl/linux/wayland/window/state.rs`
   - `WindowState::is_suspended()` tests `XdgWindowState::SUSPENDED` on the last
-    configure and has pure bitflags regression tests.
+    configure and has pure bitflags regression tests. It answers `Option<bool>`:
+    `None` — winit's documented answer for this platform — whenever the state
+    cannot be reported, i.e. before the first configure and on an xdg-shell older
+    than v6, which has no `suspended` state to send. `reported_suspended()` is the
+    pure rule behind it, tested for both `None` cases.
   - `WindowState::configure()` resets a pending frame-callback throttle when the
     `SUSPENDED` bit changes, so the configure-triggered redraw is delivered even
     when an invisible surface no longer receives its frame callback.
 - `src/platform_impl/linux/wayland/window/mod.rs`
-  - `Window::is_minimized()` returns `Some(window_state.is_suspended())` instead
-    of always returning `None`.
+  - `Window::is_minimized()` returns `window_state.is_suspended()` instead of
+    always returning `None`, so it forwards the `None` cases above unchanged.
 
 Winit already queues a redraw for every configure, so eframe's visibility pass
-observes both suspension and resume. A compositor that does not advertise
-xdg-shell v6's suspended state remains unable to prove that the window is hidden.
+observes both suspension and resume. v6's hint also covers occlusion and screen
+locking, so `Some(true)` means "the compositor says this toplevel is not visible",
+not strictly "minimized". A compositor that does not advertise xdg-shell v6's
+suspended state keeps the `None` answer: reporting `Some(false)` there would
+fabricate a measurement, and every hidden window would claim to be visible.
 
 ## Rebase procedure
 
