@@ -1,3 +1,42 @@
+## 2026-11-25 - The white window flash: a presentation gate
+
+- Reported as "occasionally" brief white flashing when the window opens, "not always", on cold
+  start, from the tray and from minimized-in-taskbar. Occasional is the fingerprint: DWM composes
+  the window at the moment Windows considers it shown, and the app's first frame lands one beat
+  later, so the flash depends on the race between them.
+- Four separate holes, all needed for a total fix. (1) Cold start: eframe creates the window
+  hidden and reveals it with a plain `set_visible(true)` after the first *painted* (not
+  presented) frame — and `run_gui` had asked for `with_visible(!initially_hidden)`, i.e. visible.
+  (2) Tray: `restore_window` cloaked only `if was_hidden`, so a tray restore of a *minimized*
+  window went out with no cloak at all. (3) Taskbar: Windows performs the restore before the
+  app's next `update()`, so any cloak set from the app was always one frame too late; and the
+  surface may have been dropped while hidden. (4) winit registers its window class with
+  `hbrBackground: 0`, so there was no background colour behind an unpainted client area at all.
+- Fix: `crates/tm-platform/src/win/present_gate.rs`. The window is cloaked (`DWMWA_CLOAK`) inside
+  eframe's creation callback, and a `SetWindowSubclass` WndProc re-cloaks before returning from
+  `WM_SHOWWINDOW`, `SWP_SHOWWINDOW`, `SC_RESTORE`/`SC_MAXIMIZE` while `IsIconic`, and the
+  `WM_SIZE` restore (backstop, keyed on a remembered `WM_SIZE(SIZE_MINIMIZED)`). `WM_ERASEBKGND`
+  and the class brush are filled with the app background, so a worst case is app-coloured.
+  `present_gate_release` is the only uncloak in the toolkit; `set_window_cloaked(.., false)` and
+  `ensure_presentable` refuse while the gate holds. The app's `finish_reveal` arms the hold on
+  `present_gate_take_transition()` and releases on the pass after a painted frame
+  (`REVEAL_MIN_TICKS = 2`), bounded by 8 passes / 2 s, and owns `acknowledge_show` as before.
+  `apply_title_bar` now runs at creation, so a dark-theme app never composes a light caption.
+- Deliberate non-goals: a third-party uncloak (virtual-desktop switch, shell) carries no window
+  message and is not treated as a transition; the cloak is cleared on release if DWM still reports
+  the window cloaked. The class-background brush is class-wide (one winit class today) and is
+  restored to what it replaced before it is deleted.
+- Process: two parallel workers in separate worktrees (platform half, app half) against a fixed
+  API contract, then one reviewer per half in fresh worktrees. The reviews found the
+  `static Mutex<Gate>` holding a `!Send` `HBRUSH` (would not compile), a `WM_NCDESTROY` that
+  removed the subclass before chaining (would have swallowed winit's destruction), a test that
+  passed for the wrong reason, and a `force_foreground` on release that could re-show a window
+  the app had just put back in the tray. The first compile then found a missing `SIZE_MINIMIZED`
+  import. Gate: `python build.py --check`.
+- Still open: the visual result cannot be verified headlessly, and which of `SC_RESTORE` vs only
+  `WM_SIZE` a real taskbar click delivers is reasoned, not observed. `TASKMAN_*` diagnostics
+  unchanged; the gate logs one `tracing::debug!` per transition.
+
 ## 2026-11-25 - Performance graphs stopped drawing through missing data
 
 - Reported as "garbage elements" in the CPU graph grid on Windows and Linux: thin strokes in

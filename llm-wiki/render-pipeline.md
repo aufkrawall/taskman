@@ -186,6 +186,49 @@ low use. These settings lower allocation floors; they do not remove the LCD pipe
 rendering. Device-loss recovery and custom callback/`WgpuSetup::Existing` resources remain
 outside the managed restore guarantee.
 
+## Presentation gate
+
+The desktop must never compose the main window before that window holds a real
+frame. `tm_platform::install_present_gate` (Windows: `win/present_gate.rs`)
+owns that invariant; the app only drives it.
+
+Three mechanisms, and all three are needed:
+
+1. **Cloak at install.** `DWMWA_CLOAK` on the HWND inside eframe's creation
+   callback, before winit's first show. A cloaked window is still visible to
+   Windows — taskbar button, focus, `WM_PAINT` — but DWM draws nothing for it.
+2. **Re-cloak from a WndProc subclass** (`SetWindowSubclass`), before returning
+   from the message that would make the window composable. The app cannot do
+   this part: a taskbar restore is performed by Windows before the next
+   `update()`, so a cloak set from the app was always one frame too late.
+
+   | Message | Relied on for | Gate |
+   | --- | --- | --- |
+   | `WM_SHOWWINDOW` (TRUE) | every hide→show, incl. the tray | unconditional |
+   | `WM_WINDOWPOSCHANGED` + `SWP_SHOWWINDOW` | a show the app did not ask for | while held |
+   | `WM_SYSCOMMAND` `SC_RESTORE`/`SC_MAXIMIZE` | the *pre*-restore notification of a taskbar click | while `IsIconic` |
+   | `WM_SIZE` `SIZE_RESTORED`/`SIZE_MAXIMIZED` | backstop when no `SYSCOMMAND` arrives | while held or after a remembered minimize (`WM_SIZE` `SIZE_MINIMIZED`) |
+
+3. **Never white, worst case.** GDI has no class background to erase with —
+   winit registers with `hbrBackground: 0` — so the gate installs the app
+   background as the class brush and fills `WM_ERASEBKGND` with it. A frame
+   that slipped through would be app-coloured, not system white. The caption,
+   border and DWM backdrop are applied at creation (`apply_title_bar`) rather
+   than in the first `ui`, so a dark-theme app never composes a light-mode
+   caption.
+
+**One uncloak door.** `present_gate_release` is the only reveal, and
+`set_window_cloaked(.., false)` plus `ensure_presentable` refuse while the gate
+holds. A zero HWND falls back to the handle the gate stored, so losing the
+cached handle cannot strand a cloak. The hold is released from
+`NativeApp::finish_reveal` on the pass after a painted frame
+(`REVEAL_MIN_TICKS = 2`), bounded by 8 passes / 2 s — a held window is always
+revealed, because an invisible task manager is worse than a flash.
+
+A third-party uncloak (virtual-desktop switch, shell) carries no message, so it
+is not a gate transition: the cloak is cleared on release if DWM still reports
+the window cloaked.
+
 ## Sub-pixel rendering, concretely
 
 Glyphs are filled at 3x horizontal resolution so each of a pixel's three LCD sub-pixels

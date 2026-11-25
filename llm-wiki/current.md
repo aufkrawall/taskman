@@ -643,10 +643,17 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   by temporarily removing the replacement registration.
 - Window drags from the strip below the caption start on the button press, the
   search box has a clear button, and the dense list rows are 20 px.
-- **No white flash restoring from the tray.** The window is cloaked
-  (`DWMWA_CLOAK`) before it is shown and uncloaked two frames later, once a
-  real frame has been presented — a hidden window is never painted, so there
-  was nothing behind it when `ShowWindow` composed it.
+- **No white flash when the window appears, on any path.** Cold start, tray and
+  taskbar restores all go through the presentation gate
+  (`tm_platform::install_present_gate`): the window is created hidden, cloaked
+  (`DWMWA_CLOAK`) inside the creation callback, and re-cloaked from a WndProc
+  subclass on `WM_SHOWWINDOW`, `SWP_SHOWWINDOW`, `SC_RESTORE`/`SC_MAXIMIZE` on a
+  minimized window and the `WM_SIZE` restore that follows. The uncloak is
+  `present_gate_release` alone, from the frame after a painted one, bounded by
+  8 frames / 2 s. The client area is erased with the app background (winit's
+  class has `hbrBackground: 0`) and the caption/border are applied at creation,
+  so even a frame that slipped through would be app-coloured, not system white.
+  Design and message coverage: `render-pipeline.md` § Presentation gate.
 - **GPU-resident state follows visibility.** Hiding the last surface to the
   tray/minimized state/occlusion drops the WGPU surface, renderer, texture cache
   and device while app logic continues; the visible path recreates them lazily
@@ -1410,11 +1417,14 @@ The window itself is now treated as a thing that can fail, not as a given:
   `CreateDIBSection` surface, checks every `BitBlt`, validates only what it blitted, and
   merges the `WM_PAINT` update region into the present set — so a failed blit or a
   zero-tile repaint can no longer leave stale pixels. Full detail in `render-pipeline.md`.
-- **A restore is not acknowledged until a frame was painted.** `finish_restore` owns both
-  the uncloak and `acknowledge_show`, bounded by 8 frames / 2 s; the hotkey worker and the
+- **A reveal is not acknowledged until a frame was painted.** `finish_reveal` drives the
+  presentation gate every pass: it arms the hold on a gate transition or on a held window
+  the app has not adopted yet, releases through `present_gate_release` only after a painted
+  frame, and owns `acknowledge_show`, bounded by 8 frames / 2 s. The hotkey worker and the
   second-launch handshake therefore cannot mistake a message loop that merely pumps for a
   window the user can see. `ensure_presentable`, `ensure_window_on_screen` and
-  `raise_above_topmost` are the repair primitives (tm-platform).
+  `raise_above_topmost` are the repair primitives (tm-platform), and the first two never
+  uncloak a window the gate holds.
 - **Placement is physical.** `ui_state` stores `position_px=` beside the legacy logical
   line and the window is fitted into the nearest monitor's work area at startup, on every
   restore and on a monitor-size change; the minimum size is clamped to the largest monitor
