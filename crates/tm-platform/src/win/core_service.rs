@@ -371,14 +371,22 @@ struct BrokerResponse {
 
 #[derive(Debug)]
 enum BrokerCallError {
+    /// Nothing was tried, or the service is not there to try.
     Unavailable(String),
+    /// The request or the answer was lost in transport, or the two sides do not
+    /// agree on the frame. The service never said no, so this is an unknown
+    /// rather than a decision: a read-only request may answer from the local
+    /// arm (the same treatment [`Self::Unavailable`] gets), while an action has
+    /// to report that its outcome is unknown.
+    NoAnswer(String),
+    /// The service answered and declined. Never worked around locally.
     Rejected(String),
 }
 
 impl std::fmt::Display for BrokerCallError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(detail) => write!(formatter, "{detail}"),
+            Self::Unavailable(detail) | Self::NoAnswer(detail) => write!(formatter, "{detail}"),
             Self::Rejected(detail) => write!(formatter, "broker rejected request: {detail}"),
         }
     }
@@ -744,22 +752,22 @@ impl BrokerClient {
             ));
         }
         let payload = serde_json::to_vec(&request)
-            .map_err(|error| BrokerCallError::Rejected(error.to_string()))?;
+            .map_err(|error| BrokerCallError::NoAnswer(error.to_string()))?;
         write_frame(&mut pipe, FRAME_REQUEST, &payload, MAX_REQUEST_BYTES).map_err(|error| {
-            BrokerCallError::Rejected(format!(
+            BrokerCallError::NoAnswer(format!(
                 "request delivery failed; action state is unknown: {error}"
             ))
         })?;
         let response =
             read_frame(&mut pipe, FRAME_RESPONSE, MAX_RESPONSE_BYTES).map_err(|error| {
-                BrokerCallError::Rejected(format!(
+                BrokerCallError::NoAnswer(format!(
                     "service response was lost; action state is unknown: {error}"
                 ))
             })?;
         let response: BrokerResponse = serde_json::from_slice(&response)
-            .map_err(|error| BrokerCallError::Rejected(error.to_string()))?;
+            .map_err(|error| BrokerCallError::NoAnswer(error.to_string()))?;
         if response.protocol_version != PROTOCOL_VERSION {
-            return Err(BrokerCallError::Rejected(
+            return Err(BrokerCallError::NoAnswer(
                 "service protocol version changed during request".into(),
             ));
         }
@@ -858,9 +866,10 @@ fn telemetry_broker_call(
 /// Outcome of asking the broker for per-process network counters.
 ///
 /// `Unavailable` and `Rejected` are kept apart on purpose: the first means
-/// "no service, or one too old to know this request", where falling back to
-/// our own token is correct; the second is the service declining, which must
-/// never be worked around locally.
+/// "no service, or one too old to know this request" — or an answer that was
+/// lost in transport, which is what a telemetry timeout already reads as —
+/// where falling back to our own token is correct; the second is the service
+/// declining, which must never be worked around locally.
 pub(crate) enum BrokeredNetwork {
     Sample(ProcessNetworkSample),
     Unavailable,
@@ -872,7 +881,9 @@ pub(crate) fn brokered_process_network() -> BrokeredNetwork {
     match telemetry_broker_call(BrokerRequest::ProcessNetworkCounters) {
         Ok(BrokerValue::ProcessNetwork(sample)) => BrokeredNetwork::Sample(sample),
         Ok(_) => BrokeredNetwork::Rejected("unexpected response type".into()),
-        Err(BrokerCallError::Unavailable(_)) => BrokeredNetwork::Unavailable,
+        Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => {
+            BrokeredNetwork::Unavailable
+        }
         Err(BrokerCallError::Rejected(detail)) => BrokeredNetwork::Rejected(detail),
     }
 }
@@ -890,7 +901,9 @@ pub(crate) fn brokered_process_disk() -> BrokeredDisk {
     match telemetry_broker_call(BrokerRequest::ProcessDiskCounters) {
         Ok(BrokerValue::ProcessDisk(sample)) => BrokeredDisk::Sample(sample),
         Ok(_) => BrokeredDisk::Rejected("unexpected response type".into()),
-        Err(BrokerCallError::Unavailable(_)) => BrokeredDisk::Unavailable,
+        Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => {
+            BrokeredDisk::Unavailable
+        }
         Err(BrokerCallError::Rejected(detail)) => BrokeredDisk::Rejected(detail),
     }
 }
@@ -920,7 +933,9 @@ pub(crate) fn brokered_process_identity(
     }) {
         Ok(BrokerValue::ProcessIdentity(identity)) => BrokeredIdentity::Token(identity),
         Ok(_) => BrokeredIdentity::Rejected("unexpected response type".into()),
-        Err(BrokerCallError::Unavailable(_)) => BrokeredIdentity::Unavailable,
+        Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => {
+            BrokeredIdentity::Unavailable
+        }
         Err(BrokerCallError::Rejected(detail)) => BrokeredIdentity::Rejected(detail),
     }
 }
@@ -968,15 +983,31 @@ impl BrokeredActions {
                 "unexpected response type",
             )),
             Err(BrokerCallError::Unavailable(_)) => local(),
+            // A lost answer is not a decision, but an ACTION whose answer was
+            // lost has an unknown outcome: reporting it is the only honest
+            // answer, and retrying it on the local token would repeat its side
+            // effect.
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
         }
     }
 
+    /// Run `request` and decode its answer, falling back to `local` when the
+    /// service is absent — and, when `lost_answer_falls_back` is set, when the
+    /// answer never arrived either.
+    ///
+    /// A lost answer is an unknown rather than a decision, so a caller that only
+    /// reads may take the local arm; a caller that changes state must pass
+    /// `false`, because repeating its side effect locally after an
+    /// unacknowledged attempt is how one reference becomes two.
     fn value_or_local<T>(
         &self,
         request: BrokerRequest,
+        lost_answer_falls_back: bool,
         decode: impl FnOnce(BrokerValue) -> Option<T>,
         local: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
@@ -984,6 +1015,10 @@ impl BrokeredActions {
             Ok(value) => decode(value)
                 .ok_or_else(|| TmError::platform("core service", "unexpected response type")),
             Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::NoAnswer(_)) if lost_answer_falls_back => local(),
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -1167,6 +1202,9 @@ impl PlatformActions for BrokeredActions {
                 pid,
                 expected_start_epoch_s: Some(start_epoch_s),
             },
+            // A read: the local arm reads the same mask, so a lost answer may
+            // take it.
+            true,
             |value| match value {
                 BrokerValue::AffinityMask(mask) => Some(mask),
                 _ => None,
@@ -1287,7 +1325,7 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected process-security response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             Err(BrokerCallError::Rejected(detail)) => {
                 local().map_err(|_| TmError::platform("core service", detail))
             }
@@ -1315,7 +1353,7 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected process-modules response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             Err(BrokerCallError::Rejected(detail)) => {
                 local().map_err(|_| TmError::platform("core service", detail))
             }
@@ -1346,7 +1384,7 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected module code-sample response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -1391,6 +1429,12 @@ impl PlatformActions for BrokeredActions {
                 tracing::debug!(pid, missing, %detail, "broker thread details unavailable");
                 Ok(threads)
             }
+            // A lost answer is no better evidence than an absent service: the
+            // handle-free list still stands and the privileged columns stay "—".
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                tracing::debug!(pid, missing, %detail, "broker thread details lost");
+                Ok(threads)
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 tracing::debug!(pid, missing, %detail, "broker refused thread details");
                 Ok(threads)
@@ -1426,9 +1470,18 @@ impl PlatformActions for BrokeredActions {
                 "core service",
                 "unexpected process file I/O response type",
             )),
-            Err(BrokerCallError::Unavailable(_)) => local(),
+            // Transport loss is a legitimate unavailability: the local arm makes
+            // the same read with our own token. A service that answered and
+            // declined is a decision and still propagates below.
+            Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_)) => local(),
+            // The service declining is a decision, and the local arm is no
+            // longer a plain read: it starts a per-file session under this
+            // process's own token, machine-wide, whenever that token is
+            // elevated. Working a policy decision around by hosting the same
+            // measurement locally is exactly what every other rejection arm in
+            // this file refuses to do, so this one propagates the reason.
             Err(BrokerCallError::Rejected(detail)) => {
-                local().map_err(|_| TmError::platform("core service", detail))
+                Err(TmError::platform("core service", detail))
             }
         }
     }
@@ -1453,6 +1506,9 @@ impl PlatformActions for BrokeredActions {
                 base_address,
                 expected_path: expected_path.to_string(),
             },
+            // A state change: repeating a FreeLibrary locally after an
+            // unacknowledged attempt could release a second reference.
+            false,
             |value| match value {
                 BrokerValue::ModuleUnload {
                     still_mapped,
@@ -1524,6 +1580,12 @@ impl PlatformActions for BrokeredActions {
                 "unexpected response type",
             )),
             Err(BrokerCallError::Unavailable(_)) => self.local.repair_task_manager_replacement(),
+            // The broker was asked to write the key and its answer was lost, so
+            // whether it happened is unknown. Repeating the write locally would
+            // claim a repair this process never got an acknowledgement for.
+            Err(BrokerCallError::NoAnswer(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
             Err(BrokerCallError::Rejected(detail)) => {
                 Err(TmError::platform("core service", detail))
             }
@@ -1971,7 +2033,20 @@ fn process_network_sample() -> ProcessNetworkSample {
             Some(usage) => {
                 if let Some(trace) = slot.as_mut() {
                     trace.usage = usage;
+                    // The replacement is timed from this request, exactly as
+                    // the disk sibling times its own: the idle watchdog
+                    // measures `last_request`, and a wake that is already due
+                    // would otherwise judge the old session's age against the
+                    // one that just started and retire it on the way past.
+                    trace.last_request = std::time::Instant::now();
                 }
+                // A replacement's totals start again at zero, and an empty
+                // total is indistinguishable from a measured "no traffic".
+                // Answering this request from it would report 0 B/s and a
+                // zeroed byte total for every process on the tick the counters
+                // restarted — the fabricated zero the disk sibling avoids by
+                // answering unknown here. The next request measures it.
+                return ProcessNetworkSample::default();
             }
             None => return ProcessNetworkSample::default(),
         }
@@ -1994,6 +2069,9 @@ fn process_network_sample() -> ProcessNetworkSample {
                     *slot = None;
                     return ProcessNetworkSample::default();
                 }
+                // A session started here has delivered nothing yet, so it
+                // cannot speak for any process either; see the restart above.
+                return ProcessNetworkSample::default();
             }
             None => {
                 // LocalSystem should always be able to start a session; if it
@@ -2036,15 +2114,95 @@ fn process_network_sample() -> ProcessNetworkSample {
 /// Hard caps on one disk response: entries, and per-disk items across the
 /// entries and the totals. Worst-case JSON stays below the 512 KiB response
 /// frame. Overflow is unavailable rather than a false zero on omitted
-/// processes. Pinned by `a_capped_disk_response_fits_the_frame_limit`.
+/// processes, and the window it refused is held for the next request instead of
+/// being dropped (see [`process_disk_sample`]). Pinned by
+/// `a_capped_disk_response_fits_the_frame_limit`.
 const DISK_MAX_ENTRIES: usize = 1_800;
 const DISK_MAX_DISK_TIMES: usize = 3_600;
+
+/// Whether one drained window encodes within the per-response caps.
+///
+/// The counts are exactly the ones the response carries: a row for every
+/// process that completed at least one request, that row's per-disk split, and
+/// the window's own per-disk totals.
+fn disk_window_fits(window: &super::disk_etw::DiskWindow) -> bool {
+    let mut entries = 0usize;
+    let mut disk_times = window.disk_totals.len();
+    for row in window.procs.values().filter(|row| row.ops != 0) {
+        entries += 1;
+        disk_times += row.per_disk.len();
+    }
+    entries <= DISK_MAX_ENTRIES && disk_times <= DISK_MAX_DISK_TIMES
+}
+
+/// Fold a window a previous response could not carry into the one that follows
+/// it.
+///
+/// The two cover consecutive spans, so the merged window's `since_ms` is their
+/// sum and every counter adds: nothing is charged to a guess and no record is
+/// dropped. A merged window is measured as one longer interval, so the shares
+/// derived from it stay ratios of the same denominator.
+fn merge_disk_windows(into: &mut super::disk_etw::DiskWindow, later: super::disk_etw::DiskWindow) {
+    into.since_ms = into.since_ms.saturating_add(later.since_ms);
+    into.events_seen = into.events_seen.saturating_add(later.events_seen);
+    into.events_decoded = into.events_decoded.saturating_add(later.events_decoded);
+    into.unattributed_service_time = into
+        .unattributed_service_time
+        .saturating_add(later.unattributed_service_time);
+    for total in later.disk_totals {
+        super::disk_etw::add_disk_time(&mut into.disk_totals, total.disk, total.service_time);
+    }
+    for (pid, disk) in later.procs {
+        let row = into.procs.entry(pid).or_default();
+        row.service_time = row.service_time.saturating_add(disk.service_time);
+        row.read_bytes = row.read_bytes.saturating_add(disk.read_bytes);
+        row.write_bytes = row.write_bytes.saturating_add(disk.write_bytes);
+        row.ops = row.ops.saturating_add(disk.ops);
+        for part in disk.per_disk {
+            super::disk_etw::add_disk_time(&mut row.per_disk, part.disk, part.service_time);
+        }
+    }
+}
+
+/// Drop rows for processes that no longer exist from a window held across
+/// requests, charging their service time to the unattributed remainder.
+///
+/// `take_window` prunes the window it drains, but a held window was drained by
+/// an earlier request and its rows are never re-checked: without this, a
+/// process that exits during the hold keeps its row for as long as the hold
+/// lasts, and every row is one more entry the response caps count — so the one
+/// thing that could make an oversized window publishable again would never
+/// happen. The charging mirrors the drain exactly, including its empty-`live`
+/// case: an empty set means "the caller could not enumerate processes", never
+/// "nothing is alive".
+fn prune_held_disk_window(
+    window: &mut super::disk_etw::DiskWindow,
+    live: &std::collections::HashSet<u32>,
+) {
+    if live.is_empty() {
+        return;
+    }
+    let mut orphaned = 0u64;
+    window.procs.retain(|pid, row| {
+        let alive = live.contains(pid);
+        if !alive {
+            orphaned = orphaned.saturating_add(row.service_time);
+        }
+        alive
+    });
+    window.unattributed_service_time = window.unattributed_service_time.saturating_add(orphaned);
+}
 
 /// The broker-hosted per-process disk trace, with the same idle watchdog as
 /// the network one.
 struct DiskTrace {
     usage: super::disk_etw::DiskUsage,
     last_request: std::time::Instant,
+    /// A drained window the previous response could not carry because it did
+    /// not fit the caps; measured together with the next one. One slot, not a
+    /// list: the windows a single machine produces over consecutive polls cover
+    /// the same processes, so holding more than one would add span, not rows.
+    pending: Option<super::disk_etw::DiskWindow>,
 }
 
 fn disk_trace() -> &'static std::sync::Mutex<Option<DiskTrace>> {
@@ -2067,10 +2225,16 @@ fn process_disk_sample() -> ProcessDiskSample {
         // Same as the network trace; the fresh session's first window is too
         // short to divide by, so this tick stays unknown either way.
         tracing::warn!("broker disk trace ended unexpectedly; restarting it");
+        let now = std::time::Instant::now();
         if let Some(usage) = super::disk_etw::DiskUsage::start(super::etw::TraceRole::Service)
             && let Some(trace) = slot.as_mut()
         {
             trace.usage = usage;
+            // The replacement is timed from this request. `last_request` still
+            // names the last poll before the old session died, so an idle
+            // watchdog whose wake is due would measure that age against the
+            // session that just started and retire it on the way past.
+            trace.last_request = now;
         }
         return ProcessDiskSample::default();
     }
@@ -2080,6 +2244,7 @@ fn process_disk_sample() -> ProcessDiskSample {
                 *slot = Some(DiskTrace {
                     usage,
                     last_request: std::time::Instant::now(),
+                    pending: None,
                 });
                 if !spawn_disk_trace_watchdog() {
                     // Same rule as the network trace: the watchdog is the only
@@ -2108,7 +2273,51 @@ fn process_disk_sample() -> ProcessDiskSample {
     };
     trace.last_request = std::time::Instant::now();
     let live = live_pids();
-    let window = trace.usage.take_window(&live);
+    let mut window = trace.usage.take_window(&live);
+    let mut resumed_hold = false;
+    if let Some(held) = trace.pending.take() {
+        // A window an earlier response could not carry; see below. It is folded
+        // in FRONT of this one, so the merged window reads in the order it
+        // covered the machine, and its rows are checked against the live set
+        // again — the drain that pruned them was an earlier request's.
+        let mut merged = held;
+        merge_disk_windows(&mut merged, window);
+        prune_held_disk_window(&mut merged, &live);
+        window = merged;
+        resumed_hold = true;
+    }
+    // The caps bound the RESPONSE, not the measurement, and the drained window
+    // is checked before anything is taken out of it: a window that cannot be
+    // encoded within them is held for the next request, so its records are
+    // measured one request later. This tick answers unknown, which is what a
+    // source that cannot be delivered has to say — publishing the rows that
+    // happen to fit would charge every other process a fabricated zero for the
+    // same window.
+    if !disk_window_fits(&window) {
+        if resumed_hold {
+            // The hold did not make it publishable, and waiting cannot: a
+            // window over the caps is over them because of the processes that
+            // are still running, and the hold has already had its chance to
+            // shrink it (exited rows are pruned above). Holding it again would
+            // pin this column unknown for as long as the page polls, so it is
+            // dropped and the source reports unavailable until a window fits.
+            if broker_warning_allowed() {
+                tracing::error!(
+                    entries = window.procs.len(),
+                    "disk window cannot fit one response even when held; it was dropped"
+                );
+            }
+            return ProcessDiskSample::default();
+        }
+        if broker_warning_allowed() {
+            tracing::warn!(
+                entries = window.procs.len(),
+                "disk response exceeds the frame budget; holding the window"
+            );
+        }
+        trace.pending = Some(window);
+        return ProcessDiskSample::default();
+    }
     let total_service_time = window.total_service_time();
     let to_wire = |times: &[super::disk_etw::DiskTime]| -> Vec<ProcessDiskTime> {
         times
@@ -2133,17 +2342,6 @@ fn process_disk_sample() -> ProcessDiskSample {
             ops: disk.ops,
         })
         .collect();
-    let disk_times =
-        disk_totals.len() + entries.iter().map(|entry| entry.disks.len()).sum::<usize>();
-    if entries.len() > DISK_MAX_ENTRIES || disk_times > DISK_MAX_DISK_TIMES {
-        if broker_warning_allowed() {
-            tracing::warn!(
-                count = entries.len(),
-                "disk response exceeds the frame budget"
-            );
-        }
-        return ProcessDiskSample::default();
-    }
     ProcessDiskSample {
         active: true,
         window_ms: window.since_ms,
@@ -2711,7 +2909,7 @@ fn attach_app_file_io_with(
 /// process, so its bytes move into `omitted_*` instead of disappearing.
 fn omit_file_bytes(
     accounting: &mut crate::actions::FileIoAccounting,
-    files: Vec<crate::actions::ProcessFileIo>,
+    files: impl IntoIterator<Item = crate::actions::ProcessFileIo>,
 ) {
     for file in files {
         if let Some(read) = file.read_bytes {
@@ -2767,11 +2965,21 @@ fn trim_file_io_to_budget(
         snapshot.accounting.handles_complete = false;
         omit_file_bytes(&mut snapshot.accounting, dropped);
     }
-    if encoded_file_io_len(snapshot)? > budget {
-        return Err(TmError::platform(
-            "broker process file io",
-            "file I/O snapshot exceeds the bounded broker response limit",
-        ));
+    // The bisection measured the snapshot while `omitted_*` still held their
+    // pre-drop values, and charging the dropped rows grew them: the remainder's
+    // own digits can push the prefix the search settled on back over the
+    // budget. Re-check the authoritative length here and give back one row at a
+    // time (each one both shrinks the list and grows the remainder), so the
+    // answer is the rows that really fit rather than no list at all.
+    while encoded_file_io_len(snapshot)? > budget {
+        let Some(row) = snapshot.files.pop() else {
+            return Err(TmError::platform(
+                "broker process file io",
+                "file I/O snapshot exceeds the bounded broker response limit",
+            ));
+        };
+        snapshot.accounting.handles_complete = false;
+        omit_file_bytes(&mut snapshot.accounting, std::iter::once(row));
     }
     Ok(())
 }
@@ -3400,9 +3608,13 @@ fn service_state(client: &BrokerClient) -> CoreServiceState {
                 let installed_gui = expected_installed_gui_path().ok();
                 if foreign_client_session(current_exe.as_deref(), installed_gui.as_deref()) {
                     CoreServiceState::ForeignClient
-                } else if matches!(ping, Err(BrokerCallError::Unavailable(_))) {
-                    // The pipe never answered. That is a different fault from
-                    // the broker answering and refusing us, and naming it
+                } else if matches!(
+                    ping,
+                    Err(BrokerCallError::Unavailable(_) | BrokerCallError::NoAnswer(_))
+                ) {
+                    // The pipe never answered — either nothing was there to
+                    // answer, or its answer was lost. That is a different fault
+                    // from the broker answering and refusing us, and naming it
                     // "authentication failed" sent users to a repair that
                     // cannot help. Both stay degraded: a reachable service
                     // whose control pipe is silent is a real problem.
@@ -4580,6 +4792,216 @@ mod tests {
         );
     }
 
+    /// Regression: `take_window` drains the accumulators, so a drained window
+    /// the caps refused was simply dropped — its service time, bytes and events
+    /// never reached a total and the next window's shares were computed without
+    /// them. A refused window is now held and measured with the next one.
+    #[test]
+    fn a_window_the_caps_refused_is_measured_with_the_next_one() {
+        use super::super::disk_etw::{DiskTime, DiskWindow, PidDisk};
+
+        let window =
+            |since_ms: u64, ops: u64, read: u64, write: u64, service: u64, disks: Vec<DiskTime>| {
+                DiskWindow {
+                    since_ms,
+                    events_seen: ops,
+                    events_decoded: ops,
+                    unattributed_service_time: ops,
+                    disk_totals: disks.clone(),
+                    procs: std::collections::HashMap::from([(
+                        42u32,
+                        PidDisk {
+                            service_time: service,
+                            per_disk: disks,
+                            read_bytes: read,
+                            write_bytes: write,
+                            ops,
+                        },
+                    )]),
+                }
+            };
+        let mut held = window(
+            1_000,
+            3,
+            10,
+            20,
+            400,
+            vec![DiskTime {
+                disk: 1,
+                service_time: 400,
+            }],
+        );
+        let next = window(
+            500,
+            2,
+            5,
+            7,
+            200,
+            vec![
+                DiskTime {
+                    disk: 1,
+                    service_time: 150,
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 50,
+                },
+            ],
+        );
+        merge_disk_windows(&mut held, next);
+        assert_eq!(held.since_ms, 1_500, "the merged window covers both spans");
+        assert_eq!(held.events_seen, 5);
+        assert_eq!(held.events_decoded, 5);
+        assert_eq!(held.unattributed_service_time, 5);
+        assert_eq!(
+            held.disk_totals,
+            vec![
+                DiskTime {
+                    disk: 1,
+                    service_time: 550,
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 50,
+                },
+            ],
+            "the window's own totals add per disk, and a new disk is kept"
+        );
+        let row = &held.procs[&42];
+        assert_eq!(row.ops, 5);
+        assert_eq!(row.read_bytes, 15);
+        assert_eq!(row.write_bytes, 27);
+        assert_eq!(row.service_time, 600);
+        assert_eq!(
+            row.per_disk,
+            vec![
+                DiskTime {
+                    disk: 1,
+                    service_time: 550,
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 50,
+                },
+            ]
+        );
+        assert_eq!(held.total_service_time(), 605);
+    }
+
+    /// A held window was drained by an earlier request, so its rows are never
+    /// re-pruned by a drain. A process that exits while the hold lasts would
+    /// otherwise keep its row for as long as the column is unknown — and the
+    /// caps are counted again on every one of those ticks.
+    #[test]
+    fn a_held_disk_window_drops_rows_for_processes_that_exited() {
+        use super::super::disk_etw::{DiskTime, DiskWindow, PidDisk};
+
+        let row = |service: u64| PidDisk {
+            service_time: service,
+            per_disk: vec![DiskTime {
+                disk: 1,
+                service_time: service,
+            }],
+            read_bytes: 1,
+            write_bytes: 2,
+            ops: 1,
+        };
+        let mut window = DiskWindow {
+            procs: std::collections::HashMap::from([(7u32, row(40)), (8, row(2))]),
+            unattributed_service_time: 5,
+            disk_totals: vec![DiskTime {
+                disk: 1,
+                service_time: 42,
+            }],
+            since_ms: 1_000,
+            events_seen: 2,
+            events_decoded: 2,
+        };
+        prune_held_disk_window(&mut window, &std::collections::HashSet::from([7u32]));
+        assert!(
+            window.procs.contains_key(&7),
+            "a live process keeps its row"
+        );
+        assert!(
+            !window.procs.contains_key(&8),
+            "an exited process must not keep a row"
+        );
+        assert_eq!(
+            window.unattributed_service_time, 7,
+            "its service time stays in the denominator instead of vanishing"
+        );
+        assert_eq!(
+            window.disk_totals[0].service_time, 42,
+            "the window's own totals are unchanged: the work happened"
+        );
+        assert_eq!(window.total_service_time(), 47);
+
+        // An empty live set means the caller could not enumerate processes,
+        // which is never "nothing is alive".
+        prune_held_disk_window(&mut window, &std::collections::HashSet::new());
+        assert!(window.procs.contains_key(&7));
+        assert_eq!(window.unattributed_service_time, 7);
+    }
+
+    /// The caps count exactly what the response carries: a row per process that
+    /// completed a request, that row's per-disk split, and the window's own
+    /// per-disk totals. The drained window is checked against them before
+    /// anything is taken out of it, so both sides of each boundary are pinned.
+    #[test]
+    fn the_disk_caps_count_what_the_response_carries() {
+        use super::super::disk_etw::{DiskTime, DiskWindow, PidDisk};
+
+        let row = |ops: u64, disks: u32| PidDisk {
+            ops,
+            per_disk: (0..disks)
+                .map(|disk| DiskTime {
+                    disk,
+                    service_time: 1,
+                })
+                .collect(),
+            ..PidDisk::default()
+        };
+        let at_entry_cap = DiskWindow {
+            procs: (0..DISK_MAX_ENTRIES as u32)
+                .map(|pid| (pid, row(1, 0)))
+                .collect(),
+            ..DiskWindow::default()
+        };
+        assert!(disk_window_fits(&at_entry_cap));
+        let mut over_entry_cap = at_entry_cap.clone();
+        over_entry_cap
+            .procs
+            .insert(DISK_MAX_ENTRIES as u32, row(1, 0));
+        assert!(
+            !disk_window_fits(&over_entry_cap),
+            "a row over the entry cap cannot be published"
+        );
+
+        // Two disks per row spends the per-disk budget exactly, so the window's
+        // own totals are what pushes it over.
+        let rows = (DISK_MAX_DISK_TIMES / 2) as u32;
+        let mut at_disk_cap = DiskWindow {
+            procs: (0..rows).map(|pid| (pid, row(1, 2))).collect(),
+            ..DiskWindow::default()
+        };
+        assert!(disk_window_fits(&at_disk_cap));
+        at_disk_cap.disk_totals.push(DiskTime {
+            disk: 9,
+            service_time: 1,
+        });
+        assert!(
+            !disk_window_fits(&at_disk_cap),
+            "the window's totals share the per-disk cap"
+        );
+
+        // A process that completed no request is not a row of the answer.
+        let idle = DiskWindow {
+            procs: std::collections::HashMap::from([(7u32, row(0, 4))]),
+            ..DiskWindow::default()
+        };
+        assert!(disk_window_fits(&idle));
+    }
+
     #[test]
     fn a_capped_module_code_response_fits_the_frame_limit() {
         let window = ProcessModuleCodeWindow {
@@ -5531,6 +5953,52 @@ mod tests {
             small.accounting.handles_complete,
             "nothing was dropped, so nothing is incomplete"
         );
+    }
+
+    /// Regression: the bisection measured the snapshot while the omitted
+    /// remainder still held its pre-drop values, but dropping rows adds their
+    /// bytes to it — so the digits the search never saw could push the prefix it
+    /// settled on over the budget, and the whole list came back as an error.
+    /// A budget that holds exactly one row is the smallest case: charging the
+    /// other seven grows the accounting past it, so the honest answer is no row
+    /// at all, not a failed request.
+    #[test]
+    fn a_trimmed_file_list_fits_the_budget_its_grown_remainder_spends() {
+        let rows = || {
+            (0..8)
+                .map(|index| {
+                    let mut row = file_row(&format!(r"C:\data\file{index}.bin"));
+                    row.read_bytes = Some(64 * 1024 * 1024);
+                    row.write_bytes = Some(4 * 1024 * 1024);
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot_with = |count: usize| crate::actions::ProcessFileIoSnapshot {
+            files: rows().into_iter().take(count).collect(),
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        let budget = encoded_file_io_len(&snapshot_with(1)).unwrap();
+        assert!(
+            encoded_file_io_len(&snapshot_with(0)).unwrap() <= budget,
+            "the empty form has to fit, or this test only proves the error path"
+        );
+        let mut snapshot = snapshot_with(8);
+        assert!(encoded_file_io_len(&snapshot).unwrap() > budget);
+        trim_file_io_to_budget(&mut snapshot, budget).expect("a trimmed list must fit its budget");
+        assert!(
+            snapshot.files.is_empty(),
+            "one row no longer fits once its dropped siblings are charged to the remainder"
+        );
+        assert_eq!(
+            snapshot.accounting.omitted_read_bytes,
+            8 * 64 * 1024 * 1024,
+            "every dropped row's bytes stay in the process total"
+        );
+        assert_eq!(snapshot.accounting.omitted_write_bytes, 8 * 4 * 1024 * 1024);
+        assert!(!snapshot.accounting.handles_complete);
+        let encoded = encoded_file_io_len(&snapshot).unwrap();
+        assert!(encoded <= budget, "{encoded} still over {budget}");
     }
 
     /// The two hosts are separate sessions under separate names: an elevated

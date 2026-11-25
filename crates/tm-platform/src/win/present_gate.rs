@@ -445,10 +445,6 @@ fn teardown(window_live: bool) {
 /// Cloak `hwnd` and mark the gate as holding it.
 ///
 /// For a reveal the app drives itself: call this before asking the window to
-/// appear, then [`present_gate_release`] once a frame has been presented.
-/// Cloak the window and mark the gate as holding it.
-///
-/// For a reveal the app drives itself: call this before asking the window to
 /// appear, then [`present_gate_release`] once a frame has been presented. A
 /// zero `hwnd` falls back to the handle the gate was installed on, mirroring
 /// [`present_gate_release`], so a hold taken without a cached handle is still
@@ -655,8 +651,16 @@ fn wake_app() {
 }
 
 /// Fill the update rectangle with the app's background colour so an erase can
-/// never show the system's white. Returns whether a brush was available.
+/// never show the system's white. Returns whether the fill actually happened.
+///
+/// The answer is what the caller reports to Windows for `WM_ERASEBKGND`, so a
+/// fill that did not land has to be a "no": reporting the erase as done would
+/// tell the default procedure the client area is already the app's colour while
+/// it is still undefined.
 fn erase_with_gate_brush(hwnd: HWND, hdc: HDC) -> bool {
+    if hdc.is_invalid() {
+        return false;
+    }
     let brush = tm_core::sync::lock(&GATE).brush;
     if brush == 0 {
         return false;
@@ -670,11 +674,8 @@ fn erase_with_gate_brush(hwnd: HWND, hdc: HDC) -> bool {
     }
     // SAFETY: `hdc` is the device context `WM_ERASEBKGND` was sent with, and the
     // brush is the one `install` created — `teardown` is the only thing that
-    // deletes it.
-    unsafe {
-        FillRect(hdc, &rect, HBRUSH(brush as *mut std::ffi::c_void));
-    }
-    true
+    // deletes it. `FillRect` answers zero when it could not fill.
+    unsafe { FillRect(hdc, &rect, HBRUSH(brush as *mut std::ffi::c_void)) != 0 }
 }
 
 /// The subclass that keeps the gate ahead of every window that appears.

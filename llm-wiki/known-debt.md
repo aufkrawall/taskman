@@ -793,6 +793,18 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
 - `Disk active time` is measured, so it is only available where an ETW session
   can run: through the LocalSystem broker (the normal install) or in an
   elevated GUI. Without either it renders "—", like the Network column.
+- **A lost broker answer at probe time still reads as "no service".** Each probe
+  picks its source from one broker answer, whose outcome has three states
+  (`Sample`/`Unavailable`/`Rejected`), and a frame lost in transport is folded
+  into `Unavailable` — the same treatment `TelemetryBroker::call_with_timeout`
+  already gave a timeout. So an elevated GUI whose probe answer is lost can
+  still start its own machine-wide session for that source, and switch to it
+  until the column closes. Accepted: the two roles use distinct session names,
+  the service's session idles out after 30 s (`NET_TRACE_IDLE`), and the case
+  predates the transport-loss variant because a probe-time timeout already did
+  this. Closing it needs a fourth state on `BrokeredNetwork`/`BrokeredDisk` and
+  a probe arm that parks the source without starting anything — do not "fix" it
+  by making a lost answer read as a refusal.
 - Requests issued by a thread that had already exited when the window was
   drained cannot be attributed and stay in the unattributed remainder, so the
   per-process shares sum to at most 100 %, not exactly 100 %. Charging them to

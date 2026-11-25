@@ -1279,7 +1279,13 @@ mod tests {
             // Out-of-context WinEvent delivery can be coalesced under a busy
             // test runner. Exercise the registered callback directly so this
             // test still verifies that sharing the foreground hook covers the
-            // suppressor window.
+            // suppressor window — but only after checking that the hook which
+            // must cover this thread is the one actually installed, which is
+            // the half the direct call cannot prove.
+            assert!(
+                !ctx.fg_loc_hook.is_invalid() && ctx.fs_loc_hook.is_invalid(),
+                "the shared foreground hook must be the only one on the suppressor's thread"
+            );
             unsafe {
                 fg_location_event_proc(
                     HWINEVENTHOOK::default(),
@@ -1305,6 +1311,12 @@ mod tests {
         ctx.sync_fullscreen_location_hook();
         assert!(!ctx.fs_loc_hook.is_invalid());
         if !resize_wakes_refresh(1024) {
+            // As above: the direct call only stands in for delivery, so the
+            // installation it stands in for is asserted first.
+            assert!(
+                ctx.fg_loc_hook.is_invalid() && !ctx.fs_loc_hook.is_invalid(),
+                "the dedicated hook must be the installed one once the foreground left"
+            );
             unsafe {
                 fs_location_event_proc(
                     HWINEVENTHOOK::default(),
