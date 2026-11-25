@@ -229,6 +229,42 @@ A third-party uncloak (virtual-desktop switch, shell) carries no message, so it
 is not a gate transition: the cloak is cleared on release if DWM still reports
 the window cloaked.
 
+### What the D3D12 path used to cost against the gate
+
+The gate makes "window visible" mean "a frame of ours is in the compositor",
+which is right, but it also handed the renderer's init a deadline: whatever
+eframe does before its first painted frame is now time the user waits with no
+window at all. Two costs sat in that gap.
+
+- **The reveal waited for the pipelines.** `Painter::set_window` built the
+  adapter, the device and every pipeline, the first frame painted, and only
+  then did `post_rendering` reveal; the CPU renderer has no comparable init.
+  `egui-wgpu` now builds the device and the surface only, and
+  `Painter::present_clear` presents one frame cleared to `App::clear_color`
+  with no pipeline involved. eframe reveals on that frame — gated on
+  `is_first_frame && reveal_first_frame && needs_primer(ROOT)`, so the primer
+  runs once before the first reveal and a restore of an already-visible window
+  paints the real ui in its own frame. `Renderer` is created lazily inside the
+  first `paint_and_update_textures`, and `RenderState.renderer` is a
+  clone-shared `Arc<OnceLock<..>>` because the `CreationContext` copy is made
+  before that paint (a `None` snapshot there silences `PaintCallback`).
+- **A restore replayed the whole init.** The Windows minimize signal
+  (`Resized(0x0)`) made the frame function call `Painter::suspend()`, which
+  dropped device, renderer, managed textures and surfaces. Restoring therefore
+  paid device creation, pipeline compilation and the atlas replay before the
+  gate saw a frame — seconds on D3D12, milliseconds on CPU.
+  `Painter::pause()` now frees the surfaces, the depth/MSAA and capture views
+  and the size-dependent targets, keeps the device, the pipelines and the
+  texture snapshots, and polls without blocking. eframe pauses on the first
+  hidden frame and only calls `suspend()` once the window has stayed hidden for
+  `HIDDEN_RESIDENCY_GRACE` (10 s), so the tray still ends at near-zero
+  resident memory while a minimize/restore is a surface reconfigure.
+
+Consequence worth knowing before touching either: the gate's `painted` flag is
+still what decides the reveal, so the primer only moves *when* the gate gets its
+first frame. Do not shorten the primer away, and do not expect a change here to
+lower `REVEAL_MIN_TICKS`.
+
 ## Sub-pixel rendering, concretely
 
 Glyphs are filled at 3x horizontal resolution so each of a pixel's three LCD sub-pixels

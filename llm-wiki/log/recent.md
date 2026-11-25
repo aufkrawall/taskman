@@ -1,3 +1,35 @@
+## 2026-11-25 - Why the D3D12 window arrived after the CPU one
+
+- Reported as "with d3d12, our window appears later after start / unminimize vs cpu rendering".
+  Two verified causes, both in the vendored fork, both on the critical path to the reveal.
+- **Startup:** `init_run_state` created the hidden window, then paid `Painter::new` +
+  `set_window` -> `RenderState::create` (adapter probe, D3D12 device, every pipeline) before the
+  app creator ran, the first frame painted and `post_rendering` revealed. The CPU renderer has no
+  such init, which is exactly the observed asymmetry.
+- **Un-minimize:** the Windows minimize signal (`WindowEvent::Resized(0x0)`) forced a repaint that
+  called `Painter::suspend()` — device, renderer, managed textures and surfaces all dropped. A
+  restore replayed device creation, pipeline compilation and the atlas replay before the present
+  gate could see a frame.
+- Fix, in the fork: device and surface only from `set_window`; `Painter::present_clear` presents a
+  cleared frame with no pipeline; eframe reveals on that frame; `Renderer` is created lazily inside
+  the first paint, with `RenderState.renderer` a clone-shared `Arc<OnceLock<..>>` so the
+  `CreationContext` copy still sees it; `Painter::pause()` frees only the surfaces and the
+  size-dependent targets, and eframe pauses on the first hidden frame with `suspend()` deferred
+  past a 10 s `HIDDEN_RESIDENCY_GRACE`.
+- The primer does not replace the present gate. `NativeApp::finish_reveal` still owns the uncloak,
+  so the change moves when the gate gets its first frame, not how many ticks it asks for. Both
+  halves meet on Windows: the gate cannot retire its hold until a frame is presentable, which is
+  why the pause/residency half is the one that reads as instant on a restore.
+- `supports_subpixel_text()` was split out because the app decides ClearType in the creator, where
+  no pipeline exists yet. It fails closed: device `DUAL_SOURCE_BLENDING` **and** the LCD shader
+  validating (cached, no device input), and `Painter::ensure_renderer` logs once when a device that
+  advertised the feature still produces no LCD pipeline. The pipeline fact remains
+  `Renderer::has_subpixel_pipeline()`; do not treat the capability as a substitute.
+- Diagnostics: `StartupTrace` gained `first_logic_enter`, `first_ui_left`, `first_frame_painted`,
+  `startup_work_done`, `restored_window_painted`, and eframe logs the reveal latency once per
+  reveal. The app-side half also moved the startup-impact store read and the log-file attach +
+  `engine.start()` off the path to the first paint (`StartupTask`/`StartupStep`).
+
 ## 2026-11-25 - What the Linux sampling tick actually cost
 
 - Reported as "after starting TaskMan on Linux, CPU usage stays elevated for at least several

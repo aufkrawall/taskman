@@ -630,6 +630,29 @@ remain follow-up rather than being simulated in headless tests:
   resolved (a miss and an empty layout are retried), because the GUI's own
   `FAILURE_RETRY_TTL` retry is the only thing that recovers a transient failure.
 
+## The D3D12 reveal is only as fast as its first frame (2026-11-25)
+
+- The presentation gate means "the window is visible" is "a frame of ours is in
+  the compositor", so the reveal can never be *earlier* than one presentable
+  frame. The renderer work moved that frame earlier (a cleared primer with no
+  pipelines, and a resident device across a minimize), it did not remove the
+  rule. `REVEAL_MIN_TICKS` is still 2 and the primer does not shorten it.
+- A backend that advertises `DUAL_SOURCE_BLENDING` but still refuses the LCD
+  pipeline leaves the app rasterizing per-channel coverage while `egui-wgpu`
+  draws it through the ordinary pipeline. `supports_subpixel_text()` fails
+  closed for every deterministic cause (device feature and Naga validation of
+  the shipped shader), and `Painter::ensure_renderer` logs one `log::error!`
+  when it happens, but reconciling after the fact needs an atlas
+  re-rasterization path that does not exist. Until then the mitigation is the
+  log line, not a repair.
+- A taskbar un-minimize bypasses `NativeApp::restore_window`, so that path
+  emits no `restored_window_painted` mark; the gate's own `present gate:`
+  debug lines and the eframe reveal line are what is left to date it.
+- `RenderState::ensure_renderer` is first-call-wins for `RendererOptions` and
+  the target format (documented on the slot, with a `debug_assert!` in
+  `Painter::ensure_renderer`). A caller that needs different options must build
+  a new `RenderState`, as kittest does.
+
 ## Platform test coverage: the Linux backend is never executed (2026-11-25)
 
 - The gate type-checks Linux (`cargo check --workspace --target
