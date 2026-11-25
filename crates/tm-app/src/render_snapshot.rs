@@ -1101,7 +1101,7 @@ mod tests {
             let egui::Shape::Mesh(mesh) = &clipped.shape else {
                 continue;
             };
-            for triangle in mesh.indices.chunks_exact(3) {
+            for triangle in mesh.indices.as_chunks::<3>().0 {
                 let x: Vec<f32> = triangle
                     .iter()
                     .map(|&i| mesh.vertices[i as usize].pos.x)
@@ -1364,7 +1364,7 @@ mod tests {
 
         for widget in [Widget::Core, Widget::Multi] {
             for (values, axis) in &cases {
-                let frame = chart_frame(widget, *values, None, *axis);
+                let frame = chart_frame(widget, values, None, *axis);
                 let tile = frame.tiles[0];
                 let allowed = allowed_rect(tile);
                 for pos in frame.vertices() {

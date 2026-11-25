@@ -216,11 +216,24 @@ mod tests {
             disk_activity_series(&[pt(0), missing.clone(), idle.clone()], "C:"),
             vec![None, None, Some(0.0)]
         );
-        // The transfer series keep the same contract: a tick without the mount
-        // is a gap, a present mount reports what it measured (0 B/s included).
+        // The transfer series gap on a different field, and this is the part
+        // that is easy to get wrong: the mount's ACTIVITY percentage is the
+        // optional one, while read/write throughput is always reported for a
+        // mount that is present. So a tick that lists the mount with unknown
+        // activity still has a measured 0 B/s transfer, and only a tick that
+        // does not list the mount at all is a gap there.
         assert_eq!(
             disk_series(&[pt(0), missing, idle], "C:", |d| d.2),
-            vec![None, None, Some(0.0)]
+            vec![None, Some(0.0), Some(0.0)]
+        );
+        // ...and a tick without the mount is a gap in both.
+        assert_eq!(
+            disk_series(&[pt(0), pt(1_000)], "C:", |d| d.2),
+            vec![None, None]
+        );
+        assert_eq!(
+            disk_activity_series(&[pt(0), pt(1_000)], "C:"),
+            vec![None, None]
         );
     }
 
