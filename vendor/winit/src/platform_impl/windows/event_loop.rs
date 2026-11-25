@@ -2332,9 +2332,13 @@ unsafe fn public_window_callback_inner(
                 // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
             }
 
-            // TaskMan fork: a failed `GetWindowRect` leaves the window as it was
-            // instead of panicking inside the window procedure.
+            // TaskMan fork: a failed `GetWindowRect` returns without panicking inside the
+            // window procedure. The scale factor stored above is put back first: the
+            // `ScaleFactorChanged` event that would tell the application about it is never
+            // sent on this path, so keeping it would leave winit and the toolkit disagreeing
+            // about the DPI for the rest of the session.
             let Ok(old_physical_inner_rect) = util::WindowArea::Inner.get_rect(window) else {
+                userdata.window_state_lock().scale_factor = old_scale_factor;
                 result = ProcResult::Value(0);
                 return;
             };
