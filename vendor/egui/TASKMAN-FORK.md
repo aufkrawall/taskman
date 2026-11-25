@@ -366,22 +366,31 @@ It fails if the opt-in variable or a non-CPU D3D12/Vulkan adapter with
 color-glyph coverage is not practical; synthetic premultiplied color texels are covered in
 software and policy tests.
 
-### 16. `egui-wgpu` + `eframe`: release resident GPU state while hidden
+### 16. `egui-wgpu` + `eframe`: reveal before the pipelines exist, release the GPU while hidden
 
-The renderer follows viewport visibility instead of keeping a dormant device and swapchain
-alive in the tray.
+The window appears as soon as one cleared frame is on screen, and the renderer follows viewport
+visibility instead of keeping a dormant device and swapchain alive in the tray.
 
 | File | Change | Why |
 | --- | --- | --- |
-| `crates/eframe/src/native/wgpu_integration.rs` | Tracks explicit app visibility, does not call `set_window()` for hidden viewports, clears the `Frame` render-state clone, and calls `Painter::suspend()` after the final visible surface hides. Keeps logic-only ticks and visible-descendant rendering; the last first-frame `Visible` command controls eframe's reveal. | A hidden surface must not keep a device/swapchain merely because eframe still owns its viewport. |
+| `crates/eframe/src/native/wgpu_integration.rs` | Reveals the window through `EpiIntegration::post_rendering` after one cleared primer frame (`Painter::present_clear` in `App::clear_color`) instead of after the first full paint, gated on `integration.is_first_frame`, the last first-frame `Visible` command and `Painter::needs_primer(egui::ViewportId::ROOT)` - so the primer runs once, before the first reveal, and a restore of an already-visible window paints the real ui in its own frame. Tracks explicit app visibility, does not call `set_window()` for hidden viewports, clears the `Frame` render-state clone, calls `Painter::pause()` on the first hidden frame and `Painter::suspend()` only from a frame that still finds the window hidden past the grace. Keeps logic-only ticks and visible-descendant rendering. | A hidden surface must not keep a device/swapchain merely because eframe still owns its viewport - but a hide is usually a short detour (minimize, tray toggle, another window on top) and the restore is what the user waits for, so dropping the device and the pipelines there replayed the whole init on the frame after the un-minimize: the D3D12 window arrived after the CPU one. The cleared frame costs exactly one present and removes the white-or-empty window that used to stand in for the pipelines still being compiled. |
+| `crates/eframe/src/native/winit_integration.rs` | `HIDDEN_RESIDENCY_GRACE` (10 s), `ResidencyAction`, the pure `residency_action` policy and `ResidencyTimer`, which remembers when the window stopped painting, whether the pause is in effect and whether the release already happened. | The decision is a table, not a timer or a sleep: the caller owns the clock and arms the remaining grace as one repaint through `Context::request_repaint_after_for`, and `Painter::suspend()` is a no-op after the first release while every hidden frame keeps resolving to `Suspend`, so the timer also says when a release is a transition worth logging. |
+| `crates/eframe/src/native/epi_integration.rs` | `note_event_loop_start`, and one `log::info!` in `post_rendering` with the latency from the event loop's creation to the first reveal. `post_rendering` runs twice in the reveal frame; the primer's call consumes `is_first_frame`, so the second is the no-op. | One line per launch is what makes the CPU and D3D12 paths comparable on the machine instead of by impression, and startup-relevant milestones belong in the log. |
 | `crates/egui-wgpu/src/winit.rs` | `Painter::suspend()` drops surfaces, depth/MSAA/capture state, managed textures and `RenderState`; CPU `TextureSnapshots` compose full/partial image updates for user textures and record only sampler options for `TextureId::default()`, replaying the live font atlas from `Context::fonts` on recreation. `max_texture_side` and subpixel capability remain cached. `destroy()` uses the same path. | egui sends user texture bytes once and keeps metadata only, so dropping a renderer without replay loses icons; meanwhile the font atlas already lives in `FontsImpl`, so skipping a second CPU pixel copy avoids duplicating multi-megabyte atlas RAM. |
 | `crates/egui-wgpu/src/setup.rs` | Requests `MemoryHints::MemoryUsage`, caps native non-sampler bindings at 8,192, and retains the 8,192px texture-dimension limit. | wgpu's performance hints start with 128/64 MiB device/host blocks and D3D12 eagerly sizes its visible descriptor heap from a one-million-binding default. |
 | `crates/egui-wgpu/src/renderer.rs` | Shrinks vertex/index buffers only after 120 mostly-underused updates (including empty/callback-only frames), to twice the live requirement with an initial-capacity floor. | Large history cards should not pin an oversized buffer for the rest of the session. |
 
-**Coverage:** hardware-free tests cover root visibility/descendant decisions, first-frame
-command precedence, partial/full texture snapshot composition, texture free, allocation
-policy, and buffer-shrink hysteresis. The release gate exercises the renderer under the
-platform backend; the GPU-memory probe is the live end-to-end measurement.
+**Coverage:** hardware-free tests cover root visibility/descendant decisions, the
+minimized/occluded fold that feeds the residency decision, first-frame command precedence, the
+residency decision table, the grace bookkeeping (a pause on the first hidden frame, nothing more
+inside the grace, one release past it, a fresh grace after a restore) and the rule that only the
+release transition is logged, partial/full texture snapshot composition, texture free, allocation
+policy, and buffer-shrink hysteresis. No unit test can present a frame or compile a pipeline, so
+the primer, the pause and the reveal latency are verified on the machine:
+`TASKMAN_RENDERER=cpu` against `TASKMAN_RENDERER=d3d12` with the
+`Revealing the window <n> ms after the event loop started` line. The release gate exercises the
+renderer under the platform backend; the GPU-memory probe is the live end-to-end measurement of
+the release itself.
 
 **Scope:** TaskMan uses the root viewport and no WGPU paint callbacks. Retained custom
 `RenderState` clones, `WgpuSetup::Existing`, hidden immediate-viewport callbacks, hard

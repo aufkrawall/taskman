@@ -888,11 +888,12 @@ impl WgpuWinitRunning<'_> {
             // colour and reveal the window through it, so that wait happens with the themed
             // background on screen instead of a white or stale window.
             //
-            // This never replaces a paint - the real frame is presented right after it - so a
-            // restore from a pause keeps its single paint of the ui, and only a renderer that
-            // tore its device down adds a cleared frame ahead of it. A failed primer only costs
-            // this frame's head start.
-            if reveal_first_frame && painter.needs_primer() {
+            // A cleared frame can only reveal a window that is not on screen yet, so it is
+            // gated on that reveal itself: it runs once, before the first reveal, and never
+            // again. A restore of an already-visible window paints the real ui in this frame,
+            // even when the device was torn down and rebuilt while it was hidden. A failed
+            // primer only costs this frame's head start.
+            if is_first_reveal && painter.needs_primer(egui::ViewportId::ROOT) {
                 profiling::scope!("reveal_primer");
                 let clear_color = app.clear_color(&egui_ctx.global_style().visuals);
                 if let Err(err) = painter.present_clear(viewport_id, clear_color, window) {
@@ -1343,6 +1344,7 @@ fn apply_residency(
     visible: bool,
 ) {
     let now = Instant::now();
+    let was_suspended = residency.is_suspended();
     let action = residency.observe(now, visible);
 
     match action {
@@ -1358,7 +1360,11 @@ fn apply_residency(
             egui_ctx.request_repaint_after_for(residency.remaining_grace(now), viewport_id);
         }
         ResidencyAction::Suspend => {
-            log::debug!("Released the resident GPU state of {viewport_id:?} after the grace");
+            // A window past the grace resolves to this on every frame it runs, and releasing
+            // a released device is a no-op, so only the transition is worth a line.
+            if !was_suspended {
+                log::debug!("Released the resident GPU state of {viewport_id:?} after the grace");
+            }
             *frame_render_state = None;
             painter.suspend();
         }
@@ -1732,6 +1738,40 @@ mod tests {
         ));
         assert!(effective_viewport_visible(None, Some(true), None, false));
         assert!(!effective_viewport_visible(None, Some(false), None, false));
+    }
+
+    #[test]
+    fn minimized_and_occluded_windows_are_not_paintable() {
+        // `apply_residency` takes a single `visible` flag, so this fold - what
+        // `ViewportInfo::visible()` reports, the app's own visibility command and the native
+        // window - is what decides it. A minimized or occluded window must stay unpaintable
+        // even when the app and the native window both say it is shown. The native window is
+        // the one input a unit test cannot build, so it is supplied here as `Some(true)`.
+        let minimized = egui::ViewportInfo {
+            minimized: Some(true),
+            ..Default::default()
+        };
+        let occluded = egui::ViewportInfo {
+            occluded: Some(true),
+            ..Default::default()
+        };
+        let shown = egui::ViewportInfo {
+            minimized: Some(false),
+            occluded: Some(false),
+            ..Default::default()
+        };
+
+        assert!(!effective_viewport_visible(minimized.visible(), None, Some(true), true));
+        assert!(!effective_viewport_visible(occluded.visible(), None, Some(true), true));
+        assert!(effective_viewport_visible(shown.visible(), None, Some(true), false));
+
+        // A viewport without a window cannot paint, whatever its info claims.
+        let mut viewport = test_viewport(ViewportId::ROOT, ViewportId::ROOT);
+        viewport.info = minimized;
+        assert!(!viewport_is_visible(&viewport, false));
+        assert!(!viewport_is_visible(&viewport, true));
+        viewport.info = shown;
+        assert!(!viewport_is_visible(&viewport, true));
     }
 
     #[test]

@@ -98,6 +98,9 @@ pub struct ResidencyTimer {
 
     /// The renderer already released its surfaces but kept the device.
     paused: bool,
+
+    /// The renderer already released the device past the grace, so nothing more can go.
+    suspended: bool,
 }
 
 impl ResidencyTimer {
@@ -115,16 +118,30 @@ impl ResidencyTimer {
             ResidencyAction::Keep => {
                 self.hidden_since = None;
                 self.paused = false;
+                self.suspended = false;
             }
             ResidencyAction::Pause => {
                 self.hidden_since.get_or_insert(now);
                 self.paused = true;
+                self.suspended = false;
             }
             ResidencyAction::KeepResident => {}
-            ResidencyAction::Suspend => self.paused = false,
+            ResidencyAction::Suspend => {
+                self.paused = false;
+                self.suspended = true;
+            }
         }
 
         action
+    }
+
+    /// Whether the release [`ResidencyAction::Suspend`] asks for already happened.
+    ///
+    /// A window that stays hidden past the grace keeps resolving to `Suspend` on every frame
+    /// it runs, and releasing an already released device is a no-op, so callers report the
+    /// transition instead of every frame.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
     }
 
     /// The part of [`HIDDEN_RESIDENCY_GRACE`] that is still left.
@@ -369,28 +386,21 @@ mod tests {
         let mut timer = ResidencyTimer::default();
         let t0 = Instant::now();
         assert_eq!(timer.observe(t0, false), ResidencyAction::Pause);
+        assert!(!timer.is_suspended());
 
         let after_grace = t0 + HIDDEN_RESIDENCY_GRACE;
         assert_eq!(timer.observe(after_grace, false), ResidencyAction::Suspend);
         assert_eq!(timer.remaining_grace(after_grace), Duration::ZERO);
+        // The release is the transition: the timer says so once, so the caller logs it once.
+        assert!(timer.is_suspended());
         // Still hidden and still past the grace: nothing more to release.
         assert_eq!(timer.observe(after_grace, false), ResidencyAction::Suspend);
-    }
+        assert!(timer.is_suspended());
 
-    #[test]
-    fn minimized_and_occluded_windows_are_not_paintable() {
-        // The residency decision takes a single `visible` flag, so the fold that turns a
-        // minimized or occluded window into "cannot paint" must stay upstream of it.
-        let minimized = egui::ViewportInfo {
-            minimized: Some(true),
-            ..Default::default()
-        };
-        let occluded = egui::ViewportInfo {
-            occluded: Some(true),
-            ..Default::default()
-        };
-
-        assert_eq!(minimized.visible(), Some(false));
-        assert_eq!(occluded.visible(), Some(false));
+        // Restored, then hidden again: the next hide pauses again from a resident device.
+        assert_eq!(timer.observe(after_grace, true), ResidencyAction::Keep);
+        assert!(!timer.is_suspended());
+        assert_eq!(timer.observe(after_grace, false), ResidencyAction::Pause);
+        assert!(!timer.is_suspended());
     }
 }
