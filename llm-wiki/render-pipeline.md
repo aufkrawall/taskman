@@ -251,6 +251,13 @@ window at all. Two costs sat in that gap.
   screen (a zero-sized, occluded, outdated or lost surface presents nothing and
   keeps the primer owed) — so the primer runs once before the first reveal and a
   restore of an already-visible window paints the real ui in its own frame.
+  Residual: the *fallback* reveal later in the same pass (`post_rendering` after
+  `paint_and_update_textures`) is unconditional, and the paint has the same
+  non-presenting arms, so a pass that skips both still reveals an unpainted
+  frame and no later pass asks for the primer again. On the shipped
+  Windows/D3D12 path `acquire_texture` cannot return `Outdated`/`Lost`, so
+  `Ok(false)` is reachable there only from a zero-sized first frame, which a
+  `Resized` heals; the Vulkan/Metal shapes are the ones that stay open.
   `Renderer` is created lazily inside the
   first `paint_and_update_textures`, and `RenderState.renderer` is a
   clone-shared `Arc<OnceLock<..>>` because the `CreationContext` copy is made
