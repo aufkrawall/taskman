@@ -837,44 +837,40 @@ mod tests {
 
     /// Regression: three 200 ms probes exhaust the per-scan budget and the
     /// candidate order is stable, so a genuinely hung app that always sorted
-    /// behind three hung ones was never labelled. Each scan now starts at a
-    /// different candidate, so a budget that only covers the first probe still
-    /// reaches every candidate over consecutive scans.
+    /// behind three hung ones was never labelled. Each scan now starts at the
+    /// candidate its scan counter points at and wraps around, so the candidates
+    /// one scan's budget cuts off are the ones the next scan probes first.
+    ///
+    /// The budget here is wide enough that no probe can exhaust it: the order
+    /// is the only thing read, and no assertion depends on how long the machine
+    /// takes between two statements. The cutoff itself is pinned by
+    /// `exhausted_probe_budget_leaves_candidates_unresolved`, which holds with
+    /// no clock at all, and an offset pinned to zero would repeat one order on
+    /// every scan and fail the assertions below.
     #[test]
-    fn the_probe_rotation_reaches_a_candidate_the_budget_cuts_off() {
+    fn the_probe_rotation_starts_each_scan_at_the_scan_counter() {
         let candidates = [(11, 1, hwnd(1)), (12, 2, hwnd(2)), (13, 3, hwnd(3))];
-        let pid_of = |raw: usize| {
-            candidates
-                .iter()
-                .find(|candidate| candidate.2.0 as usize == raw)
-                .map(|candidate| candidate.0)
-                .expect("the probed handle is one of the candidates")
-        };
-        // Each probe spends the whole budget in monotonic time before it
-        // answers, so exactly one probe fits per scan whatever the machine does.
-        let budget = Duration::from_millis(2);
-        let mut probed_first = Vec::new();
+        let all_pids: HashSet<u32> = candidates.iter().map(|candidate| candidate.0).collect();
+        let budget = Duration::from_secs(60);
+        let mut first_probes = Vec::new();
         for scan in 0..candidates.len() {
             let mut probed = Vec::new();
             let out = resolve_hung_candidates(&candidates, budget, scan, |h, _ms| {
                 probed.push(h.0 as usize);
-                let until = Instant::now() + budget;
-                while Instant::now() < until {}
                 ProbeOutcome::TimedOut
             });
-            assert_eq!(probed.len(), 1, "the budget covers a single probe");
-            assert_eq!(
-                out,
-                [pid_of(probed[0])].into_iter().collect::<HashSet<u32>>(),
-                "only the candidate that was probed is labelled"
-            );
-            probed_first.push(probed[0]);
+            let expected: Vec<usize> = (0..candidates.len())
+                .map(|step| candidates[(scan + step) % candidates.len()].2.0 as usize)
+                .collect();
+            assert_eq!(probed, expected, "scan {scan} probes from its own offset");
+            assert_eq!(out, all_pids, "every probed candidate reports itself hung");
+            first_probes.push(probed[0]);
         }
-        probed_first.sort_unstable();
+        first_probes.sort_unstable();
         assert_eq!(
-            probed_first,
+            first_probes,
             vec![1, 2, 3],
-            "every candidate is the one probed first on exactly one scan"
+            "every scan starts the probe rotation at a different candidate"
         );
     }
 
