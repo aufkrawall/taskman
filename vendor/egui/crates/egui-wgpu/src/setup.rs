@@ -341,7 +341,11 @@ mod tests {
         // smaller device. Below the target the clamp is exact, so the requirement is what the
         // adapter advertises and nothing more.
         for adapter_max in [1024, 2048, 4096, 8192, 16384] {
-            for backend in [wgpu::Backend::Gl, wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
+            for backend in [
+                wgpu::Backend::Gl,
+                wgpu::Backend::Dx12,
+                wgpu::Backend::Vulkan,
+            ] {
                 let adapter = wgpu::Limits {
                     max_texture_dimension_1d: adapter_max,
                     max_texture_dimension_2d: adapter_max,
@@ -362,14 +366,8 @@ mod tests {
         };
         for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
             let limits = gui_device_limits(backend, &large_adapter);
-            assert_eq!(
-                limits.max_texture_dimension_1d,
-                GUI_MAX_TEXTURE_DIMENSION
-            );
-            assert_eq!(
-                limits.max_texture_dimension_2d,
-                GUI_MAX_TEXTURE_DIMENSION
-            );
+            assert_eq!(limits.max_texture_dimension_1d, GUI_MAX_TEXTURE_DIMENSION);
+            assert_eq!(limits.max_texture_dimension_2d, GUI_MAX_TEXTURE_DIMENSION);
             assert_eq!(
                 limits.max_non_sampler_bindings,
                 GUI_MAX_NON_SAMPLER_BINDINGS
