@@ -990,7 +990,10 @@ rebase runbook.
   call, not an `EnableFlags` flag: both the manifest `EnableTraceEx2` for
   `Microsoft-Windows-Kernel-File` and the legacy `EVENT_TRACE_FLAG_FILE_IO` are
   accepted and deliver no record — the live elevated selfcheck that reported
-  `undelivered` with `events_lost` 0 came from them, not from an idle machine.
+  `undelivered` with `events_lost` 0 came from them, not from an idle machine
+  (that run also sampled 4 ms into the session, so its verdict alone would have
+  proved nothing; the check now issues its own file I/O and waits up to 3 s,
+  reporting the wait as `waited_ms`).
   The delivered records are still classic `FileIo` ones (class GUID in
   `ProviderId`, operation in the opcode: 12–16 for Create/Cleanup/Close/Read/
   Write), the same enable-then-class split `disk_etw` uses for `DiskIo`. An

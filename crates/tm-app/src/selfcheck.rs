@@ -1,6 +1,8 @@
 //! Headless self-check: exercises the full sampling stack without a GUI.
 //! Prints one JSON summary line and exits 0 on success, 1 on failure.
 
+use std::io::{Read, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tm_platform::actions::{FileIoAccounting, FileIoAccountingState, ProcessFileIoSnapshot};
@@ -13,6 +15,25 @@ use tm_platform::actions::{FileIoAccounting, FileIoAccountingState, ProcessFileI
 /// leaves room for open + baseline + a real reading, so the summary reports
 /// what those providers actually measured instead of their warm-up state.
 const REQUIRED_TICKS: u64 = 4;
+
+/// How long the self-check waits for the per-file trace to deliver a record of
+/// its own I/O.
+///
+/// A session delivers nothing that happened before it started, and the records
+/// reach the consumer asynchronously, so a sample taken a few milliseconds
+/// after the start can only say `undelivered` — the state means "no transfer of
+/// this process yet", not "no trace". The check gives the delivery three
+/// seconds and reports the wait beside the state, so a verdict that was taken
+/// too early is recognisable instead of final.
+const FILE_IO_DELIVERY_BUDGET: Duration = Duration::from_secs(3);
+
+/// Interval between two samples of the trace while waiting for that delivery.
+const FILE_IO_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Bytes the check writes and reads back to give the trace a request of its
+/// own: the trace issues one record per request, so one flushed write and one
+/// read are enough for a state that requires a decoded transfer.
+const OWN_IO_BYTES: usize = 64 * 1024;
 
 /// Byte count in GB, rounded to the one decimal the summary has always shown.
 fn gb(bytes: u64) -> f64 {
@@ -44,8 +65,48 @@ fn file_io_state_name(state: FileIoAccountingState) -> &'static str {
     }
 }
 
+/// `since` in whole milliseconds, saturating instead of wrapping.
+fn elapsed_ms(since: Instant) -> u64 {
+    since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// One sample of the per-file trace, and how long the check waited for it.
+#[derive(Debug)]
+struct FileIoWait {
+    /// The sample the wait settled on: the first one that was not
+    /// `undelivered`, the failure that ended the wait, or the last one before
+    /// the deadline.
+    answer: Result<ProcessFileIoSnapshot, String>,
+    /// The wait that produced `answer`, measured rather than assumed. A sample
+    /// taken four milliseconds after the session started could not have seen
+    /// an event, and this is the number that says which kind of sample it was.
+    waited_ms: u64,
+}
+
+/// The `file_io` facts of one run: which process was sampled, what waiting for
+/// it settled on, and whether the check could issue file I/O of its own.
+#[derive(Debug)]
+struct FileIoProbe {
+    /// The sampled process, or `None` when no question was asked at all.
+    pid: Option<u32>,
+    waited: FileIoWait,
+    /// Why this process's own file I/O did not happen. Non-null means an
+    /// `undelivered` answer is a statement about this check rather than about
+    /// the trace: it had nothing of its own to deliver.
+    own_io_error: Option<String>,
+}
+
+/// The accounting an answer carries, or `None` when the question itself failed.
+fn answered_accounting(wait: &FileIoWait) -> Option<&FileIoAccounting> {
+    wait.answer
+        .as_ref()
+        .ok()
+        .map(|snapshot| &snapshot.accounting)
+}
+
 /// The `file_io` block of the summary: whether per-file accounting has a live
-/// source, and how much that source has lost or capped.
+/// source, how long the check waited for it to speak, and how much that source
+/// has lost or capped.
 ///
 /// The I/O page reports the same thing as one line above the file table. A
 /// headless run has no table, so without this block a trace that starts and
@@ -57,36 +118,142 @@ fn file_io_state_name(state: FileIoAccountingState) -> &'static str {
 /// distinct from `"unavailable"` — no source — exactly as the page keeps them
 /// apart. A counter that could not be queried is `null`, never a fabricated
 /// zero.
-fn file_io_summary(
-    pid: Option<u32>,
-    accounting: Option<&FileIoAccounting>,
-    error: Option<&str>,
-) -> serde_json::Value {
+///
+/// `waited_ms` is what qualifies the state: `undelivered` after three seconds
+/// means the trace had its chance and delivered nothing, while the same word
+/// after four milliseconds means only that the check did not look again. And
+/// `decoded_bytes` reports what the trace decoded for this process, read plus
+/// write, which exists only for a `measured` sample — an unmeasured one keeps
+/// `null` rather than a zero that reads as "measured nothing".
+fn file_io_summary(probe: &FileIoProbe) -> serde_json::Value {
+    let accounting = answered_accounting(&probe.waited);
     serde_json::json!({
-        "pid": pid,
+        "pid": probe.pid,
         "state": accounting.map(|accounting| file_io_state_name(accounting.state)),
         "since_ms": accounting.map(|accounting| accounting.since_ms),
+        "waited_ms": probe.waited.waited_ms,
+        "decoded_bytes": accounting
+            .filter(|accounting| accounting.state == FileIoAccountingState::Measured)
+            .map(|accounting| accounting.read_bytes.saturating_add(accounting.write_bytes)),
         "events_lost": accounting.and_then(|accounting| accounting.events_lost),
         "unnamed_creates": accounting.map(|accounting| accounting.unnamed_creates),
         "dropped_paths": accounting.map(|accounting| accounting.dropped_paths),
         "cleared_file_objects": accounting.map(|accounting| accounting.cleared_file_objects),
-        "error": error,
+        "own_io_error": probe.own_io_error,
+        "error": probe.waited.answer.as_ref().err(),
     })
 }
 
-/// Ask the platform for per-file accounting of this process.
+/// Write, flush, read back and delete a temporary file of this process's own,
+/// so a running per-file trace has something of its own to deliver.
+///
+/// [`FileIoAccountingState::Measured`] requires one read or write record
+/// decoded for THIS process, so a check that only sampled a freshly started
+/// session could never see one: nothing had been issued yet. The file is
+/// created, written, flushed, read back and removed here, in the data directory
+/// rather than the system temp directory, because `TASKMAN_DATA_DIR` is the
+/// isolation knob a diagnostic run sets.
+///
+/// Returns the bytes written and read back. The file is removed whatever
+/// happens, including a failed read-back, so a rerun cannot mistake the
+/// leftovers of this one for its own window.
+fn exercise_own_file_io_in(dir: &Path) -> Result<u64, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let path = dir.join(format!(
+        "selfcheck-file-io-{}-{nanos}.tmp",
+        std::process::id()
+    ));
+    let payload = vec![0x5a_u8; OWN_IO_BYTES];
+    let result = write_and_read_back(&path, &payload);
+    let _ = std::fs::remove_file(&path);
+    result
+        .map(|()| (payload.len() as u64).saturating_mul(2))
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// One create/write/flush/read cycle on `path`, verified against `payload`.
+fn write_and_read_back(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(payload)?;
+    // Without the flush the bytes may still sit in a cache buffer rather than
+    // in a completed request, which is what the trace records.
+    file.sync_all()?;
+    drop(file);
+    let mut read_back = Vec::with_capacity(payload.len());
+    std::fs::File::open(path)?.read_to_end(&mut read_back)?;
+    if read_back != payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "read back a different payload",
+        ));
+    }
+    Ok(())
+}
+
+/// Sample the per-file trace until it reports something other than
+/// `undelivered`, or `budget` runs out.
+///
+/// `undelivered` is the one state a later sample can still change: it says the
+/// session delivered no transfer of this process yet, and delivery is
+/// asynchronous. Every other state is an answer — `unavailable` means there is
+/// no session to wait for, `undecodable` means records arrived and the layout
+/// did not match, `measured` means a transfer was decoded — and so is a failed
+/// request, which no amount of waiting makes askable.
+///
+/// The loop polls against a deadline instead of sleeping for it: it samples at
+/// once, then at most [`FILE_IO_POLL_INTERVAL`] apart, and returns the sample
+/// that is at or past the deadline rather than assuming one arrived.
+fn await_file_io_delivery(
+    budget: Duration,
+    mut sample: impl FnMut() -> Result<ProcessFileIoSnapshot, String>,
+) -> FileIoWait {
+    let started = Instant::now();
+    loop {
+        let answer = sample();
+        let waited_ms = elapsed_ms(started);
+        let undelivered = matches!(
+            &answer,
+            Ok(snapshot) if snapshot.accounting.state == FileIoAccountingState::Undelivered
+        );
+        if !undelivered {
+            return FileIoWait { answer, waited_ms };
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return FileIoWait { answer, waited_ms };
+        }
+        std::thread::sleep(FILE_IO_POLL_INTERVAL.min(remaining));
+    }
+}
+
+/// Measure the per-file accounting of this process, giving the trace I/O of its
+/// own to deliver and time to deliver it.
 ///
 /// The GUI asks the same question about the process its dialog shows. A
 /// headless run can only be sure of its own identity, and the accounting state
 /// is a fact about the file trace session rather than about one target, so this
 /// process is the sampled one. `--mock` has no trace at all and reports no
 /// answer instead of an invented state.
-fn probe_file_io(
-    mock: bool,
-    snapshot: &tm_core::model::Snapshot,
-) -> (Option<u32>, Result<ProcessFileIoSnapshot, String>) {
+///
+/// The session starts on the first sample and delivers nothing from before it,
+/// so that sample is taken on its own: the check then issues its own file I/O
+/// ([`exercise_own_file_io_in`]) and waits, bounded, for the trace to report it.
+/// Sampling once and printing the state was the defect — four milliseconds into
+/// a session, no event could have arrived.
+fn probe_file_io(mock: bool, snapshot: &tm_core::model::Snapshot) -> FileIoProbe {
+    let unasked = |pid: Option<u32>, error: &str| FileIoProbe {
+        pid,
+        waited: FileIoWait {
+            answer: Err(error.to_string()),
+            waited_ms: 0,
+        },
+        own_io_error: None,
+    };
     if mock {
-        return (None, Err("mock collector: no per-file trace".to_string()));
+        return unasked(None, "mock collector: no per-file trace");
     }
     let pid = std::process::id();
     let Some(start_epoch_s) = snapshot
@@ -96,18 +263,37 @@ fn probe_file_io(
         .and_then(|process| process.creation_identity())
         .filter(|start| *start > 0)
     else {
-        return (
-            Some(pid),
-            Err("own process creation time is unavailable".to_string()),
-        );
+        return unasked(Some(pid), "own process creation time is unavailable");
     };
     let actions = tm_platform::create_actions();
-    (
-        Some(pid),
+    let sample = || {
         actions
             .list_process_file_io(pid, Some(start_epoch_s))
-            .map_err(|error| error.to_string()),
-    )
+            .map_err(|error| error.to_string())
+    };
+    let started = sample();
+    let own_io_error = match &started {
+        // Only a session has anything to deliver; with no source there is no
+        // trace to feed, and touching the disk for it would measure nothing.
+        Ok(ready) if ready.accounting.state != FileIoAccountingState::Unavailable => {
+            exercise_own_file_io_in(&tm_core::settings::taskman_data_dir()).err()
+        }
+        _ => None,
+    };
+    let waited = match started {
+        Ok(ready) if ready.accounting.state == FileIoAccountingState::Undelivered => {
+            await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, sample)
+        }
+        answer => FileIoWait {
+            answer,
+            waited_ms: 0,
+        },
+    };
+    FileIoProbe {
+        pid: Some(pid),
+        waited,
+        own_io_error,
+    }
 }
 
 pub fn run(mock: bool) -> i32 {
@@ -155,7 +341,7 @@ pub fn run(mock: bool) -> i32 {
         tm_platform::create_actions().capabilities().users_sessions
     };
     let (memory_used_gb, memory_total_gb) = memory_gb(&snap.memory);
-    let (file_io_pid, file_io_answer) = probe_file_io(mock, &snap);
+    let file_io = probe_file_io(mock, &snap);
     let summary = serde_json::json!({
         "ok": true,
         "backend": if mock { "mock".to_string() } else { "platform".to_string() },
@@ -258,16 +444,11 @@ pub fn run(mock: bool) -> i32 {
             .filter(|p| p.io_ops_per_s.is_some())
             .count(),
         // Whether per-file byte accounting has a live source for the sampled
-        // process, and what that source lost: the headless answer to "is the
-        // file trace alive", which the I/O page only answers in a GUI.
-        "file_io": file_io_summary(
-            file_io_pid,
-            file_io_answer
-                .as_ref()
-                .ok()
-                .map(|snapshot: &ProcessFileIoSnapshot| &snapshot.accounting),
-            file_io_answer.as_ref().err().map(String::as_str),
-        ),
+        // process, and what that source delivered and lost: the headless answer
+        // to "is the file trace alive", which the I/O page only answers in a
+        // GUI. Read it with `waited_ms`: the same state means different things
+        // four milliseconds and three seconds into a session.
+        "file_io": file_io_summary(&file_io),
         "uptime_s": snap.system.uptime_s,
     });
     println!("{summary}");
@@ -442,6 +623,34 @@ mod tests {
         assert_eq!(memory_gb(&measured), (Some(3.0), Some(16.0)));
     }
 
+    /// One answer of the sampled process in `state`.
+    fn snapshot_in(state: FileIoAccountingState) -> ProcessFileIoSnapshot {
+        ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                state,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A probe whose wait settled on `answer` after `waited_ms`.
+    fn probe_with(answer: Result<ProcessFileIoSnapshot, String>, waited_ms: u64) -> FileIoProbe {
+        FileIoProbe {
+            pid: Some(4242),
+            waited: FileIoWait { answer, waited_ms },
+            own_io_error: None,
+        }
+    }
+
+    /// A path in the system temp directory that no other run shares.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        std::env::temp_dir().join(format!("tm-selfcheck-{name}-{nanos}"))
+    }
+
     /// The summary states the per-file accounting of the sampled process, and
     /// every state keeps its own name instead of collapsing into "unavailable".
     ///
@@ -457,17 +666,13 @@ mod tests {
             (FileIoAccountingState::Undecodable, "undecodable"),
             (FileIoAccountingState::Measured, "measured"),
         ] {
-            let accounting = FileIoAccounting {
-                state,
-                ..Default::default()
-            };
-            let summary = file_io_summary(Some(4242), Some(&accounting), None);
+            let summary = file_io_summary(&probe_with(Ok(snapshot_in(state)), 0));
             assert_eq!(summary["pid"], serde_json::json!(4242));
             assert_eq!(summary["state"], serde_json::json!(name), "{state:?}");
         }
 
         // The counters a lossy or capped session is recognised by, plus the
-        // span they cover.
+        // span they cover and the wait that produced them.
         let accounting = FileIoAccounting {
             state: FileIoAccountingState::Undelivered,
             since_ms: 1500,
@@ -477,8 +682,15 @@ mod tests {
             cleared_file_objects: 5,
             ..Default::default()
         };
-        let summary = file_io_summary(Some(4242), Some(&accounting), None);
+        let summary = file_io_summary(&probe_with(
+            Ok(ProcessFileIoSnapshot {
+                files: Vec::new(),
+                accounting,
+            }),
+            3000,
+        ));
         assert_eq!(summary["since_ms"], serde_json::json!(1500));
+        assert_eq!(summary["waited_ms"], serde_json::json!(3000));
         assert_eq!(summary["events_lost"], serde_json::json!(12));
         assert_eq!(summary["unnamed_creates"], serde_json::json!(17));
         assert_eq!(summary["dropped_paths"], serde_json::json!(3));
@@ -499,25 +711,176 @@ mod tests {
             fields,
             [
                 "cleared_file_objects",
+                "decoded_bytes",
                 "dropped_paths",
                 "error",
                 "events_lost",
+                "own_io_error",
                 "pid",
                 "since_ms",
                 "state",
                 "unnamed_creates",
+                "waited_ms",
             ]
         );
+    }
+
+    /// A trace that delivers on a later sample is reported as measured, and the
+    /// wait that found it is visible in `waited_ms`.
+    ///
+    /// Regression: the check sampled once, four milliseconds into the session,
+    /// when no event could have arrived — so the verdict was `undelivered` by
+    /// construction and said nothing about the trace.
+    #[test]
+    fn a_later_sample_that_delivers_is_measured_after_a_wait() {
+        let mut samples = 0;
+        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, || {
+            samples += 1;
+            Ok(if samples == 1 {
+                snapshot_in(FileIoAccountingState::Undelivered)
+            } else {
+                ProcessFileIoSnapshot {
+                    files: Vec::new(),
+                    accounting: FileIoAccounting {
+                        state: FileIoAccountingState::Measured,
+                        since_ms: 120,
+                        read_bytes: 4096,
+                        write_bytes: 2048,
+                        ..Default::default()
+                    },
+                }
+            })
+        });
+        assert_eq!(samples, 2, "the wait keeps sampling until it delivers");
+        let summary = file_io_summary(&FileIoProbe {
+            pid: Some(4242),
+            waited,
+            own_io_error: None,
+        });
+        assert_eq!(summary["state"], serde_json::json!("measured"));
+        assert!(
+            summary["waited_ms"].as_u64().expect("a number") > 0,
+            "{summary}"
+        );
+        assert_eq!(summary["decoded_bytes"], serde_json::json!(6144));
+    }
+
+    /// A trace that never delivers keeps saying so — after the whole deadline —
+    /// and publishes no byte total for the silence.
+    #[test]
+    fn a_trace_that_never_delivers_stays_undelivered_after_the_deadline() {
+        let budget = Duration::from_millis(40);
+        let mut samples = 0;
+        let waited = await_file_io_delivery(budget, || {
+            samples += 1;
+            Ok(snapshot_in(FileIoAccountingState::Undelivered))
+        });
+        assert!(samples >= 2, "{samples} samples before the deadline");
+        let summary = file_io_summary(&FileIoProbe {
+            pid: Some(4242),
+            waited,
+            own_io_error: None,
+        });
+        assert_eq!(summary["state"], serde_json::json!("undelivered"));
+        assert!(
+            summary["waited_ms"].as_u64().expect("a number") >= 40,
+            "{summary}"
+        );
+        // An unmeasured sample has no byte total at all: a zero here would read
+        // as "measured nothing", which is the fabrication this block avoids.
+        assert_eq!(summary["decoded_bytes"], serde_json::Value::Null);
+    }
+
+    /// Only `undelivered` is a verdict a later sample can change: a missing
+    /// source, a layout that did not decode, a measurement and a refused
+    /// question are all answers on the first sample.
+    #[test]
+    fn an_answer_that_cannot_change_is_not_waited_on() {
+        let one_poll = FILE_IO_POLL_INTERVAL.as_millis() as u64;
+        for state in [
+            FileIoAccountingState::Unavailable,
+            FileIoAccountingState::Undecodable,
+            FileIoAccountingState::Measured,
+        ] {
+            let mut samples = 0;
+            let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, || {
+                samples += 1;
+                Ok(snapshot_in(state))
+            });
+            assert_eq!(samples, 1, "{state:?}");
+            assert!(waited.waited_ms < one_poll, "{state:?}: {waited:?}");
+        }
+
+        let mut samples = 0;
+        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, || {
+            samples += 1;
+            Err("the trace refused the request".to_string())
+        });
+        assert_eq!(samples, 1);
+        assert!(waited.waited_ms < one_poll, "{}", waited.waited_ms);
+        let summary = file_io_summary(&probe_with(
+            Err("the trace refused the request".to_string()),
+            waited.waited_ms,
+        ));
+        assert_eq!(summary["state"], serde_json::Value::Null);
+        assert_eq!(
+            summary["error"],
+            serde_json::json!("the trace refused the request")
+        );
+    }
+
+    /// The check's own file I/O is real file I/O — created, written, flushed,
+    /// read back and deleted — and it leaves nothing behind for a rerun to
+    /// mistake for its own window.
+    #[test]
+    fn the_own_io_writes_reads_back_and_cleans_up() {
+        let dir = temp_path("own-io");
+        let bytes = exercise_own_file_io_in(&dir).expect("own file I/O");
+        assert_eq!(bytes, (OWN_IO_BYTES as u64) * 2);
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("the data directory exists")
+            .map(|entry| entry.expect("an entry").path())
+            .collect();
+        entries.sort();
+        assert!(entries.is_empty(), "{entries:?}");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A check that cannot issue its own I/O reports that instead of blaming
+    /// the trace for the silence it created.
+    #[test]
+    fn an_unusable_data_directory_is_reported_not_swallowed() {
+        let blocked = temp_path("own-io-blocked");
+        std::fs::write(&blocked, b"not a directory").expect("blocker file");
+        let result = exercise_own_file_io_in(&blocked);
+        let _ = std::fs::remove_file(&blocked);
+        assert!(result.is_err(), "{result:?}");
+
+        let mut probe = probe_with(Ok(snapshot_in(FileIoAccountingState::Undelivered)), 3000);
+        probe.own_io_error = Some("data directory: access denied".to_string());
+        let summary = file_io_summary(&probe);
+        assert_eq!(
+            summary["own_io_error"],
+            serde_json::json!("data directory: access denied")
+        );
+        // The state is still reported as sampled — qualified by the reason it
+        // cannot be read as a verdict about the trace.
+        assert_eq!(summary["state"], serde_json::json!("undelivered"));
     }
 
     /// A question that could not be asked reports no state, not a fabricated
     /// one: an unlost and an unasked session must not read alike.
     #[test]
     fn an_unasked_file_io_reports_null_rather_than_a_state() {
-        let summary = file_io_summary(None, None, Some("mock collector: no per-file trace"));
-        assert_eq!(summary["pid"], serde_json::Value::Null);
+        let summary = file_io_summary(&probe_with(
+            Err("mock collector: no per-file trace".to_string()),
+            0,
+        ));
+        assert_eq!(summary["pid"], serde_json::json!(4242));
         assert_eq!(summary["state"], serde_json::Value::Null);
+        assert_eq!(summary["waited_ms"], serde_json::json!(0));
         assert_eq!(summary["events_lost"], serde_json::Value::Null);
+        assert_eq!(summary["decoded_bytes"], serde_json::Value::Null);
         assert_eq!(summary["unnamed_creates"], serde_json::Value::Null);
         assert_eq!(summary["dropped_paths"], serde_json::Value::Null);
         assert_eq!(summary["cleared_file_objects"], serde_json::Value::Null);
@@ -532,17 +895,27 @@ mod tests {
             events_lost: None,
             ..Default::default()
         };
-        let summary = file_io_summary(Some(4242), Some(&accounting), None);
+        let summary = file_io_summary(&probe_with(
+            Ok(ProcessFileIoSnapshot {
+                files: Vec::new(),
+                accounting,
+            }),
+            0,
+        ));
         assert_eq!(summary["events_lost"], serde_json::Value::Null);
         assert_eq!(summary["state"], serde_json::json!("unavailable"));
     }
 
     /// A mock run has no trace, so it reports that it could not ask instead of
-    /// a state the run never observed.
+    /// a state the run never observed — and it does not wait for one either.
     #[test]
     fn a_mock_run_reports_no_file_io_answer() {
-        let (pid, answer) = probe_file_io(true, &tm_core::model::Snapshot::default());
-        assert_eq!(pid, None);
-        assert!(answer.is_err());
+        let probe = probe_file_io(true, &tm_core::model::Snapshot::default());
+        let summary = file_io_summary(&probe);
+        assert_eq!(summary["pid"], serde_json::Value::Null);
+        assert_eq!(summary["state"], serde_json::Value::Null);
+        assert_eq!(summary["waited_ms"], serde_json::json!(0));
+        assert_eq!(summary["own_io_error"], serde_json::Value::Null);
+        assert!(probe.waited.answer.is_err());
     }
 }

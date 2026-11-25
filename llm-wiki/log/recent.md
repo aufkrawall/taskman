@@ -1,3 +1,26 @@
+## 2026-11-25 - `--selfcheck` waits for the per-file trace instead of sampling once
+
+- The `file_io` verdict was worthless by construction: the check sampled the
+  accounting 4 ms after the session started (`undelivered`, `since_ms` 4), when no
+  event could have arrived. The collector was right; the check was not.
+- `crates/tm-app/src/selfcheck.rs` now starts the session, issues file I/O of its
+  own — create, write, flush (`sync_all`), read back and delete a temporary file in
+  `taskman_data_dir()` — and then polls the sample against a deadline
+  (`FILE_IO_DELIVERY_BUDGET` 3 s, `FILE_IO_POLL_INTERVAL` 50 ms) until the state
+  leaves `undelivered`. Only `undelivered` is retried: no source, an undecodable
+  layout, a measurement and a refused request are answers on the first sample.
+- New summary fields: `waited_ms` (the measured wait — tells a 4 ms sample from a
+  real one), `decoded_bytes` (read plus write the trace decoded for the process,
+  `null` unless measured, never a fabricated zero) and `own_io_error` (non-null when
+  the check's own I/O failed, which makes a silent trace the check's fault).
+- A deadline that expires still reports `undelivered`, with `waited_ms` at or past
+  the budget; nothing is upgraded on the way out. Unelevated live run afterwards:
+  `state` `unavailable`, `waited_ms` 0, `decoded_bytes` null — the expected answer.
+- Unit tests: a later sample that delivers yields `measured` with `waited_ms` > 0; a
+  trace that never delivers yields `undelivered` with `waited_ms` >= its 40 ms
+  deadline; unchangeable answers are not waited on; the own I/O is verified and
+  cleans up; an unusable data directory is reported, not swallowed.
+
 ## 2026-11-25 - The per-file trace, second attempt: the SystemIo FILE keyword
 
 - A live elevated `--selfcheck` after `c9acb05` still printed

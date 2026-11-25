@@ -777,9 +777,12 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   manifest `EnableTraceEx2` for `Microsoft-Windows-Kernel-File`, and the legacy
   `EVENT_TRACE_FLAG_FILE_IO` flag — both reported `undelivered` with
   `events_lost` 0 while the session was running). `file_etw::tests` pins the
-  enable, the decode and the state rules, and `--selfcheck`'s `file_io.state` is
-  the proof — `measured` after a run that touched files means the keyword
-  delivered records. If a live run still reports `undelivered` with the session
+  enable, the decode and the state rules, and `--selfcheck`'s `file_io` block is
+  the proof: since 2026-11-25 the check writes, flushes and reads back a
+  temporary file of its own and polls for up to 3 s, so `measured` means the
+  keyword delivered records and `undelivered` with `waited_ms` near 3000 is a
+  real negative — the earlier `undelivered` at `since_ms` 4 decided nothing.
+  If a live run still reports `undelivered` after that wait with the session
   running, the remaining lever is `SYSTEM_IO_KW_FILENAME` (the name-only
   keyword), which needs no other change to the decode path; `SYSTEM_IO_KW_DISK`
   must not be added — it would turn the disk graphs' rate into this session's.

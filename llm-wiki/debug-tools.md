@@ -56,12 +56,21 @@ blanked.
 
 `file_io` reports the per-file byte accounting of the binary's own process, which
 is the headless equivalent of the I/O page's state line: `state`
-(`unavailable`/`undelivered`/`undecodable`/`measured`), `since_ms`, and the
-session's `events_lost`, `unnamed_creates`, `dropped_paths` and
-`cleared_file_objects`. `unavailable` on an unelevated run is the expected answer
-— a `Microsoft-Windows-Kernel-File` session needs administrator rights or the
-installed service — while `undelivered`/`undecodable` mean a session started and
-delivered nothing usable. The two are worth telling apart: the session is a
+(`unavailable`/`undelivered`/`undecodable`/`measured`), `since_ms`, `waited_ms`,
+`decoded_bytes`, and the session's `events_lost`, `unnamed_creates`,
+`dropped_paths` and `cleared_file_objects`. Read `state` together with
+`waited_ms`: the check starts the session, issues file I/O of its own (a
+temporary file in `TASKMAN_DATA_DIR` is created, written, flushed, read back and
+deleted), and then polls for up to 3 s until the state leaves `undelivered`, so
+`undelivered` with `waited_ms` near 3000 is a real negative while a short wait
+is not a verdict at all. `decoded_bytes` is the read-plus-write total the trace
+decoded for the process and stays `null` unless the state is `measured` — never
+a zero that would read as "measured nothing". `own_io_error` is non-null when
+the check could not issue its own I/O, which makes a silent trace the check's
+fault rather than the trace's. `unavailable` on an unelevated run is the expected
+answer — a `Microsoft-Windows-Kernel-File` session needs administrator rights or
+the installed service — while `undelivered`/`undecodable` mean a session started
+and delivered nothing usable. The two are worth telling apart: the session is a
 system logger that enables the SystemIo provider with `SYSTEM_IO_KW_FILE`, so
 `undelivered` means the kernel accepted the session and delivered no `FileIo`
 record at all, while `undecodable` means records arrived and the payload layout
