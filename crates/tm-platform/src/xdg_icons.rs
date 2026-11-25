@@ -583,11 +583,8 @@ impl IconResolver {
             // Sorted like every other directory walk here: one icon name can
             // exist in more than one context of the same size dir, and a
             // filesystem-defined order must not decide which file wins.
-            for ctx in sorted_dir_paths(&dir.path) {
-                let f = ctx.join(file_name);
-                if f.is_file() {
-                    return Some(f);
-                }
+            if let Some(f) = first_in_contexts(&sorted_dir_paths(&dir.path), file_name) {
+                return Some(f);
             }
         }
         None
@@ -659,6 +656,20 @@ fn sorted_dir_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
     paths.sort();
     paths
+}
+
+/// First of `contexts` that holds `file_name`, in the order given.
+///
+/// A name that exists in several contexts of one size dir — `apps` and
+/// `mimetypes` both ship generic ones — is decided by this order alone, so the
+/// caller passes [`sorted_dir_paths`] and the winner never depends on the
+/// filesystem's `read_dir` order. The scan is separate from that walk so a test
+/// can hand it a fixed order.
+fn first_in_contexts(contexts: &[PathBuf], file_name: &str) -> Option<PathBuf> {
+    contexts
+        .iter()
+        .map(|context| context.join(file_name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Scan `<data_dir>/applications` (recursively, one level of subdirs is
@@ -2325,31 +2336,47 @@ mod tests {
         assert!(f.ends_with("48x48/apps/vector.png"), "{f:?}");
     }
 
-    /// One icon name can exist in several contexts of the same size dir. The
-    /// first context in `read_dir` order used to win, so which pixels a row
-    /// painted depended on the filesystem's hash order; the walk is sorted now
-    /// and `apps` supplies the file.
+    /// The `<context>` directory a resolved icon file lives in.
+    fn context_dir_of(path: &Path) -> Option<&str> {
+        path.parent()?.file_name()?.to_str()
+    }
+
+    /// One icon name can exist in several contexts of the same size dir, so the
+    /// scan must not let the filesystem's directory order decide: it takes the
+    /// candidates in the order it is given, and `find_in_theme` gives it a
+    /// sorted list. Feeding it `mimetypes` first proves the scan obeys its input
+    /// order — the order `read_dir` used to supply — and the sorted list then
+    /// has to pick `apps` on every filesystem, whatever order the two dirs were
+    /// created in.
     #[test]
     fn a_shared_icon_name_resolves_to_the_sorted_first_context() {
         let sb = Sandbox::new("context-order");
         let size_dir = sb.root.join("share/icons/custom/32x32");
         write_png(&size_dir.join("apps/ctxapp.png"), 32, 32, [0, 200, 0, 255]);
         write_png(&size_dir.join("mimetypes/ctxapp.png"), 32, 32, [200, 0, 0, 255]);
+        let apps = size_dir.join("apps");
+        let mimetypes = size_dir.join("mimetypes");
 
-        let r = IconResolver::new(sb.lookup());
-        let found = r.find_icon_file("ctxapp").expect("context icon");
+        // Unsorted candidates: whoever comes first wins, so this is the order
+        // the old `read_dir` walk would have exposed.
         assert_eq!(
-            found
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str()),
-            Some("apps"),
-            "{found:?}"
+            first_in_contexts(&[mimetypes.clone(), apps.clone()], "ctxapp.png"),
+            Some(mimetypes.join("ctxapp.png"))
         );
+        // The production order is sorted, so `apps` precedes `mimetypes`.
+        let sorted = sorted_dir_paths(&size_dir);
+        assert_eq!(sorted, vec![apps.clone(), mimetypes]);
+        let found = first_in_contexts(&sorted, "ctxapp.png").expect("context icon");
+        assert_eq!(found, apps.join("ctxapp.png"));
+
+        // End to end: the resolver's walk hands the sorted list to the scan.
+        let r = IconResolver::new(sb.lookup());
+        let resolved = r.find_icon_file("ctxapp").expect("context icon");
+        assert_eq!(context_dir_of(&resolved), Some("apps"), "{resolved:?}");
         assert_eq!(
-            decode_png_rgba(&found).map(|(_, _, rgba)| rgba[..4].to_vec()),
+            decode_png_rgba(&resolved).map(|(_, _, rgba)| rgba[..4].to_vec()),
             Some(vec![0, 200, 0, 255]),
-            "the apps context must supply the pixels: {found:?}"
+            "the apps context must supply the pixels: {resolved:?}"
         );
     }
 

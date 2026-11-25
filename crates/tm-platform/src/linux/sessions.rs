@@ -71,7 +71,7 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
         // Keep the stable list fields and report its state as unknown rather
         // than dropping a real session or failing the entire page.
         let properties = if Instant::now() < deadline {
-            show_session(row.id, deadline).unwrap_or_default()
+            show_session(&loginctl, row.id, deadline).unwrap_or_default()
         } else {
             SessionProperties::default()
         };
@@ -99,10 +99,10 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
     Ok(out)
 }
 
-fn show_session(id: u32, deadline: Instant) -> Option<SessionProperties> {
+fn show_session(loginctl: &Path, id: u32, deadline: Instant) -> Option<SessionProperties> {
     let id = id.to_string();
     let output = run_loginctl(
-        &loginctl_path()?,
+        loginctl,
         &[
             "show-session",
             "--no-pager",

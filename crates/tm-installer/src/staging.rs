@@ -11,7 +11,7 @@ impl Staging {
 
         let parent = crate::win::install_dir()?
             .parent()
-            .expect("Program Files parent")
+            .ok_or_else(|| TmError::platform("staging identity", "install dir has no parent"))?
             .to_path_buf();
         let guid = unsafe { CoCreateGuid() }
             .map_err(|e| TmError::platform("staging identity", e.to_string()))?;
