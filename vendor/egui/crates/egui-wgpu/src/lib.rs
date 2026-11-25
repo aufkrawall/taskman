@@ -330,6 +330,82 @@ impl RenderState {
             }) => (instance, adapter, device, queue),
         };
 
+        Self::assemble(
+            instance,
+            adapter,
+            #[cfg(not(target_arch = "wasm32"))]
+            available_adapters,
+            device,
+            queue,
+            compatible_surface,
+            config.surface,
+        )
+    }
+
+    /// Like [`Self::create_without_renderer`], on an adapter an earlier render state chose.
+    ///
+    /// Enumerating adapters is most of what device creation costs on D3D12: wgpu opens a
+    /// device on every adapter it lists (the WARP software rasterizer and every other GPU
+    /// included) to read its capabilities, and those probes are what the window waited for on
+    /// a restore after `Painter::suspend`. Re-opening the adapter that was already selected
+    /// skips the enumeration, the selection and the driver bring-up of the adapters nobody
+    /// renders on.
+    ///
+    /// [`Self::available_adapters`] holds only `adapter` on this path, since nothing was
+    /// enumerated. Returns `None` when `adapter` cannot present to `compatible_surface`, and
+    /// an error when it can no longer open a device (driver update, device removed); the
+    /// caller then drops the adapter and takes the full path.
+    #[cfg(feature = "winit")]
+    pub(crate) async fn create_on_adapter(
+        config: &WgpuConfiguration,
+        instance: &wgpu::Instance,
+        adapter: wgpu::Adapter,
+        compatible_surface: &wgpu::Surface<'static>,
+    ) -> Option<Result<Self, WgpuError>> {
+        profiling::scope!("RenderState::create_on_adapter");
+
+        let WgpuSetup::CreateNew(create_new) = &config.wgpu_setup else {
+            return None;
+        };
+        if !adapter.is_surface_supported(compatible_surface) {
+            return None;
+        }
+
+        let device_and_queue = {
+            profiling::scope!("request_device");
+            adapter
+                .request_device(&(*create_new.device_descriptor)(&adapter))
+                .await
+        };
+        Some(
+            device_and_queue
+                .map_err(WgpuError::from)
+                .and_then(|(device, queue)| {
+                    Self::assemble(
+                        instance.clone(),
+                        adapter.clone(),
+                        #[cfg(not(target_arch = "wasm32"))]
+                        vec![adapter],
+                        device,
+                        queue,
+                        Some(compatible_surface),
+                        config.surface,
+                    )
+                }),
+        )
+    }
+
+    /// The part of creating a render state that follows the device: the surface format and
+    /// the struct itself.
+    fn assemble(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        #[cfg(not(target_arch = "wasm32"))] available_adapters: Vec<wgpu::Adapter>,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        compatible_surface: Option<&wgpu::Surface<'static>>,
+        surface_config: SurfaceConfig,
+    ) -> Result<Self, WgpuError> {
         log_adapter_info(&adapter.get_info());
 
         let surface_formats = {
@@ -353,7 +429,7 @@ impl RenderState {
             queue,
             target_format,
             renderer: Arc::new(OnceLock::new()),
-            surface_config: config.surface,
+            surface_config,
         })
     }
 

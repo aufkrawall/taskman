@@ -119,6 +119,20 @@
   crate). Enabling a class GUID as if it were the group is not a documented
   subscription.
 
+## 2026-11-25 - D3D12 restore after the 10 s grace: re-open the adapter
+
+- Reported as "the window still opens delayed with d3d12, especially after sitting
+  minimized or in the tray longer". Past `HIDDEN_RESIDENCY_GRACE` `suspend()` drops the
+  device, and the restore re-ran `enumerate_adapters`, which on D3D12 opens a device per
+  adapter (WARP included). User logs: device 240–430 ms, pipelines ~36 ms.
+- Fix: keep only the selected adapter across `suspend()` and re-open it
+  (`RenderState::create_on_adapter`); full path on failure. Rejected: keeping the wgpu
+  device or lengthening the grace (raises hidden VRAM), DXC (binary size for ~36 ms).
+- Open: the hidden GPU-memory counters with a held adapter, and the re-open time, are to
+  be confirmed by the user's manual run (`wgpu device re-created ... from the retained
+  adapter`). Follow-up candidate: `RenderState.available_adapters` keeps every probe
+  device (WARP, other GPUs) open while visible.
+
 ## 2026-11-25 - Why the D3D12 window arrived after the CPU one
 
 - Reported as "with d3d12, our window appears later after start / unminimize vs cpu rendering".

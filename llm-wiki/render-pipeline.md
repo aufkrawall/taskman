@@ -263,6 +263,21 @@ window at all. Two costs sat in that gap.
   hidden frame and only calls `suspend()` once the window has stayed hidden for
   `HIDDEN_RESIDENCY_GRACE` (10 s), so the tray still ends at near-zero
   resident memory while a minimize/restore is a surface reconfigure.
+- **A restore past the grace re-enumerated every adapter.** Measured from the
+  logs, device creation is 240–430 ms on this host and the pipelines ~36 ms
+  (FXC; DXC would not pay for its size). Most of the device cost is
+  `enumerate_adapters`: wgpu-hal's D3D12 `Adapter::expose` opens an
+  `ID3D12Device` on every listed adapter — WARP and any second GPU included —
+  and `Adapter::open` reuses that probe device. `Painter::suspend` now keeps
+  the selected `wgpu::Adapter` (`retained_adapter`, `CreateNew` only, never the
+  enumerated list) and `add_surface` re-opens it through
+  `RenderState::create_on_adapter`, falling back to the full path when the
+  adapter cannot present to the surface or its device is gone. The attempt owns
+  the adapter so a removed device is released before the enumeration: D3D12
+  hands back the same per-adapter device while anything holds it. Every
+  re-create logs `wgpu device re-created in <n> ms from the <source>`.
+  Stale-risk: the hidden-state GPU-memory counters for a held empty adapter
+  device were not measured here (the user tests GUI restores manually).
 
 Consequence worth knowing before touching either: the gate's `painted` flag is
 still what decides the reveal, so the primer only moves *when* the gate gets its

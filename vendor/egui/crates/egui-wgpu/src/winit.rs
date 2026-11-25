@@ -285,9 +285,14 @@ impl StartupTimings {
     /// Only the first device creation is on the start-up path; re-creations after
     /// `Painter::suspend` are not, so they never overwrite the measurement.
     fn record_device(&mut self, start: web_time::Instant) {
-        if self.device_ms.is_none() {
+        if !self.device_recorded() {
             self.device_ms = Some(Self::ms(start));
         }
+    }
+
+    /// Whether a device was created before, i.e. whether the next creation is a re-create.
+    fn device_recorded(&self) -> bool {
+        self.device_ms.is_some()
     }
 
     fn record_surface(&mut self, start: web_time::Instant) {
@@ -399,6 +404,13 @@ pub struct Painter {
 
     instance: wgpu::Instance,
     render_state: Option<RenderState>,
+    /// The adapter [`Self::suspend`] released the device of, kept so the next
+    /// [`Self::set_window`] re-opens it instead of enumerating every adapter again.
+    ///
+    /// Only the selected adapter, never the enumerated list: on D3D12 each listed adapter
+    /// holds an open device, so keeping the list would keep WARP and every other GPU open
+    /// for the whole time the window is hidden.
+    retained_adapter: Option<wgpu::Adapter>,
     texture_snapshots: TextureSnapshots,
     max_texture_side: Option<usize>,
     /// The renderer of the current render state this painter has already answered for.
@@ -446,6 +458,7 @@ impl Painter {
 
             instance,
             render_state: None,
+            retained_adapter: None,
             texture_snapshots: Default::default(),
             max_texture_side: None,
             ensured: EnsuredRenderer::default(),
@@ -631,9 +644,50 @@ impl Painter {
             // Pipelines are compiled by `ensure_renderer` on the first drawn frame instead of
             // here, so this window can present a clear colour before they exist.
             let device_start = web_time::Instant::now();
-            let render_state =
-                RenderState::create_without_renderer(&self.config, &self.instance, Some(&surface))
-                    .await?;
+            let recreate = self.startup.device_recorded();
+            let mut source = "adapter enumeration";
+            let mut reopened = None;
+            if let Some(adapter) = self.retained_adapter.take() {
+                // Moved into the attempt and dropped with it: a removed device stays the
+                // process's D3D12 device for its adapter while anything holds it, so a
+                // failed re-open must let go of it before the enumeration below.
+                match RenderState::create_on_adapter(
+                    &self.config,
+                    &self.instance,
+                    adapter,
+                    &surface,
+                )
+                .await
+                {
+                    Some(Ok(render_state)) => {
+                        source = "retained adapter";
+                        reopened = Some(render_state);
+                    }
+                    Some(Err(err)) => {
+                        log::warn!("Re-opening the retained wgpu adapter failed: {err}");
+                    }
+                    None => {
+                        log::info!("The retained wgpu adapter cannot present to this window");
+                    }
+                }
+            }
+            let render_state = match reopened {
+                Some(render_state) => render_state,
+                None => {
+                    RenderState::create_without_renderer(
+                        &self.config,
+                        &self.instance,
+                        Some(&surface),
+                    )
+                    .await?
+                }
+            };
+            if recreate {
+                log::info!(
+                    "wgpu device re-created in {:.1} ms from the {source}",
+                    StartupTimings::ms(device_start)
+                );
+            }
             self.startup.record_device(device_start);
             self.max_texture_side =
                 Some(render_state.device.limits().max_texture_dimension_2d as usize);
@@ -840,7 +894,9 @@ impl Painter {
     ///
     /// This is the full teardown: device, renderer, surfaces and capture state all go away.
     /// It is correct after [`Self::pause`] (which only dropped the surfaces), and the next call
-    /// to [`Self::set_window()`] recreates the device, renderer and surface lazily. Managed
+    /// to [`Self::set_window()`] recreates the device, renderer and surface lazily. Only the
+    /// selected [`wgpu::Adapter`] is kept, so that re-create re-opens it instead of
+    /// enumerating every adapter again; [`Self::destroy`] drops it too. Managed
     /// textures are replayed from CPU-side snapshots so egui UI state and the font atlas
     /// survive the interruption. Capabilities needed to create other windows, such as
     /// [`Self::max_texture_side()`], are retained.
@@ -867,6 +923,17 @@ impl Painter {
                     renderer.free_texture(&id);
                 }
             }
+        }
+
+        // Keep the selected adapter, and only it. The wgpu device, queue, descriptor heaps,
+        // allocator blocks, pipelines and textures all go below; what stays is the adapter's
+        // own capability-probe device, which is what re-opening needs to skip enumerating
+        // every adapter again. `WgpuSetup::Existing` brings its own device and has no
+        // enumeration to skip.
+        if matches!(self.config.wgpu_setup, crate::WgpuSetup::CreateNew(_))
+            && let Some(render_state) = self.render_state.as_ref()
+        {
+            self.retained_adapter = Some(render_state.adapter.clone());
         }
 
         // The device, its pipelines and any renderer built from them are gone, so the
@@ -1527,6 +1594,8 @@ impl Painter {
 
     pub fn destroy(&mut self) {
         self.suspend();
+        // Nothing re-opens after a destroy.
+        self.retained_adapter = None;
     }
 }
 
