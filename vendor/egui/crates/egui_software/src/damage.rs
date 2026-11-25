@@ -816,6 +816,23 @@ mod tests {
         let epsilon =
             painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
         assert_eq!(epsilon.dirty_tiles, epsilon.total_tiles, "float epsilon");
+
+        // The debug toggles inject primitives that no input shape hash covers, so a toggle
+        // missing from the key leaves them on tiles the hashes still call clean.
+        ctx.options.debug_paint_clip_rects = true;
+        let clip =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(clip.dirty_tiles, clip.total_tiles, "clip rects");
+
+        ctx.options.debug_ignore_clip_rects = true;
+        let ignore =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(ignore.dirty_tiles, ignore.total_tiles, "ignore clips");
+
+        ctx.options.debug_paint_text_rects = true;
+        let text =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(text.dirty_tiles, text.total_tiles, "text rects");
     }
 
     /// Damage rects are physical pixels and must stay inside the target even when the window
