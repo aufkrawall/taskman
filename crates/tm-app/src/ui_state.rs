@@ -4,6 +4,7 @@
 //! on multi-monitor desktops and the maximized size must never clobber the
 //! stored restore size.
 
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,8 +27,30 @@ fn state_path() -> std::path::PathBuf {
     tm_core::settings::taskman_config_dir().join("window-state.ini")
 }
 
+/// Cap on the placement read. The file holds three short lines; anything
+/// larger is not a placement file, and this read sits on the window-creation
+/// path, where an unbounded allocation would delay the first frame.
+const MAX_STATE_BYTES: usize = 64 * 1024;
+
+/// The state file's text, at most [`MAX_STATE_BYTES`].
+///
+/// `None` covers every reason there is nothing to apply — absent, unreadable,
+/// oversized, not UTF-8 — so the documented fallback is unchanged: a placement
+/// that cannot be read leaves the window where the OS puts it.
+fn read_state_text(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(1024);
+    file.take((MAX_STATE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_STATE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn load_placement() -> Placement {
-    let Ok(text) = std::fs::read_to_string(state_path()) else {
+    let Some(text) = read_state_text(&state_path()) else {
         return Placement::default();
     };
     parse_placement(&text)
@@ -161,5 +184,45 @@ mod tests {
         assert_eq!(p.pos, None);
         assert_eq!(p.pos_px, None);
         assert!(!p.maximized);
+    }
+
+    /// The read is capped like the other config-side readers, and the cap is
+    /// exact: a placement of exactly [`MAX_STATE_BYTES`] still applies, one byte
+    /// more is not a placement file and the caller keeps its OS-placement
+    /// fallback. The file is read on the window-creation path, so an unbounded
+    /// read there would be paid for by the first frame.
+    #[test]
+    fn a_placement_file_is_read_only_up_to_the_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-ui-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exact = dir.join("exact.ini");
+
+        let head = "# Native window placement.\nposition=-8,320\nmaximized=true\n";
+        let mut body = String::from(head);
+        body.push_str(&"#".repeat(MAX_STATE_BYTES - head.len() - 1));
+        body.push('\n');
+        assert_eq!(body.len(), MAX_STATE_BYTES);
+        std::fs::write(&exact, &body).unwrap();
+
+        let text = read_state_text(&exact).expect("exactly the cap is still a placement file");
+        let p = parse_placement(&text);
+        assert_eq!(p.pos, Some([-8.0, 320.0]));
+        assert!(p.maximized);
+
+        let over = dir.join("over.ini");
+        let mut too_long = body;
+        too_long.push('\n');
+        std::fs::write(&over, &too_long).unwrap();
+        assert_eq!(read_state_text(&over), None);
+        // Absent and unreadable take the same path: nothing to apply.
+        assert_eq!(read_state_text(&dir.join("missing.ini")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
