@@ -785,11 +785,12 @@ impl Settings {
 
     /// Read `path` and report whether its contents could be used. A file that
     /// is present but unreadable (oversized, corrupt, locked), or readable but
-    /// holding no settings at all (empty, zero-filled, garbage after a failed
-    /// save), is unusable and does not stay where it is: one that holds bytes
-    /// is kept aside, an empty one is dropped. Reporting it unusable lets
-    /// [`Settings::load`] still fall back to the legacy JSON settings instead
-    /// of letting defaults shadow them.
+    /// holding no settings at all (empty, zero-filled, a bare BOM, whitespace,
+    /// pairs that all sit before the first header), is unusable and does not
+    /// stay where it is: one the parse emptied is dropped, one that could not
+    /// be read is kept aside. Reporting it unusable lets [`Settings::load`]
+    /// still fall back to the legacy JSON settings instead of letting defaults
+    /// shadow them.
     ///
     /// One pair under a section header is enough to be usable: a hand-edited
     /// INI legitimately sets a subset of the keys, and every key it omits
@@ -810,13 +811,15 @@ impl Settings {
                 if kv.is_empty() {
                     // Nothing to restore. Reporting this as usable would skip
                     // the JSON migration and let the first autosave of
-                    // defaults overwrite what the user actually chose.
+                    // defaults overwrite what the user actually chose. A file
+                    // with bytes in it is as empty as a zero-byte one, so the
+                    // parse decides here, not the file size.
                     tracing::warn!(
                         path = %path.display(),
                         bytes = bytes.len(),
                         "settings file holds no settings"
                     );
-                    crate::persist::set_aside(path, "settings file");
+                    crate::persist::discard_contentless(path, "settings file");
                     (Self::default(), false)
                 } else {
                     let s = Self::from_ini_map(&kv);
@@ -1717,6 +1720,68 @@ text_smoothing=banana
             recoverable,
             "an empty INI must not clobber the recoverable copy"
         );
+    }
+
+    /// The other half of the same rule, and the harder one: "holds no
+    /// settings" is not "is zero bytes". A power loss can leave a NUL-filled
+    /// config.ini, an editor a bare BOM or whitespace, and a file whose pairs
+    /// all sit before the first header carries nothing the parser keeps. Each
+    /// still parses to nothing, so none may take the `.bad` name.
+    #[test]
+    fn a_contentless_ini_never_replaces_an_existing_aside_copy() {
+        let recoverable = "[general]\ntheme=dark\nupdate_speed=high\n";
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("nul-filled", vec![0u8; 512]),
+            ("bom-only", "\u{feff}".as_bytes().to_vec()),
+            ("whitespace-only", b" \r\n\t\r\n\n".to_vec()),
+            // `theme` and `update_speed` before any header belong to no
+            // section, so the parser drops them and the file says nothing.
+            (
+                "pairs-before-the-first-header",
+                b"theme=dark\nupdate_speed=high\n".to_vec(),
+            ),
+        ];
+        for (name, contents) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.ini");
+            let aside = dir.path().join("config.ini.bad");
+            std::fs::write(&aside, recoverable).unwrap();
+            std::fs::write(&path, &contents).unwrap();
+
+            let (loaded, usable) = Settings::load_from_checked(&path);
+
+            assert_eq!(loaded, Settings::default(), "{name}");
+            assert!(!usable, "{name}: a file that holds no settings is not usable");
+            assert!(!path.exists(), "{name}: the contentless INI must leave the load path");
+            assert_eq!(
+                std::fs::read_to_string(&aside).unwrap(),
+                recoverable,
+                "{name}: a file that says nothing must not clobber the recoverable copy"
+            );
+        }
+    }
+
+    /// The same bytes, one pair later: a pair under a header makes the file
+    /// real, so nothing is dropped and no aside copy is touched.
+    #[test]
+    fn one_pair_after_the_header_makes_the_file_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let aside = dir.path().join("config.ini.bad");
+        std::fs::write(&aside, "stale").unwrap();
+        std::fs::write(&path, "theme=dark\n[general]\nupdate_speed=low\n").unwrap();
+
+        let (loaded, usable) = Settings::load_from_checked(&path);
+
+        assert!(usable, "a pair under a section is a real setting");
+        assert_eq!(loaded.update_speed, UpdateSpeed::Low);
+        assert_eq!(
+            loaded.theme,
+            Settings::default().theme,
+            "the pair before the header belongs to no section"
+        );
+        assert!(path.exists(), "a usable INI stays where the next save writes it");
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "stale");
     }
 
     /// A non-empty unusable INI is real data, so it still takes the aside

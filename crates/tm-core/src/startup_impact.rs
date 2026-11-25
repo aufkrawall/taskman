@@ -223,7 +223,9 @@ pub struct ImpactStore {
 impl ImpactStore {
     /// Load from `path`; a missing or corrupt file yields an empty store
     /// rather than an error — losing measurements must never block startup.
-    /// A corrupt one is kept aside rather than overwritten.
+    /// A corrupt file with bytes in it is kept aside rather than overwritten;
+    /// one that holds no bytes is removed instead, since moving it aside would
+    /// only take the `.bad` name from a copy that still has measurements.
     pub fn open(path: PathBuf) -> Self {
         let entries = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<StoreFile>(&text) {

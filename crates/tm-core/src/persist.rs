@@ -112,6 +112,31 @@ pub(crate) fn replace_file(
     write_result
 }
 
+/// Remove a file the caller has read and found empty of anything usable: no
+/// settings, no history, no entries.
+///
+/// Zero bytes is only the crudest form of that — a write that never reached
+/// the disk. A NUL-filled file, a bare byte-order mark, whitespace, or pairs
+/// that sit before the first section all say just as little, and only the
+/// caller can tell because only the caller reads the contents. Such a file is
+/// removed rather than moved aside, so it cannot take the `.bad` name from
+/// the copy that an earlier, real failure kept: that copy is the last file
+/// the user can still restore from. Best effort: a failed removal is logged,
+/// never fatal, and the caller still treats the load as unusable.
+pub(crate) fn discard_contentless(path: &Path, what: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            "{what} held nothing; removed it instead of keeping it aside"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "{what} held nothing and could not be removed; the next save replaces it"
+        ),
+    }
+}
+
 /// Move an existing file that could not be used out of the way (to
 /// `<name>.bad`) before the caller starts over.
 ///
@@ -119,26 +144,21 @@ pub(crate) fn replace_file(
 /// also build its state from another source instead (the settings loader falls
 /// back to the legacy `settings.json`). A file that is oversized, corrupt, not
 /// UTF-8 or merely unreadable right now still holds the user's settings or
-/// history, so it is kept for recovery instead of being overwritten. Best
-/// effort: failing to move it is logged, never fatal.
+/// history, so it is kept for recovery instead of being overwritten, and it
+/// takes the `.bad` name from any older copy: the newest recoverable bytes
+/// win. Best effort: failing to move it is logged, never fatal.
 ///
-/// A zero-byte source is removed instead of moved: it holds nothing to
-/// recover, and moving it would replace the `.bad` copy that an earlier, real
-/// failure kept aside — the one file the user can still restore from. Either
-/// way the source stops sitting where the next load would re-read it.
+/// A zero-byte source goes to [`discard_contentless`] instead: it holds
+/// nothing to recover, so it must not take the `.bad` name. Callers that can
+/// prove a non-empty file says nothing, by parsing it, call that function
+/// directly; the size check here is only for callers that cannot look inside.
+///
+/// A source that was moved or removed no longer sits where the next load
+/// would re-read it. When either step fails the warning is logged and the file
+/// stays, so the next load reads the same unusable bytes again.
 pub(crate) fn set_aside(path: &Path, what: &str) {
     if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
-        match std::fs::remove_file(path) {
-            Ok(()) => tracing::warn!(
-                path = %path.display(),
-                "{what} held nothing; removed it instead of keeping it aside"
-            ),
-            Err(error) => tracing::warn!(
-                path = %path.display(),
-                %error,
-                "{what} held nothing and could not be removed; the next save replaces it"
-            ),
-        }
+        discard_contentless(path, what);
         return;
     }
     let mut aside = path.as_os_str().to_owned();
@@ -223,6 +243,33 @@ mod tests {
             std::fs::read_to_string(&aside).unwrap(),
             "the last recoverable copy",
             "an empty file must not replace the copy kept aside earlier"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The caller parses the file, so it knows a source that has bytes still
+    /// says nothing. That decision must reach the same outcome: the source is
+    /// removed, and the copy an earlier failure kept stays byte-identical.
+    #[test]
+    fn a_contentless_source_never_replaces_an_existing_aside_copy() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-persist-contentless-{}-{}",
+            std::process::id(),
+            NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("store.json");
+        let aside = dir.join("store.json.bad");
+        std::fs::write(&aside, b"the last recoverable copy").unwrap();
+        std::fs::write(&dest, vec![0u8; 64]).unwrap();
+
+        discard_contentless(&dest, "test store");
+
+        assert!(!dest.exists(), "the unusable file must not be left for the next load");
+        assert_eq!(
+            std::fs::read_to_string(&aside).unwrap(),
+            "the last recoverable copy",
+            "a file that says nothing must not replace the copy kept aside earlier"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
