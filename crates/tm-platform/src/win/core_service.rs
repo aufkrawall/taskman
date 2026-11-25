@@ -866,9 +866,10 @@ fn telemetry_broker_call(
 /// Outcome of asking the broker for per-process network counters.
 ///
 /// `Unavailable` and `Rejected` are kept apart on purpose: the first means
-/// "no service, or one too old to know this request", where falling back to
-/// our own token is correct; the second is the service declining, which must
-/// never be worked around locally.
+/// "no service, or one too old to know this request" — or an answer that was
+/// lost in transport, which is what a telemetry timeout already reads as —
+/// where falling back to our own token is correct; the second is the service
+/// declining, which must never be worked around locally.
 pub(crate) enum BrokeredNetwork {
     Sample(ProcessNetworkSample),
     Unavailable,
