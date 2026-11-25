@@ -141,6 +141,96 @@ pub fn is_window_cloaked(_hwnd: isize) -> bool {
     false
 }
 
+/// Install the presentation gate on the main window: keep it off the compositor
+/// until a real frame is on screen, and give its client area the app's own
+/// background colour so no erase can show white.
+///
+/// `wake` is called from the window procedure on every transition that would
+/// reveal the window, and is expected to request a repaint. `background` must be
+/// the colour the app paints first. See [`win::present_gate`]; non-Windows hosts
+/// ignore it.
+#[cfg(target_os = "windows")]
+pub fn install_present_gate(
+    hwnd: isize,
+    background: [u8; 3],
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+) {
+    win::present_gate::install_present_gate(hwnd, background, wake);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn install_present_gate(
+    _hwnd: isize,
+    _background: [u8; 3],
+    _wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+) {
+}
+
+/// Take one pending gate transition, answering `true` once per transition.
+#[cfg(target_os = "windows")]
+pub fn present_gate_take_transition() -> bool {
+    win::present_gate::present_gate_take_transition()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn present_gate_take_transition() -> bool {
+    false
+}
+
+/// Whether the app owes a frame because a gate transition is unanswered.
+#[cfg(target_os = "windows")]
+pub fn present_gate_needs_frame() -> bool {
+    win::present_gate::present_gate_needs_frame()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn present_gate_needs_frame() -> bool {
+    false
+}
+
+/// Cloak the window and mark the gate as holding it, for a reveal the app is
+/// driving itself.
+#[cfg(target_os = "windows")]
+pub fn present_gate_hold(hwnd: isize) {
+    win::present_gate::present_gate_hold(hwnd);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn present_gate_hold(_hwnd: isize) {}
+
+/// Uncloak the window, clear the gate's hold and report whether a hold was
+/// released. The only uncloak the gate allows.
+#[cfg(target_os = "windows")]
+pub fn present_gate_release(hwnd: isize) -> bool {
+    win::present_gate::present_gate_release(hwnd)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn present_gate_release(_hwnd: isize) -> bool {
+    false
+}
+
+/// Whether the presentation gate is currently holding the window invisible.
+#[cfg(target_os = "windows")]
+pub fn present_gate_held() -> bool {
+    win::present_gate::present_gate_held()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn present_gate_held() -> bool {
+    false
+}
+
+/// Take the presentation gate down: uncloak, remove the window subclass and drop
+/// the background brush. Safe to call twice or after the window is gone.
+#[cfg(target_os = "windows")]
+pub fn remove_present_gate() {
+    win::present_gate::remove_present_gate();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn remove_present_gate() {}
+
 /// Move/shrink the window back inside the work area of its (nearest)
 /// monitor — see [`win::window_chrome::ensure_window_on_screen`]. Returns
 /// whether it was moved.

@@ -53,6 +53,9 @@ pub fn module_etw_test_running() -> bool {
     module_etw::trace_is_running()
 }
 mod perfcounters;
+/// Keeps the window off the compositor until it holds a real frame — see
+/// `present_gate`.
+pub mod present_gate;
 mod process_connections;
 pub(crate) mod process_file_io;
 mod process_ops;

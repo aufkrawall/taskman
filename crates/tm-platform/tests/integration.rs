@@ -1361,3 +1361,209 @@ fn list_process_file_io_for_current_process_has_complete_handles() {
         .expect("own process file io");
     assert!(snapshot.accounting.handles_complete);
 }
+
+/// The class procedure for the throwaway window below. The presentation gate's
+/// subclass runs ahead of it, so this only has to be a valid class procedure.
+unsafe extern "system" fn present_gate_test_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+}
+
+/// Drain this thread's queue, which is what actually runs the gate's subclass.
+/// `ShowWindowAsync` only posts, so nothing happens until somebody pumps.
+fn pump_window_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+    let mut message = MSG::default();
+    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+/// The presentation gate must keep a window the desktop is showing off the
+/// compositor, and give its client area the app's colour in the meantime.
+///
+/// A window of its own class, because the gate sets `GCLP_HBRBACKGROUND` on
+/// whatever class the window belongs to: the predefined classes are shared with
+/// the rest of the process and with user32, and mutating `STATIC`'s background
+/// would be a side effect on somebody else's window. The window is a tool
+/// window with no activation so it never takes focus or a taskbar button, and it
+/// lives for the length of this one test.
+#[test]
+fn the_presentation_gate_keeps_a_shown_window_cloaked_until_release() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CW_USEDEFAULT, CreateWindowExW, DestroyWindow, GCLP_HBRBACKGROUND, GetClassLongPtrW,
+        IsIconic, IsWindowVisible, RegisterClassW, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+        ShowWindowAsync, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+
+    let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None) }.expect("own module").0);
+    let class_name = windows::core::w!("TaskManPresentGateIntegrationTest");
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(present_gate_test_proc),
+        hInstance: hinstance,
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    assert_ne!(
+        unsafe { RegisterClassW(&class) },
+        0,
+        "throwaway window class must register"
+    );
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name,
+            windows::core::w!("TaskMan presentation gate test"),
+            WS_POPUP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            200,
+            150,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )
+    }
+    .expect("throwaway window");
+    let raw = hwnd.0 as isize;
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&wakes);
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+
+    assert!(
+        !tm_platform::is_window_cloaked(raw),
+        "the fixture window starts uncloaked"
+    );
+    assert_eq!(
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND) },
+        0,
+        "the fixture class starts with no background brush"
+    );
+
+    tm_platform::install_present_gate(raw, [0x19, 0x1a, 0x1b], wake);
+    assert!(tm_platform::present_gate_held(), "install holds the window");
+    assert!(
+        tm_platform::is_window_cloaked(raw),
+        "install must cloak before the window can ever be composed"
+    );
+    assert_ne!(
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND) },
+        0,
+        "the class must get the app's brush, so no erase can be the system white"
+    );
+
+    // A show request is not allowed to reach the compositor.
+    unsafe {
+        let _ = ShowWindowAsync(hwnd, SW_SHOW);
+    }
+    let shown = poll_for(
+        || {
+            pump_window_messages();
+            unsafe { IsWindowVisible(hwnd) }.as_bool().then_some(())
+        },
+        std::time::Duration::from_secs(5),
+    );
+    assert!(shown.is_some(), "the window never became visible");
+    pump_window_messages();
+    assert!(
+        tm_platform::is_window_cloaked(raw),
+        "WM_SHOWWINDOW must re-cloak before Windows composes the window"
+    );
+    assert!(
+        tm_platform::present_gate_needs_frame(),
+        "the transition must leave the app owing a frame"
+    );
+    assert!(
+        wakes.load(Ordering::Relaxed) > 0,
+        "the transition must wake the app so a frame follows"
+    );
+    assert!(
+        tm_platform::present_gate_take_transition(),
+        "the transition is reported to the app exactly once"
+    );
+    assert!(!tm_platform::present_gate_needs_frame());
+
+    assert!(
+        tm_platform::present_gate_release(raw),
+        "a hold must be released"
+    );
+    assert!(!tm_platform::present_gate_held());
+    assert!(
+        !tm_platform::is_window_cloaked(raw),
+        "release must uncloak the window"
+    );
+    assert!(
+        !tm_platform::present_gate_release(raw),
+        "release must not act without a hold"
+    );
+
+    // The taskbar path: minimize, then restore while the gate holds.
+    unsafe {
+        let _ = ShowWindowAsync(hwnd, SW_MINIMIZE);
+    }
+    let minimized = poll_for(
+        || {
+            pump_window_messages();
+            unsafe { IsIconic(hwnd) }.as_bool().then_some(())
+        },
+        std::time::Duration::from_secs(5),
+    );
+    assert!(minimized.is_some(), "the window never minimized");
+    tm_platform::present_gate_hold(raw);
+    assert!(tm_platform::present_gate_held());
+    unsafe {
+        let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+    }
+    let restored = poll_for(
+        || {
+            pump_window_messages();
+            let iconic = unsafe { IsIconic(hwnd) }.as_bool();
+            (!iconic).then_some(())
+        },
+        std::time::Duration::from_secs(5),
+    );
+    assert!(restored.is_some(), "the window never restored");
+    pump_window_messages();
+    assert!(
+        tm_platform::is_window_cloaked(raw),
+        "a restore must stay cloaked until the app has a frame"
+    );
+    assert!(
+        tm_platform::present_gate_take_transition(),
+        "the restore must ask for a frame"
+    );
+    assert!(tm_platform::present_gate_release(raw));
+
+    tm_platform::remove_present_gate();
+    assert!(!tm_platform::present_gate_held());
+    assert_eq!(
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND) },
+        0,
+        "removal must hand the class its old background back"
+    );
+    tm_platform::remove_present_gate();
+    assert!(!tm_platform::present_gate_held(), "removal is idempotent");
+
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}

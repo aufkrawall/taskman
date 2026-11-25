@@ -63,8 +63,9 @@ const DWMSBT_NONE: i32 = 1;
 
 /// COLORREF is 0x00BBGGRR — the reverse of the RGB order everywhere else, and
 /// getting it wrong yields a plausible-looking wrong color rather than an
-/// error, so it is converted in exactly one place.
-fn colorref(rgb: [u8; 3]) -> COLORREF {
+/// error, so it is converted in exactly one place (the presentation gate's
+/// erase brush uses this too).
+pub(super) fn colorref(rgb: [u8; 3]) -> COLORREF {
     COLORREF(u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16))
 }
 
@@ -288,6 +289,23 @@ pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
 /// button and its focus), which is exactly why this is used only for the
 /// handful of frames around a restore and never as the tray-hide mechanism.
 pub fn set_cloaked(hwnd: isize, cloaked: bool) {
+    // While the presentation gate holds the window, revealing it is the gate's
+    // decision and nobody else's: an uncloak here would compose exactly the
+    // unpainted window the gate exists to prevent. Concealing is always
+    // allowed — it can only make the window less visible.
+    if !cloaked && super::present_gate::present_gate_held() {
+        tracing::debug!(
+            hwnd,
+            "refusing to uncloak a window the presentation gate holds"
+        );
+        return;
+    }
+    set_cloaked_raw(hwnd, cloaked);
+}
+
+/// [`set_cloaked`] without the gate's veto, for the gate's own cloak calls and
+/// for callers that have already consulted `present_gate::present_gate_held`.
+pub(super) fn set_cloaked_raw(hwnd: isize, cloaked: bool) {
     let hwnd = HWND(hwnd as *mut std::ffi::c_void);
     set_attr(
         hwnd,
@@ -456,7 +474,9 @@ pub(crate) fn fit_rect_to_monitors(
 /// the nearest monitor's work area instead (see [`fit_rect_to_monitors`]).
 /// Returns whether the window was moved.
 ///
-/// Safe to call from the UI thread; it never activates the window.
+/// Safe to call from the UI thread; it never activates the window. It also
+/// never touches the cloak, so it cannot reveal a window the
+/// [`super::present_gate`] is holding: a held window is moved like any other.
 pub fn ensure_window_on_screen(hwnd: isize) -> bool {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -551,13 +571,18 @@ pub fn set_window_outer_position_px(hwnd: isize, pos: [i32; 2]) {
 /// uncloak it, restore it if iconic and show it if hidden. Deliberately
 /// separate from [`force_foreground`], which must not uncloak because a
 /// restore cloaks on purpose for a few frames.
+///
+/// It also must not undo a [`super::present_gate`] hold: that invisibility is
+/// deliberate and ends with a presented frame, so uncloaking here would compose
+/// the unpainted window the hold is waiting on. The window *state* is still
+/// repaired; `present_gate::present_gate_release` is the one uncloak.
 pub fn ensure_presentable(hwnd: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOW, ShowWindowAsync};
 
     let Some(window) = live_window(hwnd) else {
         return;
     };
-    if is_cloaked(hwnd) {
+    if !super::present_gate::present_gate_held() && is_cloaked(hwnd) {
         set_cloaked(hwnd, false);
     }
     unsafe {
@@ -612,6 +637,11 @@ fn live_window(hwnd: isize) -> Option<HWND> {
 /// It cannot override the foreground lock, so over an exclusive-fullscreen
 /// window it may flash the taskbar button instead of switching. The one
 /// thread allowed to do more uses [`force_foreground_attached`].
+///
+/// It never touches the cloak: showing and raising a window the
+/// [`super::present_gate`] holds is fine — the cloak survives both, and the
+/// show it generates is exactly what the gate re-cloaks on and turns into a
+/// frame request.
 pub fn force_foreground(hwnd: isize) {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsHungAppWindow};
