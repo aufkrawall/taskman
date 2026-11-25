@@ -39,9 +39,9 @@ pub fn disk_etw_test_start() -> Option<disk_etw::DiskUsage> {
 /// Test-only handle into the ETW per-file trace: which of its ordered attempts
 /// actually started, or why none did.
 ///
-/// The order is the design (the global NT Kernel Logger first, a private
-/// system-logger subscription second, a refusal third), and only a live range
-/// can say which of the three a given machine lands in. Returning the refusal
+/// The order is the design (a private system logger first, the global NT
+/// Kernel Logger second, a refusal third), and only a live range can say which
+/// of the three a given machine lands in. Returning the refusal
 /// is what lets an elevated diagnostic report the third case instead of
 /// silently passing.
 #[doc(hidden)]
@@ -50,6 +50,20 @@ pub fn file_etw_test_start()
     let trace = file_etw::FileEtw::try_start(etw::TraceRole::App)?;
     let session = trace.source().name;
     Ok((trace, session))
+}
+
+/// The per-file trace's sample, nameable from the integration tests.
+#[doc(hidden)]
+pub type FileIoSampleForTest = file_etw::FileIoSample;
+
+/// This process's creation identity, as the per-file trace's callers verify
+/// it: a sample bound to 0 could not name a handle from the handle table.
+#[doc(hidden)]
+pub fn own_start_epoch_for_test() -> i64 {
+    process_ops::creation_epoch_from_handle(unsafe {
+        windows::Win32::System::Threading::GetCurrentProcess()
+    })
+    .unwrap_or(0)
 }
 
 #[doc(hidden)]

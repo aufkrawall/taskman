@@ -21,10 +21,11 @@ const REQUIRED_TICKS: u64 = 4;
 ///
 /// A session delivers nothing that happened before it started, and the records
 /// reach the consumer asynchronously, so a sample taken a few milliseconds
-/// after the start can only say `undelivered` — the state means "no transfer of
-/// this process yet", not "no trace". The check gives the delivery three
-/// seconds and reports the wait beside the state, so a verdict that was taken
-/// too early is recognisable instead of final.
+/// after the start can only say `undelivered` — the state means "no completed
+/// transfer decoded yet", not "no trace" — and even a `measured` session may
+/// not have delivered this process's own transfers yet. The check gives the
+/// delivery three seconds and reports the wait beside the state, so a verdict
+/// that was taken too early is recognisable instead of final.
 const FILE_IO_DELIVERY_BUDGET: Duration = Duration::from_secs(3);
 
 /// Interval between two samples of the trace while waiting for that delivery.
@@ -194,32 +195,47 @@ fn write_and_read_back(path: &Path, payload: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Sample the per-file trace until it reports something other than
-/// `undelivered`, or `budget` runs out.
+/// Whether `answer` is final for a check that issued `own_bytes` of file I/O
+/// of its own.
 ///
-/// `undelivered` is the one state a later sample can still change: it says the
-/// session delivered no transfer of this process yet, and delivery is
-/// asynchronous. Every other state is an answer — `unavailable` means there is
-/// no session to wait for, `undecodable` means records arrived and the layout
-/// did not match, `measured` means a transfer was decoded — and so is a failed
-/// request, which no amount of waiting makes askable.
+/// Two answers can still change with time, because delivery is asynchronous:
+/// `undelivered` (the session has not decoded a completed transfer yet), and
+/// `measured` while the process's decoded bytes are still below what the check
+/// itself moved — the session is proven, but this check's own transfers are
+/// still in flight. Every other state is an answer — `unavailable` means there
+/// is no session to wait for, `undecodable` means records arrived and the
+/// layout did not match — and so is a failed request, which no amount of
+/// waiting makes askable.
+fn file_io_settled(answer: &Result<ProcessFileIoSnapshot, String>, own_bytes: u64) -> bool {
+    let Ok(snapshot) = answer else {
+        return true;
+    };
+    let accounting = &snapshot.accounting;
+    match accounting.state {
+        FileIoAccountingState::Undelivered => false,
+        FileIoAccountingState::Measured => {
+            accounting.read_bytes.saturating_add(accounting.write_bytes) >= own_bytes
+        }
+        _ => true,
+    }
+}
+
+/// Sample the per-file trace until its answer settles ([`file_io_settled`]),
+/// or `budget` runs out.
 ///
 /// The loop polls against a deadline instead of sleeping for it: it samples at
 /// once, then at most [`FILE_IO_POLL_INTERVAL`] apart, and returns the sample
 /// that is at or past the deadline rather than assuming one arrived.
 fn await_file_io_delivery(
     budget: Duration,
+    own_bytes: u64,
     mut sample: impl FnMut() -> Result<ProcessFileIoSnapshot, String>,
 ) -> FileIoWait {
     let started = Instant::now();
     loop {
         let answer = sample();
         let waited_ms = elapsed_ms(started);
-        let undelivered = matches!(
-            &answer,
-            Ok(snapshot) if snapshot.accounting.state == FileIoAccountingState::Undelivered
-        );
-        if !undelivered {
+        if file_io_settled(&answer, own_bytes) {
             return FileIoWait { answer, waited_ms };
         }
         let remaining = budget.saturating_sub(started.elapsed());
@@ -273,17 +289,29 @@ fn probe_file_io(mock: bool, snapshot: &tm_core::model::Snapshot) -> FileIoProbe
             .map_err(|error| error.to_string())
     };
     let started = sample();
-    let own_io_error = match &started {
+    let own_io = match &started {
         // Only a session has anything to deliver; with no source there is no
         // trace to feed, and touching the disk for it would measure nothing.
-        Ok(ready) if ready.accounting.state != FileIoAccountingState::Unavailable => {
-            exercise_own_file_io_in(&tm_core::settings::taskman_data_dir()).err()
-        }
+        Ok(ready) if ready.accounting.state != FileIoAccountingState::Unavailable => Some(
+            exercise_own_file_io_in(&tm_core::settings::taskman_data_dir()),
+        ),
         _ => None,
     };
+    let own_bytes = match &own_io {
+        Some(Ok(bytes)) => *bytes,
+        _ => 0,
+    };
+    let own_io_error = own_io.and_then(Result::err);
     let waited = match started {
-        Ok(ready) if ready.accounting.state == FileIoAccountingState::Undelivered => {
-            await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, sample)
+        // The first sample predates the check's own I/O, so a session that
+        // can deliver is sampled again until that I/O shows.
+        Ok(ready)
+            if matches!(
+                ready.accounting.state,
+                FileIoAccountingState::Undelivered | FileIoAccountingState::Measured
+            ) =>
+        {
+            await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, own_bytes, sample)
         }
         answer => FileIoWait {
             answer,
@@ -739,7 +767,7 @@ mod tests {
     #[test]
     fn a_later_sample_that_delivers_is_measured_after_a_wait() {
         let mut samples = 0;
-        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, || {
+        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, 0, || {
             samples += 1;
             Ok(if samples == 1 {
                 snapshot_in(FileIoAccountingState::Undelivered)
@@ -770,13 +798,43 @@ mod tests {
         assert_eq!(summary["decoded_bytes"], serde_json::json!(6144));
     }
 
+    /// A session that is already measuring is sampled again until the check's
+    /// OWN bytes show: the session-wide proof arrives before this process's
+    /// transfers do, and a verdict taken in between would report another
+    /// process's activity (or a zero) as this check's measurement.
+    #[test]
+    fn a_measured_session_is_waited_on_until_the_own_bytes_show() {
+        let measured = |read_bytes| ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                state: FileIoAccountingState::Measured,
+                read_bytes,
+                write_bytes: 0,
+                ..Default::default()
+            },
+        };
+        let mut samples = 0;
+        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, 4_096, || {
+            samples += 1;
+            Ok(measured(if samples < 3 { 0 } else { 4_096 }))
+        });
+        assert_eq!(samples, 3);
+        let summary = file_io_summary(&FileIoProbe {
+            pid: Some(4242),
+            waited,
+            own_io_error: None,
+        });
+        assert_eq!(summary["state"], serde_json::json!("measured"));
+        assert_eq!(summary["decoded_bytes"], serde_json::json!(4_096));
+    }
+
     /// A trace that never delivers keeps saying so — after the whole deadline —
     /// and publishes no byte total for the silence.
     #[test]
     fn a_trace_that_never_delivers_stays_undelivered_after_the_deadline() {
         let budget = Duration::from_millis(40);
         let mut samples = 0;
-        let waited = await_file_io_delivery(budget, || {
+        let waited = await_file_io_delivery(budget, 0, || {
             samples += 1;
             Ok(snapshot_in(FileIoAccountingState::Undelivered))
         });
@@ -796,9 +854,9 @@ mod tests {
         assert_eq!(summary["decoded_bytes"], serde_json::Value::Null);
     }
 
-    /// Only `undelivered` is a verdict a later sample can change: a missing
-    /// source, a layout that did not decode, a measurement and a refused
-    /// question are all answers on the first sample.
+    /// With no own bytes outstanding, only `undelivered` is a verdict a later
+    /// sample can change: a missing source, a layout that did not decode, a
+    /// measurement and a refused question are all answers on the first sample.
     #[test]
     fn an_answer_that_cannot_change_is_not_waited_on() {
         let one_poll = FILE_IO_POLL_INTERVAL.as_millis() as u64;
@@ -808,7 +866,7 @@ mod tests {
             FileIoAccountingState::Measured,
         ] {
             let mut samples = 0;
-            let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, || {
+            let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, 0, || {
                 samples += 1;
                 Ok(snapshot_in(state))
             });
@@ -817,7 +875,7 @@ mod tests {
         }
 
         let mut samples = 0;
-        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, || {
+        let waited = await_file_io_delivery(FILE_IO_DELIVERY_BUDGET, 0, || {
             samples += 1;
             Err("the trace refused the request".to_string())
         });

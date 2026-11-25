@@ -392,19 +392,18 @@ pub enum FileIoAccountingState {
     /// The rows carry no byte counts.
     #[default]
     Unavailable,
-    /// A trace is running but delivered nothing this sample could count: no
-    /// file event at all, or none that attributed a read or write to THIS
-    /// process. A silent window cannot be told apart from a broken
-    /// subscription, so it is treated as unknown rather than as zero activity.
+    /// A trace is running but has not decoded a single completed read or write
+    /// anywhere on the machine yet. A silent window cannot be told apart from a
+    /// broken subscription, so it is treated as unknown rather than as zero
+    /// activity. (Once the session has proven it delivers transfers, a process
+    /// with none is [`Self::Measured`] at zero.)
     Undelivered,
     /// The target issued file requests but none of the records could be
     /// decoded: the payload layout is not what this build expects.
     Undecodable,
-    /// No trace could be started because the single global kernel session — the
-    /// only one that delivers the classic `FileIo` class, which is what per-file
-    /// bytes need — is owned by ANOTHER application right now
-    /// (`ERROR_ALREADY_EXISTS` from `StartTraceW`, plus the fallback session
-    /// refusing).
+    /// No trace could be started: the private file session was refused, and
+    /// the fallback — the single global kernel session — is owned by ANOTHER
+    /// application right now (`ERROR_ALREADY_EXISTS` from `StartTraceW`).
     ///
     /// Distinct from [`Self::Unavailable`] because it is not a privilege
     /// problem and the user can act on it: some other tracing tool (a
@@ -415,7 +414,9 @@ pub enum FileIoAccountingState {
     /// reporting it as one would suggest the subscription is broken. The rows
     /// carry no byte counts.
     KernelLoggerInUse,
-    /// Counts are measured. Absence of a file means it saw no I/O.
+    /// Counts are measured: completed logical reads and writes since the trace
+    /// started. A row the trace knows the process has open reads zero when it
+    /// saw no transfer; a row it knows nothing about stays unavailable.
     Measured,
 }
 

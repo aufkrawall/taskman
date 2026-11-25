@@ -769,20 +769,16 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   issuing thread. The events come from `SystemIoProviderGuid` on a
   system-logger session instead (Windows 10 2004+). On older builds the
   session cannot start and the column reports "—".
-- The per-file trace's shape (a system logger enabling `SystemIoProviderGuid`
-  with `SYSTEM_IO_KW_FILE`, decoding classic `FileIo` records) is what the
-  System Providers documentation and the sibling `disk_etw` session support, but
-  it has not been proven on live kernel events in this tree: the elevated
-  `--selfcheck` so far only showed the two shapes that delivered nothing (the
-  manifest `EnableTraceEx2` for `Microsoft-Windows-Kernel-File`, and the legacy
-  `EVENT_TRACE_FLAG_FILE_IO` flag — both reported `undelivered` with
-  `events_lost` 0 while the session was running). `file_etw::tests` pins the
-  enable, the decode and the state rules, and `--selfcheck`'s `file_io` block is
-  the proof: since 2026-11-25 the check writes, flushes and reads back a
-  temporary file of its own and polls for up to 3 s, so `measured` means the
-  keyword delivered records and `undelivered` with `waited_ms` near 3000 is a
-  real negative — the earlier `undelivered` at `since_ms` 4 decided nothing.
-  If a live run still reports `undelivered` after that wait with the session
-  running, the remaining lever is `SYSTEM_IO_KW_FILENAME` (the name-only
-  keyword), which needs no other change to the decode path; `SYSTEM_IO_KW_DISK`
-  must not be added — it would turn the disk graphs' rate into this session's.
+- The per-file trace (`file_etw.rs`) was proven on live events on build 26300
+  (2026-11-25): opcodes 64–68/76, template version 3, exact byte counts in the
+  ignored elevated test `the_file_trace_measures_exact_bytes_per_file`. Open
+  limits: only version 3 is decoded (any other version is `Undecodable`, logged
+  with opcode/version/length — re-probe on a new Windows build before adding
+  one); a file touched only through a memory-mapped view shows no bytes
+  (paging I/O is excluded on purpose); a request whose `OpEnd` arrives BEFORE
+  the request itself (cross-CPU delivery order) is dropped and counted in the
+  `orphaned_requests` trace log, not shown; naming objects from the handle
+  table needs `SeDebugPrivilege` for object addresses (LocalSystem and an
+  elevated admin have it). Linux has no per-file source at all (would need
+  eBPF on `vfs_read`/`vfs_write` with root) and keeps the columns
+  `Unavailable`.

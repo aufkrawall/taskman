@@ -1,4 +1,4 @@
-//! Per-file read and written bytes from a real-time Kernel-File ETW session.
+//! Per-file read and written bytes from a real-time kernel `FileIo` trace.
 //!
 //! ## Why this exists
 //!
@@ -12,184 +12,124 @@
 //! would be "written" again at full size, a seek is not a transfer, and a
 //! memory-mapped view is invisible to both.
 //!
-//! `Microsoft-Windows-Kernel-File` is the provider that knows. It reports one
-//! event per read and write with the request size, plus the Create that names
-//! the file object it was issued on. Summed per (process, file) that is the
-//! number the dialog shows.
+//! The kernel's file I/O hooks are what know. They report every request a
+//! process issues — Create, Read, Write, Cleanup, Close, ... — with the issuing
+//! process in the record header and the `FILE_OBJECT` the request went to in
+//! the payload, and they report each request's completion (`OpEnd`) with the
+//! bytes it really transferred.
 //!
-//! ## What is subscribed, and how it is decoded
+//! ## The subscription — measured, not assumed
 //!
-//! The events come from the KERNEL's file I/O hooks and arrive as classic
-//! (MOF) `FileIo` records. Which session delivers them is the whole problem,
-//! and it is answered by three ordered attempts ([`sources`]):
+//! Every shape below was checked with an elevated probe on Windows 11 build
+//! 26300 that started the session, did its own file I/O, and histogrammed what
+//! arrived (`llm-wiki/log/recent.md`, 2026-11-25):
 //!
-//! 1. **The single global kernel session — [`etw::KERNEL_LOGGER`]** with
-//!    `EnableFlags = EVENT_TRACE_FLAG_FILE_IO`
-//!    ([`LoggerKind::KernelFile`]). This is the session the classic `FileIo`
-//!    class has always been delivered by, and the flag IS the subscription:
-//!    it is the kernel logger's own enable mechanism. Enabled with no provider
-//!    calls ([`KERNEL_PROVIDERS`] is empty) and decoded by class GUID + opcode
-//!    like every other classic kernel record.
-//! 2. **A private system logger** ([`LoggerKind::SystemFile`]) subscribing to
-//!    the SystemIo GROUP with `SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME`
-//!    ([`PROVIDERS`]) — the documented SystemIo keyword set, and the same
-//!    shape [`super::disk_etw`] uses live for `SYSTEM_IO_KW_DISK`. This exists
-//!    because the kernel logger is EXCLUSIVE: when another tracing tool owns
-//!    it (Process Hacker-style monitors, `wpr`, an installer's logger), a
-//!    private session is the only session left that may still carry the class.
-//! 3. **Nothing left**, and then the answer is a state, never a number:
-//!    [`FileTraceRefusal::KernelLoggerInUse`] when attempt 1 reported
-//!    `ERROR_ALREADY_EXISTS` and attempt 2 was refused as well, which
-//!    [`attach_refusal`] turns into
-//!    [`crate::actions::FileIoAccountingState::KernelLoggerInUse`], or
-//!    [`FileTraceRefusal::Unavailable`] for every other refusal (no elevation,
-//!    no free logger slot, a provider enable Windows said no to).
+//! * `EVENT_TRACE_FLAG_FILE_IO` alone — and the SystemIo provider's
+//!   `SYSTEM_IO_KW_FILE` keyword, which is the same stream — delivers ONLY
+//!   `OpEnd` completions (opcode 76): ~22 000 in four seconds and not one
+//!   request. Earlier builds subscribed exactly like that.
+//! * `EVENT_TRACE_FLAG_FILE_IO_INIT` delivers the requests: Create 64,
+//!   Cleanup 65, Close 66, Read 67, Write 68 (and the info, directory, flush
+//!   and path operations around them). Earlier builds filtered on 12..16 —
+//!   the manifest provider's EVENT IDS, which a classic record never carries —
+//!   and so discarded every request even where one did arrive.
+//! * Both flags work on a PRIVATE system logger
+//!   ([`LoggerKind::SystemFile`]), which is the preferred session: it
+//!   coexists with other tracing tools. The single global NT Kernel Logger
+//!   ([`LoggerKind::KernelFile`]) is the fallback when no private session can
+//!   be started, and it is EXCLUSIVE — when another application owns it, that
+//!   is reported as [`FileTraceRefusal::KernelLoggerInUse`] rather than
+//!   reclaimed.
+//! * `EVENT_TRACE_FLAG_DISK_FILE_IO` (file-name rundown) was measured too and
+//!   is NOT used: its rundown of already-open files arrives when the session
+//!   STOPS, ~79 000 records at once, which is no help to a live trace.
 //!
-//! Three shapes that look right deliver nothing, and a live elevated selfcheck
-//! reported `undelivered` with `events_lost` at 0 on each of them: enabling the
-//! MANIFEST GUID of `Microsoft-Windows-Kernel-File` on an ordinary manifest
-//! session (what this module originally did), the same provider on a system
-//! logger changed to a provider enable of the manifest GUID, and asking a
-//! PRIVATE system logger for `EVENT_TRACE_FLAG_FILE_IO` through `EnableFlags`.
-//! `EnableTraceEx2` returns success on all three, the session runs, and not one
-//! record ever arrives. That is why attempt 1 uses the flag on the kernel
-//! logger — where it is the mechanism — and attempt 2 uses a provider enable
-//! with empty `EnableFlags`. The two are NOT interchangeable.
+//! Records are identified the classic way: `FileIoGuid` in
+//! `EventHeader.ProviderId`, the operation in the opcode, template version 3.
+//! The payloads (x64, pointer `P` = 8 bytes; the fields are kernel addresses,
+//! so `P` is the machine's width whatever the issuing process is):
 //!
-//! Records are identified the way every classic kernel record is — the enable
-//! names a GROUP, each record names its class: the MOF class GUID in
-//! `EventHeader.ProviderId` ([`FileIoGuid`]) and the operation in
-//! `EventHeader.EventDescriptor.Opcode`. Those opcodes are the numbers the
-//! provider's manifest lists as event ids (`Create` 12, `Cleanup` 13,
-//! `Close` 14, `Read` 15, `Write` 16 — the same kernel hooks, so the
-//! id-to-operation mapping is unchanged). Every other operation is ignored, but
-//! neither subscription can select a subset of the class: directory
-//! enumeration, flush, information classes and deletes are delivered too and
-//! discarded in the callback, which is why the private session gets the
-//! largest buffer set in [`super::etw`].
-//!
-//! The correlation, decoding and accounting below are shared by both attempts
-//! on purpose: the records are the same class whichever session carried them,
-//! so a byte measured through the kernel logger and a byte measured through
-//! the private session mean the same thing — and the callback accepts either.
-//!
-//! Beyond the kernel logger, the fallback rides its own system logger rather
-//! than the disk session's: Windows multiplexes the SystemTraceProvider over up
-//! to eight logger sessions and reserves only the first two for the NT Kernel
-//! Logger and the Circular Kernel Context Logger (SystemTraceProvider session
-//! documentation), so the disk, loader, profile and file traces each host one
-//! of the remaining slots. One session per feature is also what lets this
-//! trace live exactly as long as the I/O page needs it: adding the FILE
-//! keyword to the disk session would trace every file on the machine for as
-//! long as the Performance page samples disks.
-//!
-//! Payloads are decoded by hand, at offsets taken from the provider's manifest
-//! templates — `wevtutil gp Microsoft-Windows-Kernel-File /ge:true` lists the
-//! ids and tasks, and PowerShell's
-//! `[System.Diagnostics.Eventing.Reader.ProviderMetadata]` prints each
-//! version's fields; there is no TDH decoding path in this crate, and one event
-//! family does not justify adding one. The classic payload is the same one the
-//! manifest templates describe: `Microsoft-Windows-Kernel-Disk` has no tasks
-//! and lists its events as values 10 and 11, matching the classic `DiskIo`
-//! opcodes `super::disk_etw` decodes.
-//!
-//! | id | event | v1 layout (after `ByteOffset` for the transfers) |
+//! | opcode | event | layout |
 //! | --- | --- | --- |
-//! | 12 | Create | `Irp` ptr, `FileObject` ptr, `IssuingThreadId` u32, `CreateOptions`, `CreateAttributes`, `ShareAccess`, `FileName` |
-//! | 13 | Cleanup | `Irp` ptr, `FileObject` ptr, `FileKey` ptr, `IssuingThreadId` u32 |
-//! | 14 | Close | same as Cleanup |
-//! | 15 | Read | u64, `Irp` ptr, `FileObject` ptr, `FileKey` ptr, `IssuingThreadId` u32, `IOSize` u32, `IOFlags`, `ExtraFlags` |
-//! | 16 | Write | same as Read |
+//! | 64 | Create | `Irp` P, `FileObject` P, `TTID` u32, `CreateOptions` u32, `FileAttributes` u32, `ShareAccess` u32, `OpenPath` UTF-16 |
+//! | 65/66 | Cleanup/Close | `Irp` P, `FileObject` P, `FileKey` P, `TTID` u32 |
+//! | 67/68 | Read/Write | `Offset` u64, `Irp` P, `FileObject` P, `FileKey` P, `TTID` u32, `IoSize` u32, `IoFlags` u32, `ExtraFlags` u32 |
+//! | 76 | OpEnd | `Irp` P, `ExtraInfo` P, `NtStatus` u32 |
 //!
-//! **Both template versions are decoded.** Version 0 spells the issuing thread
-//! as a pointer (`ThreadId`) and carries no `ExtraFlags`; version 1 uses a
-//! 32-bit `IssuingThreadId`. They differ by four bytes from the second field
-//! on, so reading a v0 record with the v1 offsets lands on a neighbouring
-//! field — the size would be a number read out of the wrong four bytes, which
-//! is a fabricated measurement, not a gap. The version is therefore part of the
-//! decode and an unknown version is counted as undecodable.
+//! Any other version is counted as undecodable and logged with its opcode,
+//! version and length, never guessed at.
 //!
-//! ## Correlation, and its bounds
+//! ## What one count means
 //!
-//! Create carries `FileObject -> FileName`; Read and Write carry the
-//! `FileObject` and no name. The map from one to the other is the whole
-//! feature, and both ends of it are bounded:
+//! **Completed bytes of logical requests.** A Read/Write is held as pending
+//! under its `Irp`; its `OpEnd` charges `ExtraInfo` — the bytes the request
+//! actually moved — to the request's process and file object. This matters,
+//! and the probe showed why:
 //!
-//! * [`MAX_OPEN_FILES`] caps the `FileObject -> name` map. A lost Close (ETW
-//!   drops events under load) leaks one entry, so on overflow the map is
-//!   dropped wholesale and the discarded entries are counted; files that stay
-//!   open then read and write into the unnamed remainder until they are opened
-//!   again. Dropping is visible, growing is not.
-//! * [`MAX_TRACKED_FILES_PER_PID`] caps distinct paths per process. Beyond it a
-//!   file's bytes go into the omitted remainder instead of a row: a row whose
-//!   count started mid-stream would look complete and be wrong.
-//! * [`MAX_TRACKED_FILES`] caps distinct (process, path) pairs across the whole
-//!   session, because the per-process cap alone would let a thousand live
-//!   processes hold eight million paths. A file past it also lands in the
-//!   omitted remainder, and the drop is counted.
-//! * Bytes whose `FileObject` was never seen are NOT attributed to anything.
-//!   That is the common case at the start of a session for long-lived handles
-//!   (a database, a log file, a VM image opened hours ago), and the honest
-//!   answer is a remainder that the dialog shows as unavailable.
-//! * A `FileObject` seen under a DIFFERENT process than the Create means either
-//!   a duplicated handle or a reused pointer after a missed Close. Either way
-//!   the old name cannot be trusted for this record, so it stays unnamed.
-//! * **Within one process, pointer reuse is invisible.** The payload carries
-//!   nothing but the address, so if both the Close and the next Create are
-//!   lost, a transfer on the reused address is charged to the name of whatever
-//!   held that address before. The bytes stay in the process's attribution —
-//!   only the name is stale — and no field in the record can detect it.
+//! * A cached write is often logged TWICE: a fast-I/O attempt that a file
+//!   system filter refuses (`OpEnd` status `0xC01C0004`,
+//!   `STATUS_FLT_DISALLOW_FAST_IO`, 0 bytes) and the IRP retry that does the
+//!   work. Counting requests counted that write twice; a failed completion
+//!   counts nothing.
+//! * A read at end of file asks for more than it gets; the completion says
+//!   what it got.
 //!
-//! ## Things that are easy to get wrong here
+//! **Paging I/O is excluded** (`IoFlags & IRP_PAGING_IO`). A flush of cached
+//! data, the lazy writer and a page fault on a mapped view all show up as
+//! paging requests — the probe saw a 128 KiB flush charged to the writer right
+//! after its own two 64 KiB writes. Counting them would charge the same bytes
+//! twice, and it is not what the per-process `IO_COUNTERS` count either. A
+//! file read or written only through a memory-mapped view therefore shows no
+//! bytes, which is the same thing the process counters show.
 //!
-//! * **The name is a DEVICE path.** Kernel-File reports
-//!   `\Device\HarddiskVolume3\Users\...`, while the rows come from
-//!   `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` as `C:\Users\...`. Without
-//!   translating the device prefix the two never compare equal and not one byte
-//!   would ever reach a row. [`dos_path`] does that translation against
-//!   `QueryDosDeviceW`, and an unresolvable name stays a remainder.
-//! * **A session in which nothing could be decoded is UNKNOWN, not zero.** See
-//!   [`FileIoSample::state`]: an idle machine is [`FileIoAccountingState::Undelivered`]
-//!   when no file event arrived at all or none of them attributed a read or a
-//!   write to the process being asked about, and
-//!   [`FileIoAccountingState::Undecodable`] when records arrived and none of
-//!   them parsed. A session that never STARTED is neither: it is
-//!   [`FileIoAccountingState::KernelLoggerInUse`] when another application owns
-//!   the kernel logger ([`attach_refusal`]), and
-//!   [`FileIoAccountingState::Unavailable`] for every other refusal. Collapsing
-//!   a refusal into `Undelivered` would report a session that does not exist.
-//! * **These are REQUESTED sizes.** The record is written when the file system
-//!   receives the request, so a request that fails or completes short counts at
-//!   its requested size. It is what every consumer of this provider reports,
-//!   and it is not a file size or an offset.
-//! * The session lifetime rules (fixed names, orphan reclamation, the
-//!   administrator requirement) live in [`super::etw`]. The kernel logger is the
-//!   one name that is NOT ours to reclaim; see [`LoggerKind::KernelFile`].
+//! An `Irp` value is reused once its request is done, so a pending entry that
+//! another request on the same `Irp` overtakes is dropped (its completion was
+//! lost); any other `FileIo` request carries its `Irp` first and invalidates
+//! the same way, so a later completion of an unrelated operation can never be
+//! charged as transferred bytes.
 //!
-//! ## What is verified here, and what is not
+//! ## Naming the file object
 //!
-//! The ids, versions and field offsets above were read from the installed
-//! provider manifest. The fallback enable is the one [`super::disk_etw`] already
-//! uses live for the `DiskIo` class (`SystemIoProviderGuid` with a keyword,
-//! records decoded by their class GUID, on a system logger); the preferred
-//! session is the kernel logger with `EVENT_TRACE_FLAG_FILE_IO`, the shape
-//! Process Hacker-style tools have always used and the SDK's kernel-logger
-//! example documents (`SystemTraceControlGuid` in `Wnode.Guid`, real-time,
-//! no `EVENT_TRACE_SYSTEM_LOGGER_MODE`). The decode/accounting path is covered
-//! by tests with synthetic records, including records driven through the real
-//! callback under the classic identity — and both attempts share that path, so
-//! the same synthetic `FileIo` record proves either session's records decode.
+//! Create carries `FileObject -> OpenPath`; transfers carry only the
+//! `FileObject`. A handle opened BEFORE the session started has no Create in
+//! it, which is the normal case for exactly the files that matter (a database,
+//! a log, a VM image). Those objects are named from the system handle table
+//! instead: [`super::process_file_io::name_file_objects`] reads the kernel
+//! address of every file handle the process holds, names each through a
+//! duplicate exactly the way the file list names its rows, and verifies the
+//! duplicate still refers to that object. The probe confirmed the table's
+//! object address IS the record's `FileObject`. This happens on the first
+//! sample of a process and again (throttled by [`SEED_INTERVAL`]) whenever
+//! bytes arrive on an object that is still unnamed — and bytes that arrived
+//! before the name are moved onto it, so nothing measured is lost to timing.
 //!
-//! What a synthetic record cannot prove is that a given Windows build ACCEPTS
-//! one of these session shapes, that names really arrive as device paths, and
-//! that ETW delivers every record at machine rates. A run that delivers nothing
-//! reports [`FileIoAccountingState::Undelivered`] and a run that delivers
-//! records this decoder rejects reports
-//! [`FileIoAccountingState::Undecodable`] with the rejected opcode, version and
-//! payload length logged, so a broken subscription shows up as a state rather
-//! than as zeros. `--selfcheck` reports that state headlessly (see
-//! `llm-wiki/debug-tools.md`), including which attempt ran, since the log line
-//! names the session and its kind.
+//! An object that is closed before it could be named keeps its bytes in the
+//! unnamed remainder. Names are device paths (`\Device\HarddiskVolume3\...`)
+//! and are translated to the DOS paths the rows use ([`dos_path`]).
+//!
+//! ## Bounds
+//!
+//! * [`MAX_OPEN_FILES`] caps the `FileObject -> name` map; on overflow it is
+//!   cleared and the discarded entries counted.
+//! * [`MAX_PENDING_REQUESTS`] caps in-flight requests; a lost `OpEnd` leaks at
+//!   most until the next request on that `Irp`, and the map is cleared at the
+//!   cap.
+//! * [`MAX_UNRESOLVED_OBJECTS`] caps bytes waiting for a name; past it they go
+//!   straight to the unnamed remainder.
+//! * [`MAX_TRACKED_FILES_PER_PID`] and [`MAX_TRACKED_FILES`] cap paths; past
+//!   them bytes go to the omitted remainder and the drop is counted.
+//! * A `FileObject` used by a DIFFERENT process than the one that opened it (a
+//!   duplicated handle) keeps its bytes unnamed for that process.
+//!
+//! ## States
+//!
+//! A session that never started is [`FileIoAccountingState::Unavailable`] (or
+//! `KernelLoggerInUse`, see above). A running session that has not decoded one
+//! completed transfer anywhere on the machine yet is `Undelivered`; records
+//! that arrived and could not be decoded are `Undecodable`. Once the session
+//! has decoded a completed transfer it is proven to see every process, so a
+//! process with no transfer is a MEASURED zero — that is a measurement, not a
+//! gap. Rows still read unavailable unless the trace knows their file object.
 //!
 //! ## What this module publishes
 //!
@@ -206,52 +146,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
-use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_RECORD, FileIoGuid, SYSTEM_IO_KW_FILE, SYSTEM_IO_KW_FILENAME, SystemIoProviderGuid,
-};
+use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, FileIoGuid};
 use windows::core::PCWSTR;
 
-use super::etw::{
-    self, KERNEL_LOGGER, LoggerKind, Provider, Session, StartError, TraceContext, TraceRole,
-};
+use super::etw::{self, KERNEL_LOGGER, LoggerKind, Session, StartError, TraceContext, TraceRole};
 use crate::actions::FileIoAccountingState;
-
-/// The FALLBACK session shape see the module docs: the private system logger.
-///
-/// Named so a test can pin the wiring: the kind is the system logger half of
-/// the subscription, and the manifest kind this module used before delivers
-/// nothing at all.
-pub(super) const LOGGER_KIND: LoggerKind = LoggerKind::SystemFile;
-
-/// What the FALLBACK session enables: the SystemIo group with the file
-/// keywords.
-///
-/// This is a PROVIDER call, not a legacy `EnableFlags` flag — `EnableTraceEx2`
-/// with `SystemIoProviderGuid` and the keywords against a system logger (System
-/// Providers documentation). Other shapes are accepted and deliver no record:
-/// the manifest GUID of `Microsoft-Windows-Kernel-File`, and
-/// `EVENT_TRACE_FLAG_FILE_IO` on a PRIVATE system logger (a live elevated
-/// selfcheck reported `undelivered` with `events_lost` 0 on them). The enable is
-/// therefore the shape [`super::disk_etw`] already uses live, a keyword set at a
-/// time so the FILE class is the only thing this stream carries.
-///
-/// `SYSTEM_IO_KW_FILE` is the class; `SYSTEM_IO_KW_FILENAME` is its name
-/// companion, kept because a Create is only useful when its name arrives.
-///
-/// The keywords name the GROUP; the records still arrive under their classic
-/// class GUID ([`FileIoGuid`]) — see [`on_event`].
-pub(super) const PROVIDERS: [Provider; 1] = [Provider {
-    guid: SystemIoProviderGuid,
-    match_any_keyword: SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME,
-}];
-
-/// What the PREFERRED session enables: nothing through a provider.
-///
-/// The kernel logger's subscription is its `EnableFlags`
-/// (`EVENT_TRACE_FLAG_FILE_IO`), set in [`super::etw::LoggerKind::KernelFile`].
-/// Enabling a provider on it as well would subscribe twice and deliver the
-/// class twice.
-pub(super) const KERNEL_PROVIDERS: [Provider; 0] = [];
 
 /// Why no per-file session could be started.
 ///
@@ -259,65 +158,70 @@ pub(super) const KERNEL_PROVIDERS: [Provider; 0] = [];
 /// measurement, and they are not the same failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTraceRefusal {
-    /// The kernel logger is owned by another application
-    /// (`ERROR_ALREADY_EXISTS` from `StartTraceW`) AND the private fallback was
-    /// refused as well, so there is no session at all.
+    /// The private session was refused AND the kernel logger fallback is owned
+    /// by another application (`ERROR_ALREADY_EXISTS` from `StartTraceW`), so
+    /// there is no session at all.
     ///
     /// Reported as its own state because it is actionable and because it must
     /// never be mistaken for a silent window: nothing started, so nothing can
     /// arrive later without the owner going away first.
     KernelLoggerInUse,
-    /// No session for any other reason: no elevation, no free
-    /// SystemTraceProvider slot, a refused provider enable.
+    /// No session for any other reason: no elevation, no free logger slot.
     Unavailable,
 }
 
-/// One ordered attempt at a session: what to start, and what that shape
-/// subscribes with.
+/// One ordered attempt at a session.
 ///
 /// A table rather than two inline calls so the ORDER — which is the design —
 /// is data a test can read, instead of control flow it has to infer.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FileSource {
-    /// ETW session name to start. The kernel logger's is fixed and global; the
-    /// fallback's is per role, so the two hosts never share one.
+    /// ETW session name to start. The private session's is per role, so the
+    /// two hosts never share one; the kernel logger's is fixed and global.
     pub name: &'static str,
     pub kind: LoggerKind,
-    /// Provider enables. Empty for the kernel logger, whose `EnableFlags` are
-    /// the subscription.
-    pub providers: &'static [Provider],
 }
 
 /// The ordered attempts for one host role, best first; see the module docs.
 ///
-/// Attempt 1 comes first every time a session is (re)started, not just at
-/// startup: the kernel logger can be released by its owner at any moment, and
-/// the next restart should prefer it again rather than stay on the fallback
-/// for the life of the process.
+/// Both kinds subscribe through their `EnableFlags` alone, so neither enables
+/// a provider. The order is re-tried best-first on every (re)start.
 pub(super) fn sources(role: TraceRole) -> [FileSource; 2] {
     [
         FileSource {
-            name: KERNEL_LOGGER,
-            kind: LoggerKind::KernelFile,
-            providers: &KERNEL_PROVIDERS,
+            name: session_name(role),
+            kind: LoggerKind::SystemFile,
         },
         FileSource {
-            name: session_name(role),
-            kind: LOGGER_KIND,
-            providers: &PROVIDERS,
+            name: KERNEL_LOGGER,
+            kind: LoggerKind::KernelFile,
         },
     ]
 }
 
-/// Opcodes of the five operations this module reads, in the classic `FileIo`
-/// class. They are the provider's task values too, which is why the manifest
-/// and classic generations agree on them; every other opcode (name create,
-/// directory enumeration, flush, information classes, deletes, ...) is ignored.
-const EVENT_CREATE: u16 = 12;
-const EVENT_CLEANUP: u16 = 13;
-const EVENT_CLOSE: u16 = 14;
-const EVENT_READ: u16 = 15;
-const EVENT_WRITE: u16 = 16;
+/// Opcodes of the classic `FileIo` class this module reads; see the module
+/// docs for their layouts.
+const EVENT_CREATE: u8 = 64;
+const EVENT_CLEANUP: u8 = 65;
+const EVENT_CLOSE: u8 = 66;
+const EVENT_READ: u8 = 67;
+const EVENT_WRITE: u8 = 68;
+const EVENT_OP_END: u8 = 76;
+
+/// The other `FileIo` REQUEST opcodes (set/query information, directory
+/// enumeration and notification, flush, file-system control, path
+/// operations). Their payloads lead with the `Irp`, which is all this module
+/// reads from them: a new request on an `Irp` retires whatever was pending on
+/// it. Name records (0, 32, 35, 36) lead with a file key instead and are not in
+/// this range.
+const OTHER_REQUESTS: std::ops::RangeInclusive<u8> = 69..=86;
+
+/// The template version every layout here was measured on.
+const FILE_IO_VERSION: u8 = 3;
+
+/// `IRP_PAGING_IO` in a transfer's `IoFlags`: cache flushes, the lazy writer
+/// and page faults. Excluded; see the module docs.
+const IRP_PAGING_IO: u32 = 0x2;
 
 /// A single request bigger than this did not come from this payload layout.
 /// Windows splits I/O long before a gigabyte, so anything above it is a read
@@ -328,26 +232,36 @@ const MAX_PLAUSIBLE_TRANSFER: u32 = 1 << 30;
 ///
 /// A lost Close leaks one entry, and ETW does drop events under load; on
 /// overflow the map is cleared (see [`Shared::create`]) and the discarded
-/// entries are counted, so it cannot grow without limit. The cost is not the
-/// entry (a `u64` key and a `{pid, Arc<str>}` value) but the name it points at:
-/// at `MAX_PATH` a name is 260 UTF-16 units, so ~520 bytes plus an allocation
-/// header, and the whole map is roughly 37 MB — not the few megabytes an
-/// ordinary process's short names would suggest.
+/// entries are counted, so it cannot grow without limit. At `MAX_PATH` names
+/// the whole map is roughly 37 MB.
 const MAX_OPEN_FILES: usize = 65_536;
+
+/// Upper bound on requests waiting for their completion. A request whose
+/// `OpEnd` was lost stays until another request reuses its `Irp`; the cap
+/// keeps a burst of such losses from growing the map, and clearing at it is
+/// counted.
+const MAX_PENDING_REQUESTS: usize = 65_536;
+
+/// Upper bound on unnamed file objects whose bytes wait for a name from the
+/// handle table. Past it, bytes go straight to the unnamed remainder.
+const MAX_UNRESOLVED_OBJECTS: usize = 65_536;
 
 /// Upper bound on distinct files tracked per process. A build or a package
 /// manager can touch hundreds of thousands of files; past this cap a file's
 /// bytes land in the omitted remainder instead of a row.
 const MAX_TRACKED_FILES_PER_PID: usize = 8_192;
 
-/// Upper bound on distinct (process, path) pairs across all processes.
-///
-/// The per-process cap alone is not a memory bound: a machine with a thousand
-/// live processes could hold eight million paths. At `MAX_PATH` names an entry
-/// is ~570 bytes, so this budget is roughly 37 MB for the whole session. Past
-/// it a file's bytes land in the requesting process's omitted remainder and the
-/// drop is counted in [`State::dropped_paths`].
+/// Upper bound on distinct (process, path) pairs across all processes, so a
+/// thousand live processes cannot hold eight million paths. Past it a file's
+/// bytes land in the requesting process's omitted remainder and the drop is
+/// counted in [`State::dropped_paths`].
 const MAX_TRACKED_FILES: usize = 65_536;
+
+/// Shortest gap between two handle-table namings of unnamed objects. A read of
+/// the system handle table costs ~10–20 ms on a desktop, twice per naming (the
+/// second read verifies), so a process churning through short-lived files must
+/// not trigger one per poll. A process's FIRST sample is never throttled.
+const SEED_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long a miss may reuse the drive list before it is rescanned. A miss is
 /// normal (`\Device\Mup\...` is a network share and never maps to a drive), and
@@ -362,13 +276,17 @@ pub struct FileBytes {
 }
 
 impl FileBytes {
-    fn add(&mut self, write: bool, size: u32) {
-        let bytes = u64::from(size);
+    fn add(&mut self, write: bool, bytes: u64) {
         if write {
             self.write_bytes = self.write_bytes.saturating_add(bytes);
         } else {
             self.read_bytes = self.read_bytes.saturating_add(bytes);
         }
+    }
+
+    fn merge(&mut self, other: FileBytes) {
+        self.read_bytes = self.read_bytes.saturating_add(other.read_bytes);
+        self.write_bytes = self.write_bytes.saturating_add(other.write_bytes);
     }
 }
 
@@ -380,13 +298,17 @@ pub struct Remainder {
 }
 
 impl Remainder {
-    fn add(&mut self, write: bool, size: u32) {
-        let bytes = u64::from(size);
+    fn add(&mut self, write: bool, bytes: u64) {
         if write {
             self.write_bytes = self.write_bytes.saturating_add(bytes);
         } else {
             self.read_bytes = self.read_bytes.saturating_add(bytes);
         }
+    }
+
+    fn merge(&mut self, bytes: FileBytes) {
+        self.read_bytes = self.read_bytes.saturating_add(bytes.read_bytes);
+        self.write_bytes = self.write_bytes.saturating_add(bytes.write_bytes);
     }
 }
 
@@ -398,35 +320,37 @@ pub struct FileIoSample {
     pub running: bool,
     /// How long this process's counts have been accumulating, in milliseconds.
     pub since_ms: u64,
-    /// Cumulative bytes per file path, since the session started.
+    /// Cumulative bytes per file path, since the session started. A file the
+    /// trace knows the process has open but saw no completed transfer on is
+    /// listed with zero bytes: that is a measurement.
     pub files: Vec<(String, FileBytes)>,
-    /// Bytes of requests whose file object could not be named: a Create that
-    /// was never seen, one whose name did not resolve to a DOS path, or one
-    /// dropped at a cap.
+    /// Bytes of transfers whose file object could not be named: opened before
+    /// the session and closed before the handle table could name it, a name
+    /// that did not resolve to a DOS path, or a map dropped at its cap.
     pub unnamed: Remainder,
     /// Bytes of files dropped by [`MAX_TRACKED_FILES_PER_PID`] or by
     /// [`MAX_TRACKED_FILES`].
     pub omitted: Remainder,
-    /// File events the callback was handed.
+    /// File records of the opcodes this module reads that the callback was
+    /// handed.
     pub events_seen: u64,
     /// ...of which the payload decoder accepted.
     pub events_decoded: u64,
-    /// Read and Write records decoded for THIS process. Create events do not
-    /// count: they carry no bytes, so they cannot make a byte count measured.
+    /// Completed logical transfers decoded across the WHOLE session. Non-zero
+    /// proves the subscription delivers transfers, which is what makes a
+    /// process with none a measured zero rather than an unknown.
+    pub session_transfers: u64,
+    /// Completed Read and Write transfers decoded for THIS process.
     pub pid_read_transfers: u64,
     pub pid_write_transfers: u64,
     /// Entries discarded from the `FileObject -> name` map when it reached
-    /// [`MAX_OPEN_FILES`], over the whole session. From that point on their
-    /// transfers are inside [`Self::unnamed`], which is why a row can read
-    /// dashes while the session is still measured.
+    /// [`MAX_OPEN_FILES`], over the whole session.
     pub cleared_file_objects: u64,
     /// Creates whose name did not resolve to a DOS path (a network share, a
-    /// `\SystemRoot\` name, a raw device), over the whole session. Their
-    /// transfers are inside [`Self::unnamed`].
+    /// `\SystemRoot\` name, a raw device), over the whole session.
     pub unnamed_creates: u64,
     /// Paths never tracked because a capacity limit (this process's or the
-    /// session's) was full, over the whole session. Their transfers are inside
-    /// [`Self::omitted`].
+    /// session's) was full, over the whole session.
     pub dropped_paths: u64,
     /// Cumulative events ETW reports as lost; counts are lower bounds when
     /// this is non-zero or unknown.
@@ -434,31 +358,30 @@ pub struct FileIoSample {
 }
 
 impl FileIoSample {
-    /// Read and Write records decoded for this process, both directions.
+    /// Read and Write transfers decoded for this process, both directions.
     pub fn pid_transfers(&self) -> u64 {
         self.pid_read_transfers
             .saturating_add(self.pid_write_transfers)
     }
 
-    /// Whether, and how far, this sample may be trusted for one process.
+    /// Whether, and how far, this sample may be trusted.
     ///
     /// [`FileIoAccountingState::Measured`] requires that the payload layout
-    /// matched AND that at least one read or write was decoded for this
-    /// process, so a process the trace has seen nothing of keeps every row
-    /// unavailable rather than reporting a measured zero.
+    /// matched AND that the session has completed at least one transfer
+    /// anywhere: from then on the trace demonstrably sees every process's
+    /// requests, so this process's count — zero included — is measured. Before
+    /// that, silence cannot be told apart from a broken subscription.
     pub fn state(&self) -> FileIoAccountingState {
         if !self.running {
             return FileIoAccountingState::Unavailable;
         }
         if self.events_seen == 0 {
-            // The session is up and delivered nothing at all: silence cannot be
-            // told apart from a broken subscription.
             return FileIoAccountingState::Undelivered;
         }
         if self.events_decoded == 0 {
             return FileIoAccountingState::Undecodable;
         }
-        if self.pid_transfers() == 0 {
+        if self.session_transfers == 0 {
             return FileIoAccountingState::Undelivered;
         }
         FileIoAccountingState::Measured
@@ -470,8 +393,7 @@ impl FileIoSample {
     pub fn attributed(&self) -> FileBytes {
         let mut total = FileBytes::default();
         for (_, bytes) in &self.files {
-            total.read_bytes = total.read_bytes.saturating_add(bytes.read_bytes);
-            total.write_bytes = total.write_bytes.saturating_add(bytes.write_bytes);
+            total.merge(*bytes);
         }
         total.read_bytes = total
             .read_bytes
@@ -485,7 +407,7 @@ impl FileIoSample {
     }
 }
 
-/// Attach a Kernel-File sample to the handle rows it names.
+/// Attach a per-file trace sample to the handle rows it names.
 ///
 /// This is the one place a [`FileIoSample`] becomes visible data, and both
 /// hosts of the trace call it: the LocalSystem service for the rows it answers
@@ -497,9 +419,14 @@ impl FileIoSample {
 /// the provider's device paths while the rows come from
 /// `GetFinalPathNameByHandleW`, and neither side guarantees the other's casing.
 ///
-/// A row with no record keeps `None` (rendered as unavailable), and a record
-/// with no row is NOT dropped: it goes into the unnamed remainder, which is
-/// what makes `read_bytes`/`write_bytes` the whole attribution for the process.
+/// A row with no record keeps `None` (rendered as unavailable). A record with
+/// no row — a file the process opened, read or wrote, and CLOSED before the
+/// handle walk ran — becomes a row of its own with no open handle, which the
+/// page shows as "(closed)". This is the common shape of real per-file I/O:
+/// a service that rereads its config every few seconds, a log appended through
+/// open-write-close, a temporary file. Folding those into the unnamed remainder
+/// made a process with plainly visible disk traffic read "0 B" on every row.
+/// Rows plus the unnamed and omitted remainders stay the process total.
 ///
 /// Several records can name ONE row: the trace's path is the provider's own
 /// (resolved from a device path), the row's is the handle walk's, and the
@@ -511,7 +438,7 @@ pub(super) fn attach_file_io(
     snapshot: &mut crate::actions::ProcessFileIoSnapshot,
     sample: &FileIoSample,
 ) {
-    let mut unnamed = sample.unnamed;
+    let unnamed = sample.unnamed;
     let accounting = &mut snapshot.accounting;
     accounting.state = sample.state();
     accounting.since_ms = sample.since_ms;
@@ -529,35 +456,42 @@ pub(super) fn attach_file_io(
     // Everything the trace attributed to the process, read before the rows are
     // touched: rows plus both remainders are exactly this total.
     let attributed = sample.attributed();
-    let index_by_path: std::collections::HashMap<String, usize> = snapshot
+    let mut index_by_path: std::collections::HashMap<String, usize> = snapshot
         .files
         .iter()
         .enumerate()
         .map(|(index, file)| (file.path.to_lowercase(), index))
         .collect();
     for (path, bytes) in &sample.files {
-        match index_by_path.get(&path.to_lowercase()) {
-            Some(&index) => {
-                let file = &mut snapshot.files[index];
-                file.read_bytes = Some(
-                    file.read_bytes
-                        .unwrap_or(0)
-                        .saturating_add(bytes.read_bytes),
-                );
-                file.write_bytes = Some(
-                    file.write_bytes
-                        .unwrap_or(0)
-                        .saturating_add(bytes.write_bytes),
-                );
-            }
+        let key = path.to_lowercase();
+        let index = match index_by_path.get(&key) {
+            Some(&index) => Some(index),
+            // A file the trace knows open with nothing transferred, that the
+            // walk did not list (opened after it): no row to add for a zero.
+            None if *bytes == FileBytes::default() => None,
             None => {
-                // Closed since the handle walk, or a file the walk could not
-                // report at all.
-                unnamed.read_bytes = unnamed.read_bytes.saturating_add(bytes.read_bytes);
-                unnamed.write_bytes = unnamed.write_bytes.saturating_add(bytes.write_bytes);
+                // Closed since the handle walk, or opened and closed between
+                // two walks: its own row, marked closed by having no handle.
+                index_by_path.insert(key, snapshot.files.len());
+                snapshot.files.push(closed_file_row(path));
+                Some(snapshot.files.len() - 1)
             }
+        };
+        if let Some(index) = index {
+            let file = &mut snapshot.files[index];
+            file.read_bytes = Some(
+                file.read_bytes
+                    .unwrap_or(0)
+                    .saturating_add(bytes.read_bytes),
+            );
+            file.write_bytes = Some(
+                file.write_bytes
+                    .unwrap_or(0)
+                    .saturating_add(bytes.write_bytes),
+            );
         }
     }
+    let accounting = &mut snapshot.accounting;
     accounting.read_bytes = attributed.read_bytes;
     accounting.write_bytes = attributed.write_bytes;
     accounting.read_ops = sample.pid_read_transfers;
@@ -566,6 +500,26 @@ pub(super) fn attach_file_io(
     accounting.unnamed_write_bytes = unnamed.write_bytes;
     accounting.omitted_read_bytes = sample.omitted.read_bytes;
     accounting.omitted_write_bytes = sample.omitted.write_bytes;
+}
+
+/// A row for a file the trace measured that the process no longer holds open.
+///
+/// Only the path is known: size, position and access belong to an open handle
+/// and stay unavailable rather than being guessed.
+fn closed_file_row(path: &str) -> crate::actions::ProcessFileIo {
+    crate::actions::ProcessFileIo {
+        path: path.to_string(),
+        read_bytes: None,
+        write_bytes: None,
+        read_ops: None,
+        write_ops: None,
+        file_size: None,
+        offset: None,
+        access_known: false,
+        is_read: false,
+        is_write: false,
+        open_handles: 0,
+    }
 }
 
 /// Say why no session could start, without inventing anything.
@@ -601,79 +555,38 @@ enum FileEvent<'a> {
     /// `name` is the raw little-endian UTF-16 tail; decoding it allocates, so
     /// it happens off the callback's borrow of the record.
     Create {
+        irp: u64,
         object: u64,
         name: &'a [u8],
     },
     Close {
+        irp: u64,
         object: u64,
     },
-    Transfer {
+    /// A Read or Write REQUEST; its bytes are charged when it completes.
+    Request {
+        irp: u64,
         object: u64,
         size: u32,
         write: bool,
+        paging: bool,
+    },
+    /// An `OpEnd`: the request on `irp` finished with `status`, moving `bytes`.
+    Completion {
+        irp: u64,
+        bytes: u64,
+        status: u32,
     },
 }
 
-/// Pointer width of a Kernel-File payload: always this machine's.
+/// Pointer width of a `FileIo` payload: always this machine's.
 ///
 /// [`super::etw::pointer_bytes`] answers a different question — how wide the
-/// pointers are in a payload a USER-MODE process wrote, which is why the
-/// record header flags a WOW64 caller (`EVENT_HEADER_FLAG_32_BIT_HEADER`) and
-/// why the loader and profile providers need it. The records here are written
-/// by the kernel: `FileObject`, `Irp` and `FileKey` are kernel addresses in
-/// every record, whoever issued the request. Taking the header flag at face
-/// value would read a 32-bit process's records four bytes off — either
-/// rejected by the alignment check or charged to the wrong file — leaving that
-/// process with dashes on every row while the session reports Measured.
+/// pointers are in a payload a USER-MODE process wrote. The records here are
+/// written by the kernel: `Irp`, `FileObject` and `FileKey` are kernel
+/// addresses in every record, whoever issued the request, so a WOW64 caller's
+/// header flag must not shift the decode.
 const KERNEL_FILE_POINTER_BYTES: usize = std::mem::size_of::<usize>();
-
-/// Offset of `FileObject` and of the trailing `FileName` in a Create payload,
-/// or `None` for a template version this build does not know.
-fn create_layout(version: u8, pointer_bytes: usize) -> Option<(usize, usize)> {
-    match version {
-        // v0: Irp, ThreadId, FileObject, CreateOptions, CreateAttributes,
-        // ShareAccess, FileName.
-        0 => Some((2 * pointer_bytes, 3 * pointer_bytes + 12)),
-        // v1: Irp, FileObject, IssuingThreadId, CreateOptions,
-        // CreateAttributes, ShareAccess, FileName.
-        1 => Some((pointer_bytes, 2 * pointer_bytes + 16)),
-        _ => None,
-    }
-}
-
-/// Offset of `FileObject`, offset of `IOSize`, and the shortest payload that
-/// holds them, for a Read/Write payload.
-fn transfer_layout(version: u8, pointer_bytes: usize) -> Option<(usize, usize, usize)> {
-    match version {
-        // v0: ByteOffset u64, Irp, ThreadId, FileObject, FileKey, IOSize,
-        // IOFlags.
-        0 => Some((
-            8 + 2 * pointer_bytes,
-            8 + 4 * pointer_bytes,
-            8 + 4 * pointer_bytes + 8,
-        )),
-        // v1: ByteOffset u64, Irp, FileObject, FileKey, IssuingThreadId,
-        // IOSize, IOFlags, ExtraFlags.
-        1 => Some((
-            8 + pointer_bytes,
-            8 + 3 * pointer_bytes + 4,
-            8 + 3 * pointer_bytes + 16,
-        )),
-        _ => None,
-    }
-}
-
-/// Offset of `FileObject` and the shortest payload that holds it, for a
-/// Cleanup/Close payload.
-fn close_layout(version: u8, pointer_bytes: usize) -> Option<(usize, usize)> {
-    match version {
-        // v0: Irp, ThreadId, FileObject, FileKey.
-        0 => Some((2 * pointer_bytes, 4 * pointer_bytes)),
-        // v1: Irp, FileObject, FileKey, IssuingThreadId.
-        1 => Some((pointer_bytes, 3 * pointer_bytes + 4)),
-        _ => None,
-    }
-}
 
 fn read_u32(payload: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(4)?;
@@ -698,12 +611,12 @@ fn plausible_file_object(value: u64, pointer_bytes: usize) -> bool {
     value != 0 && value.is_multiple_of(pointer_bytes as u64)
 }
 
-/// Decode the `FileName` tail of a Create payload.
+/// Decode the `OpenPath` tail of a Create payload.
 ///
-/// ETW writes a `win:UnicodeString` as little-endian UTF-16 running to the end
-/// of the payload, NUL-terminated, with no length prefix. An empty or
-/// odd-length tail is not a name, and the caller then keeps the handle
-/// anonymous rather than inventing one.
+/// ETW writes the string as little-endian UTF-16 running to the end of the
+/// payload, NUL-terminated, with no length prefix. An empty or odd-length tail
+/// is not a name, and the caller then keeps the handle anonymous rather than
+/// inventing one.
 fn decode_utf16(tail: &[u8]) -> Option<String> {
     if tail.len() < 2 || !tail.len().is_multiple_of(2) {
         return None;
@@ -721,57 +634,74 @@ fn decode_utf16(tail: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
-/// Decode one record, or `None` when it does not look like the template this
-/// build expects.
+/// Decode one record of the six opcodes this module reads, or `None` when it
+/// does not look like the version-3 template.
 ///
 /// Every rejection here is a field that a wrong offset, a truncated payload or
 /// a template change would produce, and the honest answer to all of them is
 /// "unknown" — never a byte count.
 fn parse_event(
-    event_id: u16,
+    opcode: u8,
     version: u8,
     payload: &[u8],
     pointer_bytes: usize,
 ) -> Option<FileEvent<'_>> {
-    match event_id {
+    if version != FILE_IO_VERSION {
+        return None;
+    }
+    let p = pointer_bytes;
+    match opcode {
         EVENT_CREATE => {
-            let (object_offset, name_offset) = create_layout(version, pointer_bytes)?;
-            let object = read_pointer(payload, object_offset, pointer_bytes)?;
-            if !plausible_file_object(object, pointer_bytes) {
+            let irp = read_pointer(payload, 0, p)?;
+            let object = read_pointer(payload, p, p)?;
+            if !plausible_file_object(object, p) {
                 return None;
             }
-            let name = payload.get(name_offset..).unwrap_or_default();
-            Some(FileEvent::Create { object, name })
+            let name = payload.get(2 * p + 16..).unwrap_or_default();
+            Some(FileEvent::Create { irp, object, name })
         }
         EVENT_READ | EVENT_WRITE => {
-            let (object_offset, size_offset, min_len) = transfer_layout(version, pointer_bytes)?;
-            if payload.len() < min_len {
+            if payload.len() < 8 + 3 * p + 16 {
                 return None;
             }
-            let object = read_pointer(payload, object_offset, pointer_bytes)?;
-            if !plausible_file_object(object, pointer_bytes) {
+            let irp = read_pointer(payload, 8, p)?;
+            let object = read_pointer(payload, 8 + p, p)?;
+            if !plausible_file_object(object, p) {
                 return None;
             }
-            let size = read_u32(payload, size_offset)?;
+            let size = read_u32(payload, 8 + 3 * p + 4)?;
             if size > MAX_PLAUSIBLE_TRANSFER {
                 return None;
             }
-            Some(FileEvent::Transfer {
+            let flags = read_u32(payload, 8 + 3 * p + 8)?;
+            Some(FileEvent::Request {
+                irp,
                 object,
                 size,
-                write: event_id == EVENT_WRITE,
+                write: opcode == EVENT_WRITE,
+                paging: flags & IRP_PAGING_IO != 0,
             })
         }
         EVENT_CLEANUP | EVENT_CLOSE => {
-            let (object_offset, min_len) = close_layout(version, pointer_bytes)?;
-            if payload.len() < min_len {
+            if payload.len() < 3 * p + 4 {
                 return None;
             }
-            let object = read_pointer(payload, object_offset, pointer_bytes)?;
-            if !plausible_file_object(object, pointer_bytes) {
+            let irp = read_pointer(payload, 0, p)?;
+            let object = read_pointer(payload, p, p)?;
+            if !plausible_file_object(object, p) {
                 return None;
             }
-            Some(FileEvent::Close { object })
+            Some(FileEvent::Close { irp, object })
+        }
+        EVENT_OP_END => {
+            if payload.len() < 2 * p + 4 {
+                return None;
+            }
+            Some(FileEvent::Completion {
+                irp: read_pointer(payload, 0, p)?,
+                bytes: read_pointer(payload, p, p)?,
+                status: read_u32(payload, 2 * p)?,
+            })
         }
         _ => None,
     }
@@ -779,10 +709,29 @@ fn parse_event(
 
 /// The `FileObject -> name` correlation map.
 struct OpenFile {
-    /// The process whose Create produced this entry. A transfer under another
-    /// pid is not charged to this name; see [`Shared::transfer`].
+    /// The process whose Create (or handle) produced this entry. A transfer
+    /// under another pid is not charged to this name; see
+    /// [`State::complete`].
     pid: u32,
     path: Arc<str>,
+}
+
+/// A Read or Write waiting for its completion.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    pid: u32,
+    object: u64,
+    write: bool,
+    requested: u32,
+}
+
+/// Completed bytes on a file object that has no name yet.
+struct Unresolved {
+    pid: u32,
+    bytes: FileBytes,
+    /// Whether the handle table was already asked about this object, so a
+    /// name it could not give is not asked for again on every poll.
+    asked: bool,
 }
 
 /// Per-process accumulators.
@@ -792,9 +741,12 @@ struct PidFiles {
     /// has named it. A pid is reused, and the counters of the process that held
     /// it before must not be handed to its successor; see [`State::bind_epoch`].
     epoch_s: Option<i64>,
+    /// Whether every file handle of this process has been named from the
+    /// handle table once in this session.
+    handles_named: bool,
     /// Cumulative bytes per path, since the session started.
     files: HashMap<Arc<str>, FileBytes>,
-    /// Read and Write records decoded for this process, by direction.
+    /// Completed Read and Write transfers decoded for this process.
     read_transfers: u64,
     write_transfers: u64,
     unnamed: Remainder,
@@ -805,37 +757,49 @@ struct PidFiles {
 struct State {
     events_seen: u64,
     events_decoded: u64,
-    /// Id, template version and payload length of the most recent record the
-    /// decoder rejected, so a layout change and a truncated or malformed
-    /// payload can be told apart from a log line instead of a debugger.
-    rejected_event_id: u16,
+    /// Opcode, template version and payload length of the most recent record
+    /// the decoder rejected, so a layout change and a truncated payload can be
+    /// told apart from a log line instead of a debugger.
+    rejected_opcode: u8,
     rejected_version: u8,
     rejected_payload_len: u32,
     open: HashMap<u64, OpenFile>,
+    pending: HashMap<u64, Pending>,
+    unresolved: HashMap<u64, Unresolved>,
     pids: HashMap<u32, PidFiles>,
-    /// Distinct paths held across every bucket in `pids`. Kept alongside the
-    /// map rather than recomputed per transfer; [`State::prune_dead`] and
-    /// [`State::bind_epoch`] rebuild it after they drop buckets.
+    /// Distinct paths held across every bucket in `pids`. Rebuilt by
+    /// [`State::prune_dead`] and [`State::bind_epoch`] after they drop buckets.
     tracked_paths: usize,
+    /// Completed logical transfers across the whole session.
+    session_transfers: u64,
     /// Entries discarded when the open-file map was cleared at its cap.
     cleared_file_objects: u64,
     /// Creates whose name did not resolve to a DOS path.
     unnamed_creates: u64,
     /// Paths never tracked because a capacity limit was full.
     dropped_paths: u64,
+    // Diagnostics only: logged, never shown as numbers.
+    /// Paging requests skipped (flushes, lazy writes, page faults).
+    paging_skipped: u64,
+    /// Completions with an error status (refused fast I/O, failed requests).
+    failed_completions: u64,
+    /// Requests whose completion never arrived before their `Irp` was reused.
+    orphaned_requests: u64,
 }
 
 impl State {
     /// Drop the accounting of processes that no longer exist.
     ///
-    /// Both maps are pinned to live processes for the same reason the disk
+    /// Every map is pinned to live processes for the same reason the disk
     /// trace is: a process that exited can never be asked about again, and its
     /// entries would otherwise accumulate for the lifetime of the service.
-    /// `tracked_paths` is rebuilt from what survived instead of being
-    /// decremented per bucket, so it cannot drift.
     fn prune_dead(&mut self, live_pids: &HashSet<u32>) {
         self.pids.retain(|pid, _| live_pids.contains(pid));
         self.open.retain(|_, file| live_pids.contains(&file.pid));
+        self.pending
+            .retain(|_, pending| live_pids.contains(&pending.pid));
+        self.unresolved
+            .retain(|_, unresolved| live_pids.contains(&unresolved.pid));
         self.tracked_paths = self.pids.values().map(|files| files.files.len()).sum();
     }
 
@@ -845,8 +809,8 @@ impl State {
     /// the broker does, because every request carries the creation time it
     /// sampled. Binding the bucket to it means a pid reused between two samples
     /// starts empty instead of inheriting the previous process's paths, and the
-    /// `FileObject` names that process had open are dropped for the same reason
-    /// (they belong to a dead object space).
+    /// `FileObject` names and pending bytes that process had are dropped for the
+    /// same reason (they belong to a dead object space).
     fn bind_epoch(&mut self, pid: u32, start_epoch_s: i64) {
         let reused = self.pids.get(&pid).is_some_and(|files| {
             files
@@ -858,14 +822,133 @@ impl State {
                 self.tracked_paths = self.tracked_paths.saturating_sub(files.files.len());
             }
             self.open.retain(|_, file| file.pid != pid);
+            self.pending.retain(|_, pending| pending.pid != pid);
+            self.unresolved
+                .retain(|_, unresolved| unresolved.pid != pid);
             tracing::debug!(
                 pid,
                 start_epoch_s,
                 "file trace saw a reused pid; its bucket starts fresh"
             );
         }
-        if let Some(files) = self.pids.get_mut(&pid) {
-            files.epoch_s = Some(start_epoch_s);
+        self.pids.entry(pid).or_default().epoch_s = Some(start_epoch_s);
+    }
+
+    /// Retire whatever request was pending on `irp`: a new request on the same
+    /// `Irp` means the old one completed and its `OpEnd` was lost. Keeping it
+    /// would charge the NEXT operation's completion as transferred bytes.
+    fn retire(&mut self, irp: u64) {
+        if self.pending.remove(&irp).is_some() {
+            self.orphaned_requests = self.orphaned_requests.saturating_add(1);
+        }
+    }
+
+    /// An object address was opened anew or closed: whatever was waiting for
+    /// a name under it belongs to an object that no longer exists, so its
+    /// bytes become the process's unnamed remainder.
+    fn forget_unresolved(&mut self, object: u64) {
+        if let Some(unresolved) = self.unresolved.remove(&object) {
+            self.pids
+                .entry(unresolved.pid)
+                .or_default()
+                .unnamed
+                .merge(unresolved.bytes);
+        }
+    }
+
+    /// Charge `bytes` on `path` to `pid`, inside the path budgets; past them
+    /// the bytes go to the omitted remainder and the drop is counted.
+    fn charge_path(&mut self, pid: u32, path: Arc<str>, bytes: FileBytes) {
+        let global_room = self.tracked_paths < MAX_TRACKED_FILES;
+        let files = self.pids.entry(pid).or_default();
+        let new_path = !files.files.contains_key(path.as_ref());
+        if new_path && (!global_room || files.files.len() >= MAX_TRACKED_FILES_PER_PID) {
+            // Charging them to a neighbouring file would be a made-up
+            // per-file number.
+            files.omitted.merge(bytes);
+            self.dropped_paths = self.dropped_paths.saturating_add(1);
+            return;
+        }
+        files.files.entry(path).or_default().merge(bytes);
+        if new_path {
+            self.tracked_paths = self.tracked_paths.saturating_add(1);
+        }
+    }
+
+    /// A completed logical transfer of `bytes` by `pid` on `object`.
+    fn complete(&mut self, pid: u32, object: u64, write: bool, bytes: u64) {
+        self.session_transfers = self.session_transfers.saturating_add(1);
+        {
+            let files = self.pids.entry(pid).or_default();
+            if write {
+                files.write_transfers = files.write_transfers.saturating_add(1);
+            } else {
+                files.read_transfers = files.read_transfers.saturating_add(1);
+            }
+        }
+        let mut amount = FileBytes::default();
+        amount.add(write, bytes);
+        match self.open.get(&object) {
+            Some(open) if open.pid == pid => {
+                let path = Arc::clone(&open.path);
+                self.charge_path(pid, path, amount);
+                return;
+            }
+            Some(_) => {
+                // Another process opened this object: a duplicated handle, or
+                // a reused address after a missed Close. Either way that name
+                // is not this process's to use.
+                self.pids.entry(pid).or_default().unnamed.add(write, bytes);
+                return;
+            }
+            None => {}
+        }
+        // Nameless: hold the bytes under the object until the handle table
+        // can name it (see [`FileEtw::sample`]), within budget.
+        if let Some(unresolved) = self.unresolved.get_mut(&object) {
+            if unresolved.pid == pid {
+                unresolved.bytes.add(write, bytes);
+            } else {
+                self.pids.entry(pid).or_default().unnamed.add(write, bytes);
+            }
+            return;
+        }
+        if self.unresolved.len() >= MAX_UNRESOLVED_OBJECTS {
+            self.pids.entry(pid).or_default().unnamed.add(write, bytes);
+            return;
+        }
+        self.unresolved.insert(
+            object,
+            Unresolved {
+                pid,
+                bytes: amount,
+                asked: false,
+            },
+        );
+    }
+
+    /// Apply names the handle table gave for `pid`'s file objects: each one
+    /// becomes known for later transfers, and bytes that waited for it move
+    /// onto its path.
+    fn apply_names(&mut self, pid: u32, names: Vec<(u64, String)>) {
+        for (object, path) in names {
+            let path: Arc<str> = Arc::from(path);
+            if let Some(unresolved) = self.unresolved.remove(&object) {
+                if unresolved.pid == pid {
+                    self.charge_path(pid, Arc::clone(&path), unresolved.bytes);
+                } else {
+                    self.pids
+                        .entry(unresolved.pid)
+                        .or_default()
+                        .unnamed
+                        .merge(unresolved.bytes);
+                }
+            }
+            // A Create the trace saw is the better witness; never overwrite
+            // it, and never clear the map for a name that is only a seed.
+            if !self.open.contains_key(&object) && self.open.len() < MAX_OPEN_FILES {
+                self.open.insert(object, OpenFile { pid, path });
+            }
         }
     }
 }
@@ -891,122 +974,130 @@ impl TraceContext for Shared {
 }
 
 impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// A file record the decoder could not read. Counted, never guessed at.
-    ///
-    /// The identity of the rejected record is kept so a log line can say which
-    /// layout is unknown (id and version) and whether the payload was truncated
-    /// (its length) instead of just that something failed.
-    fn undecodable(&self, event_id: u16, version: u8, payload_len: u32) {
+    fn undecodable(&self, opcode: u8, version: u8, payload_len: u32) {
         if !self.live.load(Ordering::Relaxed) {
             return;
         }
-        if let Ok(mut state) = self.state.lock() {
-            state.events_seen = state.events_seen.saturating_add(1);
-            state.rejected_event_id = event_id;
-            state.rejected_version = version;
-            state.rejected_payload_len = payload_len;
-        }
-    }
-
-    /// Name a Create's file object. The name is resolved before the state lock
-    /// is taken because resolving can rescan the drive list.
-    fn create(&self, pid: u32, object: u64, name: &[u8]) {
-        if !self.live.load(Ordering::Relaxed) {
-            return;
-        }
-        let resolved = self.resolve_name(name);
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = self.lock();
         state.events_seen = state.events_seen.saturating_add(1);
-        state.events_decoded = state.events_decoded.saturating_add(1);
-        let Some(path) = resolved else {
-            // A name that is not a resolvable device or DOS path (a network
-            // share, a `\SystemRoot\` name, a raw device) keeps its bytes
-            // unnamed. Nothing is inserted, so it must not cost the map
-            // anything at the cap either: clearing 65 536 live entries for a
-            // Create that is then thrown away would turn every file already
-            // open into a remainder.
-            state.unnamed_creates = state.unnamed_creates.saturating_add(1);
-            return;
-        };
-        if state.open.len() >= MAX_OPEN_FILES {
-            // A dropped Close leaves an entry behind, so the map can reach the
-            // cap with nothing that is safe to evict. Clearing recovers the
-            // memory; the names of the files still open are lost, and their
-            // reads and writes fall into the unnamed remainder (counted) until
-            // the next Create, instead of being charged to a name this module
-            // can no longer trust.
-            state.cleared_file_objects = state
-                .cleared_file_objects
-                .saturating_add(state.open.len() as u64);
-            state.open.clear();
-            tracing::debug!(
-                cap = MAX_OPEN_FILES,
-                "file trace dropped its open-file map at the cap"
-            );
-        }
-        state.open.insert(object, OpenFile { pid, path });
+        state.rejected_opcode = opcode;
+        state.rejected_version = version;
+        state.rejected_payload_len = payload_len;
     }
 
-    fn close(&self, object: u64) {
+    /// Account one decoded record. A Create's name is resolved before the
+    /// state lock is taken because resolving can rescan the drive list.
+    fn record(&self, pid: u32, event: FileEvent<'_>) {
         if !self.live.load(Ordering::Relaxed) {
             return;
         }
-        if let Ok(mut state) = self.state.lock() {
-            state.events_seen = state.events_seen.saturating_add(1);
-            state.events_decoded = state.events_decoded.saturating_add(1);
-            state.open.remove(&object);
-        }
-    }
-
-    fn transfer(&self, pid: u32, object: u64, size: u32, write: bool) {
-        if !self.live.load(Ordering::Relaxed) {
-            return;
-        }
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        state.events_seen = state.events_seen.saturating_add(1);
-        state.events_decoded = state.events_decoded.saturating_add(1);
-        let path = match state.open.get(&object) {
-            Some(open) if open.pid == pid => Some(Arc::clone(&open.path)),
+        let resolved = match event {
+            FileEvent::Create { name, .. } => Some(self.resolve_name(name)),
             _ => None,
         };
-        // Read before the bucket is borrowed: the bucket reference holds the
-        // whole state, so the session-wide counters cannot be touched while it
-        // is alive.
-        let global_room = state.tracked_paths < MAX_TRACKED_FILES;
-        let mut newly_tracked = false;
-        let mut dropped_path = false;
-        {
-            let files = state.pids.entry(pid).or_default();
-            if write {
-                files.write_transfers = files.write_transfers.saturating_add(1);
-            } else {
-                files.read_transfers = files.read_transfers.saturating_add(1);
+        let mut state = self.lock();
+        state.events_seen = state.events_seen.saturating_add(1);
+        state.events_decoded = state.events_decoded.saturating_add(1);
+        match event {
+            FileEvent::Create { irp, object, .. } => {
+                state.retire(irp);
+                // A Create on an address means whatever object held it before
+                // is gone: its name and its waiting bytes must not pass on.
+                state.open.remove(&object);
+                state.forget_unresolved(object);
+                let Some(path) = resolved.flatten() else {
+                    // Not a resolvable device or DOS path (a network share, a
+                    // `\SystemRoot\` name, a raw device): its bytes stay
+                    // unnamed. Nothing is inserted, so it must not cost the map
+                    // anything at the cap either.
+                    state.unnamed_creates = state.unnamed_creates.saturating_add(1);
+                    return;
+                };
+                if state.open.len() >= MAX_OPEN_FILES {
+                    // A dropped Close leaves an entry behind, so the map can
+                    // reach the cap with nothing that is safe to evict.
+                    // Clearing recovers the memory; the files still open lose
+                    // their names (counted) until they are opened again.
+                    state.cleared_file_objects = state
+                        .cleared_file_objects
+                        .saturating_add(state.open.len() as u64);
+                    state.open.clear();
+                    tracing::debug!(
+                        cap = MAX_OPEN_FILES,
+                        "file trace dropped its open-file map at the cap"
+                    );
+                }
+                state.open.insert(object, OpenFile { pid, path });
             }
-            let Some(path) = path else {
-                files.unnamed.add(write, size);
-                return;
-            };
-            let new_path = !files.files.contains_key(path.as_ref());
-            if new_path && (!global_room || files.files.len() >= MAX_TRACKED_FILES_PER_PID) {
-                // Out of room for this process or for the session. The bytes
-                // stay in the accounting remainder; charging them to a
-                // neighbouring file would be a made-up per-file number.
-                files.omitted.add(write, size);
-                dropped_path = true;
-            } else {
-                files.files.entry(path).or_default().add(write, size);
-                newly_tracked = new_path;
+            FileEvent::Close { irp, object } => {
+                state.retire(irp);
+                state.open.remove(&object);
+                state.forget_unresolved(object);
+            }
+            FileEvent::Request {
+                irp,
+                object,
+                size,
+                write,
+                paging,
+            } => {
+                state.retire(irp);
+                if paging {
+                    state.paging_skipped = state.paging_skipped.saturating_add(1);
+                    return;
+                }
+                if state.pending.len() >= MAX_PENDING_REQUESTS {
+                    let dropped = state.pending.len() as u64;
+                    state.orphaned_requests = state.orphaned_requests.saturating_add(dropped);
+                    state.pending.clear();
+                }
+                state.pending.insert(
+                    irp,
+                    Pending {
+                        pid,
+                        object,
+                        write,
+                        requested: size,
+                    },
+                );
+            }
+            FileEvent::Completion { irp, bytes, status } => {
+                // Most completions belong to operations this module does not
+                // count (creates, queries, closes); only a pending transfer
+                // matches.
+                let Some(request) = state.pending.remove(&irp) else {
+                    return;
+                };
+                if (status as i32) < 0 {
+                    // Refused fast I/O (retried as an IRP, which completes on
+                    // its own) or a failed request: nothing was transferred.
+                    state.failed_completions = state.failed_completions.saturating_add(1);
+                    return;
+                }
+                // A completion cannot move more than was asked for; a larger
+                // number is a misread, and the request size bounds it.
+                let moved = bytes.min(u64::from(request.requested));
+                state.complete(request.pid, request.object, request.write, moved);
             }
         }
-        if newly_tracked {
-            state.tracked_paths = state.tracked_paths.saturating_add(1);
+    }
+
+    /// Another `FileIo` request on `irp`: retire what was pending on it.
+    fn other_request(&self, irp: u64) {
+        if !self.live.load(Ordering::Relaxed) {
+            return;
         }
-        if dropped_path {
-            state.dropped_paths = state.dropped_paths.saturating_add(1);
+        let mut state = self.lock();
+        if state.pending.contains_key(&irp) {
+            state.retire(irp);
         }
     }
 
@@ -1039,7 +1130,7 @@ impl Shared {
     }
 }
 
-/// Translate a Kernel-File name into the DOS path the handle walk reports.
+/// Translate a kernel file name into the DOS path the handle walk reports.
 ///
 /// `\Device\HarddiskVolume3\Users\me\a.txt` becomes `C:\Users\me\a.txt` for the
 /// drive whose `QueryDosDeviceW` target is that device, `\??\C:\...` loses its
@@ -1094,6 +1185,11 @@ fn volume_devices() -> Vec<(String, String)> {
     devices
 }
 
+/// How a sample names file objects the trace has no Create for; see
+/// [`super::process_file_io::name_file_objects`]. A seam so the accounting
+/// around it is testable without a privileged handle-table read.
+type ObjectNamer<'a> = dyn Fn(u32, i64, Option<&HashSet<u64>>) -> Vec<(u64, String)> + 'a;
+
 /// A running per-file I/O trace.
 pub struct FileEtw {
     session: Session<Shared>,
@@ -1102,13 +1198,12 @@ pub struct FileEtw {
     /// carrying this" is the first question any report about the feature has to
     /// answer, and it cannot be re-derived from a live session afterwards.
     source: FileSource,
+    /// When unnamed objects were last named from the handle table.
+    last_naming: Mutex<Option<Instant>>,
 }
 
 impl FileEtw {
     /// Which session is carrying this trace; see [`sources`].
-    ///
-    /// The kernel logger is the one that delivers the classic `FileIo` class
-    /// machine-wide; the private fallback only runs because that one was taken.
     pub(super) fn source(&self) -> FileSource {
         self.source
     }
@@ -1120,19 +1215,12 @@ impl FileEtw {
 
     /// Start a session, trying [`sources`] in order.
     ///
-    /// The first shape that starts wins and is logged, because which one is
-    /// running is the fact an operator needs: the kernel logger carries the
-    /// class machine-wide, the private fallback only for as long as Windows
-    /// keeps multiplexing it. A refusal is only the answer once EVERY shape was
-    /// refused, and [`FileTraceRefusal::KernelLoggerInUse`] is preferred over
+    /// The first shape that starts wins and is logged. A refusal is only the
+    /// answer once EVERY shape was refused, and
+    /// [`FileTraceRefusal::KernelLoggerInUse`] is preferred over
     /// [`FileTraceRefusal::Unavailable`] in that case: "another application
     /// owns the kernel logger" is the fact that explains the whole failure and
     /// the only one a user can act on.
-    ///
-    /// One [`Shared`] serves every attempt. A refused attempt never published a
-    /// counter (it delivered no record), so a fallback starts from a clean
-    /// slate under the same accounting, and the sample a caller already holds
-    /// stays valid either way.
     pub fn try_start(role: TraceRole) -> Result<Self, FileTraceRefusal> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -1144,7 +1232,7 @@ impl FileEtw {
             match Session::try_start(
                 source.name,
                 source.kind,
-                source.providers,
+                &[],
                 Arc::clone(&shared),
                 on_event,
                 "tm-file-etw",
@@ -1153,13 +1241,13 @@ impl FileEtw {
                     tracing::info!(
                         session = source.name,
                         kind = ?source.kind,
-                        providers = source.providers.len(),
                         "per-file I/O trace started"
                     );
                     return Ok(Self {
                         session,
                         started: Instant::now(),
                         source,
+                        last_naming: Mutex::new(None),
                     });
                 }
                 Err(error) => {
@@ -1191,11 +1279,12 @@ impl FileEtw {
     ///
     /// Cumulative, not a window: the rows it fills are documented as totals
     /// since accounting began and the dialog merges two snapshots by keeping
-    /// the larger count, so a per-window delta would be read as a total. A
-    /// session that the idle watchdog stopped and restarted starts a new
-    /// epoch — the dialog's larger-of-two merge then keeps the previous
-    /// epoch's count for a row that is still open, which is an older
-    /// measurement of the same quantity rather than a new one.
+    /// the larger count, so a per-window delta would be read as a total.
+    ///
+    /// Names file objects the trace saw no Create for from the system handle
+    /// table first (see the module docs): on the process's first sample every
+    /// file handle it holds, later only objects that carry unnamed bytes, at
+    /// most once per [`SEED_INTERVAL`].
     ///
     /// An EMPTY `live_pids` means "the caller could not enumerate processes",
     /// never "nothing is alive": pruning against it would throw away every
@@ -1203,67 +1292,180 @@ impl FileEtw {
     /// for `pid`, and it is what keeps a reused pid from inheriting the
     /// previous process's counters (see [`State::bind_epoch`]).
     pub fn sample(&self, pid: u32, start_epoch_s: i64, live_pids: &HashSet<u32>) -> FileIoSample {
-        let (mut sample, rejected) = {
-            let mut state = match self.session.shared().state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+        self.sample_with(
+            pid,
+            start_epoch_s,
+            live_pids,
+            &super::process_file_io::name_file_objects,
+        )
+    }
+
+    /// [`Self::sample`] with the handle-table naming injectable.
+    fn sample_with(
+        &self,
+        pid: u32,
+        start_epoch_s: i64,
+        live_pids: &HashSet<u32>,
+        namer: &ObjectNamer<'_>,
+    ) -> FileIoSample {
+        let shared = self.session.shared();
+        let request = {
+            let mut state = shared.lock();
             if !live_pids.is_empty() {
                 state.prune_dead(live_pids);
             }
             state.bind_epoch(pid, start_epoch_s);
-            let events_seen = state.events_seen;
-            let events_decoded = state.events_decoded;
-            let files = state.pids.get(&pid);
-            let sample = FileIoSample {
-                running: self.session.is_running(),
-                since_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                files: files
-                    .map(|files| {
-                        files
-                            .files
-                            .iter()
-                            .map(|(path, bytes)| (path.to_string(), *bytes))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                unnamed: files.map_or_else(Remainder::default, |files| files.unnamed),
-                omitted: files.map_or_else(Remainder::default, |files| files.omitted),
-                events_seen,
-                events_decoded,
-                pid_read_transfers: files.map_or(0, |files| files.read_transfers),
-                pid_write_transfers: files.map_or(0, |files| files.write_transfers),
-                cleared_file_objects: state.cleared_file_objects,
-                unnamed_creates: state.unnamed_creates,
-                dropped_paths: state.dropped_paths,
-                events_lost: None,
+            let mut last = match self.last_naming.lock() {
+                Ok(last) => last,
+                Err(poisoned) => poisoned.into_inner(),
             };
-            let rejected = (
-                state.rejected_event_id,
+            naming_request(&mut state, pid, &mut last, Instant::now())
+        };
+        if let Some(wanted) = request {
+            // Outside the lock: duplicating handles and reading the table
+            // must not stall the ETW callback.
+            let names = namer(pid, start_epoch_s, wanted.as_ref());
+            let named = names.len();
+            shared.lock().apply_names(pid, names);
+            tracing::debug!(
+                pid,
+                all = wanted.is_none(),
+                asked = wanted.as_ref().map(HashSet::len),
+                named,
+                "file trace named objects from the handle table"
+            );
+        }
+        let (mut sample, diagnostics) = {
+            let state = shared.lock();
+            let since_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let sample = sample_from(&state, pid, self.session.is_running(), since_ms);
+            let diagnostics = (
+                state.rejected_opcode,
                 state.rejected_version,
                 state.rejected_payload_len,
+                state.paging_skipped,
+                state.failed_completions,
+                state.orphaned_requests,
             );
-            (sample, rejected)
+            (sample, diagnostics)
         };
         if sample.events_seen > 0 && sample.events_decoded == 0 {
             // Loud on purpose, once per request while it lasts: this is the
-            // failure that silently turns every byte count into a gap. The id,
-            // version and length separate the two causes: an id and version
-            // this build has no offsets for is a layout change, while a
-            // rejected id/version we DO know is a truncated or malformed
-            // payload.
+            // failure that silently turns every byte count into a gap.
             tracing::warn!(
                 events_seen = sample.events_seen,
-                event_id = rejected.0,
-                version = rejected.1,
-                payload_len = rejected.2,
-                "file trace decoded no records - unknown Kernel-File payload layout or rejected payloads"
+                opcode = diagnostics.0,
+                version = diagnostics.1,
+                payload_len = diagnostics.2,
+                "file trace decoded no records - unknown FileIo payload layout or rejected payloads"
             );
         }
+        tracing::trace!(
+            pid,
+            session_transfers = sample.session_transfers,
+            paging_skipped = diagnostics.3,
+            failed_completions = diagnostics.4,
+            orphaned_requests = diagnostics.5,
+            "file trace sample"
+        );
         // Queried outside the lock: the session properties live in the kernel.
         sample.events_lost = self.session.events_lost();
         sample
     }
+}
+
+/// One process's view of the accumulators: its rows, its remainders and the
+/// session-wide counters that qualify them.
+fn sample_from(state: &State, pid: u32, running: bool, since_ms: u64) -> FileIoSample {
+    let files = state.pids.get(&pid);
+    let mut paths: Vec<(String, FileBytes)> = files
+        .map(|files| {
+            files
+                .files
+                .iter()
+                .map(|(path, bytes)| (path.to_string(), *bytes))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Files the trace knows this process has open, with no completed
+    // transfer: a measured zero, which is different from a row the
+    // trace knows nothing about.
+    let mut known: HashSet<&str> = paths.iter().map(|(path, _)| path.as_str()).collect();
+    let mut idle = Vec::new();
+    for open in state.open.values() {
+        if open.pid == pid && known.insert(open.path.as_ref()) {
+            idle.push((open.path.to_string(), FileBytes::default()));
+        }
+    }
+    drop(known);
+    paths.extend(idle);
+    let mut unnamed = files.map_or_else(Remainder::default, |files| files.unnamed);
+    for waiting in state.unresolved.values() {
+        if waiting.pid == pid {
+            unnamed.merge(waiting.bytes);
+        }
+    }
+    FileIoSample {
+        running,
+        since_ms,
+        files: paths,
+        unnamed,
+        omitted: files.map_or_else(Remainder::default, |files| files.omitted),
+        events_seen: state.events_seen,
+        events_decoded: state.events_decoded,
+        session_transfers: state.session_transfers,
+        pid_read_transfers: files.map_or(0, |files| files.read_transfers),
+        pid_write_transfers: files.map_or(0, |files| files.write_transfers),
+        cleared_file_objects: state.cleared_file_objects,
+        unnamed_creates: state.unnamed_creates,
+        dropped_paths: state.dropped_paths,
+        events_lost: None,
+    }
+}
+
+/// Whether this sample should name file objects from the handle table, and
+/// which: `Some(None)` for every file handle of `pid` (its first sample in this
+/// session), `Some(Some(objects))` for objects with unnamed bytes that were not
+/// asked about yet, `None` for neither.
+///
+/// The first naming of a process is never throttled — it is what makes the
+/// first view of a long-running process complete. Later namings wait for
+/// [`SEED_INTERVAL`]; objects are marked as asked only when a naming actually
+/// happens, so a throttled poll loses nothing.
+fn naming_request(
+    state: &mut State,
+    pid: u32,
+    last: &mut Option<Instant>,
+    now: Instant,
+) -> Option<Option<HashSet<u64>>> {
+    let files = state.pids.entry(pid).or_default();
+    if !files.handles_named {
+        files.handles_named = true;
+        for waiting in state.unresolved.values_mut() {
+            if waiting.pid == pid {
+                waiting.asked = true;
+            }
+        }
+        *last = Some(now);
+        return Some(None);
+    }
+    if last.is_some_and(|at| now.saturating_duration_since(at) < SEED_INTERVAL) {
+        return None;
+    }
+    let wanted: HashSet<u64> = state
+        .unresolved
+        .iter_mut()
+        .filter(|(_, waiting)| waiting.pid == pid && !waiting.asked)
+        .map(|(object, waiting)| {
+            waiting.asked = true;
+            *object
+        })
+        .collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    *last = Some(now);
+    Some(Some(wanted))
 }
 
 /// ETW record callback. Kept minimal; only a Create allocates.
@@ -1275,29 +1477,19 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         return;
     };
     // Classic (MOF) identity: the class GUID in `ProviderId`, the operation in
-    // the opcode. The `SYSTEM_IO_KW_FILE` enable names the SystemIo GROUP, and
-    // each record it delivers still carries its own class here — the same
-    // split [`super::disk_etw`] relies on for the `DiskIo` class. The kernel
-    // fills in no manifest event id for these records, so matching on one
-    // discarded every file event that did arrive.
+    // the opcode. No manifest event id is filled in for these records.
     if record.EventHeader.ProviderId != FileIoGuid {
         return;
     }
-    let event_id = u16::from(record.EventHeader.EventDescriptor.Opcode);
-    if !matches!(
-        event_id,
-        EVENT_CREATE | EVENT_CLEANUP | EVENT_CLOSE | EVENT_READ | EVENT_WRITE
-    ) {
-        return;
-    }
+    let opcode = record.EventHeader.EventDescriptor.Opcode;
+    let version = record.EventHeader.EventDescriptor.Version;
     // A file event without a payload is exactly as undecodable as a short one,
     // so it is counted rather than dropped.
     let payload = unsafe { etw::payload_of(record) }.unwrap_or_default();
-    let version = record.EventHeader.EventDescriptor.Version;
     handle_payload(
         shared,
         record.EventHeader.ProcessId,
-        event_id,
+        opcode,
         version,
         payload,
     );
@@ -1309,16 +1501,20 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
 /// without a live session. The payload width is pinned to
 /// [`KERNEL_FILE_POINTER_BYTES`] here rather than taken from the record header;
 /// a WOW64 caller's flag says nothing about a kernel-written payload.
-fn handle_payload(shared: &Shared, pid: u32, event_id: u16, version: u8, payload: &[u8]) {
-    match parse_event(event_id, version, payload, KERNEL_FILE_POINTER_BYTES) {
-        Some(FileEvent::Create { object, name }) => shared.create(pid, object, name),
-        Some(FileEvent::Close { object }) => shared.close(object),
-        Some(FileEvent::Transfer {
-            object,
-            size,
-            write,
-        }) => shared.transfer(pid, object, size, write),
-        None => shared.undecodable(event_id, version, payload.len() as u32),
+fn handle_payload(shared: &Shared, pid: u32, opcode: u8, version: u8, payload: &[u8]) {
+    match opcode {
+        EVENT_CREATE | EVENT_CLEANUP | EVENT_CLOSE | EVENT_READ | EVENT_WRITE | EVENT_OP_END => {
+            match parse_event(opcode, version, payload, KERNEL_FILE_POINTER_BYTES) {
+                Some(event) => shared.record(pid, event),
+                None => shared.undecodable(opcode, version, payload.len() as u32),
+            }
+        }
+        _ if OTHER_REQUESTS.contains(&opcode) && version == FILE_IO_VERSION => {
+            if let Some(irp) = read_pointer(payload, 0, KERNEL_FILE_POINTER_BYTES) {
+                shared.other_request(irp);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1335,14 +1531,26 @@ pub(super) fn session_name(role: TraceRole) -> &'static str {
 mod tests {
     use super::*;
 
-    /// `Create` payload in the provider's v1 template.
-    fn create_payload(pointer_bytes: usize, object: u64, name: &str) -> Vec<u8> {
+    const P: usize = KERNEL_FILE_POINTER_BYTES;
+    /// The `Irp` every synthetic request in these tests is issued on, unless a
+    /// test needs two in flight.
+    const IRP: u64 = 0x1111_1111_1111_1110;
+    /// `STATUS_FLT_DISALLOW_FAST_IO`, the refusal the live probe saw before a
+    /// cached write was retried as an IRP.
+    const STATUS_FLT_DISALLOW_FAST_IO: u32 = 0xC01C_0004;
+    /// `IoFlags` of a paging write as the live probe saw it
+    /// (`IRP_NOCACHE | IRP_PAGING_IO | IRP_SYNCHRONOUS_PAGING_IO` plus the
+    /// upper ETW bits).
+    const PAGING_FLAGS: u32 = 0x0006_0043;
+
+    /// `Create` payload, version 3.
+    fn create_payload_on(irp: u64, object: u64, name: &str) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend(std::iter::repeat_n(0x11u8, pointer_bytes)); // Irp
-        payload.extend_from_slice(&object.to_le_bytes()[..pointer_bytes]); // FileObject
-        payload.extend_from_slice(&1_000u32.to_le_bytes()); // IssuingThreadId
+        payload.extend_from_slice(&irp.to_le_bytes()[..P]); // Irp
+        payload.extend_from_slice(&object.to_le_bytes()[..P]); // FileObject
+        payload.extend_from_slice(&1_000u32.to_le_bytes()); // TTID
         payload.extend_from_slice(&0u32.to_le_bytes()); // CreateOptions
-        payload.extend_from_slice(&0u32.to_le_bytes()); // CreateAttributes
+        payload.extend_from_slice(&0u32.to_le_bytes()); // FileAttributes
         payload.extend_from_slice(&3u32.to_le_bytes()); // ShareAccess
         for unit in name.encode_utf16() {
             payload.extend_from_slice(&unit.to_le_bytes());
@@ -1351,27 +1559,44 @@ mod tests {
         payload
     }
 
-    /// `Read`/`Write` payload in the provider's v1 template.
-    fn transfer_payload(pointer_bytes: usize, object: u64, size: u32) -> Vec<u8> {
+    fn create_payload(object: u64, name: &str) -> Vec<u8> {
+        create_payload_on(0x2222_2222_2222_2220, object, name)
+    }
+
+    /// `Read`/`Write` payload, version 3.
+    fn request_payload_on(irp: u64, object: u64, size: u32, flags: u32) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&4_096u64.to_le_bytes()); // ByteOffset
-        payload.extend(std::iter::repeat_n(0x11u8, pointer_bytes)); // Irp
-        payload.extend_from_slice(&object.to_le_bytes()[..pointer_bytes]); // FileObject
-        payload.extend(std::iter::repeat_n(0x22u8, pointer_bytes)); // FileKey
-        payload.extend_from_slice(&1_000u32.to_le_bytes()); // IssuingThreadId
-        payload.extend_from_slice(&size.to_le_bytes()); // IOSize
-        payload.extend_from_slice(&0u32.to_le_bytes()); // IOFlags
+        payload.extend_from_slice(&4_096u64.to_le_bytes()); // Offset
+        payload.extend_from_slice(&irp.to_le_bytes()[..P]); // Irp
+        payload.extend_from_slice(&object.to_le_bytes()[..P]); // FileObject
+        payload.extend(std::iter::repeat_n(0x22u8, P)); // FileKey
+        payload.extend_from_slice(&1_000u32.to_le_bytes()); // TTID
+        payload.extend_from_slice(&size.to_le_bytes()); // IoSize
+        payload.extend_from_slice(&flags.to_le_bytes()); // IoFlags
         payload.extend_from_slice(&0u32.to_le_bytes()); // ExtraFlags
         payload
     }
 
-    /// `Cleanup`/`Close` payload in the provider's v1 template.
-    fn close_payload(pointer_bytes: usize, object: u64) -> Vec<u8> {
+    fn request_payload(object: u64, size: u32) -> Vec<u8> {
+        request_payload_on(IRP, object, size, 0)
+    }
+
+    /// `Cleanup`/`Close` payload, version 3.
+    fn close_payload(object: u64) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend(std::iter::repeat_n(0x11u8, pointer_bytes)); // Irp
-        payload.extend_from_slice(&object.to_le_bytes()[..pointer_bytes]); // FileObject
-        payload.extend(std::iter::repeat_n(0x22u8, pointer_bytes)); // FileKey
-        payload.extend_from_slice(&1_000u32.to_le_bytes()); // IssuingThreadId
+        payload.extend_from_slice(&0x3333_3333_3333_3330u64.to_le_bytes()[..P]); // Irp
+        payload.extend_from_slice(&object.to_le_bytes()[..P]); // FileObject
+        payload.extend(std::iter::repeat_n(0x22u8, P)); // FileKey
+        payload.extend_from_slice(&1_000u32.to_le_bytes()); // TTID
+        payload
+    }
+
+    /// `OpEnd` payload, version 3.
+    fn op_end_payload(irp: u64, bytes: u64, status: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&irp.to_le_bytes()[..P]); // Irp
+        payload.extend_from_slice(&bytes.to_le_bytes()[..P]); // ExtraInfo
+        payload.extend_from_slice(&status.to_le_bytes()); // NtStatus
         payload
     }
 
@@ -1383,32 +1608,50 @@ mod tests {
         }
     }
 
-    /// The callback's work, minus the ETW plumbing: decode, then account.
-    fn deliver(shared: &Shared, pid: u32, event_id: u16, payload: &[u8]) {
-        handle_payload(shared, pid, event_id, 1, payload);
+    /// The callback's work, minus the ETW plumbing: decode, then account. A
+    /// Read or Write request is followed by its successful completion for the
+    /// full requested size, which is what an ordinary cached transfer looks
+    /// like; tests about completions drive [`handle_payload`] themselves.
+    fn deliver(shared: &Shared, pid: u32, opcode: u8, payload: &[u8]) {
+        handle_payload(shared, pid, opcode, FILE_IO_VERSION, payload);
+        if matches!(opcode, EVENT_READ | EVENT_WRITE) {
+            let irp = read_pointer(payload, 8, P).expect("a request carries its Irp");
+            let size = read_u32(payload, 8 + 3 * P + 4).expect("and its size");
+            complete(shared, irp, u64::from(size), 0);
+        }
+    }
+
+    fn complete(shared: &Shared, irp: u64, bytes: u64, status: u32) {
+        handle_payload(
+            shared,
+            // `OpEnd` is logged in whatever context completes the request; the
+            // pid in its header is not what the bytes are charged to.
+            4,
+            EVENT_OP_END,
+            FILE_IO_VERSION,
+            &op_end_payload(irp, bytes, status),
+        );
     }
 
     /// Drive the REAL callback with a synthetic record of `provider`'s classic
-    /// class, the way the kernel logger hands one over: the class GUID in
-    /// `ProviderId`, the operation in the opcode, and no manifest event id.
-    fn deliver_kernel_record_as(
+    /// class: the class GUID in `ProviderId`, the operation in the opcode, and
+    /// no manifest event id.
+    fn deliver_record_as(
         shared: &Shared,
         provider: windows::core::GUID,
-        opcode: u16,
+        opcode: u8,
         version: u8,
         pid: u32,
         payload: &[u8],
     ) {
-        assert!(u8::try_from(opcode).is_ok(), "opcodes are one byte");
         // SAFETY: `EVENT_RECORD` is plain data, and a zeroed one is a record
         // with no payload, no context and an all-zero descriptor — every field
         // this test cares about is set below.
         let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
         record.EventHeader.ProviderId = provider;
-        record.EventHeader.EventDescriptor.Opcode = opcode as u8;
+        record.EventHeader.EventDescriptor.Opcode = opcode;
         record.EventHeader.EventDescriptor.Version = version;
-        // Deliberately zero: the classic identity carries no event id, and
-        // matching on one is what discarded every record that did arrive.
+        // Deliberately zero: the classic identity carries no event id.
         record.EventHeader.EventDescriptor.Id = 0;
         record.EventHeader.ProcessId = pid;
         record.UserData = payload.as_ptr() as *mut core::ffi::c_void;
@@ -1419,36 +1662,12 @@ mod tests {
         unsafe { on_event(&mut record) };
     }
 
-    fn deliver_kernel_record(shared: &Shared, opcode: u16, version: u8, pid: u32, payload: &[u8]) {
-        deliver_kernel_record_as(shared, FileIoGuid, opcode, version, pid, payload);
+    fn deliver_record(shared: &Shared, opcode: u8, pid: u32, payload: &[u8]) {
+        deliver_record_as(shared, FileIoGuid, opcode, FILE_IO_VERSION, pid, payload);
     }
 
     fn sample_of(shared: &Shared, pid: u32) -> FileIoSample {
-        let state = shared.state.lock().unwrap();
-        let files = state.pids.get(&pid);
-        FileIoSample {
-            running: true,
-            since_ms: 0,
-            files: files
-                .map(|files| {
-                    files
-                        .files
-                        .iter()
-                        .map(|(path, bytes)| (path.to_string(), *bytes))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            unnamed: files.map_or_else(Remainder::default, |files| files.unnamed),
-            omitted: files.map_or_else(Remainder::default, |files| files.omitted),
-            events_seen: state.events_seen,
-            events_decoded: state.events_decoded,
-            pid_read_transfers: files.map_or(0, |files| files.read_transfers),
-            pid_write_transfers: files.map_or(0, |files| files.write_transfers),
-            cleared_file_objects: state.cleared_file_objects,
-            unnamed_creates: state.unnamed_creates,
-            dropped_paths: state.dropped_paths,
-            events_lost: None,
-        }
+        sample_from(&shared.lock(), pid, true, 0)
     }
 
     fn bytes(sample: &FileIoSample, path: &str) -> Option<FileBytes> {
@@ -1459,36 +1678,44 @@ mod tests {
             .map(|(_, bytes)| *bytes)
     }
 
-    /// The kernel delivers per-file events under the classic `FileIo` class, so
-    /// that is what the callback has to accept: the class GUID plus one of the
-    /// five opcodes, decoded with the manifest's fields.
+    fn read(read_bytes: u64) -> Option<FileBytes> {
+        Some(FileBytes {
+            read_bytes,
+            write_bytes: 0,
+        })
+    }
+
+    fn written(write_bytes: u64) -> Option<FileBytes> {
+        Some(FileBytes {
+            read_bytes: 0,
+            write_bytes,
+        })
+    }
+
+    /// The identity the live kernel delivers, end to end through the REAL
+    /// callback: `FileIoGuid`, opcodes 64/67/68/76/66, version 3.
+    ///
+    /// Regression: the decoder accepted opcodes 12..16 — the manifest
+    /// provider's EVENT IDS — and threw away every classic record that
+    /// arrived, so the page read "a trace is running but has not delivered a
+    /// file event yet" forever.
     #[test]
-    fn a_kernel_file_io_record_decodes_from_the_classic_identity() {
+    fn the_live_classic_identity_decodes_into_a_measured_sample() {
         let shared = shared();
-        deliver_kernel_record(
+        deliver_record(
             &shared,
             EVENT_CREATE,
-            1,
             20,
-            &create_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, r"\??\C:\data\a.bin"),
+            &create_payload(0x1000, r"\??\C:\data\a.bin"),
         );
-        deliver_kernel_record(
-            &shared,
-            EVENT_READ,
-            1,
-            20,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 4_096),
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_WRITE,
-            1,
-            20,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 512),
-        );
+        deliver_record(&shared, EVENT_READ, 20, &request_payload(0x1000, 4_096));
+        deliver_record(&shared, EVENT_OP_END, 4, &op_end_payload(IRP, 4_096, 0));
+        deliver_record(&shared, EVENT_WRITE, 20, &request_payload(0x1000, 512));
+        deliver_record(&shared, EVENT_OP_END, 4, &op_end_payload(IRP, 512, 0));
         let sample = sample_of(&shared, 20);
-        assert_eq!(sample.events_seen, 3);
-        assert_eq!(sample.events_decoded, 3);
+        assert_eq!(sample.events_seen, 5);
+        assert_eq!(sample.events_decoded, 5);
+        assert_eq!(sample.state(), FileIoAccountingState::Measured);
         assert_eq!(
             bytes(&sample, r"C:\data\a.bin"),
             Some(FileBytes {
@@ -1496,22 +1723,11 @@ mod tests {
                 write_bytes: 512,
             })
         );
-        // Close forgets the object, so a later transfer through it is unnamed
-        // rather than charged to the file that had the address.
-        deliver_kernel_record(
-            &shared,
-            EVENT_CLOSE,
-            1,
-            20,
-            &close_payload(KERNEL_FILE_POINTER_BYTES, 0x1000),
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_READ,
-            1,
-            20,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 128),
-        );
+        // Close forgets the object, so a later transfer through the address is
+        // not charged to the file that had it.
+        deliver_record(&shared, EVENT_CLOSE, 20, &close_payload(0x1000));
+        deliver_record(&shared, EVENT_READ, 20, &request_payload(0x1000, 128));
+        deliver_record(&shared, EVENT_OP_END, 4, &op_end_payload(IRP, 128, 0));
         let sample = sample_of(&shared, 20);
         assert_eq!(
             bytes(&sample, r"C:\data\a.bin"),
@@ -1529,257 +1745,52 @@ mod tests {
         );
     }
 
-    /// The four operations the decoder keeps, driven by records carrying the
-    /// identity the `SYSTEM_IO_KW_FILE` enable delivers: the `FileIo` class
-    /// GUID plus the classic opcode. Create names the object, Read and Write
-    /// add their sizes, Close forgets it — and every one of them counts as
-    /// DECODED, so a session that delivers them is measured, not undecodable.
+    /// The manifest event ids the old decoder matched on are NOT file records
+    /// in the classic class: a record under them is ignored, not counted as a
+    /// file event, and certainly not decoded as a transfer.
     #[test]
-    fn a_system_io_file_record_decodes_create_read_write_close() {
+    fn the_manifest_event_ids_are_not_classic_file_opcodes() {
         let shared = shared();
-        let pid = 88;
-        let object = 0x9000;
-        deliver_kernel_record(
+        for old in 12u8..=16 {
+            deliver_record(&shared, old, 20, &request_payload(0x1000, 4_096));
+        }
+        let state = shared.lock();
+        assert_eq!(state.events_seen, 0);
+        assert!(state.pending.is_empty());
+        drop(state);
+        // And a record of another class with a file opcode is not ours either.
+        deliver_record_as(
             &shared,
-            EVENT_CREATE,
-            1,
-            pid,
-            &create_payload(KERNEL_FILE_POINTER_BYTES, object, r"\??\C:\data\d.bin"),
-        );
-        deliver_kernel_record(
-            &shared,
+            windows::Win32::System::Diagnostics::Etw::DiskIoGuid,
             EVENT_READ,
-            1,
-            pid,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 1_024),
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_WRITE,
-            1,
-            pid,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 2_048),
-        );
-        let sample = sample_of(&shared, pid);
-        assert_eq!(sample.events_seen, 3);
-        assert_eq!(sample.events_decoded, 3);
-        assert_eq!(
-            bytes(&sample, r"C:\data\d.bin"),
-            Some(FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 2_048,
-            })
-        );
-        assert_eq!(sample.state(), FileIoAccountingState::Measured);
-        deliver_kernel_record(
-            &shared,
-            EVENT_CLOSE,
-            1,
-            pid,
-            &close_payload(KERNEL_FILE_POINTER_BYTES, object),
-        );
-        let sample = sample_of(&shared, pid);
-        assert_eq!(sample.events_seen, 4);
-        assert_eq!(sample.events_decoded, 4, "Close decodes too");
-        assert!(
-            !shared.state.lock().unwrap().open.contains_key(&object),
-            "Close forgets the file object"
-        );
-        assert_eq!(
-            bytes(&sample, r"C:\data\d.bin"),
-            Some(FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 2_048,
-            }),
-            "closing does not erase what was measured"
-        );
-    }
-
-    /// The defect this replaces: a live elevated session reported `undelivered`
-    /// with `events_lost` at zero because no record ever arrived. Once one does,
-    /// the state must move on — and only a decoded read or write may make it
-    /// `measured`, never a Create.
-    #[test]
-    fn a_delivered_kernel_record_is_no_longer_undelivered() {
-        let shared = shared();
-        assert_eq!(
-            sample_of(&shared, 20).state(),
-            FileIoAccountingState::Undelivered
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_CREATE,
-            1,
+            FILE_IO_VERSION,
             20,
-            &create_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, r"\??\C:\data\a.bin"),
+            &request_payload(0x1000, 4_096),
         );
-        assert_eq!(
-            sample_of(&shared, 20).state(),
-            FileIoAccountingState::Undelivered,
-            "a Create names the file but carries no bytes"
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_READ,
-            1,
-            20,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 4_096),
-        );
-        let sample = sample_of(&shared, 20);
-        assert_eq!(sample.state(), FileIoAccountingState::Measured);
-        assert_eq!(sample.pid_read_transfers, 1);
-
-        // A record from another class sharing the session is not a file event:
-        // it must leave every counter alone instead of making the state
-        // `undecodable` or inflating the byte counts.
-        deliver_kernel_record_as(
-            &shared,
-            windows::Win32::System::Diagnostics::Etw::ThreadGuid,
-            EVENT_READ,
-            1,
-            20,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x1000, 8_192),
-        );
-        assert_eq!(sample_of(&shared, 20), sample);
+        assert_eq!(shared.lock().events_seen, 0);
     }
 
-    /// The record shape the PREFERRED session delivers: a classic `FileIo`
-    /// record, whose identity is the class GUID in `ProviderId` and the
-    /// operation in the opcode (no manifest event id, no provider enable —
-    /// `EVENT_TRACE_FLAG_FILE_IO` is the whole subscription). Driven through the
-    /// real callback, the four operations the decoder keeps must add up to a
-    /// measured sample.
+    /// The session prefers its own private logger and keeps the exclusive
+    /// kernel logger as the fallback; neither enables a provider (the flags are
+    /// the subscription), and the two hosts never share the private name.
     #[test]
-    fn a_kernel_logger_file_io_record_decodes_into_a_measured_sample() {
-        let shared = shared();
-        let pid = 4_692;
-        let object = 0xff_ff_9a_00_12_34_00_00u64;
-        deliver_kernel_record(
-            &shared,
-            EVENT_CREATE,
-            1,
-            pid,
-            &create_payload(
-                KERNEL_FILE_POINTER_BYTES,
-                object,
-                r"\Device\HarddiskVolume3\Users\me\kernel.dat",
-            ),
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_WRITE,
-            1,
-            pid,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 8_192),
-        );
-        deliver_kernel_record(
-            &shared,
-            EVENT_READ,
-            1,
-            pid,
-            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 1_024),
-        );
-        let sample = sample_of(&shared, pid);
-        assert_eq!(
-            bytes(&sample, r"C:\Users\me\kernel.dat"),
-            Some(FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 8_192,
-            }),
-            "the device path is translated exactly as on the fallback session"
-        );
-        assert_eq!(sample.state(), FileIoAccountingState::Measured);
-        assert_eq!(sample.events_seen, 3);
-        assert_eq!(sample.events_decoded, 3);
-        deliver_kernel_record(
-            &shared,
-            EVENT_CLEANUP,
-            1,
-            pid,
-            &close_payload(KERNEL_FILE_POINTER_BYTES, object),
-        );
-        // Cleanup ends the handle's accounting; the measurement stands.
-        let sample = sample_of(&shared, pid);
-        assert_eq!(sample.events_decoded, 4);
-        assert_eq!(
-            bytes(&sample, r"C:\Users\me\kernel.dat"),
-            Some(FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 8_192,
-            })
-        );
-        assert!(!shared.state.lock().unwrap().open.contains_key(&object));
-    }
-
-    /// The session kind plus the provider enable ARE the subscription: a
-    /// manifest session delivers no `FileIo` record however it is enabled, and
-    /// the legacy `EVENT_TRACE_FLAG_FILE_IO` shape delivered none either on a
-    /// PRIVATE system logger — a live elevated selfcheck reported `undelivered`
-    /// with `events_lost` at 0 on both. What is left there is the documented
-    /// SystemIo provider path: the group GUID with the file keywords, on a system
-    /// logger.
-    #[test]
-    fn the_fallback_session_enables_the_system_io_provider_with_the_file_keywords() {
-        assert_eq!(LOGGER_KIND, LoggerKind::SystemFile);
-        assert_eq!(PROVIDERS.len(), 1, "one keyword set, not a broad enable");
-        assert_eq!(PROVIDERS[0].guid, SystemIoProviderGuid);
-        assert_eq!(
-            PROVIDERS[0].match_any_keyword,
-            SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME
-        );
-        assert_eq!(
-            PROVIDERS[0].match_any_keyword & !(SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME),
-            0,
-            "no other SystemIo keyword may ride this session"
-        );
-        assert!(
-            PROVIDERS[0].match_any_keyword & SYSTEM_IO_KW_FILE != 0,
-            "the class keyword stays: it is what makes the transfers arrive"
-        );
-        // The class the decoder accepts is the FILE class, not the group's
-        // disk class: the enable and the record identity are different GUIDs.
-        assert_ne!(PROVIDERS[0].guid, FileIoGuid);
-    }
-
-    /// The attempt order IS the design, so it is data a test reads.
-    ///
-    /// The kernel logger comes first because it is the session that actually
-    /// delivers the classic `FileIo` class; the private SystemIo session is the
-    /// fallback for when another tracing tool owns that one. The kernel attempt
-    /// enables NO provider — its `EnableFlags` are the subscription — and it
-    /// keeps the global name whatever the role, while the fallback's name is
-    /// per role so the two hosts never share a session.
-    #[test]
-    fn the_kernel_logger_is_tried_before_the_private_system_io_session() {
+    fn the_private_session_is_tried_before_the_kernel_logger() {
         for role in [TraceRole::Service, TraceRole::App] {
             let [primary, fallback] = sources(role);
-            assert_eq!(primary.kind, LoggerKind::KernelFile);
-            assert_eq!(primary.name, KERNEL_LOGGER);
-            assert!(
-                primary.providers.is_empty(),
-                "the kernel logger subscribes through EnableFlags, not a provider"
-            );
-            assert_eq!(
-                primary.providers.len(),
-                KERNEL_PROVIDERS.len(),
-                "and that is what KERNEL_PROVIDERS says"
-            );
-            assert_eq!(fallback.kind, LOGGER_KIND);
-            assert_eq!(fallback.name, session_name(role));
-            assert_ne!(fallback.name, KERNEL_LOGGER);
-            assert_eq!(fallback.providers.len(), 1);
-            assert_eq!(fallback.providers[0].guid, SystemIoProviderGuid);
+            assert_eq!(primary.kind, LoggerKind::SystemFile);
+            assert_eq!(primary.name, session_name(role));
+            assert_ne!(primary.name, KERNEL_LOGGER);
+            assert_eq!(fallback.kind, LoggerKind::KernelFile);
+            assert_eq!(fallback.name, KERNEL_LOGGER);
         }
-        // The two hosts must not share the FALLBACK name; only the kernel
-        // logger is global, and that is exactly why it is exclusive.
         assert_ne!(
-            sources(TraceRole::Service)[1].name,
-            sources(TraceRole::App)[1].name
+            sources(TraceRole::Service)[0].name,
+            sources(TraceRole::App)[0].name
         );
     }
 
-    /// A refusal from the kernel attempt becomes the state that names an owner,
-    /// and no byte count is invented: the snapshot keeps the handle walk's rows
+    /// A refusal that names the kernel logger's owner becomes that state, and
+    /// no byte count is invented: the snapshot keeps the handle walk's rows
     /// exactly as they were and gains only a state.
     #[test]
     fn a_kernel_logger_refusal_becomes_the_state_that_names_its_owner() {
@@ -1799,8 +1810,6 @@ mod tests {
         assert_eq!(accounting.since_ms, 0, "no session ran for any span");
         assert_eq!(accounting.read_bytes, 0);
         assert_eq!(accounting.write_bytes, 0);
-        assert_eq!(accounting.unnamed_read_bytes, 0);
-        assert_eq!(accounting.omitted_write_bytes, 0);
 
         // Every other answer leaves the snapshot at `Unavailable`: "we did not
         // get to ask" and "no elevation" are not somebody else's ownership.
@@ -1819,9 +1828,226 @@ mod tests {
         }
     }
 
-    /// A read-only handle reports bytes in Read and none in Write, and the
-    /// reverse for a write-only one. This is the whole product requirement: the
-    /// two directions are never mixed up or duplicated.
+    /// A cached write the filter manager refuses on the fast path is logged
+    /// twice: the refused attempt and the IRP retry, on the same `Irp`. Only
+    /// the completion that moved bytes counts.
+    ///
+    /// Regression: counting REQUESTS charged the probe's 2 x 64 KiB of writes
+    /// as 192 KiB.
+    #[test]
+    fn a_refused_fast_io_attempt_and_its_retry_count_once() {
+        let shared = shared();
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\w.bin"),
+        );
+        // The sequence the live probe recorded for one 64 KiB write.
+        handle_payload(
+            &shared,
+            20,
+            EVENT_WRITE,
+            FILE_IO_VERSION,
+            &request_payload_on(IRP, 0x1000, 65_536, 0),
+        );
+        complete(&shared, IRP, 0, STATUS_FLT_DISALLOW_FAST_IO);
+        handle_payload(
+            &shared,
+            20,
+            EVENT_WRITE,
+            FILE_IO_VERSION,
+            &request_payload_on(IRP, 0x1000, 65_536, 0x0006_0a00),
+        );
+        complete(&shared, IRP, 65_536, 0);
+        let sample = sample_of(&shared, 20);
+        assert_eq!(bytes(&sample, r"C:\data\w.bin"), written(65_536));
+        assert_eq!(sample.pid_write_transfers, 1, "one write, not two");
+        assert_eq!(shared.lock().failed_completions, 1);
+    }
+
+    /// The bytes charged are the bytes the completion reports: a read at end of
+    /// file asks for more than it gets.
+    #[test]
+    fn a_short_read_counts_the_bytes_it_completed_with() {
+        let shared = shared();
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\short.bin"),
+        );
+        handle_payload(
+            &shared,
+            20,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 100_000),
+        );
+        complete(&shared, IRP, 131, 0);
+        assert_eq!(
+            bytes(&sample_of(&shared, 20), r"C:\data\short.bin"),
+            read(131)
+        );
+        // A completion can never exceed the request: a larger number is a
+        // misread and is bounded by the requested size.
+        handle_payload(
+            &shared,
+            20,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 10),
+        );
+        complete(&shared, IRP, 1 << 40, 0);
+        assert_eq!(
+            bytes(&sample_of(&shared, 20), r"C:\data\short.bin"),
+            read(141)
+        );
+    }
+
+    /// The completion is charged to the process that ISSUED the request, not
+    /// to whatever context the `OpEnd` was logged in.
+    #[test]
+    fn a_completion_is_charged_to_the_requesting_process() {
+        let shared = shared();
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\async.bin"),
+        );
+        handle_payload(
+            &shared,
+            20,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 8_192),
+        );
+        // `complete` logs the OpEnd under pid 4.
+        complete(&shared, IRP, 8_192, 0);
+        assert_eq!(
+            bytes(&sample_of(&shared, 20), r"C:\data\async.bin"),
+            read(8_192)
+        );
+        assert_eq!(sample_of(&shared, 4).pid_transfers(), 0);
+    }
+
+    /// Paging I/O — a flush of cached data, the lazy writer, a page fault — is
+    /// not a logical transfer and would charge cached bytes a second time.
+    ///
+    /// Regression: the probe's `FlushFileBuffers` after 2 x 64 KiB of writes
+    /// added a 128 KiB paging write to the same process.
+    #[test]
+    fn paging_io_is_not_counted() {
+        let shared = shared();
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\flushed.bin"),
+        );
+        deliver(&shared, 20, EVENT_WRITE, &request_payload(0x1000, 65_536));
+        handle_payload(
+            &shared,
+            20,
+            EVENT_WRITE,
+            FILE_IO_VERSION,
+            &request_payload_on(0x4444_4444_4444_4440, 0x1000, 131_072, PAGING_FLAGS),
+        );
+        complete(&shared, 0x4444_4444_4444_4440, 131_072, 0);
+        let sample = sample_of(&shared, 20);
+        assert_eq!(bytes(&sample, r"C:\data\flushed.bin"), written(65_536));
+        assert_eq!(sample.pid_write_transfers, 1);
+        assert_eq!(shared.lock().paging_skipped, 1);
+    }
+
+    /// An `Irp` is reused once its request is done. When a request's
+    /// completion was lost, the next operation on that `Irp` — of ANY kind —
+    /// retires it, so the next completion is never charged as the lost
+    /// transfer's bytes.
+    #[test]
+    fn a_request_whose_completion_was_lost_is_never_charged_later() {
+        let shared = shared();
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\lost.bin"),
+        );
+        handle_payload(
+            &shared,
+            20,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 4_096),
+        );
+        // A query-information request (opcode 74) reuses the Irp; its
+        // completion reports 56 bytes of information, not of file data.
+        let mut query = Vec::new();
+        query.extend_from_slice(&IRP.to_le_bytes()[..P]);
+        query.extend_from_slice(&0x1000u64.to_le_bytes()[..P]);
+        query.extend(std::iter::repeat_n(0u8, 24));
+        handle_payload(&shared, 20, 74, FILE_IO_VERSION, &query);
+        complete(&shared, IRP, 56, 0);
+        let sample = sample_of(&shared, 20);
+        assert_eq!(sample.pid_transfers(), 0);
+        assert_eq!(
+            bytes(&sample, r"C:\data\lost.bin"),
+            Some(FileBytes::default())
+        );
+        assert_eq!(shared.lock().orphaned_requests, 1);
+
+        // The same holds for a Create on the Irp.
+        handle_payload(
+            &shared,
+            20,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 4_096),
+        );
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload_on(IRP, 0x2000, r"\??\C:\data\other.bin"),
+        );
+        complete(&shared, IRP, 128, 0);
+        assert_eq!(sample_of(&shared, 20).pid_transfers(), 0);
+    }
+
+    /// A process with no completed transfer is a MEASURED zero once the
+    /// session has proven it delivers transfers; before that it is unknown.
+    #[test]
+    fn a_process_without_io_is_measured_once_the_session_delivers() {
+        let shared = shared();
+        // Only creates so far: the subscription has not proven it carries
+        // transfers.
+        deliver(
+            &shared,
+            20,
+            EVENT_CREATE,
+            &create_payload(0x1000, r"\??\C:\data\idle.bin"),
+        );
+        let idle = sample_of(&shared, 20);
+        assert_eq!(idle.state(), FileIoAccountingState::Undelivered);
+        // Another process transfers: now silence from pid 20 is a measurement.
+        deliver(
+            &shared,
+            30,
+            EVENT_CREATE,
+            &create_payload(0x2000, r"\??\C:\data\busy.bin"),
+        );
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x2000, 10));
+        let idle = sample_of(&shared, 20);
+        assert_eq!(idle.state(), FileIoAccountingState::Measured);
+        assert_eq!(idle.attributed(), FileBytes::default());
+        // The file it has open is known to the trace: a zero, not a gap.
+        assert_eq!(
+            bytes(&idle, r"C:\data\idle.bin"),
+            Some(FileBytes::default())
+        );
+    }
+
     #[test]
     fn a_read_only_handle_reports_only_read_bytes() {
         let shared = shared();
@@ -1829,18 +2055,12 @@ mod tests {
             &shared,
             20,
             EVENT_CREATE,
-            &create_payload(8, 0x1000, r"\??\C:\data\a.bin"),
+            &create_payload(0x1000, r"\??\C:\data\a.bin"),
         );
-        deliver(&shared, 20, EVENT_READ, &transfer_payload(8, 0x1000, 4_096));
-        deliver(&shared, 20, EVENT_READ, &transfer_payload(8, 0x1000, 512));
+        deliver(&shared, 20, EVENT_READ, &request_payload(0x1000, 4_096));
+        deliver(&shared, 20, EVENT_READ, &request_payload(0x1000, 512));
         let sample = sample_of(&shared, 20);
-        assert_eq!(
-            bytes(&sample, r"C:\data\a.bin"),
-            Some(FileBytes {
-                read_bytes: 4_608,
-                write_bytes: 0,
-            })
-        );
+        assert_eq!(bytes(&sample, r"C:\data\a.bin"), read(4_608));
         assert_eq!(sample.unnamed, Remainder::default());
         assert_eq!(sample.omitted, Remainder::default());
     }
@@ -1852,141 +2072,160 @@ mod tests {
             &shared,
             24,
             EVENT_CREATE,
-            &create_payload(8, 0x2000, r"\??\C:\data\b.bin"),
+            &create_payload(0x2000, r"\??\C:\data\b.bin"),
         );
-        deliver(
-            &shared,
-            24,
-            EVENT_WRITE,
-            &transfer_payload(8, 0x2000, 8_192),
-        );
-        let sample = sample_of(&shared, 24);
+        deliver(&shared, 24, EVENT_WRITE, &request_payload(0x2000, 8_192));
         assert_eq!(
-            bytes(&sample, r"C:\data\b.bin"),
-            Some(FileBytes {
-                read_bytes: 0,
-                write_bytes: 8_192,
-            })
+            bytes(&sample_of(&shared, 24), r"C:\data\b.bin"),
+            written(8_192)
         );
     }
 
-    /// The full lifecycle: the name arrives with Create, both transfers land on
-    /// it, and Close forgets the file object so a later reuse cannot inherit it.
+    /// A handle opened before the session has no Create in it. Its bytes wait
+    /// under the object, the handle table names the object, and the bytes that
+    /// arrived BEFORE the name move onto it — later ones land there directly.
     #[test]
-    fn create_read_write_close_accumulates_then_forgets() {
+    fn a_handle_opened_before_the_trace_is_named_from_the_handle_table() {
         let shared = shared();
-        let path = r"\??\C:\data\c.bin";
-        deliver(&shared, 8, EVENT_CREATE, &create_payload(8, 0x3000, path));
-        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x3000, 1_024));
-        deliver(&shared, 8, EVENT_WRITE, &transfer_payload(8, 0x3000, 2_048));
-        let sample = sample_of(&shared, 8);
-        assert_eq!(
-            bytes(&sample, r"C:\data\c.bin"),
-            Some(FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 2_048,
-            })
-        );
-        assert_eq!(
-            sample.attributed(),
-            FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 2_048
-            }
-        );
-        deliver(&shared, 8, EVENT_CLOSE, &close_payload(8, 0x3000));
-        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x3000, 4_096));
-        let sample = sample_of(&shared, 8);
-        // The counters keep what was measured; the new read has no name.
-        assert_eq!(
-            bytes(&sample, r"C:\data\c.bin"),
-            Some(FileBytes {
-                read_bytes: 1_024,
-                write_bytes: 2_048,
-            })
-        );
+        deliver(&shared, 30, EVENT_WRITE, &request_payload(0x4000, 8_192));
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x4000, 4_096));
+        let sample = sample_of(&shared, 30);
+        assert!(sample.files.is_empty(), "nothing is charged to a guess");
         assert_eq!(
             sample.unnamed,
             Remainder {
                 read_bytes: 4_096,
-                write_bytes: 0
-            }
-        );
-        assert_eq!(
-            sample.attributed(),
-            FileBytes {
-                read_bytes: 5_120,
-                write_bytes: 2_048,
+                write_bytes: 8_192,
             },
-            "rows plus remainders are the whole attribution"
+            "waiting bytes are part of the process total meanwhile"
         );
+        let mut state = shared.lock();
+        state.apply_names(30, vec![(0x4000, r"C:\db\store.db".to_string())]);
+        drop(state);
+        deliver(&shared, 30, EVENT_WRITE, &request_payload(0x4000, 100));
+        let sample = sample_of(&shared, 30);
+        assert_eq!(
+            bytes(&sample, r"C:\db\store.db"),
+            Some(FileBytes {
+                read_bytes: 4_096,
+                write_bytes: 8_292,
+            })
+        );
+        assert_eq!(sample.unnamed, Remainder::default());
     }
 
-    /// A transfer whose FileObject was never seen — the normal case for handles
-    /// opened before the session started — is attributed to nobody.
+    /// A name from the handle table never overrides a Create the trace saw,
+    /// and never belongs to another process's bytes.
     #[test]
-    fn an_unseen_file_object_is_never_charged_to_a_name() {
+    fn a_handle_table_name_is_only_a_fallback() {
         let shared = shared();
         deliver(
             &shared,
             30,
-            EVENT_READ,
-            &transfer_payload(8, 0x4000, 65_536),
+            EVENT_CREATE,
+            &create_payload(0x4000, r"\??\C:\seen.bin"),
         );
+        // Bytes on an unnamed object of ANOTHER process.
+        deliver(&shared, 31, EVENT_READ, &request_payload(0x5000, 64));
+        let mut state = shared.lock();
+        state.apply_names(
+            30,
+            vec![
+                (0x4000, r"C:\guess.bin".to_string()),
+                (0x5000, r"C:\theirs.bin".to_string()),
+            ],
+        );
+        drop(state);
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x4000, 10));
+        assert_eq!(bytes(&sample_of(&shared, 30), r"C:\seen.bin"), read(10));
+        let other = sample_of(&shared, 31);
+        assert!(other.files.is_empty());
+        assert_eq!(other.unnamed.read_bytes, 64);
+    }
+
+    /// An unnamed object that is closed before it could be named keeps its
+    /// bytes, as unnamed; a new object at the same address starts clean.
+    #[test]
+    fn a_closed_unnamed_object_keeps_its_bytes_as_unnamed() {
+        let shared = shared();
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x4000, 512));
+        deliver(&shared, 30, EVENT_CLOSE, &close_payload(0x4000));
+        assert!(shared.lock().unresolved.is_empty());
         deliver(
             &shared,
             30,
-            EVENT_WRITE,
-            &transfer_payload(8, 0x4000, 1_024),
+            EVENT_CREATE,
+            &create_payload(0x4000, r"\??\C:\new.bin"),
         );
+        deliver(&shared, 30, EVENT_READ, &request_payload(0x4000, 8));
         let sample = sample_of(&shared, 30);
-        assert!(sample.files.is_empty(), "nothing may be charged");
+        assert_eq!(bytes(&sample, r"C:\new.bin"), read(8));
+        assert_eq!(sample.unnamed.read_bytes, 512);
+    }
+
+    /// The first sample of a process names every file handle it holds; later
+    /// samples name only objects with waiting bytes, at most once per
+    /// interval, and never the same object twice.
+    #[test]
+    fn handle_table_naming_is_bounded() {
+        let mut state = State::default();
+        let mut last = None;
+        let start = Instant::now();
         assert_eq!(
-            sample.unnamed,
-            Remainder {
-                read_bytes: 65_536,
-                write_bytes: 1_024,
-            }
+            naming_request(&mut state, 30, &mut last, start),
+            Some(None),
+            "the first sample names every handle"
+        );
+        assert_eq!(naming_request(&mut state, 30, &mut last, start), None);
+        state.complete(30, 0x4000, false, 10);
+        assert_eq!(
+            naming_request(&mut state, 30, &mut last, start + SEED_INTERVAL / 2),
+            None,
+            "throttled"
+        );
+        let wanted = naming_request(&mut state, 30, &mut last, start + SEED_INTERVAL)
+            .expect("due")
+            .expect("only the waiting objects");
+        assert_eq!(wanted, HashSet::from([0x4000]));
+        assert_eq!(
+            naming_request(&mut state, 30, &mut last, start + 3 * SEED_INTERVAL),
+            None,
+            "an object is asked about once"
+        );
+        // Another process's first sample is never throttled.
+        assert_eq!(
+            naming_request(&mut state, 31, &mut last, start + 3 * SEED_INTERVAL),
+            Some(None)
         );
     }
 
-    /// Bytes are attributed to the process in the event header, one row per
-    /// process: the same file read by two processes is two rows.
+    /// Bytes are attributed to the process in the request header: the same
+    /// file object used by another process is not its name to inherit.
     #[test]
     fn bytes_are_attributed_to_the_header_process() {
         let shared = shared();
         let path = r"\??\C:\data\shared.bin";
-        deliver(&shared, 40, EVENT_CREATE, &create_payload(8, 0x5000, path));
-        deliver(&shared, 40, EVENT_READ, &transfer_payload(8, 0x5000, 4_096));
+        deliver(&shared, 40, EVENT_CREATE, &create_payload(0x5000, path));
+        deliver(&shared, 40, EVENT_READ, &request_payload(0x5000, 4_096));
         // A handle duplicated into another process resolves the same object
         // but belongs to that process's accounting, not to the creator's.
-        deliver(&shared, 44, EVENT_READ, &transfer_payload(8, 0x5000, 512));
+        deliver(&shared, 44, EVENT_READ, &request_payload(0x5000, 512));
         assert_eq!(
             bytes(&sample_of(&shared, 40), r"C:\data\shared.bin"),
-            Some(FileBytes {
-                read_bytes: 4_096,
-                write_bytes: 0,
-            })
+            read(4_096)
         );
         let other = sample_of(&shared, 44);
         assert!(
             other.files.is_empty(),
             "a foreign pid must not inherit the name"
         );
-        assert_eq!(
-            other.unnamed,
-            Remainder {
-                read_bytes: 512,
-                write_bytes: 0
-            }
-        );
+        assert_eq!(other.unnamed.read_bytes, 512);
         assert_eq!(other.pid_transfers(), 1);
     }
 
     /// The open-file map is capped, and what it discards is counted rather than
     /// silently lost. A Create that will not be inserted must not pay that
-    /// price: clearing the map for a network-share name would turn every file
-    /// already open into a remainder.
+    /// price.
     #[test]
     fn the_open_file_map_is_capped_and_counts_what_it_drops() {
         let shared = shared();
@@ -1996,41 +2235,50 @@ mod tests {
                 &shared,
                 8,
                 EVENT_CREATE,
-                &create_payload(8, 0x10_0000 + index as u64 * 8, &path),
+                &create_payload(0x10_0000 + index as u64 * 8, &path),
             );
         }
-        assert_eq!(shared.state.lock().unwrap().open.len(), MAX_OPEN_FILES);
-        // A name that cannot resolve is not inserted, so it does not clear the
-        // map either: every live entry survives and only the refusal is
-        // counted.
+        assert_eq!(shared.lock().open.len(), MAX_OPEN_FILES);
         deliver(
             &shared,
             8,
             EVENT_CREATE,
-            &create_payload(8, 0x30_0000, r"\SystemRoot\unresolvable"),
+            &create_payload(0x30_0000, r"\SystemRoot\unresolvable"),
         );
         {
-            let state = shared.state.lock().unwrap();
+            let state = shared.lock();
             assert_eq!(state.open.len(), MAX_OPEN_FILES, "nothing was inserted");
             assert_eq!(state.cleared_file_objects, 0, "nothing was cleared");
             assert_eq!(state.unnamed_creates, 1);
-            assert!(
-                state.open.contains_key(&0x10_0000),
-                "the first file is still named"
-            );
         }
-        // One more Create that DOES resolve hits the cap: the map is cleared
-        // and the drop counted.
         deliver(
             &shared,
             8,
             EVENT_CREATE,
-            &create_payload(8, 0x20_0000, r"\??\C:\last"),
+            &create_payload(0x20_0000, r"\??\C:\last"),
         );
-        let state = shared.state.lock().unwrap();
+        let state = shared.lock();
         assert_eq!(state.open.len(), 1, "the map restarts bounded");
         assert_eq!(state.cleared_file_objects, MAX_OPEN_FILES as u64);
         assert!(state.open.contains_key(&0x20_0000));
+    }
+
+    /// In-flight requests are bounded too, and the drop is counted.
+    #[test]
+    fn pending_requests_are_capped() {
+        let shared = shared();
+        for index in 0..=MAX_PENDING_REQUESTS as u64 {
+            handle_payload(
+                &shared,
+                8,
+                EVENT_READ,
+                FILE_IO_VERSION,
+                &request_payload_on(0x100_0000 + index * 8, 0x1000, 1, 0),
+            );
+        }
+        let state = shared.lock();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.orphaned_requests, MAX_PENDING_REQUESTS as u64);
     }
 
     /// The session-wide path budget is a real bound and a real count: a file
@@ -2043,57 +2291,34 @@ mod tests {
             &shared,
             8,
             EVENT_CREATE,
-            &create_payload(8, 0x1000, r"\??\C:\data\budget.bin"),
+            &create_payload(0x1000, r"\??\C:\data\budget.bin"),
         );
-        {
-            let mut state = shared.state.lock().unwrap();
-            state.tracked_paths = MAX_TRACKED_FILES;
-        }
-        deliver(&shared, 8, EVENT_WRITE, &transfer_payload(8, 0x1000, 4_096));
-        let sample = sample_of(&shared, 8);
-        assert!(
-            sample.files.is_empty(),
-            "a path with no room must not get a row"
-        );
-        assert_eq!(
-            sample.omitted,
-            Remainder {
-                read_bytes: 0,
-                write_bytes: 4_096
-            }
-        );
-        assert_eq!(sample.dropped_paths, 1);
-        assert_eq!(
-            sample.attributed().write_bytes,
-            4_096,
-            "an untracked file is still part of the process total"
-        );
-
-        // Below the budget the same transfer tracks normally, and an already
-        // tracked path does not consume a second slot.
-        {
-            let mut state = shared.state.lock().unwrap();
-            state.tracked_paths = MAX_TRACKED_FILES - 1;
-        }
-        deliver(&shared, 8, EVENT_WRITE, &transfer_payload(8, 0x1000, 256));
+        shared.lock().tracked_paths = MAX_TRACKED_FILES;
+        deliver(&shared, 8, EVENT_WRITE, &request_payload(0x1000, 4_096));
         let sample = sample_of(&shared, 8);
         assert_eq!(
             bytes(&sample, r"C:\data\budget.bin"),
-            Some(FileBytes {
-                read_bytes: 0,
-                write_bytes: 256
-            }),
+            Some(FileBytes::default()),
+            "the open file is known, but its bytes had no room"
+        );
+        assert_eq!(sample.omitted.write_bytes, 4_096);
+        assert_eq!(sample.dropped_paths, 1);
+        assert_eq!(sample.attributed().write_bytes, 4_096);
+
+        shared.lock().tracked_paths = MAX_TRACKED_FILES - 1;
+        deliver(&shared, 8, EVENT_WRITE, &request_payload(0x1000, 256));
+        let sample = sample_of(&shared, 8);
+        assert_eq!(
+            bytes(&sample, r"C:\data\budget.bin"),
+            written(256),
             "the rejected transfer is not replayed, only this one counts"
         );
-        assert_eq!(sample.dropped_paths, 1);
-        assert_eq!(
-            shared.state.lock().unwrap().tracked_paths,
-            MAX_TRACKED_FILES
-        );
+        assert_eq!(shared.lock().tracked_paths, MAX_TRACKED_FILES);
     }
 
     /// A pid reused between two samples belongs to a different process, so the
-    /// previous process's paths and open file objects must not carry over.
+    /// previous process's paths, open file objects, pending requests and
+    /// waiting bytes must not carry over.
     #[test]
     fn a_reused_pid_starts_a_fresh_bucket() {
         let shared = shared();
@@ -2101,56 +2326,38 @@ mod tests {
             &shared,
             8,
             EVENT_CREATE,
-            &create_payload(8, 0x1000, r"\??\C:\old.bin"),
+            &create_payload(0x1000, r"\??\C:\old.bin"),
         );
-        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x1000, 4_096));
+        deliver(&shared, 8, EVENT_READ, &request_payload(0x1000, 4_096));
+        deliver(&shared, 8, EVENT_READ, &request_payload(0x7000, 64));
+        handle_payload(
+            &shared,
+            8,
+            EVENT_READ,
+            FILE_IO_VERSION,
+            &request_payload(0x1000, 1),
+        );
         {
-            let mut state = shared.state.lock().unwrap();
+            let mut state = shared.lock();
             state.bind_epoch(8, 1_000);
             assert_eq!(state.pids.get(&8).unwrap().epoch_s, Some(1_000));
             assert_eq!(state.tracked_paths, 1);
-        }
-        // Same pid, different creation time: the counters belong to a process
-        // that is gone.
-        {
-            let mut state = shared.state.lock().unwrap();
             state.bind_epoch(8, 2_000);
-            assert!(
-                !state.pids.contains_key(&8),
-                "the previous process's paths are gone"
-            );
-            assert!(
-                !state.open.contains_key(&0x1000),
-                "and so are the names it had open"
-            );
+            assert_eq!(state.pids.get(&8).unwrap().epoch_s, Some(2_000));
+            assert!(state.pids.get(&8).unwrap().files.is_empty());
+            assert!(!state.open.contains_key(&0x1000));
+            assert!(state.pending.is_empty());
+            assert!(state.unresolved.is_empty());
             assert_eq!(state.tracked_paths, 0);
         }
-        // The new process starts from nothing and accumulates its own paths.
-        let sample = sample_of(&shared, 8);
-        assert!(sample.files.is_empty());
-        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x1000, 512));
+        deliver(&shared, 8, EVENT_READ, &request_payload(0x1000, 512));
         let sample = sample_of(&shared, 8);
         assert!(sample.files.is_empty(), "the old name is not inherited");
-        assert_eq!(
-            sample.unnamed,
-            Remainder {
-                read_bytes: 512,
-                write_bytes: 0
-            }
-        );
+        assert_eq!(sample.unnamed.read_bytes, 512);
         // Re-binding the same creation time keeps the bucket.
-        deliver(
-            &shared,
-            8,
-            EVENT_CREATE,
-            &create_payload(8, 0x2000, r"\??\C:\new.bin"),
-        );
-        {
-            let mut state = shared.state.lock().unwrap();
-            let before = state.pids.get(&8).unwrap().files.len();
-            state.bind_epoch(8, 2_000);
-            assert_eq!(state.pids.get(&8).unwrap().files.len(), before);
-        }
+        let mut state = shared.lock();
+        state.bind_epoch(8, 2_000);
+        assert_eq!(state.pids.get(&8).unwrap().read_transfers, 1);
     }
 
     /// Per-process tracking is capped too, and a file beyond the cap never
@@ -2161,39 +2368,26 @@ mod tests {
         for index in 0..MAX_TRACKED_FILES_PER_PID {
             let path = format!(r"\??\C:\g{index}");
             let object = 0x10_0000 + index as u64 * 8;
-            deliver(&shared, 8, EVENT_CREATE, &create_payload(8, object, &path));
-            deliver(&shared, 8, EVENT_WRITE, &transfer_payload(8, object, 256));
+            deliver(&shared, 8, EVENT_CREATE, &create_payload(object, &path));
+            deliver(&shared, 8, EVENT_WRITE, &request_payload(object, 256));
         }
         let object = 0x90_0000;
         deliver(
             &shared,
             8,
             EVENT_CREATE,
-            &create_payload(8, object, r"\??\C:\over"),
+            &create_payload(object, r"\??\C:\over"),
         );
-        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, object, 4_096));
+        deliver(&shared, 8, EVENT_READ, &request_payload(object, 4_096));
         let sample = sample_of(&shared, 8);
-        assert_eq!(sample.files.len(), MAX_TRACKED_FILES_PER_PID);
-        assert_eq!(bytes(&sample, r"C:\over"), None);
-        assert_eq!(
-            sample.omitted,
-            Remainder {
-                read_bytes: 4_096,
-                write_bytes: 0
-            }
-        );
-        assert_eq!(
-            sample.attributed().read_bytes,
-            4_096,
-            "an omitted file is still part of the process total"
-        );
+        assert_eq!(bytes(&sample, r"C:\over"), Some(FileBytes::default()));
+        assert_eq!(sample.omitted.read_bytes, 4_096);
+        assert_eq!(sample.attributed().read_bytes, 4_096);
         assert_eq!(sample.dropped_paths, 1);
     }
 
     /// The payload is written by the kernel, so its pointers are native width
-    /// even when the record is flagged as coming from a 32-bit caller. Reading
-    /// it four bytes narrow would shift every field and leave that process with
-    /// dashes on every row while the session reports Measured.
+    /// even when the record is flagged as coming from a 32-bit caller.
     #[test]
     fn a_32_bit_header_flag_does_not_narrow_a_kernel_payload() {
         let record = EVENT_RECORD {
@@ -2205,199 +2399,148 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(
-            etw::pointer_bytes(&record),
-            4,
-            "the caller's width is what the header flag describes"
-        );
-        assert_eq!(
-            KERNEL_FILE_POINTER_BYTES,
-            std::mem::size_of::<usize>(),
-            "and it is NOT the width of this provider's payloads"
-        );
-
-        // The record's payload is native width throughout, and the callback
-        // decodes it with the pinned width: the bytes land on the file.
-        let shared = shared();
-        deliver(
-            &shared,
-            64,
-            EVENT_CREATE,
-            &create_payload(KERNEL_FILE_POINTER_BYTES, 0x8000, r"\??\C:\data\wow64.bin"),
-        );
-        let payload = transfer_payload(KERNEL_FILE_POINTER_BYTES, 0x8000, 4_096);
-        handle_payload(&shared, 64, EVENT_READ, 1, &payload);
-        let sample = sample_of(&shared, 64);
-        assert_eq!(
-            bytes(&sample, r"C:\data\wow64.bin"),
-            Some(FileBytes {
-                read_bytes: 4_096,
-                write_bytes: 0
-            }),
-            "a 32-bit caller's record still names its file"
-        );
-        assert_eq!(sample.unnamed, Remainder::default());
-        // Four-byte pointers would have read the Irp as the object and lost
-        // the record entirely.
+        assert_eq!(etw::pointer_bytes(&record), 4);
+        assert_eq!(KERNEL_FILE_POINTER_BYTES, std::mem::size_of::<usize>());
+        let payload = request_payload(0x8000, 4_096);
+        // Four-byte pointers would read a different object out of the record.
         assert_ne!(
-            parse_event(EVENT_READ, 1, &payload, 4),
-            parse_event(EVENT_READ, 1, &payload, KERNEL_FILE_POINTER_BYTES)
+            parse_event(EVENT_READ, FILE_IO_VERSION, &payload, 4),
+            parse_event(EVENT_READ, FILE_IO_VERSION, &payload, P)
         );
     }
 
-    /// A session that delivered nothing is unknown, not a measured zero; a
-    /// session whose records all failed to decode is unknown as well.
+    /// The state ladder: no session is unavailable, a session that delivered
+    /// nothing or no transfer yet is undelivered, a session whose records all
+    /// failed to decode is undecodable, and a session with a completed transfer
+    /// anywhere is measured.
     #[test]
-    fn nothing_arrived_is_undelivered_and_nothing_decoded_is_undecodable() {
+    fn the_state_follows_what_the_session_has_proven() {
         let empty = FileIoSample {
             running: true,
             ..FileIoSample::default()
         };
         assert_eq!(empty.state(), FileIoAccountingState::Undelivered);
-        assert_eq!(empty.attributed(), FileBytes::default());
-
         let broken = FileIoSample {
             running: true,
             events_seen: 4_000,
-            events_decoded: 0,
             ..FileIoSample::default()
         };
         assert_eq!(broken.state(), FileIoAccountingState::Undecodable);
-
-        let other_pid = FileIoSample {
-            running: true,
-            events_seen: 4_000,
-            events_decoded: 3_998,
-            pid_read_transfers: 0,
-            pid_write_transfers: 0,
-            ..FileIoSample::default()
-        };
-        assert_eq!(
-            other_pid.state(),
-            FileIoAccountingState::Undelivered,
-            "a process with no decoded transfer has no measured bytes"
-        );
-
-        // A Create alone does not make a byte count measured.
-        let created_only = FileIoSample {
+        let creates_only = FileIoSample {
             running: true,
             events_seen: 3,
             events_decoded: 3,
-            pid_read_transfers: 0,
-            pid_write_transfers: 0,
             ..FileIoSample::default()
         };
-        assert_eq!(created_only.state(), FileIoAccountingState::Undelivered);
-
+        assert_eq!(creates_only.state(), FileIoAccountingState::Undelivered);
         let measured = FileIoSample {
             running: true,
             events_seen: 3,
             events_decoded: 3,
-            pid_read_transfers: 1,
-            pid_write_transfers: 1,
+            session_transfers: 1,
             ..FileIoSample::default()
         };
         assert_eq!(measured.state(), FileIoAccountingState::Measured);
-
         let stopped = FileIoSample {
             running: false,
-            events_seen: 3,
-            events_decoded: 3,
-            pid_read_transfers: 1,
-            pid_write_transfers: 1,
-            ..FileIoSample::default()
+            ..measured
         };
         assert_eq!(stopped.state(), FileIoAccountingState::Unavailable);
     }
 
-    /// Undecodable records are counted, never charged, and the id, version and
-    /// payload length of the last rejection are kept so a layout change and a
-    /// truncated payload can be told apart from a log line.
+    /// Undecodable records are counted, never charged, and the opcode, version
+    /// and payload length of the last rejection are kept for the log line.
     #[test]
     fn undecodable_records_are_counted_but_never_charged() {
         let shared = shared();
         // Zeroing the file object fails the plausibility check.
-        deliver(&shared, 8, EVENT_CREATE, &create_payload(8, 0, r"\??\C:\z"));
+        deliver(&shared, 8, EVENT_CREATE, &create_payload(0, r"\??\C:\z"));
         // An implausible size.
-        deliver(
+        handle_payload(
             &shared,
             8,
             EVENT_READ,
-            &transfer_payload(8, 0x1000, u32::MAX),
+            FILE_IO_VERSION,
+            &request_payload(0x1000, u32::MAX),
         );
-        // A truncated transfer; its identity is the most recent rejection.
-        shared.undecodable(EVENT_READ, 1, 12);
-        let state = shared.state.lock().unwrap();
-        assert_eq!(state.events_seen, 3);
+        // A known record in an unknown template version.
+        handle_payload(&shared, 8, EVENT_READ, 2, &request_payload(0x1000, 64));
+        // A truncated completion; its identity is the most recent rejection.
+        handle_payload(&shared, 8, EVENT_OP_END, FILE_IO_VERSION, &[0u8; 12]);
+        let state = shared.lock();
+        assert_eq!(state.events_seen, 4);
         assert_eq!(state.events_decoded, 0);
-        assert!(state.pids.is_empty() || state.pids.values().all(|p| p.files.is_empty()));
-        assert_eq!(state.rejected_event_id, EVENT_READ);
-        assert_eq!(state.rejected_version, 1);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.rejected_opcode, EVENT_OP_END);
+        assert_eq!(state.rejected_version, FILE_IO_VERSION);
         assert_eq!(state.rejected_payload_len, 12);
     }
 
-    /// Both template generations decode, and each is read with its own
-    /// offsets: v0 spells the issuing thread as a pointer, which shifts every
-    /// following field by four bytes.
+    /// The version-3 layouts, pinned against the bytes the live probe dumped
+    /// (x64): a 100 000-byte read and a 64 KiB write on one file object, its
+    /// Cleanup, and an `OpEnd`.
     #[test]
-    fn both_template_versions_decode_their_own_layout() {
-        for pointer_bytes in [4usize, 8] {
-            let (object, size, min) = transfer_layout(1, pointer_bytes).unwrap();
-            assert_eq!(object, 8 + pointer_bytes);
-            assert_eq!(size, 8 + 3 * pointer_bytes + 4);
-            assert_eq!(min, 8 + 3 * pointer_bytes + 16);
-            let (object, size, min) = transfer_layout(0, pointer_bytes).unwrap();
-            assert_eq!(object, 8 + 2 * pointer_bytes);
-            assert_eq!(size, 8 + 4 * pointer_bytes);
-            assert_eq!(min, 8 + 4 * pointer_bytes + 8);
-            assert_eq!(
-                create_layout(1, pointer_bytes),
-                Some((pointer_bytes, 2 * pointer_bytes + 16))
-            );
-            assert_eq!(
-                create_layout(0, pointer_bytes),
-                Some((2 * pointer_bytes, 3 * pointer_bytes + 12))
-            );
-            assert_eq!(
-                close_layout(1, pointer_bytes),
-                Some((pointer_bytes, 3 * pointer_bytes + 4))
-            );
-            assert_eq!(
-                close_layout(0, pointer_bytes),
-                Some((2 * pointer_bytes, 4 * pointer_bytes))
-            );
+    fn the_layouts_match_the_records_the_kernel_wrote() {
+        if P != 8 {
+            return;
         }
-        // An unknown generation is a gap, not a guess.
-        assert_eq!(transfer_layout(2, 8), None);
-        assert_eq!(create_layout(2, 8), None);
-        assert_eq!(close_layout(2, 8), None);
-
-        // A v0 transfer read with the v1 offsets lands on the FileKey, which is
-        // a real aligned pointer — so the misread does NOT fail, it silently
-        // yields another file object and another size. That is exactly why the
-        // version is taken from the record header instead of being assumed, and
-        // the v0 payload decodes correctly with its own layout.
-        let mut v0 = Vec::new();
-        v0.extend_from_slice(&4_096u64.to_le_bytes()); // ByteOffset
-        v0.extend(std::iter::repeat_n(0x11u8, 8)); // Irp
-        v0.extend_from_slice(&1_000u64.to_le_bytes()); // ThreadId
-        v0.extend_from_slice(&0x7000u64.to_le_bytes()); // FileObject
-        v0.extend_from_slice(&0x7000_aaaa_u64.to_le_bytes()); // FileKey
-        v0.extend_from_slice(&512u32.to_le_bytes()); // IOSize
-        v0.extend_from_slice(&0u32.to_le_bytes()); // IOFlags
+        let hex = |text: &str| -> Vec<u8> {
+            let text: String = text.split_whitespace().collect();
+            (0..text.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+                .collect()
+        };
+        let read = hex(
+            "0000000000000000 f8f0abbd07d0ffff 602c08ea07d0ffff 70ab6cf48c80ffff \
+             50580000a0860100 0000000000000000",
+        );
         assert_eq!(
-            parse_event(EVENT_READ, 0, &v0, 8),
-            Some(FileEvent::Transfer {
-                object: 0x7000,
-                size: 512,
+            parse_event(EVENT_READ, 3, &read, 8),
+            Some(FileEvent::Request {
+                irp: 0xffff_d007_bdab_f0f8,
+                object: 0xffff_d007_ea08_2c60,
+                size: 100_000,
                 write: false,
+                paging: false,
             })
         );
-        assert_ne!(
-            parse_event(EVENT_READ, 1, &v0, 8),
-            parse_event(EVENT_READ, 0, &v0, 8),
-            "reading a v0 payload with the v1 offsets is a different record"
+        let write = hex(
+            "0000000000000000 f8f0abbd07d0ffff 602c08ea07d0ffff 70ab6cf48c80ffff \
+             5058000000000100 000a060000000000",
         );
+        assert_eq!(
+            parse_event(EVENT_WRITE, 3, &write, 8),
+            Some(FileEvent::Request {
+                irp: 0xffff_d007_bdab_f0f8,
+                object: 0xffff_d007_ea08_2c60,
+                size: 65_536,
+                write: true,
+                paging: false,
+            })
+        );
+        let cleanup = hex("f8f0abbd07d0ffff 602c08ea07d0ffff 70ab6cf48c80ffff 50580000");
+        assert_eq!(
+            parse_event(EVENT_CLEANUP, 3, &cleanup, 8),
+            Some(FileEvent::Close {
+                irp: 0xffff_d007_bdab_f0f8,
+                object: 0xffff_d007_ea08_2c60,
+            })
+        );
+        // The refused fast-I/O attempt's completion.
+        let op_end = hex("385119d507d0ffff 0000000000000000 04001cc0");
+        assert_eq!(
+            parse_event(EVENT_OP_END, 3, &op_end, 8),
+            Some(FileEvent::Completion {
+                irp: 0xffff_d007_d519_5138,
+                bytes: 0,
+                status: STATUS_FLT_DISALLOW_FAST_IO,
+            })
+        );
+        // Every other version is a gap, not a guess.
+        for version in [0u8, 1, 2, 4] {
+            assert_eq!(parse_event(EVENT_READ, version, &read, 8), None);
+        }
     }
 
     /// The provider names files as device paths while the rows are DOS paths;
@@ -2436,8 +2579,9 @@ mod tests {
 
     #[test]
     fn names_decode_from_utf16_and_stop_at_the_terminator() {
-        let payload = create_payload(8, 0x1000, "C:\\ä.txt");
-        let FileEvent::Create { name, .. } = parse_event(EVENT_CREATE, 1, &payload, 8).unwrap()
+        let payload = create_payload(0x1000, "C:\\ä.txt");
+        let FileEvent::Create { name, .. } =
+            parse_event(EVENT_CREATE, FILE_IO_VERSION, &payload, P).unwrap()
         else {
             panic!("expected a Create");
         };
@@ -2484,34 +2628,44 @@ mod tests {
             &shared,
             8,
             EVENT_CREATE,
-            &create_payload(8, 0x1000, r"\??\C:\a"),
+            &create_payload(0x1000, r"\??\C:\a"),
         );
-        deliver(&shared, 8, EVENT_READ, &transfer_payload(8, 0x1000, 4_096));
-        let state = shared.state.lock().unwrap();
+        deliver(&shared, 8, EVENT_READ, &request_payload(0x1000, 4_096));
+        let state = shared.lock();
         assert!(state.open.is_empty());
+        assert!(state.pending.is_empty());
         assert!(state.pids.is_empty());
         assert_eq!(state.events_seen, 0);
     }
 
-    /// Creation time is what tells a consumer how long the counts cover, and
-    /// the keys of the sampled map are strings the broker can compare.
+    /// The keys of the sampled map are strings the broker can compare.
     #[test]
-    fn a_sample_carries_paths_and_the_elapsed_time() {
+    fn a_sample_carries_paths_and_counts() {
         let shared = shared();
         shared.devices.lock().unwrap().loaded = Some((Instant::now(), Vec::new()));
         deliver(
             &shared,
             12,
             EVENT_CREATE,
-            &create_payload(8, 0x1000, r"\??\C:\x\y.log"),
+            &create_payload(0x1000, r"\??\C:\x\y.log"),
         );
-        deliver(&shared, 12, EVENT_WRITE, &transfer_payload(8, 0x1000, 700));
+        deliver(&shared, 12, EVENT_WRITE, &request_payload(0x1000, 700));
         let sample = sample_of(&shared, 12);
-        assert_eq!(sample.files.len(), 1);
-        assert_eq!(sample.files[0].0, r"C:\x\y.log");
+        assert_eq!(
+            sample.files,
+            vec![(
+                r"C:\x\y.log".to_string(),
+                FileBytes {
+                    read_bytes: 0,
+                    write_bytes: 700,
+                }
+            )]
+        );
         assert_eq!(sample.pid_transfers(), 1);
-        assert_eq!(sample.events_seen, 2);
-        assert_eq!(sample.events_decoded, 2);
+        assert_eq!(sample.session_transfers, 1);
+        // Create, Write and its OpEnd.
+        assert_eq!(sample.events_seen, 3);
+        assert_eq!(sample.events_decoded, 3);
     }
 
     fn file_row(path: &str) -> crate::actions::ProcessFileIo {
@@ -2563,6 +2717,7 @@ mod tests {
             },
             events_seen: 40,
             events_decoded: 39,
+            session_transfers: 11,
             pid_read_transfers: 9,
             pid_write_transfers: 2,
             // The session had to drop names and had nowhere to put paths; both
@@ -2588,36 +2743,30 @@ mod tests {
             &shared,
             pid,
             EVENT_CREATE,
-            &create_payload(8, 0x1000, r"\??\C:\data\a.bin"),
+            &create_payload(0x1000, r"\??\C:\data\a.bin"),
         );
-        deliver(
-            &shared,
-            pid,
-            EVENT_READ,
-            &transfer_payload(8, 0x1000, 4_096),
-        );
-        deliver(
-            &shared,
-            pid,
-            EVENT_WRITE,
-            &transfer_payload(8, 0x1000, 1_024),
-        );
+        deliver(&shared, pid, EVENT_READ, &request_payload(0x1000, 4_096));
+        deliver(&shared, pid, EVENT_WRITE, &request_payload(0x1000, 1_024));
         // A transfer on a file object whose Create was never seen: unnamed.
-        deliver(&shared, pid, EVENT_READ, &transfer_payload(8, 0x9000, 512));
+        deliver(&shared, pid, EVENT_READ, &request_payload(0x9000, 512));
+        // A file read and closed before the handle walk: a closed row.
+        deliver(
+            &shared,
+            pid,
+            EVENT_CREATE,
+            &create_payload(0x3000, r"\??\C:\data\config.ini"),
+        );
+        deliver(&shared, pid, EVENT_READ, &request_payload(0x3000, 96_167));
+        deliver(&shared, pid, EVENT_CLOSE, &close_payload(0x3000));
         // A file past the session's path budget: omitted, and no row.
         deliver(
             &shared,
             pid,
             EVENT_CREATE,
-            &create_payload(8, 0x2000, r"\??\C:\data\b.bin"),
+            &create_payload(0x2000, r"\??\C:\data\b.bin"),
         );
         shared.state.lock().unwrap().tracked_paths = MAX_TRACKED_FILES;
-        deliver(
-            &shared,
-            pid,
-            EVENT_WRITE,
-            &transfer_payload(8, 0x2000, 2_048),
-        );
+        deliver(&shared, pid, EVENT_WRITE, &request_payload(0x2000, 2_048));
 
         let sample = sample_of(&shared, pid);
         assert_eq!(sample.state(), FileIoAccountingState::Measured);
@@ -2640,6 +2789,23 @@ mod tests {
             "a row with no record stays unmeasured"
         );
         assert_eq!(snapshot.files[1].write_bytes, None);
+        // Regression: a service rereading its config every few seconds showed
+        // "0 B" on every row because closed files fell into the remainder.
+        let closed = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == r"C:\data\config.ini")
+            .expect("the closed file has a row");
+        assert_eq!(closed.open_handles, 0, "rendered as closed");
+        assert_eq!(closed.read_bytes, Some(96_167));
+        assert_eq!(closed.write_bytes, Some(0));
+        assert_eq!(closed.file_size, None, "no handle, no size");
+        assert!(!closed.access_known);
+        assert_eq!(
+            snapshot.files.len(),
+            3,
+            "the budget-dropped file has no row"
+        );
         let accounting = &snapshot.accounting;
         assert_eq!(accounting.state, FileIoAccountingState::Measured);
         assert_eq!(accounting.read_ops, sample.pid_read_transfers);
@@ -2670,7 +2836,7 @@ mod tests {
         );
         assert_eq!(accounting.read_bytes, sample.attributed().read_bytes);
         assert_eq!(accounting.write_bytes, sample.attributed().write_bytes);
-        assert_eq!(accounting.read_bytes, 4_096 + 512);
+        assert_eq!(accounting.read_bytes, 4_096 + 96_167 + 512);
         assert_eq!(accounting.write_bytes, 1_024 + 2_048);
     }
 
@@ -2710,16 +2876,23 @@ mod tests {
         assert_eq!(accounting.cleared_file_objects, 12);
         assert_eq!(accounting.unnamed_creates, 3);
         assert_eq!(accounting.dropped_paths, 4);
-        // 500 (gone.tmp) + 70 (unnamed) read; 5 + 7 written.
-        assert_eq!(accounting.unnamed_read_bytes, 570);
-        assert_eq!(accounting.unnamed_write_bytes, 12);
+        // gone.tmp is a closed row of its own; only the 70/7 is unnamed.
+        let gone = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == r"C:\temp\gone.tmp")
+            .expect("a closed row");
+        assert_eq!((gone.read_bytes, gone.write_bytes), (Some(500), Some(5)));
+        assert_eq!(gone.open_handles, 0);
+        assert_eq!(accounting.unnamed_read_bytes, 70);
+        assert_eq!(accounting.unnamed_write_bytes, 7);
         assert_eq!(accounting.omitted_read_bytes, 300);
         assert_eq!(accounting.omitted_write_bytes, 3);
         assert_eq!(accounting.read_ops, 9);
         assert_eq!(accounting.write_ops, 2);
         // The row + the two remainders are the attribution for the process.
-        assert_eq!(accounting.read_bytes, 1_000 + 570 + 300);
-        assert_eq!(accounting.write_bytes, 20 + 12 + 3);
+        assert_eq!(accounting.read_bytes, 1_000 + 500 + 70 + 300);
+        assert_eq!(accounting.write_bytes, 20 + 5 + 7 + 3);
     }
 
     /// One file can arrive as two trace buckets — `C:\...` and `c:\...` — and

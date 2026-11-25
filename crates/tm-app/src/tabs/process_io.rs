@@ -392,7 +392,7 @@ fn measured_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
 /// Whether raising the token can give the per-file byte columns a source.
 ///
 /// The line explains a privilege gap, so it is only true where that remedy
-/// exists. Windows has two hosts for the Kernel-File trace — the installed
+/// exists. Windows has two hosts for the per-file trace — the installed
 /// service and an elevated GUI. The Linux backend reports per-file bytes as
 /// [`FileIoAccountingState::Unavailable`] for every snapshot by construction
 /// and has no elevated host at all, so the line there would name a remedy that
@@ -407,20 +407,20 @@ const ELEVATION_IS_A_REMEDY: bool = cfg!(windows);
 /// them are different answers:
 ///
 /// * `Unavailable` — no source at all. This is the one a user can act on: a
-///   Kernel-File trace requires elevation and either the installed service or an
+///   per-file trace requires elevation and either the installed service or an
 ///   elevated process, so without them the columns are a gap in privilege, not
 ///   in time. `elevation_is_a_remedy` keeps the line off a platform where that
 ///   remedy does not exist, where it would blame the token for a platform
 ///   without a trace.
-/// * `Undelivered` — a trace is running and has delivered no event it could
-///   attribute to this process yet. A silent window cannot be told apart from a
-///   broken subscription, so the page reports which one it is stuck in instead
-///   of an unexplained dash.
+/// * `Undelivered` — a trace is running and has not decoded a completed
+///   transfer anywhere yet. A silent window cannot be told apart from a broken
+///   subscription, so the page reports which one it is stuck in instead of an
+///   unexplained dash.
 /// * `Undecodable` — records arrived and none of them parsed: the payload layout
 ///   is not what this build expects.
 /// * `KernelLoggerInUse` — no session could be started because another
-///   application owns the single global NT Kernel Logger, the one session that
-///   carries the classic `FileIo` class. Nothing is running, so this must not
+///   application owns the single global NT Kernel Logger, the fallback when the
+///   private file session is refused. Nothing is running, so this must not
 ///   read as a silent window: it is the one state here that names an owner the
 ///   user can close.
 ///

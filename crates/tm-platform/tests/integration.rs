@@ -1351,40 +1351,107 @@ fn sampled_profile_attributes_code_to_this_process() {
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "starts a machine-wide ETW session; needs elevation and live file traffic"]
-fn the_file_trace_reports_which_session_started() {
+fn the_file_trace_measures_exact_bytes_per_file() {
+    use std::io::{Read, Seek, Write};
     use tm_platform::actions::FileIoAccountingState;
 
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    // Opened BEFORE the session: the trace sees no Create for it, so its name
+    // has to come from the handle table.
+    let early_path = dir.join(format!("tm_file_etw_early_{pid}.bin"));
+    let mut early = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&early_path)
+        .expect("open the early file");
     let (trace, session) = match tm_platform::win::file_etw_test_start() {
         Ok(started) => started,
         Err(refusal) => {
+            let _ = std::fs::remove_file(&early_path);
             // Still an answer: say it rather than pass silently.
             eprintln!("no per-file session was started: {refusal:?}");
             return;
         }
     };
     eprintln!("per-file trace session = {session}");
-    let pid = std::process::id();
-    let victim = std::env::temp_dir().join(format!("tm_file_etw_{pid}.bin"));
-    let payload = vec![0x5Au8; 256 * 1_024];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut sample = trace.sample(pid, 0, &tm_platform::win::live_pids_for_test());
-    while std::time::Instant::now() < deadline {
-        // Give the session something of ours to attribute through the 1 s flush
-        // timer, so a measured answer is possible rather than lucky.
-        let _ = std::fs::write(&victim, &payload);
-        let _ = std::fs::read(&victim);
-        sample = trace.sample(pid, 0, &tm_platform::win::live_pids_for_test());
-        if sample.state() == FileIoAccountingState::Measured && !sample.files.is_empty() {
-            break;
-        }
+    let epoch = tm_platform::win::own_start_epoch_for_test();
+    assert!(epoch > 0, "this process's creation time is readable");
+    // The first sample names every file handle this process holds.
+    let _ = trace.sample(pid, epoch, &tm_platform::win::live_pids_for_test());
+
+    // Exact traffic: 3 x 8 KiB written and 4 KiB read through the early
+    // handle; 2 x 64 KiB written and the whole file read back (one request
+    // for more than the file holds) through a new one. The flushes add paging
+    // writes the trace must NOT count.
+    for _ in 0..3 {
+        early.write_all(&[1u8; 8_192]).expect("early write");
     }
-    let _ = std::fs::remove_file(&victim);
+    early.sync_all().expect("early flush");
+    early.seek(std::io::SeekFrom::Start(0)).expect("seek");
+    let mut buffer = vec![0u8; 4_096];
+    early.read_exact(&mut buffer).expect("early read");
+    let late_path = dir.join(format!("tm_file_etw_late_{pid}.bin"));
+    {
+        let mut late = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&late_path)
+            .expect("open the late file");
+        late.write_all(&[7u8; 65_536]).expect("late write");
+        late.write_all(&[7u8; 65_536]).expect("late write");
+        late.sync_all().expect("late flush");
+        late.seek(std::io::SeekFrom::Start(0)).expect("seek");
+        let mut whole = vec![0u8; 200_000];
+        let mut got = 0;
+        loop {
+            let read = late.read(&mut whole[got..]).expect("late read");
+            if read == 0 {
+                break;
+            }
+            got += read;
+        }
+        assert_eq!(got, 131_072);
+    }
+
+    let row = |sample: &tm_platform::win::FileIoSampleForTest, path: &std::path::Path| {
+        let wanted = path.to_string_lossy().to_lowercase();
+        sample
+            .files
+            .iter()
+            .filter(|(candidate, _)| candidate.to_lowercase() == wanted)
+            .fold((0u64, 0u64), |(read, write), (_, bytes)| {
+                (read + bytes.read_bytes, write + bytes.write_bytes)
+            })
+    };
+    let expected_early = (4_096, 3 * 8_192);
+    let expected_late = (131_072, 131_072);
+    // Delivery is asynchronous (1 s flush timer); poll against a deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut sample = trace.sample(pid, epoch, &tm_platform::win::live_pids_for_test());
+    while std::time::Instant::now() < deadline
+        && (row(&sample, &early_path) != expected_early
+            || row(&sample, &late_path) != expected_late)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        sample = trace.sample(pid, epoch, &tm_platform::win::live_pids_for_test());
+    }
+    drop(early);
+    let _ = std::fs::remove_file(&early_path);
+    let _ = std::fs::remove_file(&late_path);
     eprintln!(
-        "state={:?} seen={} decoded={} files={} lost={:?} since={} ms",
+        "state={:?} seen={} decoded={} transfers={} early={:?} late={:?} unnamed={:?} lost={:?} since={} ms",
         sample.state(),
         sample.events_seen,
         sample.events_decoded,
-        sample.files.len(),
+        sample.session_transfers,
+        row(&sample, &early_path),
+        row(&sample, &late_path),
+        sample.unnamed,
         sample.events_lost,
         sample.since_ms
     );
@@ -1396,15 +1463,16 @@ fn the_file_trace_reports_which_session_started() {
         sample.events_decoded > 0,
         "records arrived and none decoded - the payload layout changed"
     );
-    assert!(
-        matches!(
-            sample.state(),
-            FileIoAccountingState::Measured
-                | FileIoAccountingState::Undelivered
-                | FileIoAccountingState::Undecodable
-        ),
-        "a running session must never report a state that means no session: {:?}",
-        sample.state()
+    assert_eq!(sample.state(), FileIoAccountingState::Measured);
+    assert_eq!(
+        row(&sample, &late_path),
+        expected_late,
+        "a file opened under the trace: (read, written) exactly, paging flushes excluded"
+    );
+    assert_eq!(
+        row(&sample, &early_path),
+        expected_early,
+        "a handle opened before the trace is named from the handle table"
     );
 }
 

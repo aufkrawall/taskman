@@ -29,11 +29,11 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG,
-    EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_FLAG_PROFILE,
-    EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
-    ProcessTrace, StartTraceW, SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_FILE_IO_INIT, EVENT_TRACE_FLAG_IMAGE_LOAD,
+    EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE,
+    EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
+    PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -176,38 +176,32 @@ pub(crate) enum LoggerKind {
     /// can emit around one sample per logical processor per millisecond, so
     /// it gets larger buffers than the sparse disk/thread session.
     SystemProfile,
-    /// A system logger that hosts the SystemIo provider's FILE keyword: the
-    /// shape the kernel's per-file records (`FileIoGuid`) are delivered by.
+    /// A private system logger that carries the kernel's per-file records
+    /// (the classic `FileIo` class) — the per-file trace's PREFERRED session.
     ///
-    /// Two shapes that look right deliver nothing, both found on live elevated
-    /// runs: enabling the MANIFEST GUID of `Microsoft-Windows-Kernel-File` on
-    /// an ordinary manifest session (accepted, `events_lost` stays 0, not one
-    /// record), and asking this session for `EVENT_TRACE_FLAG_FILE_IO` through
-    /// `EnableFlags` (the same silence). The working subscription is the
-    /// documented SystemIo path: an `EnableTraceEx2` of `SystemIoProviderGuid`
-    /// with `SYSTEM_IO_KW_FILE` against a system logger — the same shape
-    /// [`super::disk_etw`] uses for `SYSTEM_IO_KW_DISK` — which is why this
-    /// kind carries NO legacy enable flag. The records still arrive as the
-    /// classic `FileIo` class (the group GUID is the subscription, the class
-    /// GUID is the record's identity). Like the loader and profile kinds this
-    /// is the highest-rate stream in the program, so it asks for the larger
-    /// buffer set.
+    /// Its subscription is its `EnableFlags`: `EVENT_TRACE_FLAG_FILE_IO_INIT`
+    /// (Create, Cleanup, Close, Read, Write and the rest of the request
+    /// family, opcodes 64 and up) plus `EVENT_TRACE_FLAG_FILE_IO`, which adds
+    /// the `OpEnd` completion (opcode 76) carrying the bytes a request really
+    /// transferred. Both were measured live on Windows 11 build 26300: the
+    /// `FILE_IO` flag ALONE delivers nothing but `OpEnd`, and the SystemIo
+    /// provider's `SYSTEM_IO_KW_FILE` keyword delivers the same `OpEnd`-only
+    /// stream — which is what earlier builds subscribed with, and why they never
+    /// saw a single Read or Write. No provider is enabled on this kind.
     ///
-    /// This is the FALLBACK for the per-file trace; [`LoggerKind::KernelFile`]
-    /// is tried first.
+    /// A private session rather than [`KERNEL_LOGGER`]: the kernel logger is a
+    /// machine-wide singleton other tools own, while Windows multiplexes the
+    /// SystemTraceProvider over several private system loggers, so this one
+    /// coexists with them. Like the loader and profile kinds this is the
+    /// highest-rate stream in the program, so it asks for the larger buffer
+    /// set.
     SystemFile,
-    /// The single global kernel session — [`KERNEL_LOGGER`] — which is the one
-    /// place the classic `FileIo` class is actually delivered.
+    /// The single global kernel session — [`KERNEL_LOGGER`] — with the same
+    /// file flags as [`LoggerKind::SystemFile`]: the per-file trace's
+    /// FALLBACK, for when no private system logger could be started.
     ///
-    /// Three things about it are unlike every kind above:
+    /// Two things about it are unlike every kind above:
     ///
-    /// * **Its enable flags ARE the subscription.** `EVENT_TRACE_FLAG_FILE_IO`
-    ///   turns on the whole `FileIo` class (Create, Cleanup, Close, Read, Write
-    ///   and the rest of the family), which is how Process Hacker-style tools
-    ///   have always subscribed. On a PRIVATE system logger the same flag is
-    ///   accepted and delivers nothing (that is the `undelivered` /
-    ///   `events_lost` 0 report [`LoggerKind::SystemFile`] documents), so the
-    ///   two mechanisms are not interchangeable.
     /// * **It is identified by `SystemTraceControlGuid`**, so `Wnode.Guid`
     ///   carries it the way the SDK's kernel-logger example sets it. The named
     ///   kinds above are identified by their session name alone.
@@ -218,10 +212,8 @@ pub(crate) enum LoggerKind {
     ///   is exactly one of these on the machine, so when another application
     ///   owns it `StartTraceW` returns `ERROR_ALREADY_EXISTS` and this kind
     ///   must NOT reclaim the name the way a per-role session does: stopping it
-    ///   would tear down that application's trace. That is why Process
-    ///   Hacker-style tools coordinate on this one session, and why the failure
-    ///   is surfaced to the caller ([`StartError::AlreadyExists`]) instead of
-    ///   being papered over.
+    ///   would tear down that application's trace. The failure is surfaced to
+    ///   the caller ([`StartError::AlreadyExists`]) instead.
     KernelFile,
 }
 
@@ -593,33 +585,30 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         // but the initial DCStart rundown is emitted while StartTrace creates
         // the logger. Request the corresponding legacy flags up front so a
         // loader/sample session reliably receives that initial state.
-        // `SystemFile` asks for no flag at all: its subscription is the
-        // SystemIo provider enable (see [`LoggerKind::SystemFile`]), and the
-        // legacy file flag was one of the shapes that delivered nothing on a
-        // private system logger. `KernelFile` is the kind where that flag IS
-        // the subscription (see [`LoggerKind::KernelFile`]).
+        // Both file kinds subscribe through these flags and nothing else: the
+        // request family (`FILE_IO_INIT`) plus its completions (`FILE_IO`);
+        // see [`LoggerKind::SystemFile`].
         (*properties).EnableFlags = match kind {
-            LoggerKind::Manifest | LoggerKind::System | LoggerKind::SystemFile => {
-                EVENT_TRACE_FLAG::default()
-            }
+            LoggerKind::Manifest | LoggerKind::System => EVENT_TRACE_FLAG::default(),
             LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
             LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
-            LoggerKind::KernelFile => EVENT_TRACE_FLAG_FILE_IO,
+            LoggerKind::SystemFile | LoggerKind::KernelFile => {
+                EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO
+            }
         };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
         // sampling tick without reserving much non-paged memory. The profile
         // stream, the initial loader rundown and the file I/O stream have much
-        // higher event rates, so they ask for a larger set. The kernel logger
-        // carries the same class as the system-logger file session but is
-        // machine-wide WINDOWS-visible, so it gets the sparse disk session's
-        // smaller set: it is the shared global session, not ours to size for a
-        // burst.
+        // higher event rates, so they ask for a larger set — the file stream on
+        // either session shape, since both carry every request and completion
+        // on the machine.
         let (buffer_kb, minimum, maximum) = match kind {
-            LoggerKind::Manifest | LoggerKind::System | LoggerKind::KernelFile => (64, 4, 16),
-            LoggerKind::SystemLoader | LoggerKind::SystemProfile | LoggerKind::SystemFile => {
-                (256, 8, 32)
-            }
+            LoggerKind::Manifest | LoggerKind::System => (64, 4, 16),
+            LoggerKind::SystemLoader
+            | LoggerKind::SystemProfile
+            | LoggerKind::SystemFile
+            | LoggerKind::KernelFile => (256, 8, 32),
         };
         (*properties).BufferSize = buffer_kb;
         (*properties).MinimumBuffers = minimum;
@@ -723,7 +712,6 @@ pub(crate) fn plausible_client_id(id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_FILE_IO;
 
     #[test]
     fn properties_buffer_reserves_room_for_the_session_name() {
@@ -782,13 +770,17 @@ mod tests {
         }
     }
 
-    /// The kernel's per-file records are delivered by a PROVIDER enable on a
-    /// system logger (`SystemIoProviderGuid` + `SYSTEM_IO_KW_FILE`, see
-    /// [`super::file_etw::PROVIDERS`]), and by no legacy `EnableFlags` flag:
-    /// the flag that used to be pinned here is exactly the shape a live
-    /// elevated run reported `undelivered` with `events_lost` at zero on.
+    /// The per-file session subscribes with the request flag AND the
+    /// completion flag, on a private system logger.
+    ///
+    /// Regression: earlier builds asked for `EVENT_TRACE_FLAG_FILE_IO` alone
+    /// (or the SystemIo `FILE` keyword, which is the same stream). A live
+    /// elevated probe showed that this delivers only `OpEnd` completions —
+    /// 22 000 of them in four seconds and not one Create, Read or Write — so
+    /// the trace reported "no file event yet" forever. `FILE_IO_INIT` is what
+    /// carries the requests.
     #[test]
-    fn the_file_logger_is_a_system_logger_without_a_legacy_enable_flag() {
+    fn the_file_logger_asks_for_requests_and_their_completions() {
         let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
         let buffer = properties_buffer(&name, LoggerKind::SystemFile);
         let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
@@ -797,29 +789,26 @@ mod tests {
                 (*properties).LogFileMode,
                 EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
             );
-            assert_eq!((*properties).EnableFlags, EVENT_TRACE_FLAG::default());
-            assert!(
-                !(*properties).EnableFlags.contains(EVENT_TRACE_FLAG_FILE_IO),
-                "the subscription is the SystemIo provider enable, not this flag"
+            assert_eq!(
+                (*properties).EnableFlags,
+                EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO
             );
-            // Every read and write on the machine, and the family is wider
-            // than the five ids the decoder keeps.
+            // Every request and completion on the machine.
             assert_eq!((*properties).BufferSize, 256);
             assert!((*properties).MaximumBuffers >= 32);
         }
     }
 
-    /// The disk session must keep exactly the flags it had: adding the file
-    /// flag to it would multiply its event rate and change what its windows
-    /// measure. The file trace is a session of its own, and it subscribes
-    /// through the provider rather than through this flag.
+    /// The disk, loader and profile sessions must keep exactly the flags they
+    /// had: adding the file flags to one of them would multiply its event rate
+    /// and change what its windows measure. The file trace is a session of its
+    /// own.
     #[test]
-    fn no_system_logger_asks_for_the_legacy_file_io_flag() {
+    fn no_other_system_logger_asks_for_the_file_flags() {
         for kind in [
             LoggerKind::System,
             LoggerKind::SystemLoader,
             LoggerKind::SystemProfile,
-            LoggerKind::SystemFile,
         ] {
             let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
             let buffer = properties_buffer(&name, kind);
@@ -827,19 +816,22 @@ mod tests {
             unsafe {
                 assert!(
                     !(*properties).EnableFlags.contains(EVENT_TRACE_FLAG_FILE_IO),
-                    "{kind:?} must not subscribe to per-file events through the flag"
+                    "{kind:?} must not subscribe to file completions"
+                );
+                assert!(
+                    !(*properties)
+                        .EnableFlags
+                        .contains(EVENT_TRACE_FLAG_FILE_IO_INIT),
+                    "{kind:?} must not subscribe to file requests"
                 );
             }
         }
     }
 
-    /// The kernel logger is the ONE session where the legacy file flag is the
-    /// subscription, so it must ask for it — and it must be the system trace
-    /// control GUID, be real-time only (its whole point, as opposed to a
-    /// private system logger), and keep the sparse buffer set the shared global
-    /// session gets.
+    /// The kernel logger fallback asks for the same file flags as the private
+    /// session, on the system trace control GUID, real-time only.
     #[test]
-    fn the_kernel_logger_carries_the_file_io_flag_on_the_system_trace_control_guid() {
+    fn the_kernel_logger_carries_the_file_flags_on_the_system_trace_control_guid() {
         let name: Vec<u16> = KERNEL_LOGGER
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -848,31 +840,26 @@ mod tests {
         let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
         unsafe {
             assert_eq!((*properties).Wnode.Guid, SystemTraceControlGuid);
-            assert!(
-                (*properties).EnableFlags.contains(EVENT_TRACE_FLAG_FILE_IO),
-                "the flag IS the subscription for this session"
-            );
             // Only the file class: the kernel logger is shared, so asking for
             // more would multiply the rate for every other consumer's session
             // as well as ours.
-            assert_eq!((*properties).EnableFlags, EVENT_TRACE_FLAG_FILE_IO);
+            assert_eq!(
+                (*properties).EnableFlags,
+                EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_FILE_IO
+            );
             assert_eq!(
                 (*properties).LogFileMode,
                 EVENT_TRACE_REAL_TIME_MODE,
                 "the kernel logger IS the system logger; the mode bit marks a PRIVATE one"
             );
             assert_eq!((*properties).Wnode.Flags, WNODE_FLAG_TRACED_GUID);
-            // Buffers like the disk session: the global session is not ours to
-            // size for a burst.
-            assert_eq!((*properties).BufferSize, 64);
-            assert_eq!((*properties).MinimumBuffers, 4);
-            assert_eq!((*properties).MaximumBuffers, 16);
+            assert_eq!((*properties).BufferSize, 256);
             assert_eq!((*properties).FlushTimer, 1);
         }
         // A private session does NOT get the system trace control GUID: it is
         // identified by its name, and the GUID would make `StartTraceW` try to
         // start the global session instead.
-        let buffer = properties_buffer(&name, LoggerKind::System);
+        let buffer = properties_buffer(&name, LoggerKind::SystemFile);
         let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
         unsafe {
             assert_ne!((*properties).Wnode.Guid, SystemTraceControlGuid);

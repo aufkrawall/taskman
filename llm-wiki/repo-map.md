@@ -120,19 +120,16 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
     `file_etw.rs` (per-file read/written bytes from the kernel's file I/O
-    hooks: the session is a system logger that enables the SystemIo provider
-    with `SYSTEM_IO_KW_FILE`, a provider call rather than the legacy
-    `EVENT_TRACE_FLAG_FILE_IO` flag, and the records are classic `FileIo` ones —
-    class GUID in `ProviderId`, operation in the opcode 12–16 — because a
-    manifest `EnableTraceEx2` for `Microsoft-Windows-Kernel-File` is accepted
-    and delivers nothing; Create correlates a `FileObject` with its
-    name, Read/Write add `IOSize` to that (pid, path) pair, both template
-    versions are decoded at native pointer width, device paths are translated
-    to the DOS paths the handle walk reports, the open-file map and both the
-    per-process and session-wide path budgets drop with a counter, and buckets
-    are bound to the created time that prevents pid reuse from inheriting; the
-    sample becomes rows in `attach_file_io`, the one mapping both the service's
-    session and the GUI's own elevated one share),
+    hooks: a private system logger with `FILE_IO_INIT | FILE_IO` flags, the
+    NT Kernel Logger as fallback; classic `FileIo` records, opcodes 64–68 and
+    76 `OpEnd`, version 3; a Read/Write is charged when its `OpEnd` completes
+    it, paging I/O is skipped; Create names a `FileObject`, and objects opened
+    before the session are named from the system handle table through
+    `process_file_io::name_file_objects`; device paths become DOS paths; maps
+    and path budgets are capped with counters; buckets are bound to the
+    verified creation time; the sample becomes rows in `attach_file_io`, the
+    one mapping both the service's session and the GUI's own elevated one
+    share),
     `profile_etw.rs` (demand-only system-profile sampling for one exact
     process; MOF sample type 46, profile-privilege enablement, thread
     ownership, page aggregation, module attribution, ETW-loss/lower-bound

@@ -558,10 +558,291 @@ fn query_granted_access(handle: HANDLE) -> Option<u32> {
     status.is_ok().then_some(info.GrantedAccess)
 }
 
+/// `SystemExtendedHandleInformation`: every handle on the machine with the
+/// kernel address of the object it refers to. Not in the `windows` crate's
+/// enum, so spelled by value.
+const SYSTEM_EXTENDED_HANDLE_INFORMATION:
+    windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS =
+    windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS(64);
+
+/// Header of a `SystemExtendedHandleInformation` answer.
+#[repr(C)]
+struct SystemHandleInformationEx {
+    number_of_handles: usize,
+    reserved: usize,
+}
+
+/// One `SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SystemHandleTableEntryInfoEx {
+    object: usize,
+    unique_process_id: usize,
+    handle_value: usize,
+    granted_access: u32,
+    creator_back_trace_index: u16,
+    object_type_index: u16,
+    handle_attributes: u32,
+    reserved: u32,
+}
+
+/// One handle of the system handle table: who holds it, its value, its type
+/// and the kernel address of the object it refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandleObject {
+    pid: usize,
+    handle_value: usize,
+    object_type_index: u16,
+    object: u64,
+}
+
+/// The whole system handle table, or `None` when it could not be read.
+///
+/// Object addresses come back as zero for a caller without `SeDebugPrivilege`
+/// on current Windows builds, so callers enable it first and treat a zero as
+/// "unknown", never as an address.
+fn system_handle_objects() -> Option<Vec<HandleObject>> {
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let written = crate::win::cpu_load::CpuLoadAccountant::nt_query(
+        &mut buf,
+        SYSTEM_EXTENDED_HANDLE_INFORMATION,
+    )?;
+    parse_handle_objects(buf.get(..written)?)
+}
+
+/// Decode a `SystemExtendedHandleInformation` answer; split out so the record
+/// arithmetic is testable without a privileged query.
+fn parse_handle_objects(buf: &[u8]) -> Option<Vec<HandleObject>> {
+    let header_size = std::mem::size_of::<SystemHandleInformationEx>();
+    let entry_size = std::mem::size_of::<SystemHandleTableEntryInfoEx>();
+    if buf.len() < header_size {
+        return None;
+    }
+    // SAFETY: bounds checked above; the read is unaligned because a byte
+    // buffer guarantees no alignment.
+    let header = unsafe {
+        buf.as_ptr()
+            .cast::<SystemHandleInformationEx>()
+            .read_unaligned()
+    };
+    let count = header
+        .number_of_handles
+        .min((buf.len() - header_size) / entry_size);
+    let mut handles = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: `count` was clamped to the entries the buffer holds.
+        let entry = unsafe {
+            buf.as_ptr()
+                .add(header_size + index * entry_size)
+                .cast::<SystemHandleTableEntryInfoEx>()
+                .read_unaligned()
+        };
+        handles.push(HandleObject {
+            pid: entry.unique_process_id,
+            handle_value: entry.handle_value,
+            object_type_index: entry.object_type_index,
+            object: entry.object as u64,
+        });
+    }
+    Some(handles)
+}
+
+/// Name the open FILE objects of `pid` by their kernel address.
+///
+/// The per-file trace identifies a file by its `FILE_OBJECT` address and only
+/// learns a name from a Create it saw. A handle opened BEFORE the trace started
+/// has no Create in it, so every read and write through it would stay unnamed
+/// for as long as the handle lives — a database, a log, a VM image opened an
+/// hour ago. The system handle table carries that same address for every
+/// handle, so it can name those objects after the fact.
+///
+/// Only objects in `wanted` are looked at; `None` asks for every file handle of
+/// the process. Each candidate handle is duplicated and named exactly the way
+/// the file list names its rows ([`inspect_handle`]: disk files only, so a pipe
+/// cannot hang the query), so a name here compares equal to its row.
+///
+/// The answer is VERIFIED, not assumed: between reading the table and
+/// duplicating, the target can close a handle and the value can be reused for a
+/// different object, which would charge that object's bytes to the wrong file.
+/// So the table is read a second time with the duplicates open, and a name is
+/// kept only when this process's duplicate refers to the very object the
+/// target's handle did. Unverifiable answers are dropped.
+///
+/// Empty when the process is gone or reused (`expected_start_epoch_s`), cannot
+/// be opened for handle duplication, or the table carries no object addresses
+/// (no `SeDebugPrivilege`).
+pub(super) fn name_file_objects(
+    pid: u32,
+    expected_start_epoch_s: i64,
+    wanted: Option<&std::collections::HashSet<u64>>,
+) -> Vec<(u64, String)> {
+    if pid <= 4 || wanted.is_some_and(|wanted| wanted.is_empty()) {
+        return Vec::new();
+    }
+    super::process_ops::enable_debug_privilege();
+    // A handle of our own to a file whose type index we can find in the table:
+    // the File type's index differs between Windows builds, so it is read from
+    // the table rather than hard-coded.
+    let Ok(probe) = std::env::current_exe().and_then(std::fs::File::open) else {
+        return Vec::new();
+    };
+    let probe_value = {
+        use std::os::windows::io::AsRawHandle;
+        probe.as_raw_handle() as usize
+    };
+    let self_pid = std::process::id() as usize;
+    let Some(table) = system_handle_objects() else {
+        return Vec::new();
+    };
+    let Some(file_type) = table
+        .iter()
+        .find(|entry| entry.pid == self_pid && entry.handle_value == probe_value)
+        .map(|entry| entry.object_type_index)
+    else {
+        return Vec::new();
+    };
+    let candidates: Vec<HandleObject> = table
+        .into_iter()
+        .filter(|entry| {
+            entry.pid == pid as usize
+                && entry.object_type_index == file_type
+                && entry.object != 0
+                && wanted.is_none_or(|wanted| wanted.contains(&entry.object))
+        })
+        .collect();
+    drop(probe);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let Ok(h_process) = super::process_ops::open_process_verified(
+        pid,
+        th::PROCESS_QUERY_LIMITED_INFORMATION | th::PROCESS_DUP_HANDLE,
+        Some(expected_start_epoch_s),
+    ) else {
+        return Vec::new();
+    };
+    let current_proc = unsafe { th::GetCurrentProcess() };
+    let mut path_buf = vec![0u16; 1024];
+    // (object the target's handle named, our duplicate, its path)
+    let mut named: Vec<(u64, HANDLE, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.object) {
+            // Two handles to one file object name it once.
+            continue;
+        }
+        let source = HANDLE(candidate.handle_value as *mut core::ffi::c_void);
+        let mut dup = HANDLE::default();
+        let ok = unsafe {
+            DuplicateHandle(
+                h_process,
+                source,
+                current_proc,
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok.is_err() || dup.is_invalid() {
+            continue;
+        }
+        match inspect_duplicated_handle(dup, &mut path_buf) {
+            Ok(Some(facts)) => named.push((candidate.object, dup, facts.path)),
+            _ => unsafe {
+                let _ = CloseHandle(dup);
+            },
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(h_process);
+    }
+    // The verification read: our duplicates must refer to the objects the
+    // target's handles named when the table was first read.
+    let verified: std::collections::HashMap<usize, u64> = system_handle_objects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.pid == self_pid)
+        .map(|entry| (entry.handle_value, entry.object))
+        .collect();
+    let mut answer = Vec::with_capacity(named.len());
+    let mut stale = 0usize;
+    for (object, dup, path) in named {
+        if verified.get(&(dup.0 as usize)) == Some(&object) {
+            answer.push((object, path));
+        } else {
+            stale += 1;
+        }
+        unsafe {
+            let _ = CloseHandle(dup);
+        }
+    }
+    if stale > 0 {
+        tracing::debug!(
+            pid,
+            stale,
+            "file handles changed while they were named; those names were dropped"
+        );
+    }
+    answer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// The `SystemExtendedHandleInformation` records are 40 bytes each on
+    /// x64 after a two-word header, and a count the buffer cannot hold is
+    /// clamped rather than read past the end.
+    #[test]
+    fn handle_table_records_decode_at_their_native_layout() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3usize.to_ne_bytes()); // claims three...
+        buf.extend_from_slice(&0usize.to_ne_bytes());
+        for (object, pid, handle, type_index) in [
+            (0xffff_d007_ed04_9be0u64, 22_832usize, 0x208usize, 41u16),
+            (0, 4, 0x4, 7),
+        ] {
+            buf.extend_from_slice(&(object as usize).to_ne_bytes());
+            buf.extend_from_slice(&pid.to_ne_bytes());
+            buf.extend_from_slice(&handle.to_ne_bytes());
+            buf.extend_from_slice(&0x0012_019fu32.to_ne_bytes()); // GrantedAccess
+            buf.extend_from_slice(&0u16.to_ne_bytes()); // CreatorBackTraceIndex
+            buf.extend_from_slice(&type_index.to_ne_bytes());
+            buf.extend_from_slice(&0u32.to_ne_bytes()); // HandleAttributes
+            buf.extend_from_slice(&0u32.to_ne_bytes()); // Reserved
+        }
+        // ...but holds two.
+        let handles = parse_handle_objects(&buf).expect("a header");
+        assert_eq!(
+            handles,
+            vec![
+                HandleObject {
+                    pid: 22_832,
+                    handle_value: 0x208,
+                    object_type_index: 41,
+                    object: 0xffff_d007_ed04_9be0,
+                },
+                HandleObject {
+                    pid: 4,
+                    handle_value: 0x4,
+                    object_type_index: 7,
+                    object: 0,
+                },
+            ]
+        );
+        assert_eq!(parse_handle_objects(&buf[..8]), None, "no whole header");
+    }
+
+    /// Naming asks nothing of a process it was told nothing about, and never
+    /// touches the System process.
+    #[test]
+    fn naming_file_objects_short_circuits() {
+        let none = std::collections::HashSet::new();
+        assert!(name_file_objects(std::process::id(), 1, Some(&none)).is_empty());
+        assert!(name_file_objects(4, 1, None).is_empty());
+    }
 
     #[test]
     fn strip_verbatim_handles_all_prefixes() {

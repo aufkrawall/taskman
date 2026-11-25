@@ -2205,7 +2205,7 @@ fn spawn_net_trace_watchdog() {
     );
 }
 
-/// The per-file Kernel-File trace, hosted either by the broker or by the GUI.
+/// The per-file `FileIo` trace, hosted either by the broker or by the GUI.
 ///
 /// It is started on the first file-I/O request and stopped by the same idle
 /// watchdog as the disk and network traces, because a session that reports
@@ -2351,7 +2351,7 @@ impl FileTraceAnswer {
 ///
 /// No sample means no session could be started, which the caller must keep
 /// rendering as [`crate::actions::FileIoAccountingState::Unavailable`]: a
-/// Kernel-File session needs elevation, and without one there is no source at
+/// per-file session needs elevation, and without one there is no source at
 /// all — that state has to keep meaning exactly that.
 ///
 /// `start_epoch_s` is the creation time the caller verified, passed through so
@@ -2407,7 +2407,7 @@ fn file_trace_sample(
                     || spawn_file_trace_watchdog(host),
                 );
                 if !kept {
-                    // Nothing would stop this session, and a Kernel-File
+                    // Nothing would stop this session, and a per-file
                     // session left running traces the machine for the life of
                     // the process. Report no source instead of a leak.
                     tracing::error!(

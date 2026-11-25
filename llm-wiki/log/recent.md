@@ -1,3 +1,48 @@
+## 2026-11-25 - The per-file trace, measured: wrong flag, wrong opcodes, now by completion
+
+- Reported as "per process per file read/write attribution sucks and is broken with
+  'a trace is running but has not delivered a file event yet'". Three attempts had
+  guessed at the subscription; this time an elevated scratch probe started each
+  candidate session, did its own file I/O and histogrammed what arrived.
+- Findings (build 26300): `EVENT_TRACE_FLAG_FILE_IO` alone and SystemIo
+  `SYSTEM_IO_KW_FILE` deliver only `OpEnd` (opcode 76, ~22k per 4 s, not one
+  request). `EVENT_TRACE_FLAG_FILE_IO_INIT` delivers Create 64 / Cleanup 65 /
+  Close 66 / Read 67 / Write 68 (+69..86) as `FileIoGuid` v3 — on a PRIVATE system
+  logger as well as on the NT Kernel Logger. The decoder had filtered on 12..16
+  (the manifest event ids), so it discarded every request anyway: two independent
+  bugs, each sufficient for "undelivered".
+- `DISK_FILE_IO` rundown (opcode 36) arrives only at session stop, so it cannot
+  name handles opened before the session. The system handle table can:
+  `SystemExtendedHandleInformation`'s object address equals the record's
+  `FileObject` (verified on a pre-opened handle).
+- Request records double-count: a cached write the filter manager refuses on the
+  fast path logs a request with `IoFlags` 0 whose `OpEnd` has status `0xC01C0004`
+  (`STATUS_FLT_DISALLOW_FAST_IO`), then the IRP retry (`IoFlags` 0x60a00) on the
+  SAME `Irp`. `FlushFileBuffers` adds paging writes (`IoFlags` 0x60043) under the
+  writer's pid. Counting completions (`OpEnd.ExtraInfo`, success status only) and
+  skipping `IRP_PAGING_IO` gives exact numbers.
+- Change: `LoggerKind::SystemFile`/`KernelFile` flags `FILE_IO_INIT | FILE_IO`,
+  private session first; `file_etw` rewritten around pending-by-`Irp` requests,
+  unresolved-by-object bytes and handle-table naming
+  (`process_file_io::name_file_objects`, double table read to verify the
+  duplicate); `Measured` once any completed transfer is decoded (an idle process
+  is a measured zero; rows the trace knows read "0 B"); `--selfcheck` waits for its
+  own bytes. Live elevated `the_file_trace_measures_exact_bytes_per_file`:
+  early file (4096, 24576), late file (131072, 131072), unnamed 0.
+- First user check of the installed build said "does not seem to be working":
+  greencurve-service showed "0 B" on every row with read spikes on its graph. A
+  targeted probe showed the trace attributed correctly — the process opens
+  `config.ini`, reads 96167 bytes and closes it every ~3 s — but
+  `attach_file_io` folded measured files without an open row into the unnamed
+  remainder. Such files are now rows of their own with no open handle
+  ("(closed)" on the page). Also seen: `Irp` values are reused across processes
+  within milliseconds (sequential reuse; matching by `Irp` stays correct because
+  every request on an `Irp` retires the previous one), and without
+  `SeDebugPrivilege` the handle table reports every object address as 0.
+- Rejected: dedup of fast-I/O retries by (thread, object, offset, size) — the
+  completion status says it directly. Not done: completed sizes for memory-mapped
+  I/O, and a Linux per-file source (needs eBPF).
+
 ## 2026-11-25 - `--selfcheck` waits for the per-file trace instead of sampling once
 
 - The `file_io` verdict was worthless by construction: the check sampled the

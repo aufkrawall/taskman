@@ -972,101 +972,80 @@ rebase runbook.
   non-regular devices. It has no per-file trace, so every row's byte/op counts
   stay `None`; `/proc/<pid>/io` fills only the explicit process-wide counter
   fields and leaves the accounting state unavailable.
-  Per-file read and written bytes (2026-11-25) come from an elevated
-  `Microsoft-Windows-Kernel-File` trace (`win/file_etw.rs`), started on demand
-  and stopped by the same idle watchdog as the disk and network traces. Two
-  hosts exist and keep separate fixed session names (`FileTraceHost` in
-  `core_service.rs`): the installed LocalSystem service (`TaskMan-File-Service`)
-  answers `ProcessFileIo` requests from its own session, and the GUI
-  (`TaskMan-File-App`) hosts the same trace on the direct
-  `WinActions::list_process_file_io` path whenever a request does not get a
-  served answer — no service installed, the broker unavailable, or the broker
-  rejecting the request — which still requires elevation, and attaches its
-  sample through the one shared `file_etw::attach_file_io`. Which session
-  carries the class is decided in three ordered attempts
-  (`file_etw::sources`, best first, re-tried best-first on every restart):
-  1. the single global NT Kernel Logger (`etw::KERNEL_LOGGER`,
-     `LoggerKind::KernelFile`) with `EnableFlags = EVENT_TRACE_FLAG_FILE_IO`
-     and `Wnode.Guid = SystemTraceControlGuid`, real-time only, on the disk
-     session's buffers. This is the session the classic `FileIo` class has
-     always been delivered by and the flag IS its subscription, so the attempt
-     enables no provider at all (`file_etw::KERNEL_PROVIDERS`);
-  2. a private system logger (`LoggerKind::SystemFile`) enabling the SystemIo
-     provider with `SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME`
-     (`file_etw::PROVIDERS`) — one of the eight slots the SystemTraceProvider
-     multiplexes, never the disk session, so the disk graphs keep their own
-     flags and lifetime. That enable is a PROVIDER call, not an `EnableFlags`
-     flag: both the manifest `EnableTraceEx2` for
-     `Microsoft-Windows-Kernel-File` and the legacy `EVENT_TRACE_FLAG_FILE_IO`
-     are accepted and deliver no record — the live elevated selfcheck that
-     reported `undelivered` with `events_lost` 0 came from them, not from an
-     idle machine. The two mechanisms are not interchangeable: the flag works
-     on the kernel logger and nowhere else;
-  3. a refusal, which becomes a state and never a number.
-  The kernel logger is EXCLUSIVE: there is exactly one on the machine, its name
-  is not ours, and an `ERROR_ALREADY_EXISTS` from `StartTraceW` must NOT be
-  answered the way every per-role session is (`LoggerKind::
-  reclaims_a_stale_session`) — stopping it would end another application's
-  trace. That is why Process Hacker-style tools coordinate on this one session
-  and why the code reports it instead of retrying. When another tool owns it
-  (a monitor, `wpr`, an installer's logger), attempt 2 may still carry the
-  class; when that is refused too, `FileTraceRefusal::KernelLoggerInUse`
-  reaches the snapshot as `FileIoAccountingState::KernelLoggerInUse` through
-  `file_etw::attach_refusal`, and the line reads "another application is using
-  the NT Kernel Logger, so per-file I/O cannot be traced" — a machine owner the
-  user can close, not a privilege problem and not a silent window. Should this
-  program ever own the kernel logger and crash, `SESSION_NAMES` includes it so
-  the panic teardown releases it.
-  The delivered records are still classic `FileIo` ones (class GUID in
-  `ProviderId`, operation in the opcode: 12–16 for Create/Cleanup/Close/Read/
-  Write), the same enable-then-class split `disk_etw` uses for `DiskIo`, and
-  BOTH attempts decode through that one callback, so a byte means the same
-  thing whichever session measured it. An
-  app-side start
-  that fails (the ordinary unelevated GUI) is throttled for
-  `APP_FILE_TRACE_RETRY` so the once-per-second poll does not spin on a kernel
-  refusal, and the snapshot then stays `Unavailable`. A session is only kept
-  while its idle watchdog runs: the spawn result is part of the decision,
-  because a session nothing stops would trace the machine for the life of the
-  process. The I/O page keys one dim line above the file table off the
-  accounting state (`per_file_accounting_note`), and every state but `Measured`
-  gets a line of its own: `Unavailable` says no trace is running and names
-  elevation or the installed service, `Undelivered` says a trace is running but
-  has not delivered a file event yet, `Undecodable` says events arrived and
-  could not be decoded, `KernelLoggerInUse` says another application holds the
-  kernel logger. Only `Unavailable` is Windows-only gated (the Linux
-  backend reports `Unavailable` for every snapshot and has no elevated host);
-  the other three describe what the trace could not do, not what it needs. Non-zero
-  `events_lost`, `dropped_paths` and `cleared_file_objects` are appended in that
-  order as one parenthesized phrase, so a lossy or capped session reads as such
-  instead of as complete numbers. The line is suppressed while a displayed row
-  still carries a count, since `merge_files` replaces the accounting wholesale
-  while keeping the larger of two row counts.
-  The Create event names a `FileObject`, that object's
-  Read and Write events carry the requested size, and the sizes are summed per
-  (process, path). Names arrive as device paths, so they are translated to the
-  DOS paths the handle walk reports (`QueryDosDeviceW`, cached) before being
-  matched case-insensitively; a record with no row becomes unnamed bytes and a
-  row with no record stays `None`. Two buckets can name one row (the caller's
-  casing survives the provider's name resolution), so the rows ADD their bytes
-  rather than replace them — rows plus both remainders are the process total.
-  The payloads are written by the kernel, so they are decoded at native pointer
-  width even when the record is flagged `EVENT_HEADER_FLAG_32_BIT_HEADER`;
-  `etw::pointer_bytes` answers the caller's-width question and must not be used
-  here. Buckets are bound to the created time the request verified, so a reused
-  pid starts fresh. Limits: these are REQUESTED sizes, not
-  completed transfers; an unelevated process has no session at all, so the
-  direct path there keeps reporting `Unavailable`; a handle whose Create is
-  not in the trace (opened before the session started, or dropped by ETW)
-  contributes unnamed bytes rather than a name; `events_lost` makes every count
-  a lower bound; the open-file map is capped and cleared at the cap, and paths
-  beyond the per-process or the session-wide cap go to the omitted remainder
-  (both counted, alongside the unnamed opens, in `FileIoAccounting` so a row of
-  "—" explains itself); the file list is trimmed by serialized bytes, not by
-  row count; and the totals restart when the idle watchdog stops the session
-  and the next request starts a new one. A dropped Close plus Create pair
-  within one process still charges a reused `FileObject` to the earlier name —
-  the payload carries only the address.
+  Per-file read and written bytes (2026-11-25) come from an elevated kernel
+  `FileIo` trace (`win/file_etw.rs`), started on demand and stopped by the same
+  idle watchdog as the disk and network traces. Two hosts exist and keep
+  separate fixed session names (`FileTraceHost` in `core_service.rs`): the
+  installed LocalSystem service (`TaskMan-File-Service`) answers `ProcessFileIo`
+  requests from its own session, and the GUI (`TaskMan-File-App`) hosts the same
+  trace on the direct `WinActions::list_process_file_io` path whenever a request
+  does not get a served answer — no service installed, the broker unavailable,
+  or the broker rejecting the request — which still requires elevation, and
+  attaches its sample through the one shared `file_etw::attach_file_io`.
+  The subscription was MEASURED with an elevated probe on build 26300 (see
+  `log/recent.md`): `EVENT_TRACE_FLAG_FILE_IO` alone and the SystemIo
+  `SYSTEM_IO_KW_FILE` keyword deliver only `OpEnd` completions (opcode 76);
+  `EVENT_TRACE_FLAG_FILE_IO_INIT` delivers the requests (Create 64,
+  Cleanup 65, Close 66, Read 67, Write 68, ...), all as `FileIoGuid` records,
+  template version 3. The session is a PRIVATE system logger
+  (`LoggerKind::SystemFile`) with `EnableFlags = FILE_IO_INIT | FILE_IO` and no
+  provider enable; the exclusive NT Kernel Logger (`LoggerKind::KernelFile`,
+  same flags) is only the fallback (`file_etw::sources`), and when it is owned
+  by another application that refusal still reaches the snapshot as
+  `FileIoAccountingState::KernelLoggerInUse` through `file_etw::attach_refusal`
+  (an `ERROR_ALREADY_EXISTS` on the kernel logger is never reclaimed).
+  `EVENT_TRACE_FLAG_DISK_FILE_IO` was rejected: its file-name rundown arrives
+  only when the session STOPS (~79k records at once).
+  Counting is by COMPLETION: a Read/Write request is held pending under its
+  `Irp`, and its `OpEnd` charges `ExtraInfo` (bytes actually moved) to the
+  requesting process and file object; an error status (e.g.
+  `STATUS_FLT_DISALLOW_FAST_IO`, the refused fast-I/O attempt that precedes an
+  IRP retry of the same cached write) charges nothing, and any other request on
+  the same `Irp` retires a pending one whose completion was lost. Paging I/O
+  (`IoFlags & IRP_PAGING_IO`: flushes, the lazy writer, page faults) is
+  skipped, because it re-charges cached bytes and is not what `IO_COUNTERS`
+  count — so a file touched only through a mapped view shows no bytes.
+  Names: a Create gives `FileObject -> OpenPath` (device path, translated to the
+  DOS path with `QueryDosDeviceW`, matched case-insensitively). Handles opened
+  BEFORE the session have no Create; their objects are named from the system
+  handle table (`process_file_io::name_file_objects`:
+  `SystemExtendedHandleInformation` object addresses — needs SeDebugPrivilege —
+  each handle duplicated and named like a row, then verified by a second table
+  read that our duplicate still refers to that object). The first sample of a
+  process names every file handle it holds; later samples name only objects
+  carrying unnamed bytes, throttled by `SEED_INTERVAL` (2 s); bytes that arrived
+  before the name move onto it. The live elevated test
+  `the_file_trace_measures_exact_bytes_per_file` checks exact (read, written)
+  for one file opened before and one after the trace started.
+  `attach_file_io` turns a measured path with no handle-walk row into a row
+  of its own with `open_handles: 0` (the page renders "(closed)"; size,
+  position and access stay `None`/unknown). Before, those bytes went to the
+  unnamed remainder, so greencurve-service — which rereads `config.ini`
+  (96 KB) every ~3 s through open-read-close — showed "0 B" on every row while
+  its read graph spiked. Zero-byte entries (known open, nothing moved) add no
+  row.
+  States: `Undelivered` until the session has decoded one completed transfer
+  anywhere; from then on the session is proven, and a process with no transfer
+  is `Measured` at zero. Rows the trace knows to be open read "0 B"; rows it
+  knows nothing about keep `None`. `Undecodable` means records of the read
+  opcodes arrived and none parsed (unknown version is rejected, never guessed),
+  `Unavailable` that no session could start. Only `Unavailable` is
+  Windows-only gated in the page's note (the Linux backend reports
+  `Unavailable` for every snapshot and has no elevated host). Non-zero
+  `events_lost`, `dropped_paths` and `cleared_file_objects` are appended to the
+  note; the note is suppressed while a displayed row still carries a count.
+  An app-side start that fails (the ordinary unelevated GUI) is throttled for
+  `APP_FILE_TRACE_RETRY`, and a session is only kept while its idle watchdog
+  runs. Bounds: `MAX_OPEN_FILES`, `MAX_PENDING_REQUESTS`,
+  `MAX_UNRESOLVED_OBJECTS` (bytes waiting for a name; past it they are unnamed)
+  and the per-process/session path budgets (past them bytes go to the omitted
+  remainder, counted). Rows plus the unnamed and omitted remainders are the
+  process total. Limits: a handle duplicated into another process keeps that
+  process's bytes unnamed; an object closed before it could be named stays
+  unnamed; `events_lost` makes every count a lower bound; totals restart when
+  the idle watchdog stops the session; the payloads carry only the object
+  address, so a missed Close plus Create pair within one process can still
+  charge a reused address to the earlier name.
   Threads come from one
   `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
   and service processes work unelevated); Windows 11 build 26300 ZEROES that
