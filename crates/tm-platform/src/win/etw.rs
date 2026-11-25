@@ -72,13 +72,22 @@ pub(crate) const SESSION_NAMES: [&str; 11] = [
 /// two so a typo here cannot turn into a session that never starts.
 pub(crate) const KERNEL_LOGGER: &str = "NT Kernel Logger";
 
-/// Which of [`SESSION_NAMES`] THIS process started and has not stopped.
+/// How many sessions of each of [`SESSION_NAMES`] THIS process currently owns.
+///
+/// A COUNT, not a flag: a restarted session replaces its predecessor under the
+/// same FIXED name, and the replacement is started before the old one is
+/// dropped (see the maintenance thread in `core_service`). With a flag the
+/// predecessor's `Drop` cleared the ownership the new session had just
+/// recorded, so [`stop_live_sessions`] skipped a session this process still
+/// held — for [`KERNEL_LOGGER`] that leaves the machine's kernel logger taken
+/// by a dead run, and it can never be reclaimed because that name is not ours
+/// to reclaim.
 ///
 /// Lock-free and fixed-size on purpose: it is read from the panic hook, where
 /// taking a lock the panicking thread might already hold would hang the
 /// process instead of aborting it.
-static LIVE_SESSIONS: [std::sync::atomic::AtomicBool; SESSION_NAMES.len()] =
-    [const { std::sync::atomic::AtomicBool::new(false) }; SESSION_NAMES.len()];
+static LIVE_SESSIONS: [std::sync::atomic::AtomicUsize; SESSION_NAMES.len()] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; SESSION_NAMES.len()];
 
 fn session_index(name: &[u16]) -> Option<usize> {
     let name = String::from_utf16_lossy(name);
@@ -87,9 +96,22 @@ fn session_index(name: &[u16]) -> Option<usize> {
 }
 
 fn mark_session(name: &[u16], live: bool) {
-    if let Some(index) = session_index(name) {
-        LIVE_SESSIONS[index].store(live, std::sync::atomic::Ordering::Release);
+    let Some(index) = session_index(name) else {
+        return;
+    };
+    let owners = &LIVE_SESSIONS[index];
+    if live {
+        owners.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        return;
     }
+    // Saturating, because a teardown that already zeroed the count (a caught
+    // panic) followed by this session's own `Drop` must not wrap the count
+    // into "many owners" and keep the hook stopping a session that is gone.
+    let _ = owners.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |owners| Some(owners.saturating_sub(1)),
+    );
 }
 
 /// Stop every session this process still owns, by name.
@@ -112,7 +134,9 @@ pub(crate) fn stop_live_sessions() {
     // for why this is `u64`-aligned.
     const WORDS: usize = 64;
     for (index, name) in SESSION_NAMES.iter().enumerate() {
-        if !LIVE_SESSIONS[index].swap(false, std::sync::atomic::Ordering::AcqRel) {
+        // Zeroed before the stop: a session name has one owner per running
+        // session, and this runs once for the whole process.
+        if LIVE_SESSIONS[index].swap(0, std::sync::atomic::Ordering::AcqRel) == 0 {
             continue;
         }
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -929,6 +953,46 @@ mod tests {
             !LoggerKind::KernelFile.reclaims_a_stale_session(),
             "the global session belongs to whoever started it"
         );
+    }
+
+    /// A restarted session replaces its predecessor under the same FIXED name,
+    /// and the replacement is started BEFORE the old one is dropped. The name
+    /// therefore has to stay owned while the new session holds it: with a flag,
+    /// the old session's `Drop` cleared the ownership the new one had just
+    /// recorded, and the crash teardown then skipped a session this process
+    /// still owned — for the global kernel logger, leaving it taken by a run
+    /// that is already gone, under a name that must never be reclaimed.
+    #[test]
+    fn a_replaced_session_keeps_its_name_owned_until_its_last_holder_drops() {
+        use std::sync::atomic::Ordering;
+
+        // A name no other test of this module marks.
+        let name = SESSION_NAMES[8];
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let owners =
+            || session_index(&wide).map(|index| LIVE_SESSIONS[index].load(Ordering::Acquire));
+        assert_eq!(owners(), Some(0), "nothing owns it yet");
+
+        mark_session(&wide, true);
+        mark_session(&wide, true);
+        assert_eq!(
+            owners(),
+            Some(2),
+            "a restart overlaps the session it replaces"
+        );
+
+        mark_session(&wide, false);
+        assert_eq!(
+            owners(),
+            Some(1),
+            "the predecessor's teardown must not clear the replacement's ownership"
+        );
+        mark_session(&wide, false);
+        assert_eq!(owners(), Some(0));
+        // An unbalanced release cannot wrap the count into "many owners", which
+        // would keep the panic teardown stopping a session that is long gone.
+        mark_session(&wide, false);
+        assert_eq!(owners(), Some(0));
     }
 
     /// `ERROR_ALREADY_EXISTS` has to survive as its own answer: it is the

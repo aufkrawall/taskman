@@ -2248,6 +2248,24 @@ fn kernel_pseudo_role(exe_path: Option<&std::path::Path>) -> Option<&str> {
     .then_some(text)
 }
 
+/// Publisher evidence for a process named like one of the kernel's
+/// pseudo-processes.
+///
+/// Such a row has no image file, so no publisher exists to verify and `None`
+/// ("unknown") is the only honest answer — which is exactly what `classify`'s
+/// kernel-name rule needs to keep it a System process, since a bare
+/// pseudo-name is not a path under `%SystemRoot%` and asking the ownership test
+/// about it answers "a file that is not ours". `Some(false)` is reserved for a
+/// real image that merely borrowed the name: that is the spoof the name rule
+/// must not reward.
+fn kernel_pseudo_ownership(exe_path: Option<&std::path::Path>) -> Option<bool> {
+    if exe_path.is_none() || kernel_pseudo_role(exe_path).is_some() {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// Infer elevation/UAC state from a KNOWN privileged account when the token
 /// itself cannot be queried. SYSTEM, the three service accounts, `NT SERVICE\`
 /// hosts and the DWM/UMFD session accounts all run full tokens without UAC
@@ -2490,13 +2508,13 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry], window_scan_
     // The ownership test only rejects a spoofed core image name.
     for p in processes.iter_mut() {
         // `Registry` and the other bare pseudo-process names have no image
-        // path. If one of those names is backed by a real file instead, reject
-        // the kernel-pseudo interpretation even when version metadata cannot
-        // establish a publisher.
-        let windows_owned = if classify::is_kernel_pseudo_name(&p.name)
-            && kernel_pseudo_role(p.exe_path.as_deref()).is_none()
-        {
-            Some(false)
+        // path at all: the kernel names them itself. Their ownership evidence
+        // is therefore UNKNOWN, which is what keeps `classify`'s name rule
+        // reading them as System; a kernel-like name backed by a real file is
+        // rejected instead, even when version metadata cannot establish a
+        // publisher.
+        let windows_owned = if classify::is_kernel_pseudo_name(&p.name) {
+            kernel_pseudo_ownership(p.exe_path.as_deref())
         } else {
             is_windows_owned_image(p)
         };
@@ -2791,6 +2809,60 @@ mod tests {
         assert!(kernel_pseudo_role(Some(Path::new(r"C:\Users\dev\Registry"))).is_none());
         assert!(kernel_pseudo_role(Some(Path::new(r"C:\Tools\Registry.exe"))).is_none());
         assert!(kernel_pseudo_role(Some(Path::new("svchost.exe"))).is_none());
+    }
+
+    /// The kernel's own pseudo-processes keep their System group.
+    ///
+    /// Regression: `Registry`, `Memory Compression` and `Secure System` were
+    /// classified with `Some(false)` ownership evidence because their bare
+    /// kernel names are not paths under `%SystemRoot%`. `classify`'s name rule
+    /// needs UNKNOWN ownership for a kernel pseudo-name, so all three silently
+    /// fell out of the Windows-processes group into Background.
+    #[test]
+    fn kernel_pseudo_processes_stay_system() {
+        use std::path::Path;
+        // The bare kernel name is the whole identity evidence: there is no
+        // image file, so nothing can be verified and nothing is rejected.
+        assert_eq!(kernel_pseudo_ownership(None), None);
+        assert_eq!(kernel_pseudo_ownership(Some(Path::new("Registry"))), None);
+        assert_eq!(
+            kernel_pseudo_ownership(Some(Path::new("MemCompression"))),
+            None
+        );
+        assert_eq!(
+            kernel_pseudo_ownership(Some(Path::new("Secure System"))),
+            None
+        );
+        // A real image that borrowed the name is rejected whether or not the
+        // metadata called it Microsoft's.
+        assert_eq!(
+            kernel_pseudo_ownership(Some(Path::new(r"C:\Users\dev\Registry"))),
+            Some(false)
+        );
+        assert_eq!(
+            kernel_pseudo_ownership(Some(Path::new(
+                r"\Device\HarddiskVolume3\Users\dev\Registry"
+            ))),
+            Some(false)
+        );
+
+        // End to end through the classifier the page uses, with the evidence
+        // the sampler now supplies.
+        for (pid, name, exe) in [
+            (96u32, "Registry", "Registry"),
+            (120, "Memory Compression", "MemCompression"),
+            (140, "Secure System", "Secure System"),
+        ] {
+            let mut process = ProcessEntry::new(pid, name);
+            process.exe_path = Some(exe.into());
+            let mut processes = vec![process];
+            refine_categories_and_group_apps(&mut processes, true);
+            assert_eq!(
+                processes[0].category,
+                ProcCategory::System,
+                "{name} is a kernel pseudo-process"
+            );
+        }
     }
 
     /// Elevation falls out of a known privileged account when the token

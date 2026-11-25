@@ -68,6 +68,16 @@ pub struct State {
     poll: Poll<ProcessFileIoSnapshot>,
     pub files: Vec<TrackedFileIo>,
     pub accounting: Option<FileIoAccounting>,
+    /// Whether this view ever dropped rows at [`MAX_RETAINED_IO_ROWS`].
+    ///
+    /// The cap is a presentation limit, so the table is incomplete from then
+    /// on — and the flag has to live HERE rather than only in
+    /// [`Self::accounting`], because every poll replaces that copy wholesale:
+    /// a `handles_complete = false` written by the trim survived exactly one
+    /// frame and the page then reported a trimmed list as complete. Sticky on
+    /// purpose: a dropped row's per-file bytes are never re-derived, so an
+    /// empty spot in the list cannot be filled in again later.
+    retention_truncated: bool,
     pub file_filter: String,
     pub file_sort_column: FileSortColumn,
     pub file_sort_ascending: bool,
@@ -87,6 +97,7 @@ impl Default for State {
             poll: Poll::default(),
             files: Vec::new(),
             accounting: None,
+            retention_truncated: false,
             file_filter: String::new(),
             file_sort_column: FileSortColumn::Written,
             file_sort_ascending: false,
@@ -296,6 +307,10 @@ impl State {
                 // itself succeeded.
                 accounting.handles_complete = false;
             }
+            // ...and the reason has to outlive this snapshot: the next poll
+            // assigns a fresh accounting over this one. See
+            // [`State::retention_truncated`].
+            self.retention_truncated = true;
             let mut open = Vec::new();
             let mut closed = Vec::new();
             for file in self.files.drain(..) {
@@ -460,6 +475,44 @@ fn per_file_accounting_note(
         Some(losses) => Some(format!("{state} ({losses})")),
         None => Some(state.to_string()),
     }
+}
+
+/// What the file table says when the row list is EMPTY, or `None` when
+/// [`per_file_accounting_note`] already carries the answer.
+///
+/// An empty list is only a measurement of "this process did no file I/O" when
+/// the handle enumeration covered the table AND the per-file trace measured the
+/// process: then the trace saw every request on the machine and named none of
+/// them for it. Every other answer is a gap, and "no file activity detected"
+/// would state a definite negative about file I/O nothing here observed — the
+/// same rule the Read and Written columns follow, which read "—" rather than 0.
+///
+/// A platform without a per-file source at all keeps the plain list answer
+/// (`elevation_is_a_remedy` is false there): the handle list IS the whole
+/// feature there, so nothing that could have been shown is missing.
+///
+/// **Availability outranks the filter.** A list that could not be enumerated
+/// (or was trimmed) is not a filtered list, so "no matches" would blame the
+/// search box for a gap the enumeration caused. `filter_active` also has to
+/// mean "a filter is set over a list that HAD candidates": with nothing to
+/// filter, an empty list says the same thing it would without the filter.
+fn empty_file_list_message(
+    accounting: Option<&FileIoAccounting>,
+    handles_complete: bool,
+    filter_active: bool,
+    elevation_is_a_remedy: bool,
+    lang: i18n::Lang,
+) -> Option<String> {
+    let Some(accounting) = accounting.filter(|_| handles_complete) else {
+        return Some(i18n::tr_in(lang, K::PropIoFilesUnavailable).to_string());
+    };
+    if filter_active {
+        return Some(i18n::tr_in(lang, K::NoMatches).to_string());
+    }
+    if accounting.state == FileIoAccountingState::Measured || !elevation_is_a_remedy {
+        return Some(i18n::tr_in(lang, K::PropIoNoFiles).to_string());
+    }
+    None
 }
 
 /// How much of the process's own I/O over the traced window went to files, or
@@ -942,10 +995,14 @@ pub fn show(
     }
 
     let display_files = state.sorted_and_filtered_files();
-    let handles_incomplete = state
-        .accounting
-        .as_ref()
-        .is_some_and(|accounting| !accounting.handles_complete);
+    // A trimmed list is incomplete for as long as this view lives, not only for
+    // the frame the trim happened in: `merge_files` keeps that in the tab state
+    // because every poll replaces `accounting`.
+    let handles_incomplete = state.retention_truncated
+        || state
+            .accounting
+            .as_ref()
+            .is_some_and(|accounting| !accounting.handles_complete);
     if handles_incomplete && !display_files.is_empty() {
         ui.add_space(6.0);
         ui.label(
@@ -957,16 +1014,29 @@ pub fn show(
     if display_files.is_empty() {
         ui.add_space(6.0);
         // Per-file byte/op accounting is normally Unavailable, but the file
-        // LIST is still a measured fact when handle enumeration completed.
-        let unavailable = handles_incomplete || state.accounting.is_none();
-        let msg = if unavailable {
-            i18n::tr(K::PropIoFilesUnavailable)
-        } else if !state.file_filter.trim().is_empty() {
-            i18n::tr(K::NoMatches)
-        } else {
-            i18n::tr(K::PropIoNoFiles)
-        };
-        ui.weak(msg);
+        // LIST is still a measured fact when handle enumeration completed. An
+        // EMPTY list is only "no file activity" when the per-file trace
+        // measured the process as well; otherwise the page states which state
+        // it is in, because a negative nothing observed is the one thing the
+        // Read and Written columns must never become.
+        if let Some(msg) = empty_file_list_message(
+            state.accounting.as_ref(),
+            !handles_incomplete,
+            // "No matches" only over a list that HAD candidates: with nothing
+            // to filter, the search box is not why the table is empty.
+            !state.file_filter.trim().is_empty() && !state.files.is_empty(),
+            ELEVATION_IS_A_REMEDY,
+            i18n::lang(),
+        ) {
+            ui.weak(msg);
+        } else if let Some(note) = per_file_accounting_note(
+            state.accounting.as_ref(),
+            false,
+            ELEVATION_IS_A_REMEDY,
+            i18n::lang(),
+        ) {
+            ui.label(egui::RichText::new(note).small().color(pal.text_dim));
+        }
         if process.disk_read_bps > 0.0
             || process.disk_write_bps > 0.0
             || process.io_other_bps.unwrap_or(0.0) > 0.0
@@ -1625,6 +1695,72 @@ mod tests {
                 "Es läuft keine Ablaufverfolgung: erfordert Administratorrechte oder den \
                  installierten Dienst (12 Ereignisse verloren)"
             )
+        );
+    }
+
+    /// An EMPTY file table renders the same rule as a dashed column: "no file
+    /// activity detected" is a measurement, and without a per-file source the
+    /// row list cannot make it.
+    ///
+    /// Regression: the empty branch keyed on `handles_complete` alone and
+    /// returned before the state line, so an unelevated GUI with no service —
+    /// where an empty list means "no open handles", not "no file I/O" — read
+    /// exactly like a measured zero and never named the missing source.
+    #[test]
+    fn an_empty_file_table_states_the_reason_instead_of_claiming_no_activity() {
+        use tm_core::i18n::Lang;
+
+        let no_files = Some(i18n::tr_in(Lang::En, K::PropIoNoFiles).to_string());
+        let unavailable = Some(i18n::tr_in(Lang::En, K::PropIoFilesUnavailable).to_string());
+        let no_trace = FileIoAccounting {
+            state: FileIoAccountingState::Unavailable,
+            ..Default::default()
+        };
+        let measured = FileIoAccounting {
+            state: FileIoAccountingState::Measured,
+            ..Default::default()
+        };
+        assert_eq!(
+            empty_file_list_message(Some(&no_trace), true, false, true, Lang::En),
+            None,
+            "the state line says why, not the list"
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&measured), true, false, true, Lang::En),
+            no_files,
+            "a measured process that named no file is a measured zero"
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&measured), false, false, true, Lang::En),
+            unavailable,
+            "the enumeration, not the trace, is why the list is unknown"
+        );
+        assert_eq!(
+            empty_file_list_message(None, true, false, true, Lang::En),
+            unavailable
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&no_trace), true, false, false, Lang::En),
+            no_files,
+            "a platform without a per-file source keeps the plain list answer"
+        );
+        assert_eq!(
+            empty_file_list_message(Some(&no_trace), true, true, true, Lang::En),
+            Some(i18n::tr_in(Lang::En, K::NoMatches).to_string()),
+            "a filter that matches nothing is its own answer"
+        );
+        // ...but availability outranks it: a list that could not be
+        // enumerated is not a filtered list, and blaming the search box for
+        // that gap would name the wrong cause.
+        assert_eq!(
+            empty_file_list_message(Some(&measured), false, true, true, Lang::En),
+            unavailable,
+            "an un-enumerated list is not a filtered list"
+        );
+        assert_eq!(
+            empty_file_list_message(None, true, true, true, Lang::En),
+            unavailable,
+            "an un-enumerated list is not a filtered list"
         );
     }
 
@@ -2299,6 +2435,30 @@ mod tests {
         assert_eq!(
             state.accounting.as_ref().map(|a| a.handles_complete),
             Some(false)
+        );
+        assert!(
+            state.retention_truncated,
+            "the trimmed list is flagged as incomplete"
+        );
+
+        // Every poll replaces `accounting` wholesale, so the flag has to live
+        // in the tab state: a complete snapshot one frame later must not make
+        // the page report the trimmed list as complete again.
+        state.merge_files(ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                handles_complete: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            state.accounting.as_ref().map(|a| a.handles_complete),
+            Some(true),
+            "the new snapshot really does report itself complete"
+        );
+        assert!(
+            state.retention_truncated,
+            "a complete snapshot does not undo a trim that already dropped rows"
         );
     }
 
