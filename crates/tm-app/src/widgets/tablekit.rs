@@ -1078,6 +1078,13 @@ impl TmTable {
             Some(self.drop_slot(rect, &bounds, pointer.x).unwrap_or(from))
         });
 
+        // The header's guides follow the body dividers' rule: one physical
+        // pixel wide, on a pixel centre. The header sits directly on the
+        // body, so a guide that is a point wide and half a pixel off makes
+        // the same boundary kink at the seam between them.
+        let ppp = ui.ctx().pixels_per_point();
+        let ppp = if ppp > 0.0 { ppp } else { 1.0 };
+
         for (i, col) in self.cols.iter().enumerate() {
             let w = self.col_width(i);
             let cell =
@@ -1129,12 +1136,13 @@ impl TmTable {
             }
 
             if i > 0 {
+                let gx = x.round_to_pixel_center(ppp);
                 painter.line_segment(
                     [
-                        Pos2::new(x, rect.top() + 4.0),
-                        Pos2::new(x, rect.bottom() - 4.0),
+                        Pos2::new(gx, rect.top() + 4.0),
+                        Pos2::new(gx, rect.bottom() - 4.0),
                     ],
-                    Stroke::new(1.0, pal.stroke),
+                    Stroke::new(1.0 / ppp, pal.stroke),
                 );
             }
 
