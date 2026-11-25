@@ -142,21 +142,33 @@ mod tests {
 
     #[test]
     fn replaces_the_destination_and_leaves_no_temp_file() {
-        let dir = std::env::temp_dir().join(format!("tm-persist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tm-persist-{}-{}",
+            std::process::id(),
+            NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let path = dir.join("store.json");
+        // Start from an empty directory: a leftover temp file from a crashed
+        // earlier run must not be able to fail this test's exact-set check.
+        let _ = std::fs::remove_dir_all(&dir);
         replace_file(&path, "json.tmp", |out| out.write_all(b"first")).unwrap();
         replace_file(&path, "json.tmp", |out| out.write_all(b"second")).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         // The temp file is `<name>.<pid>-<seq>.<ext>`, not `<name>.<ext>`, so
         // `path.with_extension("json.tmp")` never names what a save creates.
-        // The directory is the only place that proves none was left behind.
-        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        // Only these two saves may have run in this directory, so an exact
+        // name set proves none was left behind; a suffix scan would also blame
+        // a crashed earlier run whose PID Windows reused.
+        let entries: std::collections::HashSet<String> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".json.tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "a completed save left {leftovers:?} behind");
+        assert_eq!(
+            entries,
+            std::collections::HashSet::from(["store.json".to_string()]),
+            "a completed save left a temp file behind"
+        );
 
         set_aside(&path, "test store");
         assert!(!path.exists());
