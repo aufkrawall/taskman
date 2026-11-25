@@ -534,8 +534,11 @@ remain follow-up rather than being simulated in headless tests:
   file. Closing it needs a directory-FD `O_NOFOLLOW` + `renameat` publish:
   `autostart.rs` publishes atomically from a sibling temporary file but does so
   path-based (`fs::rename`, `renameat2` with `AT_FDCWD`) and puts its
-  `O_NOFOLLOW` on opening the existing entry for validation, not on the publish,
-  and `startup.rs` does not publish that way at all.
+  `O_NOFOLLOW` on opening the existing entry for validation, not on the publish.
+  `startup.rs` publishes its temporary file the same path-based way and has no
+  ownership marker to check, because the Startup page toggles third-party
+  entries; only its symlink branch differs, truncating through the link with
+  `fs::write`.
 
 ### 2026-11-23 remaining Linux parity contracts
 
@@ -690,14 +693,15 @@ remain follow-up rather than being simulated in headless tests:
   (`engine::tests::demand_sent_to_a_running_engine_reaches_the_collector`).
 - **The Linux privilege/ownership policies added on 2026-11-25 share that gap.**
   The hidden helper's relaunch refusal
-  (`polkit::execute_privileged_action`), the activation listener's accept
-  classification (`activation::accept_outcome`) and the autostart
-  entry-ownership rule (`autostart::is_replaceable_entry`) each carry a focused
-  unit test next to the policy, and no gate executes any of them: the Linux
-  cross check omits `--all-targets`, so even type-checking them takes a manual
-  form. The request side and the root side of the elevation policy at least
-  cannot disagree silently, because both build their refusal through one pair of
-  constructors in `polkit.rs`; a rule that needs to *run* under a gate has to
+  (`polkit::execute_privileged_action`), the activation listener's accept and
+  poll classifications (`activation::accept_outcome`,
+  `activation::poll_failure`) and the autostart entry-ownership rule
+  (`autostart::is_replaceable_entry`) each carry a focused unit test next to the
+  policy, and no gate executes any of them: the Linux cross check omits
+  `--all-targets`, so even type-checking them takes a manual form. The request
+  side and the root side of the elevation policy at least cannot disagree
+  silently, because both build their refusal through one pair of constructors in
+  `polkit.rs`; a rule that needs to *run* under a gate has to
   move into a platform-neutral module (`linux_action_support.rs`, compiled under
   `cfg(any(target_os = "linux", test))`, is the existing home for the parser
   half). Do not add another unrunnable Linux test and call the rule covered.
