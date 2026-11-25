@@ -37,13 +37,56 @@
 //! path can uncloak a window the gate still holds, so no code path can turn the
 //! flash back on.
 //!
+//! The app has to call it from the frame *after* the one that painted — a paint
+//! is not on screen until its frame ends — and it has to be willing to call it
+//! again on every later frame, because a transition that arrives after a release
+//! takes a new hold. Release without a hold is a no-op, so "call it at the start
+//! of every frame" is the shape that cannot miss a hold, and
+//! [`present_gate_needs_frame`] says whether the app must request a repaint to
+//! answer the one it may not have noticed. [`remove_present_gate`] is the other
+//! way out and uncloaks as part of taking the gate down, so even an app that
+//! gives up on frames can make the window visible again.
+//!
+//! ## The window class
+//!
+//! The erase brush is installed as the window *class* background
+//! (`GCLP_HBRBACKGROUND`) as well as being filled by the `WM_ERASEBKGND`
+//! handler, so an erase the handler declines — an empty update rectangle, or the
+//! default procedure erasing on its own — is still the app's colour and never
+//! the system's white. That attribute belongs to the class, so it covers every
+//! window of the class in this process, not just the gated one: today the app
+//! has a single winit window, and any winit window or egui viewport added later
+//! would inherit the same background, which is the colour a TaskMan window wants
+//! anyway. `teardown` hands the previous brush back before it deletes ours, so
+//! nothing of the sort outlives the gate.
+//!
+//! ## What it cannot cover
+//!
+//! Cloaking is a single bit per window and other parties own it too: a virtual
+//! desktop switch, or the shell uncloaking a window, writes the same attribute
+//! without sending this thread a message, and a third party can uncloak at any
+//! moment. The transitions below are also not all preemptive — `WM_SIZE` is the
+//! post-hoc backstop for restores that send nothing else, so it closes the door
+//! right after the window is back rather than before. The background colour is
+//! what makes those cases survivable: they cost at worst a frame of the app's
+//! own colour, never a frame of the system's white.
+//!
 //! ## Threads
 //!
 //! The subclass runs inside `DispatchMessage` on the thread that owns the
-//! window, and installation is a UI-thread call. The readers are not so
-//! disciplined — `ensure_presentable` is reached from the hotkey worker and
-//! from cross-process activation — so the state sits behind one mutex, and
-//! nothing calls the app's `wake` callback while it is held.
+//! window, and every mutation of the gate — install, hold, release, teardown —
+//! is a call from that thread as well: installation happens where the window was
+//! created, release follows a frame. Because of that, a transition and a
+//! release can never interleave halfway, which is what keeps `held` and the
+//! cloak in step. The readers are the undisciplined ones — `ensure_presentable`
+//! is reached from the hotkey worker and from cross-process activation — so the
+//! state sits behind one mutex, and nothing calls the app's `wake` callback
+//! while it is held.
+//!
+//! Installation must happen before the window is ever shown (eframe's
+//! `CreationContext`, not its first `update`): the cloak is what covers the very
+//! first `ShowWindow`, and a gate installed after it arrives too late for that
+//! one show.
 
 use std::sync::{Arc, Mutex};
 
@@ -169,9 +212,16 @@ struct Gate {
     /// A minimize was seen and no reveal has been handled since — see
     /// `WindowFacts::was_iconic`.
     was_iconic: bool,
-    /// Client-area erase brush. Shared with the window class background, so it
-    /// has to outlive the class's reference to it.
-    brush: HBRUSH,
+    /// Client-area erase brush, as a raw handle rather than [`HBRUSH`]. Shared
+    /// with the window class background, so it has to outlive the class's
+    /// reference to it.
+    ///
+    /// It is an integer because this struct sits in a `static`, and [`HBRUSH`]
+    /// wraps a pointer: it is neither `Send` nor `Sync`, so a
+    /// `Mutex<Gate>` holding one could not be a `static` at all. Nothing is lost
+    /// — a GDI handle is only meaningful on the thread that owns the window, and
+    /// every use of this one (`install`, `teardown`, `WM_ERASEBKGND`) is there.
+    brush: isize,
     /// The class background that was there before installation (winit leaves
     /// it null).
     previous_class_brush: isize,
@@ -185,7 +235,7 @@ impl Gate {
             held: false,
             pending: false,
             was_iconic: false,
-            brush: HBRUSH(std::ptr::null_mut()),
+            brush: 0,
             previous_class_brush: 0,
             wake: None,
         }
@@ -299,7 +349,7 @@ pub fn install_present_gate(hwnd: isize, background: [u8; 3], wake: Arc<dyn Fn()
     {
         let mut gate = tm_core::sync::lock(&GATE);
         gate.hwnd = hwnd;
-        gate.brush = brush;
+        gate.brush = brush.0 as isize;
         gate.previous_class_brush = previous_class_brush;
         gate.wake = Some(wake);
         // A fresh installation is a hold: the frame the app is about to paint
@@ -340,7 +390,7 @@ fn teardown(window_live: bool) {
         gate.held = false;
         gate.pending = false;
         gate.was_iconic = false;
-        gate.brush = HBRUSH(std::ptr::null_mut());
+        gate.brush = 0;
         gate.previous_class_brush = 0;
         gate.wake = None;
         recorded
@@ -373,11 +423,11 @@ fn teardown(window_live: bool) {
         let _ = RemoveWindowSubclass(window, Some(gate_subclass_proc), SUBCLASS_ID);
         SetClassLongPtrW(window, GCLP_HBRBACKGROUND, previous_class_brush);
     }
-    if !brush.0.is_null() {
-        // SAFETY: the class no longer references the brush, and nothing else
-        // was ever handed it.
+    if brush != 0 {
+        // SAFETY: `brush` is the `CreateSolidBrush` handle from `install`; the
+        // class no longer references it, and nothing else was ever handed it.
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(brush.0));
+            let _ = DeleteObject(HGDIOBJ(brush as *mut std::ffi::c_void));
         }
     }
     tracing::debug!(hwnd, held, "presentation gate removed");
@@ -522,18 +572,21 @@ fn wake_app() {
 /// never show the system's white. Returns whether a brush was available.
 fn erase_with_gate_brush(hwnd: HWND, hdc: HDC) -> bool {
     let brush = tm_core::sync::lock(&GATE).brush;
-    if brush.0.is_null() {
+    if brush == 0 {
         return false;
     }
     let mut rect = RECT::default();
-    // SAFETY: live window and DC from the message; `false` leaves the update
-    // region for the real paint to validate.
-    if !unsafe { GetUpdateRect(hwnd, Some(&mut rect), false) }.as_bool() {
+    // SAFETY: live window from the message; `false` leaves the update region to
+    // be validated by the real paint, which eframe's software backend relies on
+    // (`os_update_rect` reads the region before it validates it).
+    if !unsafe { GetUpdateRect(hwnd, Some(&raw mut rect), false) }.as_bool() {
         return false;
     }
-    // SAFETY: `hdc` is the device context `WM_ERASEBKGND` was sent with.
+    // SAFETY: `hdc` is the device context `WM_ERASEBKGND` was sent with, and the
+    // brush is the one `install` created — `teardown` is the only thing that
+    // deletes it.
     unsafe {
-        FillRect(hdc, &rect, brush);
+        FillRect(hdc, &rect, HBRUSH(brush as *mut std::ffi::c_void));
     }
     true
 }
@@ -561,12 +614,20 @@ unsafe extern "system" fn gate_subclass_proc(
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     }
     if message == WM_NCDESTROY {
-        // The documented place to drop a subclass, and the only reliable one:
-        // after this the window handle is gone and the class background it
-        // shares our brush with could never be handed back.
+        // The window is being destroyed and this is its last message. The
+        // original procedure must receive it — winit frees the window and drops
+        // its per-window state there — so the chain runs FIRST. `DefSubclassProc`
+        // only knows what to forward to while this subclass is still installed:
+        // comctl32 resolves the next procedure from the subclass record the
+        // message arrived through, so a `RemoveWindowSubclass` before the chain
+        // leaves nothing to walk and can swallow the notification outright. The
+        // handle stays usable for `RemoveWindowSubclass` and `SetClassLongPtrW`
+        // until the last procedure returns from this message, which is where
+        // `teardown` now runs.
+        // SAFETY: chaining to the window's own procedure.
+        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
         teardown(true);
-        // SAFETY: the class procedure still has to see the destruction.
-        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        return result;
     }
     if let Some(decision) = decide(hwnd, message, wparam.0, lparam) {
         unmask(hwnd, message, decision);
@@ -764,6 +825,20 @@ mod tests {
         assert!(gate.release(), "a hold is released exactly once");
         assert!(!gate.held);
         assert!(!gate.release(), "release is idempotent");
+    }
+
+    /// The app calls release on every frame, so the release that acts on nothing
+    /// must also change nothing: the remembered minimize is what makes the next
+    /// size restore a reveal when the shell sends no command for it.
+    #[test]
+    fn a_release_without_a_hold_keeps_the_remembered_minimize() {
+        let mut gate = Gate::new();
+        gate.note_minimize();
+        assert!(!gate.release(), "no hold, so nothing to release");
+        assert!(
+            gate.was_iconic,
+            "a no-op release must not spend the minimize it never answered"
+        );
     }
 
     /// A transition takes the hold and leaves one frame owed, reported once.

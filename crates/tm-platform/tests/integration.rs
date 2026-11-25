@@ -1471,6 +1471,20 @@ fn the_presentation_gate_keeps_a_shown_window_cloaked_until_release() {
         "the class must get the app's brush, so no erase can be the system white"
     );
 
+    // Release the install hold BEFORE the show, so the cloak asserted after it
+    // can only be the subclass's. This is the case that matters: a window that
+    // becomes visible while the gate holds nothing (a tray show, a cold start
+    // after the first release) has nothing but the WndProc between it and the
+    // compositor.
+    assert!(
+        tm_platform::present_gate_release(raw),
+        "the install hold must be releasable"
+    );
+    assert!(
+        !tm_platform::is_window_cloaked(raw),
+        "the release must uncloak the window"
+    );
+
     // A show request is not allowed to reach the compositor.
     unsafe {
         let _ = ShowWindowAsync(hwnd, SW_SHOW);
