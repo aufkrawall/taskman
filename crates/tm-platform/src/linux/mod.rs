@@ -24,14 +24,17 @@ mod x11_windows;
 
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
+use crate::linux_telemetry;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
     UpdateKind,
 };
 use tm_core::classify;
+use tm_core::demand::TelemetryDemand;
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
@@ -46,6 +49,11 @@ pub struct LinuxCollector {
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
+    /// Which optional providers the UI currently needs. Cheap collectors stay
+    /// on at every demand, exactly like the Windows sampler's core set.
+    demand: TelemetryDemand,
+    /// Command lines keyed by pid, with the start ticks they were read for.
+    cmdlines: HashMap<u32, (i64, Option<String>)>,
     /// L1/L2/L3 totals in KB; cache geometry is static, so the sysfs walk
     /// over every CPU runs once instead of every tick.
     cache_kb: [u64; 3],
@@ -58,6 +66,10 @@ impl SystemCollector for LinuxCollector {
         "linux/sysinfo+procfs+sysfs+systemd"
     }
 
+    fn set_demand(&mut self, demand: TelemetryDemand) {
+        self.demand = demand;
+    }
+
     fn sample(&mut self, started: Instant) -> Result<Snapshot> {
         let interval_s = self
             .last_tick
@@ -65,12 +77,18 @@ impl SystemCollector for LinuxCollector {
             .unwrap_or(1.0)
             .clamp(0.05, 3600.0);
         self.last_tick = Some(started);
+        let providers = linux_telemetry::providers(self.demand);
 
-        self.sys.refresh_specifics(
-            RefreshKind::nothing()
-                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency())
-                .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
-        );
+        // The per-CPU current-frequency probe is the slow half of this refresh
+        // (a `scaling_cur_freq` read per CPU, or the whole `/proc/cpuinfo` per
+        // CPU when cpufreq is absent), and only the Performance page's CPU card
+        // shows it, so it follows `CPU_SPEED`.
+        let memory = MemoryRefreshKind::nothing().with_ram().with_swap();
+        let mut refresh = RefreshKind::nothing().with_memory(memory);
+        if providers.cpu_speed {
+            refresh = refresh.with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency());
+        }
+        self.sys.refresh_specifics(refresh);
         // Bracket sysinfo's observation. An identity read only after the
         // refresh could belong to a later occupant of the same PID.
         let before_refresh: HashMap<_, _> = self
@@ -100,13 +118,34 @@ impl SystemCollector for LinuxCollector {
         self.networks.refresh(true);
 
         let cpus = self.sys.cpus();
-        let logical = cpus.len().max(1);
-        let freq = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32;
-        let (physical_cores, sockets) = cpu_topology();
         let proc_stat = std::fs::read_to_string("/proc/stat").ok();
         let cpu_sample = proc_stat
             .as_deref()
             .and_then(|text| self.cpu_stats.sample(text));
+        // `/proc/stat` carries one `cpuN` line per logical processor, so its line count is the
+        // live count. sysinfo's CPU list is a snapshot from construction that never shrinks and
+        // only grows through `refresh_cpu_list`, so it is the fallback, not the source: a CPU
+        // removed at runtime would otherwise be counted for the rest of the run, and a count
+        // published as 1 would scale CPU time by the core count in App History and the threads
+        // view.
+        let logical = proc_stat
+            .as_deref()
+            .map(linux_telemetry::cpu_count)
+            .filter(|count| *count > 0)
+            .or_else(|| (!cpus.is_empty()).then_some(cpus.len()))
+            .unwrap_or(1);
+        // Zero when the current speed is not demanded, which the UI renders as
+        // unavailable instead of reusing a stale or nominal clock.
+        //
+        // Averaged over the CPUs actually summed: a CPU hot-added at runtime raises `logical`
+        // while sysinfo's list stays as it was.
+        let freq = if providers.cpu_speed {
+            let summed = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>();
+            summed / cpus.len().max(1) as f32
+        } else {
+            0.0
+        };
+        let (physical_cores, sockets) = cpu_topology();
         // The per-process window is the same two `/proc/stat` reads, so a
         // process' share and the machine's utilization cannot drift apart.
         self.process_cpu
@@ -214,16 +253,26 @@ impl SystemCollector for LinuxCollector {
             // it, so add the main thread back for parity.
             entry.threads = p.tasks().map(|tasks| tasks.len() as u32 + 1);
             entry.handles = fd_count(pid_u);
-            entry.command_line = proc_cmdline(pid_u);
-            entry.priority = proc_priority(pid_u);
+            entry.command_line = cached_cmdline(&mut self.cmdlines, pid_u, boot_start_ticks);
+            entry.priority = proc_priority(stat_bytes.as_deref());
             entry.elevated = entry.user.as_deref().map(|u| u == "root");
             processes.push(entry);
         }
         self.desktop_evidence.retain_live(&live_pids);
         self.process_cpu.retain_live(&live_pids);
+        self.cmdlines.retain(|pid, _| live_pids.contains(pid));
         mark_desktop_app_roots(&mut processes);
 
-        let diskstats = diskstats::read();
+        // Disk rates and active time are one `/proc/diskstats` read per tick;
+        // they follow the demand that shows them. Forgetting the previous
+        // counters while it is off keeps the first tick back unmeasured instead
+        // of dividing a whole off window by one tick.
+        let diskstats = if providers.disk_rates {
+            diskstats::read()
+        } else {
+            diskstats::forget();
+            Vec::new()
+        };
         let mut disks = Vec::new();
         for d in self.disks.list() {
             let mount = d.mount_point().to_string_lossy().to_string();
@@ -299,6 +348,13 @@ impl SystemCollector for LinuxCollector {
             .map(|n| (n.name.clone(), (n.total_recv_bytes, n.total_sent_bytes)))
             .collect();
 
+        // Every memory counter below comes from this one `/proc/meminfo` read;
+        // a counter the kernel omits stays 0 in the model, which has no
+        // "unknown" for it.
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .map(|text| linux_telemetry::parse_meminfo(&text))
+            .unwrap_or_default();
+
         let snap = Snapshot {
             timestamp_ms: now_ms(),
             sample_duration_ms: started.elapsed().as_millis() as u64,
@@ -337,10 +393,12 @@ impl SystemCollector for LinuxCollector {
                 total_bytes: self.sys.total_memory(),
                 used_bytes: self.sys.used_memory(),
                 available_bytes: self.sys.available_memory(),
-                cached_bytes: proc_meminfo_field("Cached")
-                    .saturating_add(proc_meminfo_field("SReclaimable")),
-                commit_total_bytes: proc_meminfo_field("CommitLimit"),
-                commit_used_bytes: proc_meminfo_field("Committed_AS"),
+                cached_bytes: meminfo
+                    .cached_bytes
+                    .unwrap_or(0)
+                    .saturating_add(meminfo.sreclaimable_bytes.unwrap_or(0)),
+                commit_total_bytes: meminfo.commit_limit_bytes.unwrap_or(0),
+                commit_used_bytes: meminfo.committed_as_bytes.unwrap_or(0),
                 paged_pool_bytes: 0,
                 non_paged_pool_bytes: 0,
                 swap_total_bytes: self.sys.total_swap(),
@@ -349,7 +407,7 @@ impl SystemCollector for LinuxCollector {
             },
             disks,
             networks: nets,
-            gpus: drm::gpus(),
+            gpus: drm::gpus(providers.measure_gpus),
             processes,
             system: SystemMisc {
                 hostname: hostname(),
@@ -405,24 +463,6 @@ fn mark_desktop_app_roots(processes: &mut [ProcessEntry]) {
     }
 }
 
-fn proc_meminfo_field(field: &str) -> u64 {
-    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
-        for line in text.lines() {
-            if line.split(':').next() == Some(field) {
-                let num: String = line
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(kb) = num.parse::<u64>() {
-                    return kb * 1024;
-                }
-            }
-        }
-    }
-    0
-}
-
 fn proc_status_kb(pid: u32, field: &str) -> Option<u64> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in text.lines() {
@@ -454,22 +494,44 @@ fn proc_cmdline(pid: u32) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Linux nice value from /proc/<pid>/stat field 19, mapped onto the portable
-/// Task Manager priority classes. Parsing after the final ')' avoids spaces
-/// and parentheses in process names corrupting positional fields.
-fn proc_priority(pid: u32) -> PriorityClass {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return PriorityClass::Unknown;
+/// Command line of one process generation.
+///
+/// Read once per (pid, start ticks) instead of on every tick. Two honest limits: `execve`
+/// keeps the creation ticks, so a process that re-execs itself keeps the command line it was
+/// first seen with, and a `setproctitle`/`PR_SET_MM_ARG_START` rewrite is not observed until
+/// it exits — Windows makes the same trade. A failed read is deliberately not remembered:
+/// `hidepid` and a fork that has not filled `argv` yet both clear, so the next tick retries
+/// instead of blanking that row for the rest of the session. A kernel thread has no command
+/// line at all, so it stays uncached and is re-read each tick — which is what the pre-cache
+/// code did for every process.
+fn cached_cmdline(
+    cache: &mut HashMap<u32, (i64, Option<String>)>,
+    pid: u32,
+    start_ticks: Option<i64>,
+) -> Option<String> {
+    let Some(ticks) = start_ticks else {
+        return proc_cmdline(pid);
     };
-    let Some(end_name) = stat.rfind(')') else {
-        return PriorityClass::Unknown;
-    };
-    let fields: Vec<&str> = stat[end_name + 1..].split_whitespace().collect();
-    // After comm, field[0] is stat field 3. Nice is stat field 19 => index 16.
-    let Some(nice) = fields.get(16).and_then(|s| s.parse::<i32>().ok()) else {
-        return PriorityClass::Unknown;
-    };
-    priority_for_nice(nice)
+    let known = cache
+        .get(&pid)
+        .is_some_and(|(cached_ticks, _)| *cached_ticks == ticks);
+    if known {
+        return cache.get(&pid).and_then(|(_, cmdline)| cmdline.clone());
+    }
+    let cmdline = proc_cmdline(pid);
+    if cmdline.is_some() {
+        cache.insert(pid, (ticks, cmdline.clone()));
+    }
+    cmdline
+}
+
+/// Priority class for the `/proc/<pid>/stat` record the sample loop already
+/// read. Parsing after the final ')' avoids spaces and parentheses in process
+/// names corrupting positional fields.
+fn proc_priority(stat_bytes: Option<&[u8]>) -> PriorityClass {
+    stat_bytes
+        .and_then(linux_telemetry::parse_proc_stat_nice)
+        .map_or(PriorityClass::Unknown, priority_for_nice)
 }
 
 /// The nice value `set_priority` writes for each class, and the anchors
@@ -588,26 +650,12 @@ fn action_io_error(context: &'static str, error: std::io::Error) -> tm_core::TmE
     }
 }
 
+/// Physical core and package counts. Both ids describe static hardware, so the
+/// sysfs walk runs once per process; an unreadable tree stays `(0, 0)`.
 fn cpu_topology() -> (usize, usize) {
-    let mut cores: HashSet<(u32, u32)> = HashSet::new();
-    let mut packages: HashSet<u32> = HashSet::new();
-    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
-        return (0, 0);
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let topo = entry.path().join("topology");
-        let package = read_u32(topo.join("physical_package_id"));
-        let core = read_u32(topo.join("core_id"));
-        if let (Some(package), Some(core)) = (package, core) {
-            packages.insert(package);
-            cores.insert((package, core));
-        }
-    }
-    (cores.len(), packages.len())
+    static TOPOLOGY: OnceLock<(usize, usize)> = OnceLock::new();
+    let root = Path::new("/sys/devices/system/cpu");
+    *TOPOLOGY.get_or_init(|| linux_telemetry::cpu_topology(root))
 }
 
 fn read_u32(path: impl AsRef<Path>) -> Option<u32> {
@@ -701,22 +749,12 @@ fn parse_cache_size(text: &str) -> Option<u64> {
     }
 }
 
+/// Highest cpufreq `base_frequency` in MHz. The base clock describes static
+/// hardware, so it is derived once; 0 (unknown) when the kernel publishes none.
 fn base_freq_from_cpufreq() -> f32 {
-    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
-        return 0.0;
-    };
-    entries
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
-        .filter_map(|e| {
-            std::fs::read_to_string(e.path().join("base_frequency"))
-                .ok()?
-                .trim()
-                .parse::<f32>()
-                .ok()
-        })
-        .map(|khz| khz / 1000.0)
-        .fold(0.0f32, f32::max)
+    static BASE_MHZ: OnceLock<f32> = OnceLock::new();
+    let root = Path::new("/sys/devices/system/cpu/cpufreq");
+    *BASE_MHZ.get_or_init(|| linux_telemetry::base_frequency_mhz(root))
 }
 
 /// Kernel block device name for a mount source, as /proc/diskstats lists
@@ -1345,6 +1383,8 @@ pub fn create_collector() -> LinuxCollector {
         prev_net_totals: HashMap::new(),
         last_tick: None,
         first_tick_done: false,
+        demand: TelemetryDemand::core(),
+        cmdlines: HashMap::new(),
         cache_kb: cache_totals_kb(&read_cache_indexes()),
         window_observer: x11_windows::WindowObserver::new(),
         desktop_evidence: desktop_session::DesktopEvidenceCache::new(),

@@ -6,6 +6,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod actions;
+/// Linux host-fact parsing and telemetry-demand selection, shared by the
+/// Linux backend. Platform-neutral on purpose so its tests run on every host.
+pub mod linux_telemetry;
 /// Freedesktop icon-theme lookup, shared by the Unix backends. Platform-
 /// neutral on purpose so its tests run on every host.
 pub mod xdg_icons;

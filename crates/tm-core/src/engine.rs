@@ -547,6 +547,54 @@ mod tests {
         join.join().unwrap();
     }
 
+    /// Regression: a demand change sent while the engine is already running must
+    /// reach the collector. The UI ships one from `update_demand` on every tab,
+    /// column or visibility change and only re-sends on change, so a dropped
+    /// mid-run hop silently leaves the expensive provider running (or dark) for the
+    /// rest of the session — the same class of bug as the pre-start one above.
+    #[test]
+    fn demand_sent_to_a_running_engine_reaches_the_collector() {
+        #[derive(Clone, Default)]
+        struct Seen(Arc<std::sync::Mutex<Vec<u64>>>);
+        struct DemandCollector(Seen);
+        impl SystemCollector for DemandCollector {
+            fn sample(&mut self, _now: Instant) -> Result<Snapshot> {
+                Ok(tiny_snapshot())
+            }
+            fn backend_name(&self) -> &'static str {
+                "demand-mock"
+            }
+            fn set_demand(&mut self, demand: crate::demand::TelemetryDemand) {
+                self.0.0.lock().unwrap().push(demand.bits());
+            }
+        }
+
+        let seen = Seen::default();
+        let factory_seen = seen.clone();
+        let (h, join) = spawn_lazy(
+            Box::new(move || Box::new(DemandCollector(factory_seen))),
+            Duration::from_millis(15),
+            None,
+        )
+        .unwrap();
+        h.start();
+        assert!(
+            wait_for(|| h.tick_count() >= 1, 5000),
+            "the engine never sampled"
+        );
+
+        let wanted = crate::demand::TelemetryDemand::core()
+            .union(crate::demand::TelemetryDemand::PROCESS_DISK);
+        h.set_demand(wanted);
+        assert!(
+            wait_for(|| seen.0.lock().unwrap().contains(&wanted.bits()), 5000),
+            "collector never received the mid-run demand: {:?}",
+            seen.0.lock().unwrap()
+        );
+        h.shutdown();
+        join.join().unwrap();
+    }
+
     /// An interval set before start must also survive, for the same reason.
     #[test]
     fn interval_sent_before_start_is_honored() {

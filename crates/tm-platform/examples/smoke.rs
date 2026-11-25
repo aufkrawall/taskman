@@ -1,6 +1,9 @@
 fn main() {
     let mut collector = tm_platform::create_collector();
     let actions = tm_platform::create_actions();
+    // A diagnostic run wants every provider measured: at the default demand the
+    // optional ones (GPU counters, disk rates, CPU speed) are correctly off.
+    collector.set_demand(tm_core::demand::TelemetryDemand::all());
     println!("backend: {}", collector.backend_name());
     let snap = collector.sample(std::time::Instant::now()).unwrap();
     println!(

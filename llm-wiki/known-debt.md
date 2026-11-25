@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-11-24 (Linux per-process CPU attribution, icon-chain snapshots, and the Wayland full-paint residual)
+Last verified: 2026-11-25 (Linux sampling cost, positive-only caches, and the absence of a Linux test runner)
 
 Primary sources:
 - `AGENTS.md`
@@ -625,6 +625,32 @@ remain follow-up rather than being simulated in headless tests:
   same rule is § 2026-11-22 above), so switching the desktop icon theme keeps the
   chain the process started with. Re-resolving per lookup would mean reading
   XSettings and walking `index.theme` files on the UI thread for every row.
+  Cached *answers* are a narrower rule: an icon name's file, its decoded pixels
+  and a theme's parsed layout are remembered for the process, but only when they
+  resolved (a miss and an empty layout are retried), because the GUI's own
+  `FAILURE_RETRY_TTL` retry is the only thing that recovers a transient failure.
+
+## Platform test coverage: the Linux backend is never executed (2026-11-25)
+
+- The gate type-checks Linux (`cargo check --workspace --target
+  x86_64-unknown-linux-gnu`, plus `-p tm-platform --all-targets` when a change
+  touches it) but nothing *runs* Linux code: CI is `windows-latest` only, and
+  `crates/tm-platform/tests/integration.rs` is `#![cfg(target_os = "windows")]`.
+  A `#[cfg(target_os = "linux")]` test therefore never executes anywhere, and
+  `build.py`'s cross check omits `--all-targets`, so even `#[cfg(test)]` code
+  inside a Linux-only module is only type-checked when someone runs the
+  all-targets form by hand.
+- Consequence for review: logic that must stay pinned has to be reachable from a
+  non-Linux build. `crates/tm-platform/src/linux_telemetry.rs` exists for exactly
+  that (meminfo/`nice`/topology/base-frequency parsing, the `/proc/stat` CPU
+  count, DRM identity comparison, the demand-to-provider mapping), and
+  `xdg_icons.rs` is platform-neutral on purpose. Behaviour that only exists as a
+  call site inside `#[cfg(target_os = "linux")]` — the demand gates themselves,
+  the identity bracket, `forget()` on a resumed disk window — has no automated
+  regression test. Do not "fix" this with an unrunnable Linux test.
+- The one wiring hop that does have host coverage is the engine's: a demand
+  change sent to a running engine must reach the collector
+  (`engine::tests::demand_sent_to_a_running_engine_reaches_the_collector`).
 
 ## Row/total audit leftovers (2026-10-21)
 

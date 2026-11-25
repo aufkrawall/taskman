@@ -18,9 +18,11 @@
 //! platform-neutral on purpose: only the Linux backend calls it, but compiling
 //! it everywhere lets its unit tests run on the Windows dev box and CI.
 
-use std::collections::HashMap;
+use std::borrow::Borrow;
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Maximum edge of a decoded icon; larger PNGs are box-downsampled so the
 /// GUI-side texture cache stays small (64×64×4 ≈ 16 KiB per icon).
@@ -35,6 +37,15 @@ const MAX_ICON_SOURCE_EDGE: u32 = 2048;
 const MAX_ICON_DECODE_BYTES: usize = 32 * 1024 * 1024;
 /// The GUI paints icons at ~18 px; 32 is the size desktop shells hand out.
 const TARGET_SIZE: u32 = 32;
+
+/// Bounds for the caches of a lookup's per-process static answers: a theme's
+/// layout, an icon name's file and a decoded PNG do not change while the
+/// process runs. The caps only keep a session that meets thousands of distinct
+/// names from growing them without limit; 128 decoded icons is at most ~2 MiB
+/// (the 64 px cap allows 16 KiB each, a 32 px theme icon is 4 KiB).
+const THEME_DIR_CACHE_CAP: usize = 64;
+const FILE_CACHE_CAP: usize = 1024;
+const DECODE_CACHE_CAP: usize = 128;
 
 /// Theme that stands in for "the desktop's configured theme" when nothing
 /// names one: `/usr/share/icons/default/index.theme` is the spec's designated
@@ -353,8 +364,87 @@ fn parse_kde_icon_theme(text: &str) -> Option<String> {
     None
 }
 
+/// A small fixed-capacity map that drops its oldest insertion once full.
+///
+/// Every entry it holds is per-process static, so eviction only matters for a
+/// session that meets thousands of distinct names; FIFO keeps it predictable.
+struct Bounded<K, V> {
+    entries: HashMap<K, V>,
+    order: VecDeque<K>,
+    cap: usize,
+}
+
+impl<K: Eq + Hash + Clone, V> Bounded<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        // Replacing a known key keeps its position, so `order` and `entries`
+        // stay in lockstep and the replacement does not allocate.
+        if let Some(slot) = self.entries.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        self.entries.insert(key.clone(), value);
+        self.order.push_back(key);
+        while self.entries.len() > self.cap {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.entries.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Lazily filled answers: a theme's parsed layout, an icon name's file and a
+/// PNG's decoded pixels.
+///
+/// Only successes are stored. A miss must stay retryable: the GUI keeps a
+/// failed key out of the queue for `FAILURE_RETRY_TTL` and then asks again, so
+/// an icon, theme file or temporarily unreadable directory that shows up later
+/// still resolves. Caching the negative for the process lifetime would turn
+/// that bounded retry into "never again", and a directory read can fail for
+/// reasons that have nothing to do with the icon existing (EACCES, EMFILE, an
+/// I/O error on a network home).
+struct Caches {
+    /// `<icon dir>/<theme>` → its candidate size dirs, best first.
+    theme_dirs: Bounded<PathBuf, Arc<Vec<SizeDir>>>,
+    /// Icon name → resolved file.
+    files: Bounded<String, PathBuf>,
+    /// Resolved file → decoded RGBA.
+    decoded: Bounded<PathBuf, (u32, u32, Vec<u8>)>,
+}
+
+impl Default for Caches {
+    fn default() -> Self {
+        Self {
+            theme_dirs: Bounded::new(THEME_DIR_CACHE_CAP),
+            files: Bounded::new(FILE_CACHE_CAP),
+            decoded: Bounded::new(DECODE_CACHE_CAP),
+        }
+    }
+}
+
 /// Resolver with a lazily built desktop-file index (exe basename → icon
-/// name), so repeated lookups do not rescan `applications/`.
+/// name), so repeated lookups do not rescan `applications/`, plus bounded
+/// caches for the rest of a lookup's static answers: a theme's parsed layout,
+/// an icon name's file, and a decoded PNG (one `Icon=` value is shared by many
+/// executables — every Electron helper, every launcher entry).
 pub struct IconResolver {
     lookup: IconLookup,
     /// exe basename (lowercase) → `Icon=` value, highest-precedence desktop
@@ -364,6 +454,8 @@ pub struct IconResolver {
     /// `default`), its transitive `Inherits`, then `hicolor`. Resolved once
     /// because a theme's name does not change while the process runs.
     themes: Vec<String>,
+    /// Only the icon worker resolves icons, so this is never contended.
+    caches: Mutex<Caches>,
 }
 
 impl IconResolver {
@@ -381,6 +473,7 @@ impl IconResolver {
             lookup,
             desktop_index,
             themes,
+            caches: Mutex::new(Caches::default()),
         }
     }
 
@@ -389,16 +482,17 @@ impl IconResolver {
     pub fn icon_rgba_for_exe(&self, exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
         let name = self.icon_name_for(exe_path)?;
         let file = self.find_icon_file(&name)?;
-        decode_png_rgba(&file)
+        self.icon_rgba_for_file(&file)
     }
 
     /// The icon the theme shows for an executable that has no icon of its own
     /// (a kernel thread, an app without a `.desktop` entry): the standard
     /// "this is an application" icon, then the spec's missing-image icon.
     pub fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
-        DEFAULT_APP_ICON_NAMES
-            .iter()
-            .find_map(|name| self.find_icon_file(name).and_then(|f| decode_png_rgba(&f)))
+        DEFAULT_APP_ICON_NAMES.iter().find_map(|name| {
+            self.find_icon_file(name)
+                .and_then(|f| self.icon_rgba_for_file(&f))
+        })
     }
 
     /// The icon name (or absolute path) the OS would use for `exe_path`.
@@ -427,10 +521,28 @@ impl IconResolver {
     /// Locate the file for an icon `name` following the theme spec: absolute
     /// path used as-is; otherwise the theme chain across all icon dirs, then
     /// the pixmaps dirs. PNG files only.
+    ///
+    /// The answer is cached by name, so the walk runs once per distinct name
+    /// rather than once per executable that uses it. A miss is not cached: the
+    /// GUI retries a failed lookup on its own bounded schedule.
     pub fn find_icon_file(&self, name: &str) -> Option<PathBuf> {
         if name.is_empty() {
             return None;
         }
+        let cached = tm_core::sync::lock(&self.caches).files.get(name).cloned();
+        if let Some(cached) = cached {
+            return Some(cached);
+        }
+        let file = self.resolve_icon_file(name)?;
+        tm_core::sync::lock(&self.caches)
+            .files
+            .insert(name.to_string(), file.clone());
+        Some(file)
+    }
+
+    /// Uncached [`Self::find_icon_file`]: the walk over the theme chain, then
+    /// the pixmaps dirs.
+    fn resolve_icon_file(&self, name: &str) -> Option<PathBuf> {
         // Per the spec an icon name that is an absolute path is used directly.
         if Path::new(name).is_absolute() {
             let p = PathBuf::from(name);
@@ -440,7 +552,7 @@ impl IconResolver {
         let icon_dirs = self.lookup.icon_dirs();
         for theme in &self.themes {
             for dir in &icon_dirs {
-                if let Some(f) = find_in_theme(dir, theme, &file_name) {
+                if let Some(f) = self.find_in_theme(dir, theme, &file_name) {
                     return Some(f);
                 }
             }
@@ -451,6 +563,86 @@ impl IconResolver {
             .iter()
             .map(|px| px.join(&file_name))
             .find(|f| f.is_file())
+    }
+
+    /// Find `<icon_dir>/<theme>/<size>/<context>/<file_name>`, choosing the size
+    /// closest to [`TARGET_SIZE`]. Uses the theme's `index.theme` directory list
+    /// when present; otherwise walks the two-level `<size>/<context>` layout.
+    fn find_in_theme(&self, icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBuf> {
+        let theme_dir = icon_dir.join(theme);
+        if !theme_dir.is_dir() {
+            return None;
+        }
+        for dir in self.size_dirs(&theme_dir).iter() {
+            // The icon may sit directly in the size dir (rare) or one context
+            // level deeper (the standard layout).
+            let direct = dir.path.join(file_name);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            if let Ok(contexts) = std::fs::read_dir(&dir.path) {
+                for ctx in contexts.flatten() {
+                    let f = ctx.path().join(file_name);
+                    if f.is_file() {
+                        return Some(f);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Candidate size dirs of `theme_dir`, best first, parsed once per theme
+    /// dir: a theme's layout is static for the process, while it used to be
+    /// re-read from `index.theme` — and its `<size>` dirs re-listed — for every
+    /// theme of every icon dir, on every lookup.
+    fn size_dirs(&self, theme_dir: &Path) -> Arc<Vec<SizeDir>> {
+        let cached = {
+            let caches = tm_core::sync::lock(&self.caches);
+            caches.theme_dirs.get(theme_dir).cloned()
+        };
+        if let Some(cached) = cached {
+            return cached;
+        }
+        // Parsed outside the guard: reading `index.theme` is filesystem work,
+        // and the lock is meant to cover the map, not the I/O.
+        let dirs = Arc::new(size_dirs_of_theme(theme_dir));
+        // An empty layout is not a success: it is what a failed `read_dir`, a
+        // half-written `index.theme` or a `Directories=` list that has not been
+        // filled in yet all look like, and those clear. Keeping it would make
+        // that theme resolve nothing for the rest of the session, which is the
+        // exact failure this cache was fixed to avoid.
+        if !dirs.is_empty() {
+            tm_core::sync::lock(&self.caches)
+                .theme_dirs
+                .insert(theme_dir.to_path_buf(), dirs.clone());
+        }
+        dirs
+    }
+
+    /// Decoded pixels of an icon file, decoded once per process.
+    ///
+    /// Many executables share one `Icon=` value (every Electron helper, every
+    /// Wine process of the same entry), so the same PNG used to be read and
+    /// downsampled once per distinct executable path. A file that does not
+    /// decode is *not* remembered: the caller retries on its own schedule and a
+    /// miss stays `None`, so the row draws nothing rather than a fabricated
+    /// icon.
+    fn icon_rgba_for_file(&self, file: &Path) -> Option<(u32, u32, Vec<u8>)> {
+        let cached = {
+            let caches = tm_core::sync::lock(&self.caches);
+            caches.decoded.get(file).cloned()
+        };
+        if let Some(cached) = cached {
+            return Some(cached);
+        }
+        // Decoded outside the guard: a PNG read and decode is the expensive
+        // half and must not hold the map lock.
+        let decoded = decode_png_rgba(file)?;
+        tm_core::sync::lock(&self.caches)
+            .decoded
+            .insert(file.to_path_buf(), decoded.clone());
+        Some(decoded)
     }
 }
 
@@ -783,77 +975,63 @@ fn png_file_name(name: &str) -> String {
     }
 }
 
-/// Find `<icon_dir>/<theme>/<size>/<context>/<file_name>`, choosing the size
-/// closest to [`TARGET_SIZE`]. Uses the theme's `index.theme` directory list
-/// when present; otherwise walks the two-level `<size>/<context>` layout.
-fn find_in_theme(icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBuf> {
-    let theme_dir = icon_dir.join(theme);
-    if !theme_dir.is_dir() {
-        return None;
-    }
-    // Candidate subdirs with their pixel size and nominal size, best first.
-    // The nominal size is what breaks a pixel-size tie: `16x16@2` and `32x32`
-    // both hold 32 px files, but only `32x32` is native at that size.
-    let mut candidates: Vec<(u32, u32, PathBuf)> = Vec::new();
-    if let Some(dirs) = theme_directories(&theme_dir) {
-        for declared in dirs {
-            candidates.push((
-                declared.pixel_size,
-                declared.size,
-                theme_dir.join(declared.subdir),
-            ));
+/// One candidate size directory of a theme.
+struct SizeDir {
+    /// `Size × Scale`: the number of pixels its files hold.
+    pixel_size: u32,
+    /// The declared `Size=` itself, i.e. the size the directory is native at.
+    size: u32,
+    path: PathBuf,
+}
+
+/// Candidate size dirs of `theme_dir`, best first: the `index.theme` directory
+/// list when it declares one, else the `<size>` subdirectory names.
+///
+/// Pixel size closest to the target, then the size closest to it, then the
+/// path: a `read_dir` order must never decide between equal candidates. The
+/// nominal size breaks a pixel-size tie — `16x16@2` and `32x32` both hold 32 px
+/// files, but only `32x32` is native at that size.
+fn size_dirs_of_theme(theme_dir: &Path) -> Vec<SizeDir> {
+    let mut dirs: Vec<SizeDir> = Vec::new();
+    if let Some(declared) = theme_directories(theme_dir) {
+        for d in declared {
+            dirs.push(SizeDir {
+                pixel_size: d.pixel_size,
+                size: d.size,
+                path: theme_dir.join(d.subdir),
+            });
         }
-    } else {
+    } else if let Ok(sizes) = std::fs::read_dir(theme_dir) {
         // No index.theme: scan one level of `<size>` dirs, then `<context>`.
-        if let Ok(sizes) = std::fs::read_dir(&theme_dir) {
-            for size_entry in sizes.flatten() {
-                let Ok(meta) = size_entry.metadata() else {
-                    continue;
-                };
-                if !meta.is_dir() {
-                    continue;
-                }
-                let Some(size_name) = size_entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                candidates.push((
-                    dir_size_from_name(&size_name),
-                    nominal_size_from_name(&size_name),
-                    size_entry.path(),
-                ));
+        for size_entry in sizes.flatten() {
+            let Ok(meta) = size_entry.metadata() else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
             }
+            let Some(size_name) = size_entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            dirs.push(SizeDir {
+                pixel_size: dir_size_from_name(&size_name),
+                size: nominal_size_from_name(&size_name),
+                path: size_entry.path(),
+            });
         }
     }
-    // Pixel size closest to the target, then the size closest to it, then the
-    // path: a `read_dir` order must never decide between equal candidates.
-    candidates.sort_by(|(a_pixel, a_size, a_dir), (b_pixel, b_size, b_dir)| {
-        a_pixel
+    dirs.sort_by(|a, b| {
+        a.pixel_size
             .abs_diff(TARGET_SIZE)
-            .cmp(&b_pixel.abs_diff(TARGET_SIZE))
+            .cmp(&b.pixel_size.abs_diff(TARGET_SIZE))
             .then_with(|| {
-                a_size
+                a.size
                     .abs_diff(TARGET_SIZE)
-                    .cmp(&b_size.abs_diff(TARGET_SIZE))
+                    .cmp(&b.size.abs_diff(TARGET_SIZE))
             })
-            .then_with(|| a_dir.cmp(b_dir))
+            .then_with(|| a.path.cmp(&b.path))
     });
-    for (_, _, dir) in candidates {
-        // The icon may sit directly in the size dir (rare) or one context
-        // level deeper (the standard layout).
-        let direct = dir.join(file_name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        if let Ok(contexts) = std::fs::read_dir(&dir) {
-            for ctx in contexts.flatten() {
-                let f = ctx.path().join(file_name);
-                if f.is_file() {
-                    return Some(f);
-                }
-            }
-        }
-    }
-    None
+    dirs
 }
 
 /// One directory declared by a theme's `index.theme`.
@@ -2154,5 +2332,144 @@ mod tests {
         assert_eq!(parse_kde_icon_theme(text).as_deref(), Some("breeze-dark"));
         assert_eq!(parse_kde_icon_theme("[Icons]\nTheme=\n"), None);
         assert_eq!(parse_kde_icon_theme("[General]\nTheme=ignored\n"), None);
+    }
+
+    /// A theme's `index.theme` is read and parsed once per theme dir, not once
+    /// per icon. The declared layout is only reachable through that file (the
+    /// no-index fallback walks one level of `<size>` and one of `<context>`,
+    /// this one is deeper), so the second icon of the same theme still resolves
+    /// after the file disappears — while a fresh resolver, which has to read it
+    /// again, finds nothing.
+    #[test]
+    fn theme_layout_is_parsed_once_per_theme_dir() {
+        let sb = Sandbox::new("theme-layout-cache");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=vendor/32x32/apps\n\n\
+             [vendor/32x32/apps]\nSize=32\nType=Fixed\n",
+        );
+        for (name, rgba) in [("first", [1, 1, 1, 255]), ("second", [2, 2, 2, 255])] {
+            write_png(
+                &sb.root
+                    .join(format!("share/icons/custom/vendor/32x32/apps/{name}.png")),
+                32,
+                32,
+                rgba,
+            );
+        }
+        let r = IconResolver::new(sb.lookup());
+        let first = r.find_icon_file("first").expect("declared layout");
+        assert!(first.ends_with("vendor/32x32/apps/first.png"), "{first:?}");
+        std::fs::remove_file(sb.root.join("share/icons/custom/index.theme")).unwrap();
+        let second = r.find_icon_file("second").expect("cached theme layout");
+        assert!(
+            second.ends_with("vendor/32x32/apps/second.png"),
+            "{second:?}"
+        );
+        // Control: without the cached parse the same tree yields nothing.
+        let fresh = IconResolver::new(sb.lookup());
+        assert_eq!(fresh.find_icon_file("second"), None);
+    }
+
+    /// One `Icon=` value is shared by many executables (every Chrome/Electron
+    /// helper, every Wine process of the same entry). The PNG is decoded once:
+    /// the pixels survive the file being deleted, so a second executable that
+    /// maps to the same icon still paints it. Requires both the resolved-file
+    /// cache and the decoded-pixels cache — either alone re-reads the gone file.
+    #[test]
+    fn shared_icon_value_is_decoded_once() {
+        let sb = Sandbox::new("decode-cache");
+        write_desktop(
+            &sb.root.join("share/applications/aaa.desktop"),
+            "[Desktop Entry]\nName=Aaa\nExec=/usr/bin/aaa\nIcon=shared\n",
+        );
+        write_desktop(
+            &sb.root.join("share/applications/bbb.desktop"),
+            "[Desktop Entry]\nName=Bbb\nExec=/usr/bin/bbb\nIcon=shared\n",
+        );
+        write_desktop(
+            &sb.root.join("share/icons/hicolor/index.theme"),
+            HICOLOR_INDEX,
+        );
+        let png = sb.root.join("share/icons/hicolor/32x32/apps/shared.png");
+        write_png(&png, 32, 32, [9, 9, 9, 255]);
+        let r = IconResolver::new(sb.lookup());
+        let icon = |exe: &str| r.icon_rgba_for_exe(exe).expect("icon");
+        let first = icon("/usr/bin/aaa");
+        assert_eq!((first.0, first.1), (32, 32));
+        std::fs::remove_file(&png).unwrap();
+        let second = icon("/usr/bin/bbb");
+        assert_eq!(second, first);
+    }
+
+    /// The decoded-icon cache is bounded: past its cap the oldest insertion is
+    /// dropped, so a session meeting thousands of distinct icons cannot grow it
+    /// without limit. An evicted icon is simply decoded again — still not a
+    /// fabricated one.
+    #[test]
+    fn decoded_cache_evicts_oldest_past_its_cap() {
+        let sb = Sandbox::new("decode-cap");
+        let r = IconResolver::new(sb.lookup());
+        let icon = |i: usize| sb.root.join(format!("icons/{i}.png"));
+        for i in 0..DECODE_CACHE_CAP + 4 {
+            write_png(&icon(i), 8, 8, [1, 2, 3, 255]);
+            assert!(r.icon_rgba_for_file(&icon(i)).is_some(), "icon {i}");
+        }
+        let caches = tm_core::sync::lock(&r.caches);
+        assert_eq!(caches.decoded.entries.len(), DECODE_CACHE_CAP);
+        for i in 0..4 {
+            assert!(
+                caches.decoded.get(&icon(i)).is_none(),
+                "the four oldest insertions are gone (icon {i})"
+            );
+        }
+        assert!(
+            caches.decoded.get(&icon(4)).is_some(),
+            "the next-oldest insertion stays cached"
+        );
+        assert!(caches.decoded.get(&icon(DECODE_CACHE_CAP + 3)).is_some());
+        drop(caches);
+        assert!(r.icon_rgba_for_file(&icon(0)).is_some());
+    }
+
+    /// A file that does not decode is a miss on every call and is not
+    /// remembered: the row draws nothing instead of a fabricated icon, and the
+    /// caller's own retry schedule decides when to try again.
+    #[test]
+    fn a_failed_decode_is_not_cached_and_stays_none() {
+        let sb = Sandbox::new("decode-fail");
+        let broken = sb.root.join("broken.png");
+        std::fs::write(&broken, b"not a png at all").unwrap();
+        let r = IconResolver::new(sb.lookup());
+        assert_eq!(r.icon_rgba_for_file(&broken), None);
+        assert_eq!(r.icon_rgba_for_file(&broken), None);
+        let caches = tm_core::sync::lock(&r.caches);
+        assert!(caches.decoded.get(&broken).is_none());
+    }
+
+    /// A lookup that misses must stay retryable: the GUI keeps a failed key out
+    /// of the queue only for `FAILURE_RETRY_TTL`, so an icon that appears later
+    /// (an installed package, a file restored over the network, a directory
+    /// that was briefly unreadable) has to resolve on the next attempt. This
+    /// pins that the negative answer is not cached for the process lifetime.
+    #[test]
+    fn a_missed_lookup_resolves_once_the_file_appears() {
+        let sb = Sandbox::new("miss-retry");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=vendor/32x32/apps\n\n\
+             [vendor/32x32/apps]\nSize=32\nType=Fixed\n",
+        );
+        let r = IconResolver::new(sb.lookup());
+        assert_eq!(r.find_icon_file("late"), None);
+        write_png(
+            &sb.root
+                .join("share/icons/custom/vendor/32x32/apps/late.png"),
+            32,
+            32,
+            [7, 8, 9, 255],
+        );
+        let late = r.find_icon_file("late").expect("retried lookup finds it");
+        assert!(late.ends_with("vendor/32x32/apps/late.png"), "{late:?}");
     }
 }

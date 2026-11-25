@@ -7,7 +7,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tm_core::model::GpuInfo;
+
+/// Adapter identity describes a loaded driver, not a moment, so it is re-read
+/// on this bound instead of every tick. A card that appears later (eGPU, driver
+/// reload) is picked up at the next expiry; an empty scan stays empty rather
+/// than inventing an adapter.
+const IDENTITY_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default)]
 struct CardFacts {
@@ -25,32 +33,139 @@ struct CardFacts {
     temperature_c: Option<f32>,
 }
 
-pub fn gpus() -> Vec<GpuInfo> {
-    let nvidia_names = nvidia_models();
-    let mut cards = drm_cards();
-    cards.sort_by_key(|(name, _)| card_number(name));
-    cards
-        .into_iter()
+/// Adapter identity read once per cache window, with the sysfs card path whose
+/// live counters are read every tick.
+#[derive(Debug, Clone)]
+struct CardIdentity {
+    path: PathBuf,
+    /// The PCI device this card number pointed at when the identity was read.
+    /// `/sys/class/drm/cardN` is per-driver probe order and is reused, so the
+    /// number alone would pair card A's cached name and VRAM total with card
+    /// B's live counters after a removal.
+    device: Option<PathBuf>,
+    facts: CardFacts,
+}
+
+struct CardCache {
+    cards: Vec<CardIdentity>,
+    nvidia_names: HashMap<String, String>,
+    read_at: Instant,
+}
+
+impl CardCache {
+    /// Whether these identities still describe the cards sysfs lists right now.
+    ///
+    /// One directory listing plus one symlink read per card per tick catches a
+    /// removed card, a newly probed one, a reused card number and a card that
+    /// now names another device, so a real change is picked up immediately
+    /// instead of at the next TTL expiry. The expensive identity reads stay
+    /// behind the TTL. A listing that fails cannot prove the cache wrong, so it
+    /// keeps what it has rather than publishing an empty adapter list.
+    fn still_accurate(&self) -> bool {
+        let Some(current) = drm_cards() else {
+            return true;
+        };
+        let current: Vec<(PathBuf, Option<PathBuf>)> = current
+            .into_iter()
+            .map(|(_, path)| {
+                let device = card_device(&path);
+                (path, device)
+            })
+            .collect();
+        let cached: Vec<(PathBuf, Option<PathBuf>)> = self
+            .cards
+            .iter()
+            .map(|card| (card.path.clone(), card.device.clone()))
+            .collect();
+        crate::linux_telemetry::card_identities_hold(&cached, &current)
+    }
+}
+
+fn card_device(path: &Path) -> Option<PathBuf> {
+    std::fs::read_link(path.join("device")).ok()
+}
+
+fn card_cache() -> &'static Mutex<Option<CardCache>> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<CardCache>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// One entry per DRM card, lowest card number first.
+///
+/// `measure` reads the counters that change between ticks (utilization, VRAM
+/// and GTT use, temperature) for a surface that shows them. Without it the
+/// adapters are still listed — as Windows lists the adapters it enumerated —
+/// while their measurements stay unavailable.
+pub fn gpus(measure: bool) -> Vec<GpuInfo> {
+    let mut guard = tm_core::sync::lock(card_cache());
+    let stale = guard
+        .as_ref()
+        .is_none_or(|cache| cache.read_at.elapsed() >= IDENTITY_TTL || !cache.still_accurate());
+    if stale {
+        // A listing that failed is not "no cards": keep the adapters we already
+        // described instead of blanking the GPU page for a whole cache window.
+        if let Some(fresh) = scan_cards() {
+            *guard = Some(fresh);
+        }
+    }
+    let Some(cache) = guard.as_ref() else {
+        return Vec::new();
+    };
+    cache
+        .cards
+        .iter()
         .enumerate()
-        .map(|(id, (_, path))| gpu_from_card(id, read_card(&path), &nvidia_names))
+        .map(|(id, card)| gpu_for(id, card, measure, cache))
         .collect()
 }
 
-fn drm_cards() -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
-        return Vec::new();
+/// Enumerate the adapters, once per [`IDENTITY_TTL`] window.
+///
+/// `None` when `/sys/class/drm` cannot be listed: that is "unknown", not "no GPU".
+fn scan_cards() -> Option<CardCache> {
+    let mut cards = drm_cards()?;
+    cards.sort_by_key(|(name, _)| card_number(name));
+    Some(CardCache {
+        cards: cards
+            .into_iter()
+            .map(|(_, path)| CardIdentity {
+                device: card_device(&path),
+                facts: read_identity(&path),
+                path,
+            })
+            .collect(),
+        nvidia_names: nvidia_models(),
+        read_at: Instant::now(),
+    })
+}
+
+/// One adapter row: cached identity plus, when measured, this tick's counters.
+fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> GpuInfo {
+    let facts = if measure {
+        read_live(card)
+    } else {
+        card.facts.clone()
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let number = name.strip_prefix("card")?;
-            if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-            Some((name, entry.path()))
-        })
-        .collect()
+    gpu_from_card(id, facts, &cache.nvidia_names)
+}
+
+/// The cards sysfs lists, lowest name order. `None` when the directory cannot be
+/// read, which the caller must not confuse with "this host has no DRM".
+fn drm_cards() -> Option<Vec<(String, PathBuf)>> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let number = name.strip_prefix("card")?;
+                if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
+                    return None;
+                }
+                Some((name, entry.path()))
+            })
+            .collect(),
+    )
 }
 
 fn card_number(name: &str) -> u32 {
@@ -59,7 +174,9 @@ fn card_number(name: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-fn read_card(card: &Path) -> CardFacts {
+/// Static per-card facts: driver, module version, label, PCI ids/slot and the
+/// VRAM/GTT totals, all of which describe the loaded driver.
+fn read_identity(card: &Path) -> CardFacts {
     let device = card.join("device");
     let uevent = std::fs::read_to_string(device.join("uevent")).unwrap_or_default();
     let (vendor_id, device_id) = parse_pci_id(&uevent);
@@ -75,14 +192,23 @@ fn read_card(card: &Path) -> CardFacts {
             .or_else(|| pci_slot_from_path(&device)),
         vendor_id,
         device_id,
+        vram_total: read_u64(device.join("mem_info_vram_total")),
+        gtt_total: read_u64(device.join("mem_info_gtt_total")),
+        ..Default::default()
+    }
+}
+
+/// The counters that change between ticks, on top of the cached identity.
+fn read_live(card: &CardIdentity) -> CardFacts {
+    let device = card.path.join("device");
+    CardFacts {
         busy_pct: read_trim(device.join("gpu_busy_percent"))
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && (0.0..=100.0).contains(value)),
         vram_used: read_u64(device.join("mem_info_vram_used")),
-        vram_total: read_u64(device.join("mem_info_vram_total")),
         gtt_used: read_u64(device.join("mem_info_gtt_used")),
-        gtt_total: read_u64(device.join("mem_info_gtt_total")),
         temperature_c: read_temperature(&device),
+        ..card.facts.clone()
     }
 }
 
