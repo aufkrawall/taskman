@@ -132,6 +132,14 @@ impl Tracker {
                 // (reporting "—" forever) and restart the observation window.
                 // A known time on one side only IS a new identity: it either
                 // appeared or was lost, so the pair proves nothing.
+                //
+                // Residual, accepted: on a host that reports no create times at
+                // all, a recycled TID cannot be told apart, so the new thread
+                // inherits the dead one's `cpu_100ns`/`first_seen` and its first
+                // delta is a `saturating_sub` (usually a measured-looking
+                // `Some(0.0)`) or partly the dead thread's time. Dropping the
+                // track instead would lose a real measurement on every tick for
+                // every such row, which is the worse error.
                 let previous = self
                     .tracks
                     .remove(&thread.tid)
