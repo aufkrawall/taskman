@@ -983,13 +983,27 @@ rebase runbook.
   start_background_accounting`, off the UI thread, after a broker `Ping`
   fails). It is no longer idle-stopped with the page: a 60 s maintenance
   thread restarts a session stopped underneath it and prunes exited
-  processes. The session also carries `EVENT_TRACE_FLAG_PROCESS`; a
-  `Process/End` record (opcode 2, pid at payload offset `P`) drops the
-  process's buckets, names, pending requests and waiting bytes at once, so a
-  reused pid inherits nothing. Coverage is stated: a process created after the
-  session started (creation ticks > session start) has its whole life traced
-  (`traced_since_process_start`); for older ones the session snapshots every
-  process's `IO_COUNTERS` just before it starts
+  processes. The session also carries `EVENT_TRACE_FLAG_PROCESS`, so it sees
+  `Process/Start` (1), the session-start rundown (3) and `Process/End` (2), each
+  with a `UniqueProcessKey` at payload offset 0 and the pid at `P`. A START
+  whose key differs from the pid's recorded one (`State::process_keys`) is proof
+  that the pid changed owner, so that is where the reuse is applied: it drops
+  the predecessor's buckets, names, pending requests and waiting bytes at once,
+  exactly as its exit would have, so nothing of the dead process is ever
+  published as the successor's and the fresh bucket (no epoch) cannot be
+  mistaken for a stale incarnation by the next `bind_epoch`. An END drops that
+  state only while the key it carries still matches; a mismatched one names an
+  earlier holder of the pid (Windows reuses a pid within about a second and this
+  class can arrive a flush interval late) and is ignored, because the start
+  record already dropped that state. The rundown only SEEDS a key — it is a
+  snapshot a live start can overtake — and a pid with no recorded key (started
+  before the session, or its start record was lost) still drops on any exit.
+  Accepted cost: a transfer charged between a reused pid's real start and its
+  start record arriving goes with the predecessor's bucket and is unknown.
+  Coverage is stated: a process created after the session started (creation
+  ticks > session start) has its whole life traced
+  (`traced_since_process_start`); for older ones the
+  session snapshots every process's `IO_COUNTERS` just before it starts
   (`process_file_io::snapshot_io_counters`), and `attach_file_io` turns the
   baseline into `counter_window_*` — the process's own counters over exactly
   the traced window. The page's second line compares them with the file

@@ -1,10 +1,12 @@
 //! Shared plumbing for the real-time ETW sessions this program hosts.
 //!
-//! Three features need one: per-process network bytes ([`super::net_etw`]),
-//! per-process disk service time ([`super::disk_etw`]) and per-file read and
-//! written bytes ([`super::file_etw`]). The lifetime rules are identical for
-//! all of them and every one has already been learned the hard way, so they
-//! live here once instead of being copied:
+//! Five features need one: per-process network bytes ([`super::net_etw`]),
+//! per-process disk service time ([`super::disk_etw`]), per-file read and
+//! written bytes ([`super::file_etw`]), sampled CPU profiling
+//! ([`super::profile_etw`]) and the one-shot module rundown
+//! ([`super::module_etw`]). The lifetime rules are identical for all of them
+//! and every one of them has already been learned the hard way, so they live
+//! here once instead of being copied:
 //!
 //! * **Starting a session needs administrator rights** (or membership in
 //!   "Performance Log Users"). When that fails the caller stays inactive and
@@ -127,21 +129,54 @@ fn mark_session(name: &[u16], live: bool) {
     }
 }
 
+/// Longest session name [`stop_live_sessions`] can carry, in `u16` units
+/// including the terminator.
+///
+/// The longest entry of [`SESSION_NAMES`] is 24 units, so this leaves room; a
+/// test pins that, because a name that did not fit would silently skip its
+/// session and leave a kernel trace running after a crash.
+const SESSION_NAME_UNITS: usize = 32;
+
+/// Encode `name` into `out` as a NUL-terminated wide string, returning its
+/// length in `u16` units, or `None` when it does not fit.
+///
+/// A caller-provided buffer instead of a `Vec` because [`stop_live_sessions`]
+/// runs inside the panic hook, where `tm_core::logging::set_panic_cleanup`
+/// requires the callback to avoid allocating. Refusing an oversized name is
+/// deliberate: a truncated one would name a DIFFERENT session, and stopping
+/// that would end somebody else's trace.
+fn encode_session_name(name: &str, out: &mut [u16]) -> Option<usize> {
+    let last = out.len().checked_sub(1)?;
+    let mut units = 0usize;
+    for unit in name.encode_utf16() {
+        if units >= last {
+            return None;
+        }
+        out[units] = unit;
+        units += 1;
+    }
+    out[units] = 0;
+    Some(units + 1)
+}
+
 /// Stop every session this process still owns, by name.
 ///
 /// An ETW session is a KERNEL object: it outlives the process that started it
 /// and keeps filling buffers for every disk and network operation on the
-/// machine until something stops it or the user reboots. `Drop` handles the
-/// ordinary exit, but release builds are `panic = "abort"` and a killed
-/// process runs no destructor either, so this is registered as the panic
-/// teardown the first time a session comes up.
+/// machine until something stops it or the user reboots. `Drop` handles an
+/// orderly exit and the shutdown paths call this function directly; it is also
+/// registered as the panic teardown the first time a session comes up, and a
+/// panic hook DOES run under `panic = "abort"`, so that covers a release-build
+/// panic too. A process that is killed rather than panicking runs none of them:
+/// its per-role sessions are reclaimed by name on the next start, and
+/// [`KERNEL_LOGGER`] — which must never be reclaimed — stays taken until the
+/// machine reboots.
 ///
 /// Only sessions THIS process started are touched. A crashing GUI must not
 /// stop the service's sessions: that is a different, still-healthy process.
 ///
-/// Panic-hook safe: no locks, no allocation past one stack buffer, no
-/// `unwrap`. A session that is already gone just reports an error nobody
-/// reads.
+/// Panic-hook safe: no locks, no allocation at all, no `unwrap`. A session that
+/// is already gone just reports an error nobody reads.
 pub(crate) fn stop_live_sessions() {
     // `EVENT_TRACE_PROPERTIES` plus the longest name; see `properties_buffer`
     // for why this is `u64`-aligned.
@@ -152,9 +187,14 @@ pub(crate) fn stop_live_sessions() {
         if LIVE_SESSIONS[index].swap(0, std::sync::atomic::Ordering::AcqRel) == 0 {
             continue;
         }
-        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // A stack buffer, not a `Vec`: this runs inside the panic hook, which
+        // `tm_core::logging::set_panic_cleanup` requires to avoid allocating.
+        let mut wide = [0u16; SESSION_NAME_UNITS];
+        let Some(units) = encode_session_name(name, &mut wide) else {
+            continue;
+        };
         let header = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-        let total = header + wide.len() * 2;
+        let total = header + units * 2;
         if total > WORDS * std::mem::size_of::<u64>() {
             continue;
         }
@@ -758,6 +798,37 @@ pub(crate) fn plausible_client_id(id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The crash teardown runs inside the panic hook, which must not allocate,
+    /// so every session name has to fit a fixed stack buffer.
+    ///
+    /// Regression risk this pins: the teardown built each name with
+    /// `encode_utf16().collect::<Vec<u16>>()` — a heap allocation in the one
+    /// callback `tm_core::logging::set_panic_cleanup` explicitly requires to
+    /// avoid allocating. A name that no longer fit would also have to be
+    /// REFUSED rather than truncated: a truncated name would stop a different
+    /// session, or none at all, and leave ours running.
+    #[test]
+    fn every_session_name_fits_the_allocation_free_teardown() {
+        let mut wide = [0u16; SESSION_NAME_UNITS];
+        for name in SESSION_NAMES {
+            let units = encode_session_name(name, &mut wide).expect("a session name fits");
+            assert_eq!(wide[units - 1], 0, "NUL-terminated: {name}");
+            assert_eq!(
+                String::from_utf16_lossy(&wide[..units - 1]),
+                name,
+                "the whole name, never a prefix"
+            );
+        }
+        let long = "TaskMan-".repeat(8);
+        assert_eq!(
+            encode_session_name(&long, &mut wide),
+            None,
+            "an oversized name is refused, not truncated"
+        );
+        assert_eq!(encode_session_name("", &mut wide), Some(1));
+        assert_eq!(encode_session_name("Ab", &mut [0u16; 2]), None);
+    }
 
     #[test]
     fn properties_buffer_reserves_room_for_the_session_name() {
