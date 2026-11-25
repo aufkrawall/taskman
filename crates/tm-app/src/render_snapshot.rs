@@ -815,9 +815,17 @@ mod tests {
     const GATE_W: f32 = 420.0;
     const GATE_H: f32 = 220.0;
 
-    /// Tile size, close to a real per-core grid cell (about 88x56 at the
-    /// default 4x4 layout, which is where the artifact was seen).
+    /// Tile size, close to a real per-core grid cell (about 219x86 for a 4-wide
+    /// grid on a maximized Performance page; the artifact was reported on a
+    /// 334x100 cell of a 4x4 grid). Every gate assertion is relative to the
+    /// tile and its sample interval, so the exact size does not matter.
     const TILE: egui::Vec2 = vec2(160.0, 90.0);
+
+    /// Window of the axis the gate fixtures use, in seconds. The same number
+    /// feeds the widget and the derived sample interval; two literals would let
+    /// one edit silently re-scale the other.
+    const WINDOW_S: u32 = 12;
+    const WINDOW_MS: u64 = WINDOW_S as u64 * 1_000;
 
     /// Values with four runs and three gaps, in twelve samples: a run, a NaN, a
     /// run, +inf, a run, -inf, and a further run.
@@ -1035,6 +1043,11 @@ mod tests {
     /// This is the "one sample interval" a stroke edge may cover: a segment
     /// joining two neighbouring samples is at most this wide, so anything wider
     /// jumped over data that does not exist.
+    ///
+    /// The maximum over the fixture, deliberately: a fixture whose spacing is
+    /// irregular would otherwise widen the tolerance by its longest gap and let
+    /// a short bridge through between two regular samples. Keep fixture spacing
+    /// regular, or assert per pair instead.
     fn one_interval(rect: Rect, stamps: &[u64], window_ms: u64, n: usize) -> f32 {
         let xs: Vec<f32> = (0..n)
             .map(|i| axis_x(rect, stamps, window_ms, i, n))
@@ -1044,17 +1057,27 @@ mod tests {
             .fold(0.0, f32::max)
     }
 
-    /// Every painted polyline, one point list per `Shape::Path`.
+    /// Every painted polyline, one point list per open, unfilled `Shape::Path`.
     ///
     /// A chart frame contains no other paths -- the chrome is rects and line
     /// segments -- so this counts SERIES RUNS, which is the property the gate
     /// is after: a gap has to end the line and start a new one, because epaint
     /// cannot express a break inside a path.
+    ///
+    /// Open and unfilled on purpose: a fill that is ever reworked into a closed
+    /// path would otherwise inflate the count and make the run assertion pass
+    /// for the wrong reason. A run of ONE sample is not a path at all -- the
+    /// painter draws a 1.25 px dot for it -- so a fixture that wants to count
+    /// such a run has to count [`egui::Shape::Circle`] as well.
     fn polyline_runs(shapes: &[egui::epaint::ClippedShape]) -> Vec<Vec<Pos2>> {
         shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
-                egui::Shape::Path(path) => Some(path.points.clone()),
+                egui::Shape::Path(path)
+                    if !path.closed && path.fill == egui::Color32::TRANSPARENT =>
+                {
+                    Some(path.points.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -1081,7 +1104,10 @@ mod tests {
                 let mut span = 0.0f32;
                 for pair in [[x[0], x[1]], [x[1], x[2]], [x[2], x[0]]] {
                     let d = (pair[0] - pair[1]).abs();
-                    if !(d <= span) {
+                    // Written as a positive test followed by the NaN arm: the
+                    // `!(d <= span)` spelling reads the same but trips
+                    // clippy::neg_cmp_op_on_partial_ord, i.e. the heavy gate.
+                    if d > span || d.is_nan() {
                         span = d;
                     }
                 }
@@ -1091,15 +1117,19 @@ mod tests {
         spans
     }
 
-    /// The tile grown by its own size: the most a chart may paint outside its
-    /// rect.
+    /// The tile grown by its own size, plus the stroke fringe.
     ///
     /// The window-anchored axis deliberately carries one sample from just
     /// before the window so the polyline can enter at the true slope, which
     /// puts one vertex LEFT of the tile; `x_on_axis` clamps that lead-in to at
-    /// most one rect width out. Anything further is a bridge to nowhere.
+    /// most one rect width out, and the lead-in may be a run of its own once it
+    /// is a break. The extra four points are geometry, not tolerance: the
+    /// rasterizer sees the STROKE, whose half-width (0.7 px for a 1.4 px line)
+    /// plus epaint's one-pixel feather sits outside the path point, and an
+    /// isolated sample is a 1.25 px dot centred on it. Asserting against the
+    /// bare clamp bound would fail on a correct chart at the edge.
     fn allowed_rect(tile: Rect) -> Rect {
-        tile.expand2(tile.size())
+        tile.expand2(tile.size() + vec2(4.0, 4.0))
     }
 
     /// GATE: a missing sample -- NaN, +inf or -inf -- must END the series line
@@ -1113,17 +1143,20 @@ mod tests {
     #[test]
     fn a_core_tile_breaks_its_series_at_missing_samples() {
         let stamps: Vec<u64> = (0..GAP_VALUES.len() as u64).map(|i| i * 1_000).collect();
-        // Three runs of values, so four runs painted.
+        // Three gaps, so four runs painted. Every one of them is at least two
+        // samples long, which is why the count can be exact: a one-sample run
+        // would be a dot rather than a path (see `polyline_runs`).
         let runs_expected = 4;
+        let samples_plotted = GAP_VALUES.iter().filter(|v| v.is_finite()).count();
         for widget in [Widget::Core, Widget::Multi] {
             let frame = chart_frame(
                 widget,
                 &GAP_VALUES,
                 Some(&GAP_KERNEL),
-                Some((stamps.as_slice(), 12)),
+                Some((stamps.as_slice(), WINDOW_S)),
             );
             let tile = frame.tiles[0];
-            let interval = one_interval(tile, stamps.as_slice(), 12_000, GAP_VALUES.len());
+            let interval = one_interval(tile, stamps.as_slice(), WINDOW_MS, GAP_VALUES.len());
 
             // 1. Nothing poisoned reached the tessellator.
             for pos in frame.vertices() {
@@ -1134,13 +1167,21 @@ mod tests {
                 );
             }
 
-            // 2. A gap separates runs instead of being drawn through.
+            // 2. A gap separates runs instead of being drawn through -- and it
+            //    separates them without losing a measured sample on the way.
             let runs = polyline_runs(&frame.shapes);
-            assert!(
-                runs.len() >= runs_expected,
+            assert_eq!(
+                runs.len(),
+                runs_expected,
                 "{widget:?}: {} painted polylines for {runs_expected} measured runs -- a \
-                 stroke spans a gap in the data",
+                 stroke spans a gap in the data, or the series was split past repair",
                 runs.len()
+            );
+            assert_eq!(
+                runs.iter().map(Vec::len).sum::<usize>(),
+                samples_plotted,
+                "{widget:?}: the painted runs do not hold all {samples_plotted} measured \
+                 samples -- a gap swallowed data"
             );
 
             // 3. No stroke edge bridges more than one sample interval.
@@ -1156,8 +1197,14 @@ mod tests {
             }
 
             // 4. Neither does the area fill, which is built one triangle pair
-            //    per segment.
-            for span in mesh_triangle_x_spans(&frame.shapes) {
+            //    per segment. The empty case is a failure, not a pass: a chart
+            //    that stopped filling would otherwise satisfy this vacuously.
+            let spans = mesh_triangle_x_spans(&frame.shapes);
+            assert!(
+                !spans.is_empty(),
+                "{widget:?}: the chart painted no area fill at all"
+            );
+            for span in spans {
                 assert!(
                     span <= interval + 2.0,
                     "{widget:?}: a fill triangle spans {span:.1} px, more than one sample \
@@ -1214,17 +1261,19 @@ mod tests {
             // The stale sample is clamped a whole rect width left of the plot.
             // On its own that is the documented lead-in; what must not happen
             // is that it is JOINED to the samples inside the window, which is
-            // what turns it into a stroke across the graph.
-            let straddling = runs
-                .iter()
-                .filter(|run| run.iter().any(|p| p.x < tile.left() - slack))
-                .count();
-            assert!(
-                straddling == 0 || runs.len() >= 2,
-                "{widget:?}: {straddling} of {} run(s) join a sample from outside the axis \
-                 to samples inside it -- the pinned sample is drawn as a bridging stroke",
-                runs.len()
-            );
+            // what turns it into a stroke across the graph. So the assertion is
+            // per run: a run may hold off-axis points or on-axis points, never
+            // both. Counting runs instead would accept a split that still
+            // bridged the stale sample to its neighbours.
+            let off_axis = |p: &Pos2| p.x < tile.left() - slack;
+            let on_axis = |p: &Pos2| p.x >= tile.left() - 0.5;
+            for run in &runs {
+                assert!(
+                    !(run.iter().any(off_axis) && run.iter().any(on_axis)),
+                    "{widget:?}: a run joins a sample from outside the axis to samples \
+                     inside it -- the pinned sample is drawn as a bridging stroke"
+                );
+            }
 
             // ...and no single edge may cross more plot than the plot is wide.
             for run in &runs {
@@ -1301,7 +1350,7 @@ mod tests {
         let two: &[f64] = &[10.0, 20.0];
         let two_gapped: &[f64] = &[10.0, f64::NAN];
         let cases: [SeriesCase<'_>; 3] = [
-            (long.as_slice(), Some((stamps.as_slice(), 12))),
+            (long.as_slice(), Some((stamps.as_slice(), WINDOW_S))),
             (two, None),
             (two_gapped, None),
         ];
@@ -1340,12 +1389,17 @@ mod tests {
 
     /// A gap series must not paint outside the tile that owns it.
     ///
-    /// The pixel half of the gate, deliberately structural: two tiles side by
-    /// side, the first fed the adversarial series, and the only claims are that
-    /// the series colour stays inside the two tile rects and that both tiles
-    /// actually painted their series. A bridging stroke that escapes its clip,
-    /// or a tile that paints nothing where a curve belongs, fails it; a layout
-    /// change does not.
+    /// A rasterization smoke test, not the artifact detector: the reported
+    /// strokes were INSIDE their tile, and both chart shapes clip their painter
+    /// to it, so this cannot fail for a bridging segment. What it does pin is
+    /// the clip itself -- a chart that stops clipping (or a tile that paints
+    /// nothing where a curve belongs) fails here, and neither is visible in the
+    /// tessellated-geometry gates above, which describe shape data rather than
+    /// what the rasterizer is allowed to cover.
+    ///
+    /// Deliberately structural: two tiles side by side, the first fed the
+    /// adversarial series, and the only claims are that the series colour stays
+    /// inside the two tile rects and that both tiles actually painted it.
     #[test]
     fn gap_series_pixels_stay_inside_their_own_tile() {
         const PW: u32 = 420;
@@ -1370,7 +1424,7 @@ mod tests {
                 // to land rather than immediately hitting its neighbour.
                 ui.spacing_mut().item_spacing = vec2(24.0, 4.0);
                 ui.horizontal(|ui| {
-                    let axis = chart::TimeAxis::new(&stamps, 12);
+                    let axis = chart::TimeAxis::new(&stamps, WINDOW_S);
                     for (values, label) in [
                         (GAP_VALUES.as_slice(), "CPU 0"),
                         (healthy.as_slice(), "CPU 1"),
