@@ -1978,6 +1978,13 @@ fn process_network_sample() -> ProcessNetworkSample {
                 if let Some(trace) = slot.as_mut() {
                     trace.usage = usage;
                 }
+                // A replacement's totals start again at zero, and an empty
+                // total is indistinguishable from a measured "no traffic".
+                // Answering this request from it would report 0 B/s and a
+                // zeroed byte total for every process on the tick the counters
+                // restarted — the fabricated zero the disk sibling avoids by
+                // answering unknown here. The next request measures it.
+                return ProcessNetworkSample::default();
             }
             None => return ProcessNetworkSample::default(),
         }
@@ -2000,6 +2007,9 @@ fn process_network_sample() -> ProcessNetworkSample {
                     *slot = None;
                     return ProcessNetworkSample::default();
                 }
+                // A session started here has delivered nothing yet, so it
+                // cannot speak for any process either; see the restart above.
+                return ProcessNetworkSample::default();
             }
             None => {
                 // LocalSystem should always be able to start a session; if it
