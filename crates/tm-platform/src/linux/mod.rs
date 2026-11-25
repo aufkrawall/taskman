@@ -213,7 +213,11 @@ impl SystemCollector for LinuxCollector {
             entry.display = name.clone();
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
-            entry.desktop_role = Some(desktop_evidence.role_marker());
+            // Only a process whose generation this tick actually bracketed has
+            // an authoritative role. Without one the collector proved nothing,
+            // and publishing `Unknown` as if it had would suppress the
+            // name-based fallback that a just-started process still deserves.
+            entry.desktop_role = boot_start_ticks.map(|_| desktop_evidence.role_marker());
             entry.cpu_pct = proc_cpu.and_then(|cpu| cpu.pct);
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
