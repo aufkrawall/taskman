@@ -2717,7 +2717,7 @@ fn attach_app_file_io_with(
 /// process, so its bytes move into `omitted_*` instead of disappearing.
 fn omit_file_bytes(
     accounting: &mut crate::actions::FileIoAccounting,
-    files: Vec<crate::actions::ProcessFileIo>,
+    files: impl IntoIterator<Item = crate::actions::ProcessFileIo>,
 ) {
     for file in files {
         if let Some(read) = file.read_bytes {
@@ -2773,11 +2773,21 @@ fn trim_file_io_to_budget(
         snapshot.accounting.handles_complete = false;
         omit_file_bytes(&mut snapshot.accounting, dropped);
     }
-    if encoded_file_io_len(snapshot)? > budget {
-        return Err(TmError::platform(
-            "broker process file io",
-            "file I/O snapshot exceeds the bounded broker response limit",
-        ));
+    // The bisection measured the snapshot while `omitted_*` still held their
+    // pre-drop values, and charging the dropped rows grew them: the remainder's
+    // own digits can push the prefix the search settled on back over the
+    // budget. Re-check the authoritative length here and give back one row at a
+    // time (each one both shrinks the list and grows the remainder), so the
+    // answer is the rows that really fit rather than no list at all.
+    while encoded_file_io_len(snapshot)? > budget {
+        let Some(row) = snapshot.files.pop() else {
+            return Err(TmError::platform(
+                "broker process file io",
+                "file I/O snapshot exceeds the bounded broker response limit",
+            ));
+        };
+        snapshot.accounting.handles_complete = false;
+        omit_file_bytes(&mut snapshot.accounting, std::iter::once(row));
     }
     Ok(())
 }
@@ -5537,6 +5547,52 @@ mod tests {
             small.accounting.handles_complete,
             "nothing was dropped, so nothing is incomplete"
         );
+    }
+
+    /// Regression: the bisection measured the snapshot while the omitted
+    /// remainder still held its pre-drop values, but dropping rows adds their
+    /// bytes to it — so the digits the search never saw could push the prefix it
+    /// settled on over the budget, and the whole list came back as an error.
+    /// A budget that holds exactly one row is the smallest case: charging the
+    /// other seven grows the accounting past it, so the honest answer is no row
+    /// at all, not a failed request.
+    #[test]
+    fn a_trimmed_file_list_fits_the_budget_its_grown_remainder_spends() {
+        let rows = || {
+            (0..8)
+                .map(|index| {
+                    let mut row = file_row(&format!(r"C:\data\file{index}.bin"));
+                    row.read_bytes = Some(64 * 1024 * 1024);
+                    row.write_bytes = Some(4 * 1024 * 1024);
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot_with = |count: usize| crate::actions::ProcessFileIoSnapshot {
+            files: rows().into_iter().take(count).collect(),
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        let budget = encoded_file_io_len(&snapshot_with(1)).unwrap();
+        assert!(
+            encoded_file_io_len(&snapshot_with(0)).unwrap() <= budget,
+            "the empty form has to fit, or this test only proves the error path"
+        );
+        let mut snapshot = snapshot_with(8);
+        assert!(encoded_file_io_len(&snapshot).unwrap() > budget);
+        trim_file_io_to_budget(&mut snapshot, budget).expect("a trimmed list must fit its budget");
+        assert!(
+            snapshot.files.is_empty(),
+            "one row no longer fits once its dropped siblings are charged to the remainder"
+        );
+        assert_eq!(
+            snapshot.accounting.omitted_read_bytes,
+            8 * 64 * 1024 * 1024,
+            "every dropped row's bytes stay in the process total"
+        );
+        assert_eq!(snapshot.accounting.omitted_write_bytes, 8 * 4 * 1024 * 1024);
+        assert!(!snapshot.accounting.handles_complete);
+        let encoded = encoded_file_io_len(&snapshot).unwrap();
+        assert!(encoded <= budget, "{encoded} still over {budget}");
     }
 
     /// The two hosts are separate sessions under separate names: an elevated
