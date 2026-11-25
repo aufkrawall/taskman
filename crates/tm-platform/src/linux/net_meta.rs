@@ -133,6 +133,19 @@ fn adapter_description(base: &Path) -> String {
             return value;
         }
     }
+    // A USB NIC's `device` link names its `usb_interface` (`…/2-1/2-1:1.0`),
+    // where none of the marketing strings above exist; they live on the
+    // `usb_device` one level further up. `idVendor` is what identifies that
+    // device, so a PCI parent — whose `product` would name the bridge, not the
+    // NIC — is never consulted.
+    let usb_device = device.join("../..");
+    if usb_device.join("idVendor").is_file() {
+        for candidate in ["product", "manufacturer"] {
+            if let Some(value) = read_trim(usb_device.join(candidate)).filter(|v| !v.is_empty()) {
+                return value;
+            }
+        }
+    }
     let Some(uevent) = std::fs::read_to_string(device.join("uevent")).ok() else {
         return String::new();
     };

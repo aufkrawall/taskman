@@ -451,8 +451,13 @@ pub struct IconResolver {
     /// file wins.
     desktop_index: HashMap<String, String>,
     /// Themes to search, in order: the configured one (or the spec's
-    /// `default`), its transitive `Inherits`, then `hicolor`. Resolved once
-    /// because a theme's name does not change while the process runs.
+    /// `default`), its transitive `Inherits`, then `hicolor`.
+    ///
+    /// Resolved with the resolver rather than per lookup: the chain costs an
+    /// XSettings round-trip plus one `index.theme` read per theme, and the file
+    /// cache below answers by icon name, which is theme-independent. A theme
+    /// the user switches to at runtime is therefore picked up when TaskMan next
+    /// starts, not mid-session.
     themes: Vec<String>,
     /// Only the icon worker resolves icons, so this is never contended.
     caches: Mutex<Caches>,
@@ -507,14 +512,16 @@ impl IconResolver {
         {
             return Some(icon);
         }
-        let base = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase())?;
-        if let Some(icon) = self.desktop_index.get(&base) {
+        let base = path.file_name().map(|n| n.to_string_lossy().into_owned())?;
+        // The index is keyed lowercase so a case-sensitive filesystem cannot
+        // hide `MyApp.desktop` from a `myapp` process.
+        if let Some(icon) = self.desktop_index.get(&base.to_ascii_lowercase()) {
             return Some(icon.clone());
         }
         // No desktop entry: the icon theme spec's fallback is the executable
         // basename as a themed icon name (hicolor ships one for most apps).
+        // That name keeps its original case — a theme file is `MyApp.png`, not
+        // `myapp.png`, on the case-sensitive filesystems Linux uses.
         Some(base)
     }
 
@@ -547,6 +554,12 @@ impl IconResolver {
         if Path::new(name).is_absolute() {
             let p = PathBuf::from(name);
             return p.is_file().then_some(p);
+        }
+        // A themed icon name is one path component. `Icon=` and `Inherits=`
+        // reach `Path::join` below, where a relative `..` or a separator would
+        // resolve outside the icon dirs the spec says to search.
+        if !is_themed_icon_name(name) {
+            return None;
         }
         let file_name = png_file_name(name);
         let icon_dirs = self.lookup.icon_dirs();
@@ -696,10 +709,11 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
         let apps = data_dir.join("applications");
         let mut stack = vec![(apps, 0u8)];
         while let Some((dir, depth)) = stack.pop() {
+            let mut subdirs: Vec<(PathBuf, u8)> = Vec::new();
             for p in sorted_dir_paths(&dir) {
                 if p.is_dir() {
                     if depth < MAX_DEPTH {
-                        stack.push((p, depth + 1));
+                        subdirs.push((p, depth + 1));
                     }
                     continue;
                 }
@@ -721,6 +735,11 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
                     index.entry(exe_base).or_insert_with(|| icon.to_string());
                 }
             }
+            // Reversed onto the LIFO stack, so the alphabetically first
+            // subdirectory is scanned first — the same rule that decides a
+            // shared name inside one directory. A plain push order let the last
+            // `applications/<vendor>/` subdirectory win instead.
+            stack.extend(subdirs.into_iter().rev());
         }
     }
     index
@@ -835,7 +854,13 @@ fn desktop_file_entry(path: &Path) -> Option<DesktopEntry> {
         } else if let Some(v) = line.strip_prefix("TryExec=") {
             entry.try_exec.get_or_insert_with(|| v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("Icon=") {
-            entry.icon.get_or_insert_with(|| v.trim().to_string());
+            // An empty `Icon=` is not an icon. Keeping it would store "" in the
+            // index and shadow another entry's real icon for the same
+            // executable, because the first value inserted wins.
+            let icon = v.trim();
+            if !icon.is_empty() {
+                entry.icon.get_or_insert_with(|| icon.to_string());
+            }
         }
     }
     Some(entry)
@@ -893,6 +918,19 @@ fn flatpak_command(exec: &str) -> Option<String> {
     None
 }
 
+/// Whether `key` is the name half of an `env`-style `VAR=value` prefix before
+/// an `Exec=` binary.
+///
+/// Only the name decides this: a shell variable name is ASCII alphanumerics and
+/// underscores, so a value holding a path or a field code cannot turn the
+/// assignment itself into the executable.
+fn is_env_assignment_name(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// First meaningful token of a desktop `Exec=` line: strip field codes
 /// (`%u`, `%F`, ...), then skip execution prefixes (`env`, `sudo`, `setsid`,
 /// `nohup`, `nice` — also their absolute paths and flags) and `VAR=value`
@@ -916,8 +954,14 @@ fn exec_first_binary(exec: &str) -> Option<String> {
             }
             continue;
         }
-        if first.contains('=') && !first.contains('/') {
-            // env-style assignment prefix (only before the binary)
+        if let Some((key, _)) = first.split_once('=')
+            && is_env_assignment_name(key)
+        {
+            // env-style assignment prefix (only before the binary). The test is
+            // on the assignment's name, not on its value: a value such as
+            // `LD_LIBRARY_PATH=/opt/app/lib` contains slashes, and reading the
+            // whole token as the executable made the entry claim an icon for a
+            // binary named `lib`.
             first = tokens.next()?;
             continue;
         }
@@ -970,6 +1014,12 @@ fn theme_chain(icon_dirs: &[PathBuf], current: Option<&str>) -> Vec<String> {
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![start];
     while let Some(theme) = stack.pop() {
+        // A theme name is one path component, and this one is also joined onto
+        // every icon dir. A malformed `Inherits=` value must not redirect the
+        // search outside them.
+        if !is_themed_icon_name(&theme) {
+            continue;
+        }
         if !visited.insert(theme.clone()) {
             continue;
         }
@@ -984,6 +1034,17 @@ fn theme_chain(icon_dirs: &[PathBuf], current: Option<&str>) -> Vec<String> {
         chain.push(FALLBACK_THEME.to_string());
     }
     chain
+}
+
+/// Whether `name` is a themed icon name or theme name: exactly one path
+/// component.
+///
+/// `Icon=` values and `Inherits=` entries end up in a `Path::join` against the
+/// icon dirs, so a name carrying a separator or a `.`/`..` component would read
+/// outside the icon dirs the spec says to search. Such a name is not a themed
+/// name, and treating it as one would report an unrelated file as the icon.
+fn is_themed_icon_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
 /// The file name to look for inside a theme: `<name>.png`, unless the icon
@@ -1010,9 +1071,12 @@ struct SizeDir {
 /// list when it declares one, else the `<size>` subdirectory names.
 ///
 /// Pixel size closest to the target, then the size closest to it, then the
-/// path: a `read_dir` order must never decide between equal candidates. The
-/// nominal size breaks a pixel-size tie — `16x16@2` and `32x32` both hold 32 px
-/// files, but only `32x32` is native at that size.
+/// larger pixel size, then the path: a `read_dir` order must never decide
+/// between equal candidates. The nominal size breaks a pixel-size tie —
+/// `16x16@2` and `32x32` both hold 32 px files, but only `32x32` is native at
+/// that size. When two directories are equally far from the target the larger
+/// one wins, so a 32 px target takes a native 48 px asset (scaled down) over a
+/// 16 px one (scaled up).
 fn size_dirs_of_theme(theme_dir: &Path) -> Vec<SizeDir> {
     let mut dirs: Vec<SizeDir> = Vec::new();
     if let Some(declared) = theme_directories(theme_dir) {
@@ -1051,6 +1115,7 @@ fn size_dirs_of_theme(theme_dir: &Path) -> Vec<SizeDir> {
                     .abs_diff(TARGET_SIZE)
                     .cmp(&b.size.abs_diff(TARGET_SIZE))
             })
+            .then_with(|| b.pixel_size.cmp(&a.pixel_size))
             .then_with(|| a.path.cmp(&b.path))
     });
     dirs

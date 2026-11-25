@@ -90,7 +90,18 @@ pub(crate) fn split(command_line: &str) -> Result<Vec<String>, CommandLineError>
                             message: "trailing escape in command line",
                         });
                     };
-                    current.push(escaped);
+                    // Inside double quotes a backslash only escapes the
+                    // characters that still carry a meaning there (`$`,
+                    // backtick, `"`, `\`); a newline is a line continuation.
+                    // Before anything else the backslash is literal, so
+                    // `grep "\."` keeps the pattern it was typed with instead
+                    // of silently becoming `grep .`.
+                    if matches!(escaped, '$' | '`' | '"' | '\\') {
+                        current.push(escaped);
+                    } else if escaped != '\n' {
+                        current.push('\\');
+                        current.push(escaped);
+                    }
                 }
                 ch => current.push(ch),
             },
@@ -135,6 +146,24 @@ mod tests {
                 "quoted program".to_string(),
                 String::new(),
                 "tail slash".to_string()
+            ]
+        );
+    }
+
+    /// POSIX keeps a backslash inside double quotes unless it precedes `$`,
+    /// a backtick, `"`, `\` or a newline. Anything else is literal, so the
+    /// pattern the user typed survives instead of being silently unescaped.
+    #[test]
+    fn double_quotes_only_strip_the_escapes_that_are_special_there() {
+        assert_eq!(
+            split(r#"grep "\." "a\nb" "q\"x" "back\\slash" "d\$e""#).unwrap(),
+            vec![
+                "grep".to_string(),
+                r"\.".to_string(),
+                r"a\nb".to_string(),
+                "q\"x".to_string(),
+                r"back\slash".to_string(),
+                "d$e".to_string()
             ]
         );
     }
