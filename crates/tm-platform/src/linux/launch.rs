@@ -19,22 +19,6 @@ use tm_core::error::{Result, TmError};
 /// runaway child from allocating without bound inside its deadline.
 const HELPER_OUTPUT_LIMIT: usize = 1024 * 1024;
 
-pub(super) fn spawn_detached(
-    program: &OsStr,
-    arguments: &[OsString],
-    environment: &[(String, String)],
-) -> Result<()> {
-    build_command(program, arguments, environment)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| {
-            TmError::platform(
-                "launch",
-                format!("could not start {}: {error}", program.to_string_lossy()),
-            )
-        })
-}
-
 /// Start a program in its own process group and reap it from a short helper
 /// thread without keeping the caller's action lane occupied for the program's
 /// lifetime.

@@ -212,7 +212,7 @@ fn write_owned_entry(path: &Path, contents: &str) -> Result<()> {
     if let Some(file) = existing.as_mut() {
         validate_owned_regular_file(file)?;
         let existing = read_entry(file)?;
-        if !is_owned_entry(&existing) {
+        if !is_replaceable_entry(&existing) {
             return Err(TmError::platform(
                 "XDG autostart",
                 "refusing to replace an entry not owned by TaskMan",
@@ -395,6 +395,28 @@ fn read_entry(file: &mut File) -> Result<String> {
 }
 
 fn is_owned_entry(text: &str) -> bool {
+    entry_has_line(text, OWNED_MARKER)
+}
+
+/// The marker `startup.rs` writes into the minimal `Hidden=true` file it creates
+/// at a lower-precedence entry's name. Duplicated here because that module owns
+/// the override's content; keep the two literals equal.
+const STARTUP_OVERRIDE_KEY: &str = "X-Taskman-Override=true";
+
+/// Whether the file at TaskMan's own entry name may be replaced.
+///
+/// A full entry carries `OWNED_MARKER`. The Startup page also writes a minimal
+/// `Hidden=true` file at this same name when the user disables a system-wide
+/// entry — ours by `STARTUP_OVERRIDE_KEY`, but with no `Exec` and no autostart
+/// marker. Refusing that one made a later "start with system" fail with "not
+/// owned by TaskMan" until the user deleted the file by hand. Anything carrying
+/// neither marker is still left untouched, permission bits included.
+fn is_replaceable_entry(text: &str) -> bool {
+    entry_has_line(text, OWNED_MARKER) || entry_has_line(text, STARTUP_OVERRIDE_KEY)
+}
+
+/// Whether a `[Desktop Entry]` group in `text` holds the exact `wanted` line.
+fn entry_has_line(text: &str, wanted: &str) -> bool {
     let mut in_entry = false;
     for raw in text.lines() {
         let line = raw.trim();
@@ -402,7 +424,7 @@ fn is_owned_entry(text: &str) -> bool {
             in_entry = line == "[Desktop Entry]";
             continue;
         }
-        if in_entry && line == OWNED_MARKER {
+        if in_entry && line == wanted {
             return true;
         }
     }
@@ -484,6 +506,31 @@ mod tests {
             0o644,
             "a foreign entry keeps its permission bits as well as its content"
         );
+        let _ = fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn a_startup_page_override_is_replaceable() {
+        let config = test_config("startup-override");
+        let dir = config.join("autostart");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ENTRY_FILE_NAME);
+        // What the Startup page writes when the user disables a lower-precedence
+        // system entry: TaskMan's override marker, but no Exec and no autostart
+        // marker. It must not block a later "start with system".
+        fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=io.github.aufkrawall.Taskman\n\
+             Hidden=true\nX-Taskman-Override=true\n",
+        )
+        .unwrap();
+
+        set_enabled_at(&config, Path::new("/opt/taskman"), true).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(is_owned_entry(&text), "the entry becomes TaskMan's own");
+        assert!(text.contains("Exec=/opt/taskman"));
+        assert!(!text.contains("Hidden=true"));
         let _ = fs::remove_dir_all(config);
     }
 

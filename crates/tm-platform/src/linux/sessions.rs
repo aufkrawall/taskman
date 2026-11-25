@@ -270,15 +270,10 @@ fn logon_epoch_s(boot_epoch_s: Option<u64>, monotonic_us: Option<u64>) -> Option
 /// root-owned and not group/other writable. A root-owned but writable tool, or
 /// one reachable through a writable directory, is refused instead of run.
 fn loginctl_path() -> Option<std::path::PathBuf> {
-    for candidate in ["/usr/bin/loginctl", "/bin/loginctl"] {
-        let candidate = Path::new(candidate);
-        if candidate.is_file()
-            && let Ok(path) = launch::trusted_system_program(candidate)
-        {
-            return Some(path);
-        }
-    }
-    None
+    // Same candidate list, and therefore the same NixOS profile paths, as the
+    // `systemctl` resolver: one list keeps the two probes from disagreeing about
+    // which systemd tools this host has.
+    super::services::trusted_system_tool("loginctl").ok()
 }
 
 #[cfg(test)]

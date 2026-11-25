@@ -6,8 +6,11 @@
 //! process actions and GUI relaunch fail closed until a protected helper ships.
 
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use tm_core::error::{Result, TmError};
 
@@ -26,6 +29,9 @@ const PKEXEC_CANDIDATES: [&str; 5] = [
     "/run/current-system/sw/bin/pkexec",
 ];
 const MAX_PKEXEC_DIAGNOSTIC_CHARS: usize = 4 * 1024;
+/// Generous on purpose: a human answers the Polkit prompt. The bound only
+/// exists so a wedged agent or an unanswered dialog cannot park an action lane.
+const PKEXEC_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn is_elevated() -> bool {
     unsafe { libc::geteuid() == 0 }
@@ -61,11 +67,10 @@ pub fn handle_helper(args: &[String]) -> Option<i32> {
 
 /// Elevating the portable, user-writable TaskMan image would turn the Polkit
 /// prompt into privilege escalation for mutable code, so this path fails
-/// closed until a protected helper image exists.
+/// closed until a protected helper image exists. The refusal text is the same
+/// constructor the hidden helper's own arm uses.
 pub fn relaunch_elevated() -> Result<()> {
-    Err(TmError::Unsupported(
-        "elevated GUI relaunch from a portable, user-writable installation",
-    ))
+    Err(unsupported_relaunch())
 }
 
 /// Split the Run dialog's command line into argv and launch it directly. The
@@ -103,7 +108,7 @@ pub(super) fn run_privileged_action(action: &PrivilegedAction) -> Result<()> {
     }
     match action {
         PrivilegedAction::Service { unit, action } => {
-            let systemctl = trusted_program(&["/usr/bin/systemctl", "/bin/systemctl"])?;
+            let systemctl = services::trusted_system_tool("systemctl")?;
             let verb = match action {
                 crate::actions::ServiceAction::Start => "start",
                 crate::actions::ServiceAction::Stop => "stop",
@@ -125,13 +130,22 @@ pub(super) fn run_privileged_action(action: &PrivilegedAction) -> Result<()> {
         | PrivilegedAction::Suspend { .. }
         | PrivilegedAction::Resume { .. }
         | PrivilegedAction::SetPriority { .. }
-        | PrivilegedAction::SetAffinity { .. } => Err(TmError::Unsupported(
-            "privileged process action in a portable installation; run TaskMan from a protected install",
-        )),
-        PrivilegedAction::Relaunch { .. } => Err(TmError::Unsupported(
-            "elevated GUI relaunch from a portable installation",
-        )),
+        | PrivilegedAction::SetAffinity { .. } => Err(unsupported_process_action()),
+        PrivilegedAction::Relaunch { .. } => Err(unsupported_relaunch()),
     }
+}
+
+/// The one request-side and root-side policy for actions this installation
+/// cannot elevate. Both halves call these so the hidden helper entry point
+/// cannot perform what the GUI refuses to ask for.
+fn unsupported_process_action() -> TmError {
+    TmError::Unsupported(
+        "privileged process action in a portable installation; run TaskMan from a protected install",
+    )
+}
+
+fn unsupported_relaunch() -> TmError {
+    TmError::Unsupported("elevated GUI relaunch from a portable installation")
 }
 
 /// Escalate only a permission failure. Every other error is returned intact,
@@ -177,35 +191,101 @@ pub(super) fn is_permission_denied(error: &TmError) -> bool {
 
 fn run_pkexec(program: &Path, args: &[String], action: &'static str) -> Result<()> {
     let pkexec = pkexec_path()?;
-    let output = Command::new(&pkexec)
+    let mut child = Command::new(&pkexec)
         .arg(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|error| {
             TmError::platform(
                 "pkexec",
                 format!("Polkit's pkexec is unavailable or could not start: {error}"),
             )
         })?;
-    if output.status.success() {
+    // Neither pipe may wait for the exit: `pkexec` writes its diagnostics while
+    // it authenticates, and a full pipe would block the helper we are timing.
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TmError::platform(
+            "pkexec",
+            "could not capture the authorization helper's output",
+        ));
+    };
+    let (stdout, stderr) = match (
+        drain_pipe("tm-pkexec-out", stdout),
+        drain_pipe("tm-pkexec-err", stderr),
+    ) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        // A refused thread must fail this action. `std::thread::spawn` panics
+        // instead, and release builds abort on panic, so the process would die
+        // rather than the service request.
+        (Err(error), _) | (_, Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TmError::platform(
+                action,
+                format!("could not start the thread that reads pkexec's output: {error}"),
+            ));
+        }
+    };
+    // An interactive prompt is expected to take a while, but a hung agent or an
+    // unanswered dialog must not park one of the two action lanes (and then its
+    // queue) for the rest of the session.
+    if let Err(error) =
+        launch::wait_for_exit(&mut child, Instant::now() + PKEXEC_DEADLINE, "pkexec")
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TmError::platform(
+            action,
+            format!(
+                "Polkit authorization did not complete within {} seconds and was cancelled: {error}",
+                PKEXEC_DEADLINE.as_secs()
+            ),
+        ));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| TmError::platform("pkexec", error.to_string()))?;
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
         return Ok(());
     }
 
-    let mut detail = first_diagnostic(&output.stdout, &output.stderr)
-        .unwrap_or_else(|| output.status.to_string());
+    let mut detail = first_diagnostic(&stdout, &stderr).unwrap_or_else(|| status.to_string());
     if let Some((index, _)) = detail.char_indices().nth(MAX_PKEXEC_DIAGNOSTIC_CHARS) {
         detail.truncate(index);
     }
-    let guidance = match output.status.code() {
+    let guidance = match status.code() {
         Some(126) => "Polkit authorization was dismissed",
         Some(127) => "Polkit denied authorization",
         Some(125) => "Polkit authentication failed or no authentication agent was available",
         _ => "Polkit authorization or the requested privileged action failed",
     };
     Err(TmError::platform(action, format!("{guidance}: {detail}")))
+}
+
+/// Read one of the helper's pipes to its end on its own thread, so the deadline
+/// wait and a chatty helper cannot block each other. A refused thread is
+/// returned to the caller, which kills and reaps the child and fails the action:
+/// the handle is deliberately dropped, never joined, on the timeout path,
+/// because a descendant that inherited the pipe would make the join unbounded.
+/// `name` becomes the kernel's `comm`, which Linux truncates to 15 bytes, so keep
+/// it short enough for two concurrent readers to stay distinguishable.
+fn drain_pipe(
+    name: &'static str,
+    pipe: impl Read + Send + 'static,
+) -> std::io::Result<JoinHandle<Vec<u8>>> {
+    std::thread::Builder::new().name(name).spawn(move || {
+        let mut pipe = pipe;
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
 }
 
 fn pkexec_path() -> Result<PathBuf> {
@@ -242,6 +322,10 @@ fn first_diagnostic(stdout: &[u8], stderr: &[u8]) -> Option<String> {
         .find(|line| !line.is_empty())
 }
 
+/// Execute the action this process was entered as root for. The process
+/// controls are the protected-helper half of the design and stay unreachable
+/// from the GUI, which refuses them at request time; a relaunch is refused here
+/// as well, because it would run this user-writable image as root.
 fn execute_privileged_action(action: PrivilegedAction) -> Result<()> {
     match action {
         PrivilegedAction::Service { unit, action } => services::control_unit_direct(&unit, action),
@@ -273,21 +357,11 @@ fn execute_privileged_action(action: PrivilegedAction) -> Result<()> {
             validate_privileged_target(pid)?;
             super::set_affinity_direct(pid, Some(start_ticks), mask)
         }
-        PrivilegedAction::Relaunch {
-            arguments,
-            environment,
-        } => {
-            if arguments.iter().any(|arg| is_privileged_helper_arg(arg)) {
-                return Err(TmError::platform(
-                    "elevated relaunch",
-                    "refusing a relaunch argument that re-enters the privileged helper",
-                ));
-            }
-            let executable = std::env::current_exe()
-                .map_err(|error| TmError::platform("current_exe", error.to_string()))?;
-            let arguments: Vec<OsString> = arguments.into_iter().map(OsString::from).collect();
-            launch::spawn_detached(executable.as_os_str(), &arguments, &environment)
-        }
+        // The root side of the same policy: being entered as root does not make
+        // this image a protected one. Re-executing the portable, user-writable
+        // TaskMan as root is exactly what the request side refuses, so the
+        // hidden entry point must not do it either.
+        PrivilegedAction::Relaunch { .. } => Err(unsupported_relaunch()),
     }
 }
 
@@ -341,6 +415,17 @@ mod tests {
         assert!(validate_privileged_target(1).is_err());
         assert!(validate_privileged_target(std::process::id()).is_err());
         assert!(validate_privileged_target(123_456_789).is_ok());
+    }
+
+    #[test]
+    fn the_helper_refuses_to_execute_its_own_image_as_root() {
+        let error = execute_privileged_action(PrivilegedAction::Relaunch {
+            arguments: vec!["--tab=services".into()],
+            environment: vec![("DISPLAY".into(), ":0".into())],
+        })
+        .expect_err("a portable image must never be re-executed as root");
+        assert!(matches!(error, TmError::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("relaunch"), "{error}");
     }
 
     #[test]

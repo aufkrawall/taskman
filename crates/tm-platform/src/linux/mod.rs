@@ -201,19 +201,23 @@ impl SystemCollector for LinuxCollector {
                 .map_or_else(desktop_session::DesktopEvidence::default, |ticks| {
                     self.desktop_evidence.evidence(pid_u, ticks, started)
                 });
+            // Only a process whose generation this tick bracketed has an
+            // authoritative role. `None` tells the classifier that nothing was
+            // observed, so it may still use its userspace-name fallback.
+            let desktop_role = boot_start_ticks.map(|_| desktop_evidence.role_marker());
             let has_window = window_evidence(
                 window_observation.owners.get(&pid_u).copied(),
                 boot_start_ticks,
                 window_observation.coverage,
             );
-            let category = classify_collected_process(pid_u, &name, has_window, &desktop_evidence);
+            let category = classify_collected_process(pid_u, &name, has_window, desktop_role);
 
             let du = p.disk_usage();
             let mut entry = ProcessEntry::new(pid_u, name.clone());
             entry.display = name.clone();
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
-            entry.desktop_role = Some(desktop_evidence.role_marker());
+            entry.desktop_role = desktop_role;
             entry.cpu_pct = proc_cpu.and_then(|cpu| cpu.pct);
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
@@ -1325,15 +1329,20 @@ fn window_evidence(
     }
 }
 
-/// The collector always has an authoritative Linux desktop-role result, even
-/// when that result is Unknown. Passing the raw optional role would make
-/// `classify` treat Unknown as a legacy no-marker snapshot and reapply Unix
-/// userspace name fallbacks (for example, a synthetic-WSL `dbus-daemon`).
+/// Classify with the desktop role this tick actually observed.
+///
+/// `desktop_role` is `Some` only when the sample bracketed the process's
+/// generation, and then it is authoritative even when it is Unknown (an
+/// app.slice unit with no graphical evidence, or a cgroup this build cannot
+/// read). `None` means nothing was observed — the process appeared after the
+/// bracket, or its `/proc/<pid>/stat` read failed — and only then may `classify`
+/// take its Unix userspace-name fallback, which keeps a debuting
+/// `dbus-daemon`/`systemd` from rendering as Unknown for a tick.
 fn classify_collected_process(
     pid: u32,
     name: &str,
     has_window: Option<bool>,
-    desktop_evidence: &desktop_session::DesktopEvidence,
+    desktop_role: Option<classify::DesktopRoleEvidence>,
 ) -> ProcCategory {
     classify::classify(classify::ClassifyInput {
         platform: classify::ProcessPlatform::Unix,
@@ -1342,7 +1351,7 @@ fn classify_collected_process(
         has_window,
         critical: None,
         windows_owned: None,
-        desktop_role: Some(desktop_evidence.role_marker()),
+        desktop_role,
     })
 }
 
@@ -1483,16 +1492,23 @@ mod tests {
         assert_eq!(evidence.role, None, "the collector saw no positive role");
         for name in ["systemd", "dbus-daemon"] {
             assert_eq!(
-                classify_collected_process(3000, name, None, &evidence),
+                classify_collected_process(3000, name, None, Some(evidence.role_marker())),
                 ProcCategory::Unknown,
-                "the collector must pass its authoritative Unknown marker for {name}, not None"
+                "a bracketed process must pass its authoritative Unknown marker for {name}, not None"
+            );
+            // The same row before a tick bracketed its generation: nothing was
+            // observed, so the Unix userspace-name fallback still decides.
+            assert_eq!(
+                classify_collected_process(3000, name, None, None),
+                ProcCategory::System,
+                "an unobserved {name} must not render as Unknown"
             );
         }
 
         let mut background = desktop_session::DesktopEvidence::default();
         background.role = Some(classify::DesktopRoleEvidence::Background);
         assert_eq!(
-            classify_collected_process(1, "systemd", None, &background),
+            classify_collected_process(1, "systemd", None, Some(background.role_marker())),
             ProcCategory::Background,
             "an explicit user-session role must beat the Unix userspace-name fallback"
         );
