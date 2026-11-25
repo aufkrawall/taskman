@@ -59,9 +59,13 @@ plausibility gate (at least five processes, a logical-processor count, a measure
 CPU share) that decides the exit code, and `error` carries that gate's reason
 when it fails — so the JSON line and the exit status can no longer disagree.
 `--mock` skips the gate, since a mock snapshot describes no real machine.
-`startup_to_snapshot_ms` is measured when the first snapshot arrives; it must not
-be timed at the print, because the per-file probe below waits up to three seconds
-for a trace delivery and that wait is not startup cost.
+`startup_to_snapshot_ms` is the time to the first *usable* snapshot, not process
+startup cost. Most of the figure is deliberate: the check samples until
+`REQUIRED_TICKS` (4) ticks at a 250 ms interval so the two-sample PDH groups
+(GPU, disk rates, CPU speed) hold a real reading instead of their warm-up state.
+What it must not contain is the per-file probe below, which waits up to three
+seconds for a trace delivery — so it is measured when the snapshot arrives, never
+at the print.
 
 `file_io` reports the per-file byte accounting of the binary's own process, which
 is the headless equivalent of the I/O page's state line: `state`
