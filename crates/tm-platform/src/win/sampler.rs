@@ -2086,9 +2086,16 @@ impl Sampler {
 /// already produced (so the probe does not cost an extra round trip).
 fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
     match core_service::brokered_process_network() {
-        core_service::BrokeredNetwork::Sample(sample) if sample.active => (
+        // A broker answer keeps the broker even when it is unknown. Its value
+        // is decided by the caller, not here: a session that was just started
+        // or replaced has delivered nothing yet, and reading that as "no
+        // service" would start a second machine-wide session on our own token
+        // (when elevated) and stop asking the service — which keeps running its
+        // own — for as long as the column is up. `probe_disk_source` reads its
+        // answer the same way.
+        core_service::BrokeredNetwork::Sample(sample) => (
             NetSource::Broker { misses: 0 },
-            Some(sample_to_map(&sample)),
+            sample.active.then(|| sample_to_map(&sample)),
         ),
         // An explicit refusal is a policy decision; do not route around it.
         core_service::BrokeredNetwork::Rejected(detail) => {
@@ -2102,15 +2109,17 @@ fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
         }
         // No service (or one too old to know the request), and no trace of its
         // own: fall back to our token, which only works when elevated.
-        _ => match net_etw::NetworkUsage::start(net_etw::TraceRole::App) {
-            Some(usage) => (NetSource::Local(usage), None),
-            None => (
-                NetSource::Unavailable {
-                    since: Instant::now(),
-                },
-                None,
-            ),
-        },
+        core_service::BrokeredNetwork::Unavailable => {
+            match net_etw::NetworkUsage::start(net_etw::TraceRole::App) {
+                Some(usage) => (NetSource::Local(usage), None),
+                None => (
+                    NetSource::Unavailable {
+                        since: Instant::now(),
+                    },
+                    None,
+                ),
+            }
+        }
     }
 }
 
