@@ -317,6 +317,89 @@ impl FileIoSample {
     }
 }
 
+/// Attach a Kernel-File sample to the handle rows it names.
+///
+/// This is the one place a [`FileIoSample`] becomes visible data, and both
+/// hosts of the trace call it: the LocalSystem service for the rows it answers
+/// with, and the GUI for the session it hosts itself when it is elevated and
+/// no service is installed. A row therefore means the same thing whichever
+/// session measured it.
+///
+/// Paths are compared case-insensitively: the trace's names were resolved from
+/// the provider's device paths while the rows come from
+/// `GetFinalPathNameByHandleW`, and neither side guarantees the other's casing.
+///
+/// A row with no record keeps `None` (rendered as unavailable), and a record
+/// with no row is NOT dropped: it goes into the unnamed remainder, which is
+/// what makes `read_bytes`/`write_bytes` the whole attribution for the process.
+///
+/// Several records can name ONE row: the trace's path is the provider's own
+/// (resolved from a device path), the row's is the handle walk's, and the
+/// caller's casing survives both, so `C:\Windows\a.dll` and `c:\windows\a.dll`
+/// are two buckets for one file. Their bytes are ADDED into the row; assigning
+/// would let the last bucket overwrite the first, and the row would then hold
+/// less than the process total while nothing absorbed the difference.
+pub(super) fn attach_file_io(
+    snapshot: &mut crate::actions::ProcessFileIoSnapshot,
+    sample: &FileIoSample,
+) {
+    let mut unnamed = sample.unnamed;
+    let accounting = &mut snapshot.accounting;
+    accounting.state = sample.state();
+    accounting.since_ms = sample.since_ms;
+    accounting.events_lost = sample.events_lost;
+    // Why rows can read unavailable while the state is measured: these say it
+    // happened, instead of leaving a user to conclude the feature is broken.
+    accounting.cleared_file_objects = sample.cleared_file_objects;
+    accounting.unnamed_creates = sample.unnamed_creates;
+    accounting.dropped_paths = sample.dropped_paths;
+    if accounting.state != FileIoAccountingState::Measured {
+        // Nothing was decoded for this process, so there is nothing to attach
+        // and every row stays unavailable.
+        return;
+    }
+    // Everything the trace attributed to the process, read before the rows are
+    // touched: rows plus both remainders are exactly this total.
+    let attributed = sample.attributed();
+    let index_by_path: std::collections::HashMap<String, usize> = snapshot
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (file.path.to_lowercase(), index))
+        .collect();
+    for (path, bytes) in &sample.files {
+        match index_by_path.get(&path.to_lowercase()) {
+            Some(&index) => {
+                let file = &mut snapshot.files[index];
+                file.read_bytes = Some(
+                    file.read_bytes
+                        .unwrap_or(0)
+                        .saturating_add(bytes.read_bytes),
+                );
+                file.write_bytes = Some(
+                    file.write_bytes
+                        .unwrap_or(0)
+                        .saturating_add(bytes.write_bytes),
+                );
+            }
+            None => {
+                // Closed since the handle walk, or a file the walk could not
+                // report at all.
+                unnamed.read_bytes = unnamed.read_bytes.saturating_add(bytes.read_bytes);
+                unnamed.write_bytes = unnamed.write_bytes.saturating_add(bytes.write_bytes);
+            }
+        }
+    }
+    accounting.read_bytes = attributed.read_bytes;
+    accounting.write_bytes = attributed.write_bytes;
+    accounting.read_ops = sample.pid_read_transfers;
+    accounting.write_ops = sample.pid_write_transfers;
+    accounting.unnamed_read_bytes = unnamed.read_bytes;
+    accounting.unnamed_write_bytes = unnamed.write_bytes;
+    accounting.omitted_read_bytes = sample.omitted.read_bytes;
+    accounting.omitted_write_bytes = sample.omitted.write_bytes;
+}
+
 /// One decoded record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileEvent<'a> {
@@ -1781,5 +1864,222 @@ mod tests {
         assert_eq!(sample.pid_transfers(), 1);
         assert_eq!(sample.events_seen, 2);
         assert_eq!(sample.events_decoded, 2);
+    }
+
+    fn file_row(path: &str) -> crate::actions::ProcessFileIo {
+        crate::actions::ProcessFileIo {
+            path: path.to_string(),
+            read_bytes: None,
+            write_bytes: None,
+            read_ops: None,
+            write_ops: None,
+            file_size: Some(4_096),
+            offset: Some(0),
+            access_known: true,
+            is_read: true,
+            is_write: false,
+            open_handles: 1,
+        }
+    }
+
+    fn measured_sample() -> FileIoSample {
+        FileIoSample {
+            running: true,
+            since_ms: 12_000,
+            files: vec![
+                // A different casing of a real row: the trace's names come from
+                // device-path resolution, the rows from the handle walk.
+                (
+                    r"c:\windows\system32\A.dll".to_string(),
+                    FileBytes {
+                        read_bytes: 1_000,
+                        write_bytes: 20,
+                    },
+                ),
+                // No row: the handle was closed since the walk.
+                (
+                    r"C:\temp\gone.tmp".to_string(),
+                    FileBytes {
+                        read_bytes: 500,
+                        write_bytes: 5,
+                    },
+                ),
+            ],
+            unnamed: Remainder {
+                read_bytes: 70,
+                write_bytes: 7,
+            },
+            omitted: Remainder {
+                read_bytes: 300,
+                write_bytes: 3,
+            },
+            events_seen: 40,
+            events_decoded: 39,
+            pid_read_transfers: 9,
+            pid_write_transfers: 2,
+            // The session had to drop names and had nowhere to put paths; both
+            // explain a row that reads unavailable while the state is measured.
+            cleared_file_objects: 12,
+            unnamed_creates: 3,
+            dropped_paths: 4,
+            events_lost: Some(1),
+        }
+    }
+
+    /// The whole point of the wiring: bytes reach exactly the rows they name,
+    /// everything else is accounted for as a remainder, and nothing is
+    /// invented. Rows plus both remainders must add up to the process totals.
+    #[test]
+    fn per_file_bytes_reach_only_the_rows_they_name() {
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![
+                file_row(r"C:\Windows\System32\a.dll"),
+                file_row(r"C:\data\untouched.bin"),
+            ],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_file_io(&mut snapshot, &measured_sample());
+        assert_eq!(
+            snapshot.files[0].read_bytes,
+            Some(1_000),
+            "case-insensitive match"
+        );
+        assert_eq!(snapshot.files[0].write_bytes, Some(20));
+        assert_eq!(
+            snapshot.files[1].read_bytes, None,
+            "a row with no record stays unavailable"
+        );
+        assert_eq!(snapshot.files[1].write_bytes, None);
+        let accounting = &snapshot.accounting;
+        assert_eq!(
+            accounting.state,
+            crate::actions::FileIoAccountingState::Measured
+        );
+        assert_eq!(accounting.since_ms, 12_000);
+        assert_eq!(accounting.events_lost, Some(1));
+        // A user needs to see WHY a row reads unavailable while the state is
+        // measured: a lost name, a refused open, or a full path budget.
+        assert_eq!(accounting.cleared_file_objects, 12);
+        assert_eq!(accounting.unnamed_creates, 3);
+        assert_eq!(accounting.dropped_paths, 4);
+        // 500 (gone.tmp) + 70 (unnamed) read; 5 + 7 written.
+        assert_eq!(accounting.unnamed_read_bytes, 570);
+        assert_eq!(accounting.unnamed_write_bytes, 12);
+        assert_eq!(accounting.omitted_read_bytes, 300);
+        assert_eq!(accounting.omitted_write_bytes, 3);
+        assert_eq!(accounting.read_ops, 9);
+        assert_eq!(accounting.write_ops, 2);
+        // The row + the two remainders are the attribution for the process.
+        assert_eq!(accounting.read_bytes, 1_000 + 570 + 300);
+        assert_eq!(accounting.write_bytes, 20 + 12 + 3);
+    }
+
+    /// One file can arrive as two trace buckets — `C:\...` and `c:\...` — and
+    /// both match the same row. The row must hold their SUM: overwriting with
+    /// the second bucket left the row short of the process total with nothing
+    /// absorbing the difference, so "rows + remainders == attributed" was false.
+    #[test]
+    fn two_case_variants_of_one_path_accumulate_on_that_row() {
+        let mut sample = measured_sample();
+        sample.files = vec![
+            (
+                r"C:\Windows\System32\A.dll".to_string(),
+                FileBytes {
+                    read_bytes: 1_000,
+                    write_bytes: 20,
+                },
+            ),
+            (
+                r"c:\windows\system32\a.dll".to_string(),
+                FileBytes {
+                    read_bytes: 400,
+                    write_bytes: 5,
+                },
+            ),
+        ];
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![
+                file_row(r"C:\Windows\System32\a.dll"),
+                file_row(r"C:\data\untouched.bin"),
+            ],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_file_io(&mut snapshot, &sample);
+        assert_eq!(
+            snapshot.files[0].read_bytes,
+            Some(1_400),
+            "both buckets land on the row"
+        );
+        assert_eq!(snapshot.files[0].write_bytes, Some(25));
+        assert_eq!(snapshot.files[1].read_bytes, None);
+        let accounting = &snapshot.accounting;
+        let rows_read: u64 = snapshot
+            .files
+            .iter()
+            .filter_map(|file| file.read_bytes)
+            .sum();
+        assert_eq!(
+            rows_read + accounting.unnamed_read_bytes + accounting.omitted_read_bytes,
+            accounting.read_bytes,
+            "rows plus remainders are still the whole attribution"
+        );
+        assert_eq!(accounting.read_bytes, 1_400 + 70 + 300);
+    }
+
+    /// A measured zero is a measurement and renders as 0; an absent record is
+    /// not, and stays unavailable. Collapsing the two is the invariant this
+    /// program exists to keep.
+    #[test]
+    fn a_measured_zero_stays_distinct_from_an_absent_record() {
+        let mut sample = measured_sample();
+        sample.files = vec![(
+            r"C:\Windows\System32\a.dll".to_string(),
+            FileBytes::default(),
+        )];
+        sample.unnamed = Remainder::default();
+        sample.omitted = Remainder::default();
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![
+                file_row(r"C:\Windows\System32\a.dll"),
+                file_row(r"C:\data\untouched.bin"),
+            ],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_file_io(&mut snapshot, &sample);
+        assert_eq!(snapshot.files[0].read_bytes, Some(0));
+        assert_eq!(snapshot.files[0].write_bytes, Some(0));
+        assert_eq!(snapshot.files[1].read_bytes, None);
+        assert_eq!(snapshot.files[1].write_bytes, None);
+        assert_eq!(snapshot.accounting.read_bytes, 0);
+    }
+
+    /// A trace that decoded nothing for this process leaves every row alone.
+    /// Attaching zeros here would turn "the subscription delivered nothing"
+    /// into "this process did no I/O".
+    #[test]
+    fn an_unmeasured_sample_leaves_every_row_unavailable() {
+        for sample in [
+            FileIoSample::default(),
+            FileIoSample {
+                running: true,
+                events_seen: 500,
+                events_decoded: 0,
+                ..FileIoSample::default()
+            },
+        ] {
+            let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+                files: vec![file_row(r"C:\Windows\System32\a.dll")],
+                accounting: crate::actions::FileIoAccounting::default(),
+            };
+            attach_file_io(&mut snapshot, &sample);
+            assert_eq!(snapshot.files[0].read_bytes, None);
+            assert_eq!(snapshot.files[0].write_bytes, None);
+            assert_ne!(
+                snapshot.accounting.state,
+                crate::actions::FileIoAccountingState::Measured
+            );
+            assert_eq!(snapshot.accounting.read_bytes, 0);
+            assert_eq!(snapshot.accounting.unnamed_read_bytes, 0);
+        }
     }
 }
