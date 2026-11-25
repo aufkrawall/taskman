@@ -1159,10 +1159,19 @@ fn row_ui<'a>(
     );
     let name_rect = table.col_rect(0, rect);
     let name_x = name_rect.left() + 56.0 + row.depth as f32 * 22.0;
-    // The name is painted clipped; when the column is too narrow the full
-    // name becomes a fallback row tooltip (lowest precedence below).
-    let name_truncated =
-        tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 10.0 > name_rect.right() - name_x;
+    // The name is painted clipped; when the column is too narrow the full name
+    // becomes a fallback row tooltip (lowest precedence below). Both answers
+    // are consumed only under the pointer, so the text layout behind them is
+    // paid for only then: measuring every visible row's name laid out a whole
+    // viewport of text on every repaint, scroll frames included.
+    let name_room = name_rect.right() - name_x;
+    let hovering_name = ui.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|pos| name_rect.contains(pos))
+    });
+    let name_truncated = hovering_name && name_clipped(ui, &row.name, name_room);
     ui.painter_at(name_rect).text(
         egui::Pos2::new(name_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1210,12 +1219,6 @@ fn row_ui<'a>(
     });
     // Lowest precedence: only when hovering the name column does the truncated
     // name or command line explain the process under the pointer.
-    let hovering_name = ui.input(|input| {
-        input
-            .pointer
-            .hover_pos()
-            .is_some_and(|pos| name_rect.contains(pos))
-    });
     let name_tip = hovering_name
         .then(|| match (&row.command_line, name_truncated) {
             (Some(cmd), true) if cmd != &row.name => Some(format!("{}\n{cmd}", row.name)),
@@ -1267,14 +1270,15 @@ fn row_ui<'a>(
     // column under the pointer. Over the name the command line wins, because a
     // row-level reason (an unmeasured CPU share, a pseudo-row's description)
     // must not push out what the process actually runs; it still applies
-    // everywhere else in the row.
-    let fallback_tip = name_tip;
-    let resp = match (status_tip, unknown_tip, fallback_tip, row.tooltip.clone()) {
-        (Some(tip), _, _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
-        (None, Some(tip), _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
-        (None, None, Some(tip), _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
-        (None, None, None, Some(tip)) => tablekit::hover_text_at_fixed_pointer(resp, tip),
-        (None, None, None, None) => resp,
+    // everywhere else in the row. The chain is borrowed: a repaint must not
+    // clone the row's tooltip for a pointer that is somewhere else.
+    let tip = status_tip
+        .or(unknown_tip)
+        .or(name_tip.as_deref())
+        .or(row.tooltip.as_deref());
+    let resp = match tip {
+        Some(tip) => tablekit::hover_text_at_fixed_pointer(resp, tip),
+        None => resp,
     };
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
@@ -1333,6 +1337,15 @@ fn cell_tip(
 /// Width the status glyph strip needs; also the auto-fit contribution when
 /// a row has no "not responding" text.
 const STATUS_GLYPH_W: f32 = 22.0;
+
+/// Whether `name` is wider than the `room` left for it once the cell's own
+/// padding is accounted for.
+///
+/// Separated from the row because it costs a text layout: the one consumer is
+/// the row tooltip, so it is only ever asked for the row under the pointer.
+fn name_clipped(ui: &egui::Ui, name: &str, room: f32) -> bool {
+    tablekit::text_width(ui, name, tablekit::FONT_ROW) + 10.0 > room
+}
 
 /// Paint the Status cell: glyphs first, then any remaining text after them,
 /// and report what the glyph under the cursor means.
