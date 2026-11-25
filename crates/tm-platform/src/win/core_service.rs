@@ -2150,6 +2150,35 @@ fn merge_disk_windows(into: &mut super::disk_etw::DiskWindow, later: super::disk
     }
 }
 
+/// Drop rows for processes that no longer exist from a window held across
+/// requests, charging their service time to the unattributed remainder.
+///
+/// `take_window` prunes the window it drains, but a held window was drained by
+/// an earlier request and its rows are never re-checked: without this, a
+/// process that exits during the hold keeps its row for as long as the hold
+/// lasts, and every row is one more entry the response caps count — so the one
+/// thing that could make an oversized window publishable again would never
+/// happen. The charging mirrors the drain exactly, including its empty-`live`
+/// case: an empty set means "the caller could not enumerate processes", never
+/// "nothing is alive".
+fn prune_held_disk_window(
+    window: &mut super::disk_etw::DiskWindow,
+    live: &std::collections::HashSet<u32>,
+) {
+    if live.is_empty() {
+        return;
+    }
+    let mut orphaned = 0u64;
+    window.procs.retain(|pid, row| {
+        let alive = live.contains(pid);
+        if !alive {
+            orphaned = orphaned.saturating_add(row.service_time);
+        }
+        alive
+    });
+    window.unattributed_service_time = window.unattributed_service_time.saturating_add(orphaned);
+}
+
 /// The broker-hosted per-process disk trace, with the same idle watchdog as
 /// the network one.
 struct DiskTrace {
@@ -2231,13 +2260,17 @@ fn process_disk_sample() -> ProcessDiskSample {
     trace.last_request = std::time::Instant::now();
     let live = live_pids();
     let mut window = trace.usage.take_window(&live);
+    let mut resumed_hold = false;
     if let Some(held) = trace.pending.take() {
         // A window an earlier response could not carry; see below. It is folded
         // in FRONT of this one, so the merged window reads in the order it
-        // covered the machine.
+        // covered the machine, and its rows are checked against the live set
+        // again — the drain that pruned them was an earlier request's.
         let mut merged = held;
         merge_disk_windows(&mut merged, window);
+        prune_held_disk_window(&mut merged, &live);
         window = merged;
+        resumed_hold = true;
     }
     // The caps bound the RESPONSE, not the measurement, and the drained window
     // is checked before anything is taken out of it: a window that cannot be
@@ -2247,6 +2280,21 @@ fn process_disk_sample() -> ProcessDiskSample {
     // happen to fit would charge every other process a fabricated zero for the
     // same window.
     if !disk_window_fits(&window) {
+        if resumed_hold {
+            // The hold did not make it publishable, and waiting cannot: a
+            // window over the caps is over them because of the processes that
+            // are still running, and the hold has already had its chance to
+            // shrink it (exited rows are pruned above). Holding it again would
+            // pin this column unknown for as long as the page polls, so it is
+            // dropped and the source reports unavailable until a window fits.
+            if broker_warning_allowed() {
+                tracing::error!(
+                    entries = window.procs.len(),
+                    "disk window cannot fit one response even when held; it was dropped"
+                );
+            }
+            return ProcessDiskSample::default();
+        }
         if broker_warning_allowed() {
             tracing::warn!(
                 entries = window.procs.len(),
@@ -4824,6 +4872,61 @@ mod tests {
             ]
         );
         assert_eq!(held.total_service_time(), 605);
+    }
+
+    /// A held window was drained by an earlier request, so its rows are never
+    /// re-pruned by a drain. A process that exits while the hold lasts would
+    /// otherwise keep its row for as long as the column is unknown — and the
+    /// caps are counted again on every one of those ticks.
+    #[test]
+    fn a_held_disk_window_drops_rows_for_processes_that_exited() {
+        use super::super::disk_etw::{DiskTime, DiskWindow, PidDisk};
+
+        let row = |service: u64| PidDisk {
+            service_time: service,
+            per_disk: vec![DiskTime {
+                disk: 1,
+                service_time: service,
+            }],
+            read_bytes: 1,
+            write_bytes: 2,
+            ops: 1,
+        };
+        let mut window = DiskWindow {
+            procs: std::collections::HashMap::from([(7u32, row(40)), (8, row(2))]),
+            unattributed_service_time: 5,
+            disk_totals: vec![DiskTime {
+                disk: 1,
+                service_time: 42,
+            }],
+            since_ms: 1_000,
+            events_seen: 2,
+            events_decoded: 2,
+        };
+        prune_held_disk_window(&mut window, &std::collections::HashSet::from([7u32]));
+        assert!(
+            window.procs.contains_key(&7),
+            "a live process keeps its row"
+        );
+        assert!(
+            !window.procs.contains_key(&8),
+            "an exited process must not keep a row"
+        );
+        assert_eq!(
+            window.unattributed_service_time, 7,
+            "its service time stays in the denominator instead of vanishing"
+        );
+        assert_eq!(
+            window.disk_totals[0].service_time, 42,
+            "the window's own totals are unchanged: the work happened"
+        );
+        assert_eq!(window.total_service_time(), 47);
+
+        // An empty live set means the caller could not enumerate processes,
+        // which is never "nothing is alive".
+        prune_held_disk_window(&mut window, &std::collections::HashSet::new());
+        assert!(window.procs.contains_key(&7));
+        assert_eq!(window.unattributed_service_time, 7);
     }
 
     /// The caps count exactly what the response carries: a row per process that
