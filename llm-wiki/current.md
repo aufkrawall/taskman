@@ -988,14 +988,19 @@ rebase runbook.
   refusal, and the snapshot then stays `Unavailable`. A session is only kept
   while its idle watchdog runs: the spawn result is part of the decision,
   because a session nothing stops would trace the machine for the life of the
-  process. The I/O page keys one dim line above the file table off exactly that
-  state (`per_file_bytes_need_a_source`), saying per-file bytes need elevation
-  or the installed service and that no trace is running —
-  `Undelivered`/`Undecodable` get no such line, because a source exists and the
-  gap is in time, not privilege. The line is Windows-only (the Linux backend
-  reports `Unavailable` for every snapshot and has no elevated host) and is
-  suppressed while a displayed row still carries a count, since `merge_files`
-  replaces the accounting wholesale while keeping the larger of two row counts.
+  process. The I/O page keys one dim line above the file table off the
+  accounting state (`per_file_accounting_note`), and every state but `Measured`
+  gets a line of its own: `Unavailable` says no trace is running and names
+  elevation or the installed service, `Undelivered` says a trace is running but
+  has not delivered a file event yet, `Undecodable` says events arrived and
+  could not be decoded. Only `Unavailable` is Windows-only gated (the Linux
+  backend reports `Unavailable` for every snapshot and has no elevated host);
+  the other two describe what the trace did, not what it needs. Non-zero
+  `events_lost`, `dropped_paths` and `cleared_file_objects` are appended in that
+  order as one parenthesized phrase, so a lossy or capped session reads as such
+  instead of as complete numbers. The line is suppressed while a displayed row
+  still carries a count, since `merge_files` replaces the accounting wholesale
+  while keeping the larger of two row counts.
   The Create event names a `FileObject`, that object's
   Read and Write events carry the requested size, and the sizes are summed per
   (process, path). Names arrive as device paths, so they are translated to the

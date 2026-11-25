@@ -399,29 +399,93 @@ fn measured_sum(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
 /// does not exist on a table that is not broken.
 const ELEVATION_IS_A_REMEDY: bool = cfg!(windows);
 
-/// Whether the per-file byte columns have no source AT ALL, as opposed to a
-/// source that has measured nothing for this process yet.
+/// What the page says above the file table about per-file byte accounting, or
+/// `None` when the table speaks for itself.
 ///
-/// This is the one state a user can act on, and the only one that needs a line
-/// of its own: a Kernel-File trace requires elevation and either the installed
-/// service or an elevated process, so without them the Read and Written columns
-/// are not a gap in time but a gap in privilege. Left unexplained, a table full
-/// of "—" reads as a broken feature.
+/// Every state but [`FileIoAccountingState::Measured`] means the Read and
+/// Written columns hold "—" for reasons the table cannot show, and the three of
+/// them are different answers:
+///
+/// * `Unavailable` — no source at all. This is the one a user can act on: a
+///   Kernel-File trace requires elevation and either the installed service or an
+///   elevated process, so without them the columns are a gap in privilege, not
+///   in time. `elevation_is_a_remedy` keeps the line off a platform where that
+///   remedy does not exist, where it would blame the token for a platform
+///   without a trace.
+/// * `Undelivered` — a trace is running and has delivered no event it could
+///   attribute to this process yet. A silent window cannot be told apart from a
+///   broken subscription, so the page reports which one it is stuck in instead
+///   of an unexplained dash.
+/// * `Undecodable` — records arrived and none of them parsed: the payload layout
+///   is not what this build expects.
+///
+/// Before, one line covered `Unavailable` only, so a trace that started and
+/// delivered nothing looked exactly like a working session on a quiet process.
 ///
 /// `rows_measured` suppresses the line when a row still carries a count.
 /// [`State::merge_files`] replaces the accounting wholesale while keeping the
 /// larger of two row counts, so a snapshot without a source can arrive over
-/// rows measured a moment earlier; the rows are the measurement then, and a
-/// "no source" line under them would contradict what the table shows.
-fn per_file_bytes_need_a_source(
+/// rows measured a moment earlier; the rows are the measurement then, and a "no
+/// trace" or "nothing delivered yet" line under them would contradict what the
+/// table shows.
+///
+/// Language is a parameter rather than the process-global active one so the
+/// rendered text is pinned by tests in both languages.
+fn per_file_accounting_note(
     accounting: Option<&FileIoAccounting>,
     rows_measured: bool,
     elevation_is_a_remedy: bool,
-) -> bool {
-    elevation_is_a_remedy
-        && !rows_measured
-        && accounting
-            .is_some_and(|accounting| accounting.state == FileIoAccountingState::Unavailable)
+    lang: i18n::Lang,
+) -> Option<String> {
+    if rows_measured {
+        return None;
+    }
+    let accounting = accounting?;
+    let state = match accounting.state {
+        FileIoAccountingState::Measured => return None,
+        FileIoAccountingState::Unavailable if !elevation_is_a_remedy => return None,
+        FileIoAccountingState::Unavailable => i18n::tr_in(lang, K::PropIoPerFileNoTrace),
+        FileIoAccountingState::Undelivered => i18n::tr_in(lang, K::PropIoPerFileUndelivered),
+        FileIoAccountingState::Undecodable => i18n::tr_in(lang, K::PropIoPerFileUndecodable),
+    };
+    match accounting_losses(accounting, lang) {
+        Some(losses) => Some(format!("{state} ({losses})")),
+        None => Some(state.to_string()),
+    }
+}
+
+/// The non-zero loss and cap counters of one answer as one phrase.
+///
+/// Each of them makes the counts on screen lower bounds: events ETW reports as
+/// dropped, paths never tracked because a capacity limit was full, and names
+/// discarded from the trace's map (whose later transfers land in the unnamed
+/// remainder). A zero or an unqueried `events_lost` is left out rather than
+/// printed, so a healthy session keeps a plain line and an unknown loss count
+/// stays unknown.
+fn accounting_losses(accounting: &FileIoAccounting, lang: i18n::Lang) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(lost) = accounting.events_lost.filter(|lost| *lost > 0) {
+        parts.push(format!(
+            "{} {}",
+            format::format_thousands(lost),
+            i18n::tr_in(lang, K::PropIoEventsLost)
+        ));
+    }
+    if accounting.dropped_paths > 0 {
+        parts.push(format!(
+            "{} {}",
+            format::format_thousands(accounting.dropped_paths),
+            i18n::tr_in(lang, K::PropIoPathsDropped)
+        ));
+    }
+    if accounting.cleared_file_objects > 0 {
+        parts.push(format!(
+            "{} {}",
+            format::format_thousands(accounting.cleared_file_objects),
+            i18n::tr_in(lang, K::PropIoFileNamesCleared)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 fn cmp_known_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::cmp::Ordering {
@@ -871,21 +935,19 @@ pub fn show(
 
     // Above the table, so the Read and Written columns are explained rather
     // than left to look broken: without a trace there is nothing to show in
-    // them for any row, however open the files are.
+    // them for any row, and a trace that has delivered or decoded nothing says
+    // which of the two it is.
     let rows_measured = display_files
         .iter()
         .any(|file| file.read_bytes.is_some() || file.write_bytes.is_some());
-    if per_file_bytes_need_a_source(
+    if let Some(note) = per_file_accounting_note(
         state.accounting.as_ref(),
         rows_measured,
         ELEVATION_IS_A_REMEDY,
+        i18n::lang(),
     ) {
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(i18n::tr(K::PropIoPerFileNeedsSource))
-                .small()
-                .color(pal.text_dim),
-        );
+        ui.label(egui::RichText::new(note).small().color(pal.text_dim));
     }
 
     ui.add_space(4.0);
@@ -1389,49 +1451,185 @@ mod tests {
         assert!(half.contains('\u{2014}'));
     }
 
-    /// The table's Read and Written columns can be empty for two different
-    /// reasons and only one of them is actionable. "No trace at all" on a
-    /// platform where elevation can create one is explained above the table as
-    /// a privilege requirement; "nothing measured yet" is a gap in time and
-    /// gets no such line, or the page would blame the token for a quiet
-    /// process. A row that still carries a count is a source as well, however
-    /// the accounting of the moment reads.
+    /// Every accounting state the file table can be in renders one exact line,
+    /// and only `Measured` renders none.
+    ///
+    /// Regression: one line covered `Unavailable` and the other two states got
+    /// nothing at all, so a trace that started and delivered nothing printed
+    /// exactly what a working session on a quiet process prints — a column of
+    /// "—" with no explanation. Text is pinned literally, not against the
+    /// translation table, so a reworded key or a broken composition fails here.
     #[test]
-    fn only_a_missing_trace_needs_the_elevation_note() {
-        let accounting = |state| FileIoAccounting {
+    fn the_file_table_renders_one_line_per_accounting_state() {
+        use tm_core::i18n::Lang;
+
+        let plain = |state| FileIoAccounting {
             state,
             ..Default::default()
         };
-        let unavailable = accounting(FileIoAccountingState::Unavailable);
-        assert!(
-            per_file_bytes_need_a_source(Some(&unavailable), false, true),
-            "an unelevated Windows run is the state the line is written for"
+        let note = |state| per_file_accounting_note(Some(&plain(state)), false, true, Lang::En);
+
+        let cases = [
+            (
+                FileIoAccountingState::Unavailable,
+                Some("no trace is running: needs administrator rights or the installed service"),
+            ),
+            (
+                FileIoAccountingState::Undelivered,
+                Some("a trace is running but has not delivered a file event yet"),
+            ),
+            (
+                FileIoAccountingState::Undecodable,
+                Some("file events arrived but could not be decoded"),
+            ),
+            (FileIoAccountingState::Measured, None),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(note(state).as_deref(), expected, "{state:?}");
+        }
+
+        // The German wording is pinned once, with a counter, because the line is
+        // the only place a capped session is visible in that language too.
+        let capped = FileIoAccounting {
+            state: FileIoAccountingState::Unavailable,
+            events_lost: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            per_file_accounting_note(Some(&capped), false, true, Lang::De).as_deref(),
+            Some(
+                "Es läuft keine Ablaufverfolgung: erfordert Administratorrechte oder den \
+                 installierten Dienst (12 Ereignisse verloren)"
+            )
         );
+    }
+
+    /// The loss and cap counters ride on the same line, and only when they are
+    /// non-zero: a healthy session keeps a plain line, an unqueried loss count
+    /// stays unknown rather than becoming a zero.
+    #[test]
+    fn the_file_table_appends_losses_and_caps_to_the_state() {
+        use tm_core::i18n::Lang;
+
+        let undelivered = FileIoAccounting {
+            state: FileIoAccountingState::Undelivered,
+            ..Default::default()
+        };
+        let line = |accounting: &FileIoAccounting| {
+            per_file_accounting_note(Some(accounting), false, true, Lang::En)
+        };
+        assert_eq!(
+            line(&undelivered).as_deref(),
+            Some("a trace is running but has not delivered a file event yet")
+        );
+
+        // One counter at a time, then all three in a fixed order.
+        let mut lost = undelivered.clone();
+        lost.events_lost = Some(12);
+        assert_eq!(
+            line(&lost).as_deref(),
+            Some("a trace is running but has not delivered a file event yet (12 events lost)")
+        );
+
+        let mut dropped = undelivered.clone();
+        dropped.dropped_paths = 3;
+        assert_eq!(
+            line(&dropped).as_deref(),
+            Some("a trace is running but has not delivered a file event yet (3 paths dropped)")
+        );
+
+        let mut cleared = undelivered.clone();
+        cleared.cleared_file_objects = 5;
+        assert_eq!(
+            line(&cleared).as_deref(),
+            Some(
+                "a trace is running but has not delivered a file event yet (5 file names cleared)"
+            )
+        );
+
+        let mut all = undelivered.clone();
+        all.events_lost = Some(12);
+        all.dropped_paths = 3;
+        all.cleared_file_objects = 5;
+        assert_eq!(
+            line(&all).as_deref(),
+            Some(
+                "a trace is running but has not delivered a file event yet \
+                 (12 events lost, 3 paths dropped, 5 file names cleared)"
+            )
+        );
+
+        // Zeros are not losses, and a counter that could not be queried is not a
+        // zero: neither may print.
+        let mut healthy = undelivered.clone();
+        healthy.events_lost = Some(0);
+        assert_eq!(line(&healthy), line(&undelivered));
+
+        // `Measured` carries no line at all, counters or not.
+        let measured_with_losses = FileIoAccounting {
+            state: FileIoAccountingState::Measured,
+            events_lost: Some(12),
+            dropped_paths: 3,
+            cleared_file_objects: 5,
+            ..Default::default()
+        };
+        assert_eq!(line(&measured_with_losses), None);
+    }
+
+    /// A line is suppressed by a measured row, and by a platform on which
+    /// elevation is not the remedy — but only for `Unavailable`, which is the
+    /// state that names it.
+    #[test]
+    fn a_measured_row_or_a_remediless_platform_suppresses_the_line() {
+        use tm_core::i18n::Lang;
+
+        let with = |state| FileIoAccounting {
+            state,
+            ..Default::default()
+        };
         for state in [
-            FileIoAccountingState::Measured,
+            FileIoAccountingState::Unavailable,
+            FileIoAccountingState::Undelivered,
+            FileIoAccountingState::Undecodable,
+        ] {
+            // merge_files keeps the larger of two row counts while replacing the
+            // accounting, so an unmeasured snapshot can arrive over measured
+            // rows. Those rows ARE the source; a line would deny them.
+            assert_eq!(
+                per_file_accounting_note(Some(&with(state)), true, true, Lang::En),
+                None,
+                "{state:?} must stay silent under a measured row"
+            );
+        }
+
+        // Linux reports Unavailable for every snapshot and has no elevated host,
+        // so the line would name a remedy the platform does not have.
+        assert_eq!(
+            per_file_accounting_note(
+                Some(&with(FileIoAccountingState::Unavailable)),
+                false,
+                false,
+                Lang::En
+            ),
+            None
+        );
+        // The other two states say a trace exists, not that it needs rights, so
+        // they do not depend on the remedy.
+        for state in [
             FileIoAccountingState::Undelivered,
             FileIoAccountingState::Undecodable,
         ] {
             assert!(
-                !per_file_bytes_need_a_source(Some(&accounting(state)), false, true),
-                "{state:?} has a source and must not claim it needs elevation"
+                per_file_accounting_note(Some(&with(state)), false, false, Lang::En).is_some(),
+                "{state:?} states what the trace did, not what it needs"
             );
         }
-        assert!(
-            !per_file_bytes_need_a_source(None, false, true),
-            "no answer yet is not the same as no source"
-        );
-        // Linux reports Unavailable for every snapshot and has no elevated
-        // host, so the line would name a remedy the platform does not have.
-        assert!(
-            !per_file_bytes_need_a_source(Some(&unavailable), false, false),
-            "a platform without an elevation remedy must never see this line"
-        );
-        // merge_files keeps the larger of two row counts while replacing the
-        // accounting, so an unmeasured snapshot can arrive over measured rows.
-        assert!(
-            !per_file_bytes_need_a_source(Some(&unavailable), true, true),
-            "rows that still carry bytes ARE the source; the line would deny them"
+
+        // No answer yet is not the same as no source.
+        assert_eq!(
+            per_file_accounting_note(None, false, true, Lang::En),
+            None,
+            "an unchecked process has nothing to explain yet"
         );
     }
 

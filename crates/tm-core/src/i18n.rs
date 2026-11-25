@@ -476,10 +476,21 @@ keys! {
     PropIoSearchPlaceholder => ["Dateien filtern...", "Filter files..."],
     PropIoNoFiles => ["Keine Datei-Aktivität für diesen Prozess erkannt", "No file activity detected for this process"],
     PropIoFilesUnavailable => ["Datei-Informationen nicht verfügbar", "File information unavailable"],
-    PropIoPerFileNeedsSource => [
-        "Bytes pro Datei erfordern Administratorrechte oder den installierten Dienst; es läuft keine Ablaufverfolgung",
-        "Bytes per file need administrator rights or the installed service; no trace is running"
+    PropIoPerFileNoTrace => [
+        "Es läuft keine Ablaufverfolgung: erfordert Administratorrechte oder den installierten Dienst",
+        "no trace is running: needs administrator rights or the installed service"
     ],
+    PropIoPerFileUndelivered => [
+        "Eine Ablaufverfolgung läuft, hat aber noch kein Dateiereignis geliefert",
+        "a trace is running but has not delivered a file event yet"
+    ],
+    PropIoPerFileUndecodable => [
+        "Dateiereignisse kamen an, konnten aber nicht dekodiert werden",
+        "file events arrived but could not be decoded"
+    ],
+    PropIoEventsLost => ["Ereignisse verloren", "events lost"],
+    PropIoPathsDropped => ["Pfade verworfen", "paths dropped"],
+    PropIoFileNamesCleared => ["Dateinamen verworfen", "file names cleared"],
     PropNetworkReceive => ["Netzwerk empfangen", "Network receive"],
     PropNetworkSend => ["Netzwerk senden", "Network send"],
     PropNetworkReceivedTotal => ["Empfangen gesamt", "Total received"],
