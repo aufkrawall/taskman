@@ -1397,17 +1397,14 @@ impl Context {
         .map(|widget_rect| self.get_response(widget_rect))
     }
 
-    /// Rectangles that could receive pointer input in the last completed pass.
+    /// Hit-test the widgets of the previous pass at `pos`.
     ///
-    /// This exposes the same widget rectangles egui uses for hit-testing, after
-    /// filtering out disabled widgets, non-interactive widgets, and layers that
-    /// are currently blocked from interaction. The returned rectangles are in
-    /// global viewport coordinates, with layer transforms applied.
-    ///
-    /// TASKMAN-FORK (#11): hit-test the widgets of the previous pass, exactly
-    /// as `begin_pass` does for the current pointer position. Lets an
-    /// integration ask "would the hovered widgets change if the pointer were
-    /// at `pos`?" between frames, without running a pass.
+    /// TASKMAN-FORK (#11): answers "would the hovered widgets change if the
+    /// pointer were at `pos`?" between frames, without running a pass, by
+    /// hit-testing exactly as `begin_pass` does for the current pointer
+    /// position. `pos` is in global viewport coordinates; disabled widgets,
+    /// non-interactive widgets, and layers that are currently blocked from
+    /// interaction are filtered out.
     #[must_use]
     pub fn hit_test_last_pass(&self, pos: Pos2) -> crate::WidgetHits {
         self.read(|ctx| {
