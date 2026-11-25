@@ -1,3 +1,48 @@
+## 2026-11-25 - Review pass: ETW session plumbing and the per-file trace
+
+- Reviewed the 314-commit burst's platform side (`win/etw.rs`, `file_etw.rs`,
+  `process_file_io.rs`, `disk_etw.rs`, `perfcounters.rs`, `process_threads.rs`,
+  `process_ops.rs`, `sampler.rs`) by reading the current code, not the patches.
+  **No P0/P1 found**; the session lifecycle, the FileIo decoder and the
+  per-file attribution held up line by line, so do not re-derive these:
+  - `Session` ownership is a per-name COUNT: a restarted session replaces its
+    predecessor under the same fixed name before the old one drops, and the
+    crash teardown zeroes each name it stops. A panic hook DOES run under
+    `panic = "abort"`, so the teardown covers a release panic; only a killed
+    process leaks (per-role names are reclaimed on the next start).
+  - `LoggerKind::KernelFile` never reclaims: `ERROR_ALREADY_EXISTS` there is
+    `StartError::AlreadyExists` -> `FileIoAccountingState::KernelLoggerInUse`,
+    and `start_session` reclaims only when `reclaims_a_stale_session()`.
+    `Wnode.Guid = SystemTraceControlGuid`, no
+    `EVENT_TRACE_SYSTEM_LOGGER_MODE` for it, and both file kinds subscribe
+    through `FILE_SESSION_FLAGS` alone.
+  - The FileIo layouts are pinned against a live dump
+    (`the_layouts_match_the_records_the_kernel_wrote`): `Irp` really is
+    pointer-sized at offset 8 of a Read/Write record, and the Create tail
+    starts at `2P + 16`. Byte accounting is completion-only
+    (`OpEnd.ExtraInfo`, success status, capped at the requested size), paging
+    requests are skipped AFTER retiring their `Irp`, and a request record on
+    any opcode 69..=86 retires the same `Irp`.
+  - `handle_payload` pins native pointer width for kernel-written payloads;
+    `etw::pointer_bytes` stays for user-mode-written ones (it moved there from
+    `disk_etw`).
+  - `State`'s caps keep `tracked_paths`/`unresolved_count` consistent through
+    `evict`/`prune_dead`/`bind_epoch`/`process_ended`, and `attributed()` is
+    exactly rows + unnamed + omitted.
+- Fixed: the crash teardown's per-name `Vec<u16>` (an allocation in the panic
+  hook, against its own doc); the `## Bounds` bullet that still claimed a
+  duplicated handle's bytes stay unnamed; the `known-debt` claim that an early
+  `OpEnd` is counted in `orphaned_requests` (it charges nothing at all).
+- Not fixed, recorded in `known-debt.md`: a killed run that owns the exclusive
+  NT Kernel Logger leaves it taken until reboot.
+- Left as-is on purpose, with the reasoning: `resolve_name`'s drive rescan runs
+  in the ETW consumer (one scan per 5 s, only on a miss, and `QueryDosDeviceW`
+  resolves in the object manager); `disk_etw` ignores a poisoned state mutex
+  while `file_etw` recovers from one (a panic inside the callback aborts the
+  process, so that branch is unreachable); the Process/End layout is trusted
+  for every version (only v4 has been probed, and a version guard would risk
+  the verified path more than it protects).
+
 ## 2026-11-25 - Per-file I/O for the host's whole life, and what the graphs hold beyond files
 
 - Asked: per-file counts accumulated only while the I/O page was open (the
