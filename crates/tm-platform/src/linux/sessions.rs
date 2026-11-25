@@ -6,6 +6,7 @@
 //! session IDs come from the same validated cgroup read used by
 //! `desktop_session`, so the collector does not reread procfs for them.
 
+use super::launch;
 use std::path::Path;
 use std::process::{Child, Command, Output};
 use std::sync::Mutex;
@@ -278,20 +279,22 @@ fn logon_epoch_s(boot_epoch_s: Option<u64>, monotonic_us: Option<u64>) -> Option
     boot.checked_add(elapsed)
 }
 
+/// `loginctl` at a trusted absolute path.
+///
+/// The caller executes this binary, so it is held to the same policy as
+/// `systemctl` and `pkexec`: a canonical absolute path whose every ancestor is
+/// root-owned and not group/other writable. A root-owned but writable tool, or
+/// one reachable through a writable directory, is refused instead of run.
 fn loginctl_path() -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
-
-    ["/usr/bin/loginctl", "/bin/loginctl"]
-        .into_iter()
-        .map(std::path::PathBuf::from)
-        .find(|candidate| {
-            candidate.metadata().is_ok_and(|metadata| {
-                metadata.is_file()
-                    && metadata.uid() == 0
-                    && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
+    for candidate in ["/usr/bin/loginctl", "/bin/loginctl"] {
+        let candidate = Path::new(candidate);
+        if candidate.is_file()
+            && let Ok(path) = launch::trusted_system_program(candidate)
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
