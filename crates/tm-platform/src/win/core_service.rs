@@ -2019,6 +2019,12 @@ fn process_network_sample() -> ProcessNetworkSample {
             Some(usage) => {
                 if let Some(trace) = slot.as_mut() {
                     trace.usage = usage;
+                    // The replacement is timed from this request, exactly as
+                    // the disk sibling times its own: the idle watchdog
+                    // measures `last_request`, and a wake that is already due
+                    // would otherwise judge the old session's age against the
+                    // one that just started and retire it on the way past.
+                    trace.last_request = std::time::Instant::now();
                 }
                 // A replacement's totals start again at zero, and an empty
                 // total is indistinguishable from a measured "no traffic".
