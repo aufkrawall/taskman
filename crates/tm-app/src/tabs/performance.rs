@@ -219,6 +219,19 @@ mod tests {
         );
     }
 
+    /// Regression: the caption under the memory title printed a byte total
+    /// under a title that had already given up. "0 B" underneath "Memory
+    /// \u{2014}" states a total nobody measured; a caption without one reads
+    /// the same dash the header does.
+    #[test]
+    fn an_unreported_total_reads_as_unavailable_in_the_caption() {
+        assert_eq!(bytes_or_dash(0), "\u{2014}");
+        assert_eq!(
+            bytes_or_dash(16 * 1024 * 1024 * 1024),
+            format::format_bytes_loc(16 * 1024 * 1024 * 1024)
+        );
+    }
+
     /// Regression: the memory card's sparkline plotted a measured-looking 0 %
     /// on a tick that reported no total — the card's text line had already
     /// given up and read "\u{2014}", so the graph below it contradicted it.
@@ -1673,6 +1686,20 @@ fn memory_usage_text(mem: &tm_core::model::MemoryInfo) -> String {
     )
 }
 
+/// A byte total for a caption, or "\u{2014}" when the platform reports no such
+/// total.
+///
+/// `format_bytes_loc(0)` states a measured zero, so a caption carrying a total
+/// the platform never gave would contradict the header above it — which already
+/// reads "\u{2014}" for the same missing measurement (see [`memory_usage_text`]).
+fn bytes_or_dash(bytes: u64) -> String {
+    if bytes == 0 {
+        "\u{2014}".to_string()
+    } else {
+        format::format_bytes_loc(bytes)
+    }
+}
+
 /// Page title row: big name left, detail right.
 fn page_title(ui: &mut egui::Ui, pal: &Palette, title: &str, right: &str) {
     let (rect, _) =
@@ -2698,7 +2725,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui,
         pal,
         &i18n::trf(K::MemUsageWindow, &[&window_text]),
-        &format::format_bytes_loc(snap.memory.total_bytes),
+        &bytes_or_dash(snap.memory.total_bytes),
     );
 
     let win = window(app);
@@ -2727,7 +2754,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui,
         pal,
         &i18n::trf(K::CommittedWindow, &[&window_text]),
-        &format::format_bytes_loc(snap.memory.commit_total_bytes),
+        &bytes_or_dash(snap.memory.commit_total_bytes),
     );
     let commit: Vec<f64> = series(win, |h| {
         h.commit_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0
@@ -2760,6 +2787,13 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         |ui| {
             ui.vertical(|ui| {
                 let w = 170.0;
+                // Commit charge, cache and the pools are Windows figures:
+                // macOS leaves them all at 0, which means "not reported", not
+                // a measured zero. Such a row is dropped the way the pagefile
+                // row below is dropped without swap, so the page never states
+                // a value nobody measured.
+                let pools_reported =
+                    m.cached_bytes > 0 || m.paged_pool_bytes > 0 || m.non_paged_pool_bytes > 0;
                 big_stat(
                     ui,
                     pal,
@@ -2767,40 +2801,50 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     &format::format_bytes_loc(m.used_bytes),
                     w + 20.0,
                 );
-                big_stat(
-                    ui,
-                    pal,
-                    i18n::tr(K::StatCommitted),
-                    &format!(
-                        "{}/{}",
-                        format::format_bytes_loc(m.commit_used_bytes),
-                        format::format_bytes_loc(m.commit_total_bytes)
-                    ),
-                    w + 60.0,
-                );
-                ui.horizontal_top(|ui| {
-                    med_stat(
+                if m.commit_total_bytes > 0 {
+                    big_stat(
                         ui,
                         pal,
-                        i18n::tr(K::StatCached),
-                        &format::format_bytes_loc(m.cached_bytes),
-                        w,
+                        i18n::tr(K::StatCommitted),
+                        &format!(
+                            "{}/{}",
+                            format::format_bytes_loc(m.commit_used_bytes),
+                            format::format_bytes_loc(m.commit_total_bytes)
+                        ),
+                        w + 60.0,
                     );
-                    med_stat(
-                        ui,
-                        pal,
-                        i18n::tr(K::StatPagedPool),
-                        &format::format_bytes_loc(m.paged_pool_bytes),
-                        w,
-                    );
-                    med_stat(
-                        ui,
-                        pal,
-                        i18n::tr(K::StatNonPagedPool),
-                        &format::format_bytes_loc(m.non_paged_pool_bytes),
-                        w + 40.0,
-                    );
-                });
+                }
+                if pools_reported {
+                    ui.horizontal_top(|ui| {
+                        if m.cached_bytes > 0 {
+                            med_stat(
+                                ui,
+                                pal,
+                                i18n::tr(K::StatCached),
+                                &format::format_bytes_loc(m.cached_bytes),
+                                w,
+                            );
+                        }
+                        if m.paged_pool_bytes > 0 {
+                            med_stat(
+                                ui,
+                                pal,
+                                i18n::tr(K::StatPagedPool),
+                                &format::format_bytes_loc(m.paged_pool_bytes),
+                                w,
+                            );
+                        }
+                        if m.non_paged_pool_bytes > 0 {
+                            med_stat(
+                                ui,
+                                pal,
+                                i18n::tr(K::StatNonPagedPool),
+                                &format::format_bytes_loc(m.non_paged_pool_bytes),
+                                w + 40.0,
+                            );
+                        }
+                    });
+                }
             });
         },
         |ui| {
@@ -2817,12 +2861,14 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     i18n::tr(K::KvAvailable),
                     &format::format_bytes_loc(m.available_bytes),
                 );
-                kv_row(
-                    ui,
-                    pal,
-                    i18n::tr(K::KvCommitLimit),
-                    &format::format_bytes_loc(m.commit_total_bytes),
-                );
+                if m.commit_total_bytes > 0 {
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::KvCommitLimit),
+                        &format::format_bytes_loc(m.commit_total_bytes),
+                    );
+                }
                 if m.swap_total_bytes > 0 {
                     kv_row(
                         ui,
