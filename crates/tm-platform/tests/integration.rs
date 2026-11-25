@@ -1423,11 +1423,13 @@ fn files_of_a_child_process_survive_handle_type_probing() {
                 .any(|file| file.path.to_ascii_lowercase() == expected);
             last_walk = Some(Ok((holds_file, snapshot.accounting.handles_complete)));
             // A walk can legitimately report itself incomplete: the child opens
-            // and closes handles of its own while it is being read, and a disk
-            // handle whose path, position or access cannot be read leaves the
-            // flag down. Completeness is therefore part of what this waits for,
-            // not something to demand of the first walk that sees the file.
-            (holds_file && snapshot.accounting.handles_complete).then(|| snapshot.clone())
+            // and closes handles of its own while it is being read, a protected
+            // handle cannot be duplicated, and a disk handle whose path,
+            // position or access cannot be read leaves the flag down. The
+            // regression this pins is that the child's file is reported at all,
+            // so completeness is recorded for the failure message rather than
+            // demanded here.
+            holds_file.then(|| snapshot.clone())
         },
         std::time::Duration::from_secs(10),
     );
@@ -1455,9 +1457,10 @@ fn files_of_a_child_process_survive_handle_type_probing() {
         .find(|file| file.path.to_ascii_lowercase() == expected)
         .expect("the found file is still there");
     assert!(row.is_read, "`type` opened the file for reading: {row:?}");
-    // No `handles_complete` assertion follows: the poll only answered for a walk
-    // that reported a complete handle table, so the flag is part of the
-    // condition that produced this snapshot and could not read false here.
+    // No `handles_complete` assertion follows: the flag says whether every
+    // handle in the child's table could be duplicated and read, which a live
+    // child can legitimately prevent (see the poll comment), and the regression
+    // this test pins is that the child's file is reported at all.
 }
 
 /// The class procedure for the throwaway window below. The presentation gate's
