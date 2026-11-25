@@ -669,6 +669,19 @@ fn guide_width(ppp: f32) -> f32 {
     if ppp > 0.0 { 1.0 / ppp } else { 1.0 }
 }
 
+/// x of one heat cell's separator: its left edge on a physical pixel CENTRE.
+///
+/// The heat band paints its own separators OVER the row's dividers (the opaque
+/// heat fill would otherwise swallow them), so inside the numeric block these
+/// are the lines the user sees. They follow the same rule as the guides in
+/// [`TmTable::header`] and [`TmTable::row`] for the same reason: a stroke
+/// centred on the fractional value a column sum actually has splits its
+/// coverage across the two pixels it straddles, which reads as a 2 px smudge
+/// and no longer lines up with the guide above it.
+fn heat_separator_x(cell_left: f32, ppp: f32) -> f32 {
+    cell_left.round_to_pixel_center(ppp)
+}
+
 /// One value cell: its heat intensity and the text it shows.
 ///
 /// The text BORROWS by default because a table paints its visible cells on
@@ -1610,16 +1623,16 @@ impl TmTable {
         cells: &[HeatCell<'_>],
     ) {
         let painter = ui.painter_at(row.expand(2.0));
+        let ppp = ui.ctx().pixels_per_point();
+        let ppp = if ppp > 0.0 { ppp } else { 1.0 };
         for (k, cell_data) in cells.iter().enumerate() {
             self.describe_cell(ui, from + k, &cell_data.text);
             let cell = self.col_rect(from + k, row);
             painter.rect_filled(cell, 0.0, crate::theme::heat_blue(pal, cell_data.intensity));
+            let sep_x = heat_separator_x(cell.left(), ppp);
             painter.line_segment(
-                [
-                    Pos2::new(cell.left(), row.top()),
-                    Pos2::new(cell.left(), row.bottom()),
-                ],
-                Stroke::new(1.0, pal.heat_sep),
+                [Pos2::new(sep_x, row.top()), Pos2::new(sep_x, row.bottom())],
+                Stroke::new(guide_width(ppp), pal.heat_sep),
             );
         }
         // Re-apply the row's selection/hover fill over the band we just
@@ -2583,6 +2596,31 @@ mod tests {
             );
         }
         assert_eq!(guide_width(0.0), 1.0, "a degenerate scale stays finite");
+    }
+
+    /// The heat band's own separators follow that same guide rule.
+    ///
+    /// They are painted AFTER the row divider and over the opaque heat fill, so
+    /// inside the numeric block they are the lines a reader actually sees. A
+    /// point-wide stroke on the fractional boundary a sum of column widths
+    /// really has splits its coverage between two pixels — the 2 px smudge —
+    /// and stops lining up with the guide above it in the header.
+    #[test]
+    fn heat_separators_sit_on_a_physical_pixel_centre() {
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            for left in [0.0f32, 37.3, 100.5, 512.75] {
+                let x = heat_separator_x(left, ppp);
+                let device = x * ppp - 0.5;
+                assert!(
+                    (device - device.round()).abs() < 1e-4,
+                    "ppp {ppp}: separator at {x} is not centred on a physical pixel"
+                );
+                assert!(
+                    (x - left).abs() <= 0.5 / ppp + 1e-6,
+                    "ppp {ppp}: separator moved more than half a pixel from {left}"
+                );
+            }
+        }
     }
 
     #[test]
