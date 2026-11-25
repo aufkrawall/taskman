@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Default)]
 pub struct NetMeta {
@@ -19,40 +20,79 @@ pub struct NetMeta {
     pub ipv6: Option<String>,
 }
 
+/// What an interface *is*: the model/driver description and its class. It only
+/// changes when the interface is replaced, so it is read once per interface
+/// instead of on every tick.
+#[derive(Debug, Clone, Default)]
+struct AdapterIdentity {
+    /// `device` symlink target the identity was read for, so a NIC unplugged and
+    /// replugged under the same interface name is described again.
+    device: Option<PathBuf>,
+    desc: String,
+    kind: String,
+}
+
+fn identity_cache() -> &'static Mutex<HashMap<String, AdapterIdentity>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, AdapterIdentity>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ipv6Address {
     address: Ipv6Addr,
     flags: u8,
 }
 
+/// Current state of every interface: name, description, link state, addresses.
+///
+/// The description and class come from [`AdapterIdentity`]; operstate, carrier,
+/// link speed and addresses are read on every call, so no column loses
+/// freshness to the split.
 pub fn collect() -> HashMap<String, NetMeta> {
     let ipv4 = ipv4_addresses();
     let ipv6 = std::fs::read_to_string("/proc/net/if_inet6")
         .map(|text| parse_if_inet6(&text))
         .unwrap_or_default();
+    let mut identities = tm_core::sync::lock(identity_cache());
     let mut out = HashMap::new();
-    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.is_empty() {
-            continue;
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.is_empty() {
+                continue;
+            }
+            let base = entry.path();
+            let device = std::fs::read_link(base.join("device")).ok();
+            let cached = identities
+                .get(&name)
+                .filter(|known| known.device == device)
+                .cloned();
+            let identity = cached.unwrap_or_else(|| {
+                let fresh = AdapterIdentity {
+                    device,
+                    desc: adapter_description(&base),
+                    kind: adapter_kind(&base, &name),
+                };
+                identities.insert(name.clone(), fresh.clone());
+                fresh
+            });
+            let addresses = ipv4.get(&name);
+            out.insert(
+                name.clone(),
+                NetMeta {
+                    desc: identity.desc,
+                    kind: identity.kind,
+                    oper_up: adapter_oper_up(&base, &name),
+                    link_bps: adapter_link_bps(&base),
+                    ipv4: preferred_ipv4(addresses.into_iter().flatten().copied()),
+                    ipv6: preferred_ipv6(ipv6.get(&name).into_iter().flatten().copied()),
+                },
+            );
         }
-        let base = entry.path();
-        let addresses = ipv4.get(&name);
-        out.insert(
-            name.clone(),
-            NetMeta {
-                desc: adapter_description(&base),
-                kind: adapter_kind(&base, &name),
-                oper_up: adapter_oper_up(&base, &name),
-                link_bps: adapter_link_bps(&base),
-                ipv4: preferred_ipv4(addresses.into_iter().flatten().copied()),
-                ipv6: preferred_ipv6(ipv6.get(&name).into_iter().flatten().copied()),
-            },
-        );
     }
+    // Interfaces that are gone take their cached identity with them.
+    identities.retain(|name, _| out.contains_key(name));
     out
 }
 

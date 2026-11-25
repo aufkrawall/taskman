@@ -7,7 +7,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tm_core::model::GpuInfo;
+
+/// Adapter identity describes a loaded driver, not a moment, so it is re-read
+/// on this bound instead of every tick. A card that appears later (eGPU, driver
+/// reload) is picked up at the next expiry; an empty scan stays empty rather
+/// than inventing an adapter.
+const IDENTITY_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default)]
 struct CardFacts {
@@ -25,15 +33,75 @@ struct CardFacts {
     temperature_c: Option<f32>,
 }
 
-pub fn gpus() -> Vec<GpuInfo> {
-    let nvidia_names = nvidia_models();
+/// Adapter identity read once per cache window, with the sysfs card path whose
+/// live counters are read every tick.
+#[derive(Debug, Clone)]
+struct CardIdentity {
+    path: PathBuf,
+    facts: CardFacts,
+}
+
+struct CardCache {
+    cards: Vec<CardIdentity>,
+    nvidia_names: HashMap<String, String>,
+    read_at: Instant,
+}
+
+fn card_cache() -> &'static Mutex<Option<CardCache>> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<CardCache>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// One entry per DRM card, lowest card number first.
+///
+/// `measure` reads the counters that change between ticks (utilization, VRAM
+/// and GTT use, temperature) for a surface that shows them. Without it the
+/// adapters are still listed — as Windows lists the adapters it enumerated —
+/// while their measurements stay unavailable.
+pub fn gpus(measure: bool) -> Vec<GpuInfo> {
+    let mut guard = tm_core::sync::lock(card_cache());
+    let stale = guard
+        .as_ref()
+        .is_none_or(|cache| cache.read_at.elapsed() >= IDENTITY_TTL);
+    if stale {
+        *guard = Some(scan_cards());
+    }
+    let Some(cache) = guard.as_ref() else {
+        return Vec::new();
+    };
+    cache
+        .cards
+        .iter()
+        .enumerate()
+        .map(|(id, card)| gpu_for(id, card, measure, cache))
+        .collect()
+}
+
+/// Enumerate the adapters, once per [`IDENTITY_TTL`] window.
+fn scan_cards() -> CardCache {
     let mut cards = drm_cards();
     cards.sort_by_key(|(name, _)| card_number(name));
-    cards
-        .into_iter()
-        .enumerate()
-        .map(|(id, (_, path))| gpu_from_card(id, read_card(&path), &nvidia_names))
-        .collect()
+    CardCache {
+        cards: cards
+            .into_iter()
+            .map(|(_, path)| CardIdentity {
+                facts: read_identity(&path),
+                path,
+            })
+            .collect(),
+        nvidia_names: nvidia_models(),
+        read_at: Instant::now(),
+    }
+}
+
+/// One adapter row: cached identity plus, when measured, this tick's counters.
+fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> GpuInfo {
+    let facts = if measure {
+        read_live(card)
+    } else {
+        card.facts.clone()
+    };
+    gpu_from_card(id, facts, &cache.nvidia_names)
 }
 
 fn drm_cards() -> Vec<(String, PathBuf)> {
@@ -59,7 +127,9 @@ fn card_number(name: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-fn read_card(card: &Path) -> CardFacts {
+/// Static per-card facts: driver, module version, label, PCI ids/slot and the
+/// VRAM/GTT totals, all of which describe the loaded driver.
+fn read_identity(card: &Path) -> CardFacts {
     let device = card.join("device");
     let uevent = std::fs::read_to_string(device.join("uevent")).unwrap_or_default();
     let (vendor_id, device_id) = parse_pci_id(&uevent);
@@ -75,14 +145,23 @@ fn read_card(card: &Path) -> CardFacts {
             .or_else(|| pci_slot_from_path(&device)),
         vendor_id,
         device_id,
+        vram_total: read_u64(device.join("mem_info_vram_total")),
+        gtt_total: read_u64(device.join("mem_info_gtt_total")),
+        ..Default::default()
+    }
+}
+
+/// The counters that change between ticks, on top of the cached identity.
+fn read_live(card: &CardIdentity) -> CardFacts {
+    let device = card.path.join("device");
+    CardFacts {
         busy_pct: read_trim(device.join("gpu_busy_percent"))
             .and_then(|value| value.parse::<f32>().ok())
             .filter(|value| value.is_finite() && (0.0..=100.0).contains(value)),
         vram_used: read_u64(device.join("mem_info_vram_used")),
-        vram_total: read_u64(device.join("mem_info_vram_total")),
         gtt_used: read_u64(device.join("mem_info_gtt_used")),
-        gtt_total: read_u64(device.join("mem_info_gtt_total")),
         temperature_c: read_temperature(&device),
+        ..card.facts.clone()
     }
 }
 
