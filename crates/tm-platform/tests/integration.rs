@@ -1362,6 +1362,81 @@ fn list_process_file_io_for_current_process_has_complete_handles() {
     assert!(snapshot.accounting.handles_complete);
 }
 
+/// Regression: the pre-copy `GetFileType` short-circuit resolved the child's
+/// handle VALUES in this process's handle table, so a foreign process's files
+/// were dropped unless a local handle happened to share the value and be a
+/// disk file. Only a child process can show the end-to-end effect.
+///
+/// `type` opens the file inside `cmd.exe` and blocks writing it into a stdout
+/// pipe nobody drains, which is what keeps the handle open: no sleep, and the
+/// open handle is the child's own, not one this process could have made.
+#[cfg(target_os = "windows")]
+#[test]
+fn files_of_a_child_process_survive_handle_type_probing() {
+    /// Kills and reaps the holder however this test leaves.
+    struct ChildHolder(std::process::Child);
+    impl Drop for ChildHolder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("tm_child_file_io_{}.bin", std::process::id()));
+    // Larger than any anonymous pipe buffer, so the child cannot finish the
+    // copy and close the file before it is enumerated.
+    std::fs::write(&path, vec![0u8; 1 << 20]).expect("write the held file");
+
+    let child = std::process::Command::new("cmd")
+        .args(["/C", "type"])
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let holder = match child {
+        Ok(child) => ChildHolder(child),
+        Err(error) => {
+            eprintln!("cannot spawn a child to hold a file open: {error}");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    };
+    let pid = holder.0.id();
+    let expected = path.to_string_lossy().to_ascii_lowercase();
+
+    let actions = tm_platform::win::WinActions;
+    let snapshot = poll_for(
+        || {
+            let snapshot = actions.list_process_file_io(pid, None).ok()?;
+            let holds_file = snapshot
+                .files
+                .iter()
+                .any(|file| file.path.to_ascii_lowercase() == expected);
+            holds_file.then(|| snapshot.clone())
+        },
+        std::time::Duration::from_secs(10),
+    );
+
+    drop(holder);
+    let _ = std::fs::remove_file(&path);
+
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => panic!("child {pid} never reported the file it holds open"),
+    };
+    let row = snapshot
+        .files
+        .iter()
+        .find(|file| file.path.to_ascii_lowercase() == expected)
+        .expect("the found file is still there");
+    assert!(row.is_read, "`type` opened the file for reading: {row:?}");
+    // The walk read the whole table, so it must not report itself truncated.
+    assert!(
+        snapshot.accounting.handles_complete,
+        "the child's handle table was fully readable but the flag says otherwise"
+    );
+}
+
 /// The class procedure for the throwaway window below. The presentation gate's
 /// subclass runs ahead of it, so this only has to be a valid class procedure.
 unsafe extern "system" fn present_gate_test_proc(

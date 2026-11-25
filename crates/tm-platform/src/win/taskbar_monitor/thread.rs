@@ -786,8 +786,17 @@ pub(super) fn taskbar_thread_main(
             LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
             IN_ELEVATED_BAND.store(false, std::sync::atomic::Ordering::Release);
             REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            // Same order as the shutdown below: the state must be unreachable
+            // from the window before it can be freed.
             unsafe {
-                let _ = DestroyWindow(hwnd);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                if let Err(error) = DestroyWindow(hwnd) {
+                    tracing::warn!(
+                        hwnd = hwnd.0 as isize,
+                        %error,
+                        "cannot destroy the monitor window"
+                    );
+                }
                 drop(Box::from_raw(state_raw));
             }
             break;
@@ -865,13 +874,27 @@ pub(super) fn taskbar_thread_main(
             ctx.unhook_dynamic_hooks();
             ctx.user_closing
         };
+        // Detach the state before the window can outlive it: `DestroyWindow`
+        // can fail, and a window still holding the pointer would dispatch its
+        // next message straight into freed memory (or into whatever window
+        // reused the handle). `wnd_proc` handles `WM_DESTROY` before it reads
+        // the pointer and sends every other message with a null one to
+        // `DefWindowProcW`, so clearing it first is the safe order.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
         if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() } {
             unsafe {
-                let _ = DestroyWindow(hwnd);
+                if let Err(error) = DestroyWindow(hwnd) {
+                    tracing::warn!(
+                        hwnd = hwnd.0 as isize,
+                        %error,
+                        "cannot destroy the monitor window"
+                    );
+                }
             }
         }
         unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(Box::from_raw(state_raw));
         }
 

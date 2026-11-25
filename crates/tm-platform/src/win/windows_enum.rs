@@ -45,8 +45,11 @@ pub fn window_owners() -> WindowOwners {
         .is_ok()
     };
     pair_minimized_views(&mut scan);
-    scan.owners.not_responding =
-        resolve_hung_candidates(&scan.hung_candidates, probe_window_responds);
+    scan.owners.not_responding = resolve_hung_candidates(
+        &scan.hung_candidates,
+        MAX_PROBE_BUDGET_PER_SCAN,
+        probe_window_responds,
+    );
     let out = scan.owners;
     *tm_core::sync::lock(&CACHE) = Some(out.clone());
     out
@@ -384,8 +387,16 @@ fn probe_window_responds(hwnd: HWND, timeout_ms: u32) -> ProbeOutcome {
     }
 }
 
+/// Turn the `IsHungAppWindow` candidates into confirmed non-responders.
+///
+/// A candidate is only reported after its probe says the thread does not pump,
+/// and only while `budget` lasts. A candidate the scan runs out of budget for
+/// stays unresolved: the set is debounced for 10 s by
+/// `sampler::NotRespondingHold`, so an unprobed pid would label a responsive
+/// app as hung long after the scan that guessed.
 fn resolve_hung_candidates(
     candidates: &[(u32, u32, HWND)],
+    budget: Duration,
     mut probe: impl FnMut(HWND, u32) -> ProbeOutcome,
 ) -> HashSet<u32> {
     let mut not_responding = HashSet::new();
@@ -402,8 +413,7 @@ fn resolve_hung_candidates(
         if tid != 0 && !probed_threads.insert(tid) {
             continue;
         }
-        if start.elapsed() >= MAX_PROBE_BUDGET_PER_SCAN {
-            not_responding.insert(pid);
+        if start.elapsed() >= budget {
             continue;
         }
         if hung_from_probe(probe(hwnd, WM_NULL_PROBE_TIMEOUT_MS)) {
@@ -731,13 +741,18 @@ mod tests {
 
     #[test]
     fn resolve_hung_candidates_dedups_threads_and_honors_probe_outcomes() {
+        let budget = MAX_PROBE_BUDGET_PER_SCAN;
         // Active message pump refutes `IsHungAppWindow` and deduplicates
         // multiple windows on the same UI thread into a single probe.
         let mut probed = Vec::new();
-        let out = resolve_hung_candidates(&[(42, 100, hwnd(1)), (42, 100, hwnd(2))], |h, _ms| {
-            probed.push(h.0 as usize);
-            ProbeOutcome::Responded
-        });
+        let out = resolve_hung_candidates(
+            &[(42, 100, hwnd(1)), (42, 100, hwnd(2))],
+            budget,
+            |h, _ms| {
+                probed.push(h.0 as usize);
+                ProbeOutcome::Responded
+            },
+        );
         assert_eq!(probed, vec![1]);
         assert!(out.is_empty());
 
@@ -745,28 +760,60 @@ mod tests {
         // and short-circuits further threads of the same PID.
         for outcome in [ProbeOutcome::TimedOut, ProbeOutcome::AccessDenied] {
             let mut count = 0;
-            let out =
-                resolve_hung_candidates(&[(77, 10, hwnd(1)), (77, 11, hwnd(2))], |_h, _ms| {
+            let out = resolve_hung_candidates(
+                &[(77, 10, hwnd(1)), (77, 11, hwnd(2))],
+                budget,
+                |_h, _ms| {
                     count += 1;
                     outcome
-                });
+                },
+            );
             assert_eq!(count, 1);
             assert_eq!(out, [77u32].into_iter().collect::<HashSet<u32>>());
         }
 
         // First thread healthy, second thread genuinely wedged -> PID reported.
-        let out = resolve_hung_candidates(&[(88, 1, hwnd(1)), (88, 2, hwnd(2))], |h, _ms| {
-            if h == hwnd(1) {
-                ProbeOutcome::Responded
-            } else {
-                ProbeOutcome::TimedOut
-            }
-        });
+        let out = resolve_hung_candidates(
+            &[(88, 1, hwnd(1)), (88, 2, hwnd(2))],
+            budget,
+            |h, _ms| {
+                if h == hwnd(1) {
+                    ProbeOutcome::Responded
+                } else {
+                    ProbeOutcome::TimedOut
+                }
+            },
+        );
         assert_eq!(out, [88u32].into_iter().collect::<HashSet<u32>>());
 
         // Destroyed window during scan is ignored.
-        let out = resolve_hung_candidates(&[(99, 5, hwnd(1))], |_, _| ProbeOutcome::InvalidWindow);
+        let out = resolve_hung_candidates(
+            &[(99, 5, hwnd(1))],
+            budget,
+            |_, _| ProbeOutcome::InvalidWindow,
+        );
         assert!(out.is_empty());
+    }
+
+    /// Regression: a scan that ran out of probe budget used to insert the
+    /// candidate it could not probe, so four `IsHungAppWindow` hits were enough
+    /// to have `NotRespondingHold` label a responsive app hung for 10 s.
+    #[test]
+    fn exhausted_probe_budget_leaves_candidates_unresolved() {
+        let mut count = 0;
+        let out = resolve_hung_candidates(
+            &[(11, 1, hwnd(1)), (12, 2, hwnd(2)), (13, 3, hwnd(3))],
+            Duration::ZERO,
+            |_h, _ms| {
+                count += 1;
+                ProbeOutcome::TimedOut
+            },
+        );
+        assert_eq!(count, 0, "an exhausted budget must not probe");
+        assert!(
+            out.is_empty(),
+            "an unprobed candidate must not be reported as hung"
+        );
     }
 
     struct OwnedHwnd(HWND);
