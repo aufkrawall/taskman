@@ -1800,6 +1800,23 @@ fn list_process_file_io_for_current_process_has_complete_handles() {
 fn list_process_file_io_with_a_creation_time_keeps_the_accounting_consistent() {
     use tm_platform::actions::FileIoAccountingState;
 
+    /// Stops every ETW session this process started, however this test leaves.
+    ///
+    /// A session is a kernel object and process termination runs no
+    /// destructor, so an elevated run — the one where the attach step really
+    /// starts a per-file trace — would leave that session filling buffers on
+    /// the machine until the next reboot as soon as an assertion failed. It is
+    /// created before anything can start a session and dropped last, which is
+    /// what makes it cover the panic paths in between.
+    struct EtwTeardown;
+    impl Drop for EtwTeardown {
+        fn drop(&mut self) {
+            tm_platform::win::stop_live_etw_sessions();
+        }
+    }
+
+    let _etw_teardown = EtwTeardown;
+
     let mut collector = tm_platform::create_collector();
     let snapshot = collector
         .sample(std::time::Instant::now())
