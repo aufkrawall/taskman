@@ -1020,17 +1020,21 @@ fn restore_needs_present_gate(was_hidden: bool, minimized: bool) -> bool {
     was_hidden || minimized
 }
 
-/// Has a restored window's first frame really reached the screen?
+/// Has a restored window's first frame been handed to the backend?
 ///
-/// `armed` is whether a restore is still waiting for its acknowledgement,
-/// `marked` whether this restore already logged, `painted` the app's
+/// `armed` is whether a restore still waits for its acknowledgement; the
+/// deadline clears that wait when it gives up, so a late pass claims nothing.
+/// `marked` says whether this restore already logged, `painted` is the app's
 /// painted-frame counter and `armed_at` the value `restore_window` recorded.
 /// `ui` bumps that counter before eframe tessellates and paints the frame it
-/// just laid out, so a frame counted there has no paint behind it yet; the pass
-/// that begins after it is the first one with a presented frame — the same
-/// one-frame boundary `REVEAL_MIN_TICKS` exists for. A restore the
-/// acknowledgement deadline gives up on clears the wait, so it never produces a
-/// painted claim.
+/// just laid out, so a frame counted there has no paint behind it yet; the
+/// pass that begins after it is the one whose frame was handed over, the same
+/// one-frame boundary `REVEAL_MIN_TICKS` exists for. Only the `ui` pass is
+/// observable from here: whether the present succeeded cannot be seen, and a
+/// failed one leaves the claim standing.
+///
+/// The mark lives in `logic` rather than in `ui` because this check runs
+/// before `finish_reveal`, which clears the wait it reads.
 #[cfg(target_os = "windows")]
 fn restore_paint_seen(armed: bool, marked: bool, painted: u32, armed_at: u32) -> bool {
     armed && !marked && painted > armed_at
@@ -2485,10 +2489,10 @@ mod tests {
         assert!(!restore_needs_present_gate(false, false));
     }
 
-    /// `restored_window_painted` claims a frame is on screen, so it may not be
-    /// logged on the pass that armed the restore: `ui` bumps the painted-frame
-    /// counter before that frame is painted, and only the pass after it has a
-    /// presented frame behind it.
+    /// `restored_window_painted` claims a frame was handed to the backend, so
+    /// it may not be logged on the pass that armed the restore: `ui` bumps the
+    /// painted-frame counter before that frame is painted, and only the pass
+    /// after it has handed a frame over.
     #[cfg(target_os = "windows")]
     #[test]
     fn a_restore_paint_is_marked_only_after_a_frame_really_painted() {
