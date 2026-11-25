@@ -50,13 +50,19 @@ struct Ipv6Address {
 /// link speed and addresses are read on every call, so no column loses
 /// freshness to the split.
 pub fn collect() -> HashMap<String, NetMeta> {
+    collect_from(Path::new("/sys/class/net"))
+}
+
+/// [`collect`] against one sysfs `net` directory, which is also how a test drives
+/// a tree instead of the host's adapters.
+fn collect_from(net_dir: &Path) -> HashMap<String, NetMeta> {
     let ipv4 = ipv4_addresses();
     let ipv6 = std::fs::read_to_string("/proc/net/if_inet6")
         .map(|text| parse_if_inet6(&text))
         .unwrap_or_default();
     let mut identities = tm_core::sync::lock(identity_cache());
     let mut out = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+    if let Ok(entries) = std::fs::read_dir(net_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.is_empty() {
@@ -94,9 +100,14 @@ pub fn collect() -> HashMap<String, NetMeta> {
         // A listing that failed is not "no interfaces". Blanking every description
         // and pruning the cached names would outlast the failure, so the identities
         // already measured are published as the only facts left — the same way the
-        // DRM card scan keeps a list it cannot re-read. The live fields stay
-        // unclaimed because they cannot be read without the interface directory.
-        tracing::debug!("could not list /sys/class/net; keeping the known adapter identities");
+        // DRM card scan keeps a list it cannot re-read. Nothing here is pruned: a
+        // name missing from a listing nobody could read says nothing about the
+        // interface still existing.
+        //
+        // The live fields stay unclaimed rather than measured. Neither can express
+        // that from this arm: `oper_up` is carried but read by no page, and a zero
+        // `link_bps` draws no bar, so an unmeasured link is not published as a fact.
+        tracing::debug!("could not list the sysfs net directory; keeping the known adapters");
         return identities
             .iter()
             .map(|(name, identity)| {
@@ -528,5 +539,39 @@ fe800000000000000000000000000001 02 40 20 80 eth0
             preferred_ipv4([link_local, Ipv4Addr::LOCALHOST].into_iter()),
             Some(link_local.to_string())
         );
+    }
+
+    /// A listing that failed is not "no interfaces": the descriptions already read
+    /// are published from the cache, and they stay cached, so a name that comes
+    /// back with no readable device link keeps what it was described as.
+    #[test]
+    fn a_failed_listing_keeps_the_adapters_it_already_described() {
+        let tree = Tree::new("net-listing");
+        tree.write(
+            "net/eth0/device/uevent",
+            "DRIVER=e1000e\nPCI_ID=8086:15B8\n",
+        );
+        let net = tree.root.join("net");
+
+        let listed = collect_from(&net);
+        assert_eq!(listed["eth0"].desc, "e1000e (8086:15B8)");
+        assert_eq!(listed["eth0"].kind, "Ethernet");
+
+        // The directory cannot be read: the adapter is still named, and its link
+        // state is not claimed.
+        std::fs::remove_dir_all(&net).unwrap();
+        let unreadable = collect_from(&net);
+        assert_eq!(unreadable["eth0"].desc, "e1000e (8086:15B8)");
+        assert_eq!(unreadable["eth0"].kind, "Ethernet");
+        assert!(!unreadable["eth0"].oper_up);
+        assert_eq!(unreadable["eth0"].link_bps, 0);
+
+        // The identity was kept for later calls too: the same name without a
+        // device link resolves from the cache instead of being described again
+        // from nothing.
+        tree.mkdir("net/eth0");
+        let recovered = collect_from(&net);
+        assert_eq!(recovered["eth0"].desc, "e1000e (8086:15B8)");
+        assert_eq!(recovered["eth0"].kind, "Ethernet");
     }
 }
