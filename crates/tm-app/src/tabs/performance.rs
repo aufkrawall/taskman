@@ -1375,9 +1375,12 @@ fn net_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<Option<f64>> {
 
 /// Highest MEASURED value across some gap series, for a chart's y scale.
 ///
-/// Gaps are skipped rather than counted as a zero reading, and a non-finite
-/// sample can never win the fold: `f64::max` would carry a NaN peak into
-/// `chart_multi`'s y scale and poison every point of the chart.
+/// Gaps are skipped rather than counted as a zero reading. A non-finite sample
+/// is skipped as well: `f64::max` would ignore it, but the scale would then be
+/// decided by whatever `nice_rate_max` makes of the remaining peak - and a
+/// non-finite peak of its own would silently collapse a rate chart to its
+/// 1 KB/s floor, which reads as "nothing happened" on a chart that is in fact
+/// reporting bytes. Filtering here keeps the scale a function of real readings.
 fn peak_measured<'a>(samples: impl Iterator<Item = &'a Option<f64>>) -> f64 {
     samples
         .filter_map(|sample| *sample)
@@ -1962,8 +1965,15 @@ fn grid_core_count(win: &[HistoryPoint], snapshot_len: usize) -> usize {
 /// kernel band it cannot vouch for: a truncated or stale kernel vector would
 /// otherwise be paired with per-core values it does not describe, and the band
 /// would be drawn against a different core set than the tile underneath it.
+///
+/// The tick's own CPU window belongs in the rule, not beside it. It used to be
+/// an `&&` at the aggregate call site only, which left the per-core tiles
+/// charting a kernel band on a blind tick while the aggregate chart showed a
+/// gap for the very same instant — one page, two answers.
 fn kernel_sample_usable(point: &HistoryPoint) -> bool {
-    !point.per_core_kernel.is_empty() && point.per_core_kernel.len() == point.per_core.len()
+    point.cpu_available
+        && !point.per_core_kernel.is_empty()
+        && point.per_core_kernel.len() == point.per_core.len()
 }
 
 /// Aggregate utilization history, `None` where the tick had no usable CPU
@@ -1979,7 +1989,7 @@ fn cpu_total_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
 /// per-core kernel sample that lines up with its per-core values.
 fn cpu_kernel_series(win: &[HistoryPoint]) -> Vec<Option<f64>> {
     gap_series(win, |point| {
-        (point.cpu_available && kernel_sample_usable(point)).then_some(f64::from(point.cpu_kernel))
+        kernel_sample_usable(point).then_some(f64::from(point.cpu_kernel))
     })
 }
 
