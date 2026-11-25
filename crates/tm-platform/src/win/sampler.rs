@@ -721,9 +721,13 @@ impl Sampler {
         if matches!(self.net_source, NetSource::Undecided) {
             let (source, first) = probe_net_source();
             self.net_source = source;
-            if first.is_some() {
-                return first;
-            }
+            // The probe already answered for this tick, and "nothing to publish"
+            // is one of its legitimate answers: a session the probe started has
+            // not delivered an event yet. Asking again would answer from that
+            // same session - an EMPTY map, which the caller reads as "measured
+            // no traffic" and renders as 0 B/s with a zeroed total for every
+            // process.
+            return first;
         }
         match &self.net_source {
             NetSource::Broker { misses } => {
