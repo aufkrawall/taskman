@@ -259,7 +259,10 @@ struct StartupTimings {
     since: web_time::Instant,
     device_ms: Option<f32>,
     surface_ms: Option<f32>,
+    /// The first pipeline compile, reported by the start-up line.
     renderer_ms: Option<f32>,
+    /// A pipeline compile that landed after the start-up line had already gone out.
+    late_renderer_ms: Option<f32>,
     logged: bool,
 }
 
@@ -270,6 +273,7 @@ impl StartupTimings {
             device_ms: None,
             surface_ms: None,
             renderer_ms: None,
+            late_renderer_ms: None,
             logged: false,
         }
     }
@@ -292,8 +296,14 @@ impl StartupTimings {
         }
     }
 
+    /// The first compile belongs to the start-up line, which keeps the first measurement. A
+    /// compile that lands after that line has gone out can only be a recompile — the pipelines a
+    /// new device builds after `Painter::suspend` — and it is measured on its own, so no line
+    /// describes one compile with another compile's cost.
     fn record_renderer(&mut self, start: web_time::Instant) {
-        if self.renderer_ms.is_none() {
+        if self.logged {
+            self.late_renderer_ms = Some(Self::ms(start));
+        } else if self.renderer_ms.is_none() {
             self.renderer_ms = Some(Self::ms(start));
         }
     }
@@ -327,14 +337,16 @@ impl StartupTimings {
     /// before the pipelines exist; without this the pipeline cost would never be reported, and
     /// that cost is exactly what this deferral took off the window's reveal path.
     ///
-    /// Consumes the measurement, so every line describes the compile it just waited for: a
-    /// device created after `Painter::suspend` recompiles the pipelines, and reusing the first
-    /// device's timing for it would report a cost that compile never had.
+    /// Only a compile that happened after that line is reported: a compile that landed before the
+    /// first present is already in it. Consumes the measurement, so every line describes the
+    /// compile it just waited for: a device created after `Painter::suspend` recompiles the
+    /// pipelines, and reusing an earlier compile's timing for it would report a cost it never
+    /// had.
     fn late_renderer_message(&mut self) -> Option<String> {
         if !self.logged {
             return None;
         }
-        let renderer_ms = self.renderer_ms.take()?;
+        let renderer_ms = self.late_renderer_ms.take()?;
         let total_ms = self.since.elapsed().as_secs_f32() * 1000.0;
         Some(format!(
             "wgpu pipelines compiled {renderer_ms:.1} ms, {total_ms:.1} ms after painter creation"
@@ -1786,7 +1798,9 @@ mod tests {
         assert!(timings.first_present_message().is_some());
         assert!(timings.late_renderer_message().is_none());
 
-        timings.renderer_ms = Some(13.5);
+        // The deferred path's compile, which `record_renderer` puts in the late field because
+        // the start-up line has already gone out.
+        timings.late_renderer_ms = Some(13.5);
         let message = timings
             .late_renderer_message()
             .expect("late phase reported");
@@ -1805,6 +1819,36 @@ mod tests {
         assert!(
             !recompiled.contains("13.5"),
             "the recompile must not reuse the first device's cost: {recompiled}"
+        );
+    }
+
+    #[test]
+    fn a_compile_before_the_first_present_is_not_reused_for_the_next_one() {
+        // A launch whose primer was skipped, or one whose `present_clear` failed and the paint
+        // proceeded anyway, compiles the pipelines before any frame reaches the screen.
+        let mut timings = startup_timings(Some(4.0), Some(2.0), Some(11.75));
+
+        let message = timings
+            .first_present_message()
+            .expect("the first present reports the start-up line");
+        assert!(message.contains("pipelines 11.8 ms"), "{message}");
+
+        // That compile is the one the line above described; it is not reported again.
+        assert!(
+            timings.late_renderer_message().is_none(),
+            "one compile, one line"
+        );
+
+        // A new device recompiles the pipelines after the first present, so the late line has to
+        // describe that compile instead of repeating the start-up cost against a later elapsed
+        // time.
+        timings.record_renderer(web_time::Instant::now());
+        let restored = timings
+            .late_renderer_message()
+            .expect("the compile after the first present is reported");
+        assert!(
+            !restored.contains("11.8"),
+            "the restore must not be described with the start-up compile's cost: {restored}"
         );
     }
 
