@@ -1429,10 +1429,13 @@ impl eframe::App for NativeApp {
         #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
         // The first frame of a restore. It is marked HERE and not in `ui` for
-        // the reason `frames_painted` documents: this pass begins after the
-        // frame `ui` laid out was painted and presented. `restore_window` arms
-        // the wait and only a new restore re-arms it, so this fires once per
-        // restore. Before `finish_reveal`, which clears the wait it reads.
+        // the reason `frames_painted` documents: this pass begins after `ui`
+        // ran for a frame, so that frame was handed to the backend. Whether
+        // the present itself succeeded is not observable from here — the mark
+        // means "handed over", not "on screen", and a failed present leaves it
+        // set. `restore_window` arms the wait and only a new restore re-arms
+        // it, so this fires once per restore. Before `finish_reveal`, which
+        // clears the wait it reads.
         #[cfg(target_os = "windows")]
         if restore_paint_seen(
             self.show_ack_pending,
