@@ -531,8 +531,11 @@ remain follow-up rather than being simulated in headless tests:
   make TaskMan truncate another file that user can already write. The accepted
   direction is "a file the same user could rewrite without TaskMan anyway", the
   content written is a desktop entry, and the damage is bounded to that one
-  file. Closing it needs a directory-FD `O_NOFOLLOW` + `renameat` publish, which
-  `autostart.rs` already performs for its own entry and `startup.rs` does not.
+  file. Closing it needs a directory-FD `O_NOFOLLOW` + `renameat` publish:
+  `autostart.rs` publishes atomically from a sibling temporary file but does so
+  path-based (`fs::rename`, `renameat2` with `AT_FDCWD`) and puts its
+  `O_NOFOLLOW` on opening the existing entry for validation, not on the publish,
+  and `startup.rs` does not publish that way at all.
 
 ### 2026-11-23 remaining Linux parity contracts
 
