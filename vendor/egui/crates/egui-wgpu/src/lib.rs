@@ -136,6 +136,12 @@ pub struct RenderState {
     pub queue: wgpu::Queue,
 
     /// The target texture format used for presenting to the window.
+    ///
+    /// The renderer bakes this into its pipelines when it is created, so it is only meaningful
+    /// while the renderer slot below is still empty: change it before the first
+    /// [`Self::ensure_renderer`] call, as `egui_kittest`'s explicit-format helper does.
+    /// Changing it afterwards makes the pipelines render for a format the surface does not
+    /// present, because the renderer is not rebuilt.
     pub target_format: wgpu::TextureFormat,
 
     /// Egui renderer responsible for drawing the UI, once its pipelines exist.
@@ -144,6 +150,14 @@ pub struct RenderState {
     /// `Painter::ensure_renderer` on the winit path). Device creation has to happen before a
     /// window can present anything; pipeline compilation does not, so it is kept out of the
     /// path that ends in the window becoming visible.
+    ///
+    /// First call wins: the slot holds whichever renderer was created first, with the
+    /// [`RendererOptions`] and `target_format` of that call, and later calls return it
+    /// unchanged. Nothing can rebuild the renderer in place — a different
+    /// [`RendererOptions`] needs a new [`RenderState`], and the same goes for a different
+    /// `target_format`. A mismatch is not silent on the winit path:
+    /// `Painter::ensure_renderer` asserts it in debug builds and
+    /// [`Renderer::was_created_with`] answers it in release builds.
     ///
     /// The slot is shared with every clone rather than copied, because eframe hands a clone to
     /// `CreationContext` (and to `Frame`) before the first paint: a long-lived clone has to see
@@ -358,6 +372,11 @@ impl RenderState {
     /// it while the rest of this state stays borrowed immutably. Idempotent: calling it on
     /// every frame costs one `Arc` clone, and a clone of this state taken before the first
     /// call observes the renderer it built.
+    ///
+    /// First call wins: `options` and [`Self::target_format`] are the ones the renderer is
+    /// built with, and a later call with different `options` returns the renderer that exists
+    /// instead of rebuilding it. [`Renderer::was_created_with`] reports which options are in
+    /// use; a new [`RendererOptions`] or `target_format` needs a new [`Self`].
     #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
     pub fn ensure_renderer(&self, options: RendererOptions) -> Arc<RwLock<Renderer>> {
         profiling::function_scope!();

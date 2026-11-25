@@ -107,7 +107,9 @@ pub fn create_render_state_with_format(
 ) -> egui_wgpu::RenderState {
     let mut state = create_render_state_without_renderer(setup);
     // The pipelines bake the target format in, so it has to be selected before the renderer
-    // is compiled; the returned lock is all this helper needs.
+    // is compiled. The slot behind `ensure_renderer` is shared with every clone of the state,
+    // so the renderer stays reachable through `state` even though the returned lock is
+    // discarded here.
     state.target_format = target_format;
     let _renderer = state.ensure_renderer(options);
     state

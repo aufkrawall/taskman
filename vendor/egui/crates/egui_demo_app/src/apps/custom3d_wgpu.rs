@@ -9,6 +9,14 @@ use eframe::{
 
 pub struct Custom3d {
     angle: f32,
+
+    /// The triangle's GPU resources, until there is a renderer to hand them to.
+    ///
+    /// They have to live in the renderer's `callback_resources`, next to the render pass, and
+    /// eframe only compiles the renderer with the first drawn frame — after the
+    /// `CreationContext` of [`Self::new`] handed out a render state whose renderer slot is
+    /// still empty. See [`Self::ensure_callback_resources`].
+    resources: Option<TriangleRenderResources>,
 }
 
 impl Custom3d {
@@ -84,28 +92,47 @@ impl Custom3d {
         });
 
         // Because the graphics pipeline must have the same lifetime as the egui render pass,
-        // instead of storing the pipeline in our `Custom3D` struct, we insert it into the
-        // `paint_callback_resources` type map, which is stored alongside the render pass.
+        // the demo keeps it in the `callback_resources` type map, which is stored alongside the
+        // render pass.
         //
-        // Those resources live in the renderer, so the demo needs one: eframe compiles the
-        // pipelines with the first drawn frame, and a `CreationContext` taken before that has
-        // no renderer yet.
-        let renderer = wgpu_render_state.renderer()?;
-        renderer
-            .write()
-            .callback_resources
-            .insert(TriangleRenderResources {
+        // That map lives in the renderer, and one does not exist yet: eframe compiles it with
+        // the first drawn frame, so the insert happens in `ensure_callback_resources`.
+        Some(Self {
+            angle: 0.0,
+            resources: Some(TriangleRenderResources {
                 pipeline,
                 bind_group,
                 uniform_buffer,
-            });
+            }),
+        })
+    }
 
-        Some(Self { angle: 0.0 })
+    /// Move the triangle's GPU resources into the renderer, once there is one.
+    ///
+    /// The render state from the `CreationContext` of `new` is created before eframe compiles
+    /// the pipelines, and its renderer slot is shared with the clone that `Frame` hands out, so
+    /// this sees the renderer on the first frame that has one. Taking the resources out of the
+    /// option keeps that from ever inserting them twice.
+    fn ensure_callback_resources(&mut self, ui: &egui::Ui, frame: &eframe::Frame) {
+        if self.resources.is_none() {
+            return;
+        }
+        let Some(renderer) = frame.wgpu_render_state().and_then(|state| state.renderer()) else {
+            // eframe compiles the renderer during this frame's paint, after the UI is built, so
+            // ask for the frame that can register the resources.
+            ui.ctx().request_repaint();
+            return;
+        };
+        if let Some(resources) = self.resources.take() {
+            renderer.write().callback_resources.insert(resources);
+        }
     }
 }
 
 impl crate::DemoApp for Custom3d {
-    fn demo_ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn demo_ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.ensure_callback_resources(ui, frame);
+
         // TODO(emilk): Use `ScrollArea::content_margin`
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
@@ -184,6 +211,14 @@ impl Custom3d {
             ui.allocate_exact_size(egui::Vec2::splat(300.0), egui::Sense::drag());
 
         self.angle += response.drag_motion().x * 0.01;
+
+        // The callback looks its resources up in the renderer, which does not exist until this
+        // frame's paint; `ensure_callback_resources` asked for the frame after it. Draw the
+        // canvas empty until then rather than queue a callback that would find nothing.
+        if self.resources.is_some() {
+            return;
+        }
+
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             CustomTriangleCallback { angle: self.angle },

@@ -210,6 +210,45 @@ impl PrimerState {
     }
 }
 
+/// What the painter has already done for the renderer it currently has.
+///
+/// The renderer lives in a slot that every clone of the [`RenderState`] shares, so it can be
+/// compiled without the painter creating it: eframe hands a clone to `CreationContext` (and to
+/// `Frame`), and an application may call [`RenderState::ensure_renderer`] on it. Neither "the
+/// slot is still empty" nor the cached capability answer can tell that apart from a renderer
+/// this painter already replayed into — both outlive the device re-create that is the only way
+/// to get a new renderer — so the work is keyed on the render state instead: a new renderer
+/// needs a new render state, and [`Painter::add_surface`] is where one is installed.
+#[derive(Clone, Copy, Debug, Default)]
+struct EnsuredRenderer {
+    /// Set once the renderer of the current render state has been answered for, reported on
+    /// and replayed into.
+    done: bool,
+
+    /// Whether that renderer built the LCD text pipeline.
+    subpixel_text: Option<bool>,
+}
+
+impl EnsuredRenderer {
+    /// Whether the current render state's renderer still owes this painter its capability
+    /// answer, its LCD report and the managed-texture replay.
+    fn is_due(&self) -> bool {
+        !self.done
+    }
+
+    /// Record the answer for the renderer that just ran, completing this painter's work for it.
+    fn record(&mut self, subpixel_text: bool) {
+        self.done = true;
+        self.subpixel_text = Some(subpixel_text);
+    }
+
+    /// Forget everything, because a new render state — and with it a new renderer — was
+    /// installed.
+    fn forget(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Where the time before the first presented frame went.
 ///
 /// Reported as one line on the first present, so a slow start-up can be attributed to device
@@ -329,7 +368,8 @@ pub struct Painter {
     render_state: Option<RenderState>,
     texture_snapshots: TextureSnapshots,
     max_texture_side: Option<usize>,
-    subpixel_text: Option<bool>,
+    /// The renderer of the current render state this painter has already answered for.
+    ensured: EnsuredRenderer,
     primer: PrimerState,
     startup: StartupTimings,
 
@@ -375,7 +415,7 @@ impl Painter {
             render_state: None,
             texture_snapshots: Default::default(),
             max_texture_side: None,
-            subpixel_text: None,
+            ensured: EnsuredRenderer::default(),
             primer: PrimerState::default(),
             startup: StartupTimings::new(created_at),
 
@@ -565,6 +605,9 @@ impl Painter {
             self.max_texture_side =
                 Some(render_state.device.limits().max_texture_dimension_2d as usize);
             self.render_state = Some(render_state);
+            // A new render state brings a new renderer, which none of the painter's
+            // once-per-renderer work has run for yet.
+            self.ensured.forget();
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
         Ok(())
@@ -577,7 +620,10 @@ impl Painter {
     /// any pipeline is built. Every paint path calls this, so an unprimed painter still draws,
     /// and managed textures captured while the renderer was absent are replayed once it exists.
     ///
-    /// Idempotent; the second and later calls cost a dead check.
+    /// The capability answer, the missing-pipeline report and that replay run once per
+    /// renderer, including for a renderer this painter did not create (see `EnsuredRenderer`),
+    /// and again after [`Self::set_window`] installs a new render state. Idempotent; the second
+    /// and later calls cost a dead check.
     pub fn ensure_renderer(&mut self) {
         profiling::function_scope!();
 
@@ -585,12 +631,19 @@ impl Painter {
             return;
         };
         if let Some(renderer) = render_state.renderer() {
-            // The renderer slot is shared with every clone of the render state, so an
-            // application that compiled the pipelines through a clone would otherwise leave
-            // this painter without a capability answer and without its snapshots uploaded.
-            if self.subpixel_text.is_none() {
+            // First call wins on the slot, so a renderer compiled through another holder of
+            // this state was built with *its* options; nothing rebuilds it to match these, and
+            // a release build keeps drawing with what exists.
+            debug_assert!(
+                renderer.read().was_created_with(self.options),
+                "this render state's renderer was built with different RendererOptions"
+            );
+            // The slot is shared, so an application that compiled the pipelines through a
+            // clone would otherwise leave this painter without a capability answer and
+            // without its snapshots uploaded.
+            if self.ensured.is_due() {
                 let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
-                self.subpixel_text = Some(has_lcd_pipeline);
+                self.ensured.record(has_lcd_pipeline);
                 report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
                 self.texture_snapshots.replay_into(&self.context, render_state);
             }
@@ -605,7 +658,7 @@ impl Painter {
         }
 
         let has_lcd_pipeline = renderer.read().has_subpixel_pipeline();
-        self.subpixel_text = Some(has_lcd_pipeline);
+        self.ensured.record(has_lcd_pipeline);
         report_missing_lcd_pipeline(render_state, has_lcd_pipeline);
         self.texture_snapshots.replay_into(&self.context, render_state);
     }
@@ -686,10 +739,12 @@ impl Painter {
     ///
     /// `None` means no device has been initialized yet, or the renderer's pipelines have not
     /// been compiled yet ([`Self::ensure_renderer`]). The value remains available while paused
-    /// or suspended and reports the actual feature of that last device, not just what the
-    /// selected adapter advertised.
+    /// and reports the actual feature of that device, not just what the selected adapter
+    /// advertised. Installing a new render state ([`Self::suspend`] followed by
+    /// [`Self::set_window`]) clears it: the old answer says nothing about the next device, and
+    /// the next paint answers for it.
     pub fn subpixel_text(&self) -> Option<bool> {
-        self.subpixel_text
+        self.ensured.subpixel_text
     }
 
     /// Whether `viewport_id`'s surface still owes its first presented frame.
@@ -724,10 +779,11 @@ impl Painter {
     ///
     /// The surfaces, their depth and MSAA views and any capture target are dropped; the
     /// adapter, device, queue, renderer (pipelines), CPU-side texture snapshots,
-    /// `max_texture_side` and `subpixel_text` are kept. Restoring therefore
-    /// costs a surface re-create and a configure instead of a device initialisation plus a
-    /// pipeline compile plus a full font-atlas re-upload, which is what made the window blank
-    /// for the whole re-init after a minimize.
+    /// `max_texture_side`, the sub-pixel answer and the fact that this painter already replayed
+    /// into that renderer are kept. Restoring therefore costs a surface re-create and a
+    /// configure instead of a device initialisation plus a pipeline compile plus a full
+    /// font-atlas re-upload, which is what made the window blank for the whole re-init after a
+    /// minimize.
     ///
     /// This deliberately does not wait for the GPU. The blocking
     /// `poll(PollType::Wait { .. })` in [`Self::suspend`] is bounded at 250 ms and would be
@@ -1565,6 +1621,49 @@ mod tests {
 
     fn second_viewport() -> ViewportId {
         ViewportId::from_hash_of("second viewport")
+    }
+
+    #[test]
+    fn the_renderer_is_answered_for_once_and_a_new_state_owes_it_again() {
+        let mut ensured = EnsuredRenderer::default();
+        assert!(
+            ensured.is_due(),
+            "a painter that has not painted yet is due, whether or not a clone already \
+             compiled the pipelines into the shared slot"
+        );
+        assert_eq!(ensured.subpixel_text, None);
+
+        ensured.record(true);
+        assert!(!ensured.is_due(), "the same renderer is not replayed twice");
+        assert_eq!(ensured.subpixel_text, Some(true));
+
+        // Pausing (minimize) keeps the device and its renderer, so nothing calls `forget` and
+        // the answer stays valid; only a new render state invalidates it.
+        ensured.forget();
+        assert!(
+            ensured.is_due(),
+            "a newly installed render state's renderer has not been replayed into"
+        );
+        assert_eq!(
+            ensured.subpixel_text, None,
+            "the previous device's answer must not be reported for a new one"
+        );
+    }
+
+    #[test]
+    fn the_answer_follows_the_renderer_that_built_the_lcd_pipeline() {
+        let mut ensured = EnsuredRenderer::default();
+        ensured.record(false);
+        assert_eq!(
+            ensured.subpixel_text,
+            Some(false),
+            "a device with the blend but no pipeline answers false, not nothing"
+        );
+
+        // A device re-create that does build the pipeline answers for itself.
+        ensured.forget();
+        ensured.record(true);
+        assert_eq!(ensured.subpixel_text, Some(true));
     }
 
     #[test]

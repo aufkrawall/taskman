@@ -398,7 +398,7 @@ pub struct Texture {
 }
 
 /// Ways to configure [`Renderer`] during creation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RendererOptions {
     /// Set the level of the multisampling anti-aliasing (MSAA).
     ///
@@ -517,13 +517,15 @@ impl Renderer {
         supports_subpixel_features(device.features())
     }
 
-    /// Whether an LCD pipeline can be built for this device.
+    /// Whether the device and the shader can build an LCD pipeline.
     ///
     /// Combines [`Self::advertises_subpixel_text`] with the deterministic validation of the
-    /// dual-source shader, so it only reports true when [`Self::new`] really can create the
-    /// pipeline; it fails closed rather than promising a blend the driver will not provide.
-    /// The backend's own compile result is not knowable before the pipeline exists, so
-    /// [`Self::has_subpixel_pipeline`] stays the authoritative answer afterwards.
+    /// dual-source shader: true means the device and the shader can create the pipeline, not
+    /// that one will exist — the backend may still refuse it, which is what the error scopes in
+    /// [`Self::new`] and the painter's missing-pipeline report are for. It fails closed rather
+    /// than promising a blend the driver will not provide, and the backend's own compile result
+    /// is not knowable before the pipeline exists, so [`Self::has_subpixel_pipeline`] stays the
+    /// authoritative answer afterwards.
     pub fn supports_subpixel_text(device: &wgpu::Device) -> bool {
         subpixel_text_supported(device.features(), lcd_shader_validation().is_ok())
     }
@@ -547,6 +549,15 @@ impl Renderer {
         self.subpixel_mode = mode;
         self.subpixel_gamma = normalized_gamma(gamma);
         self.subpixel_contrast = normalized_contrast(contrast);
+    }
+
+    /// Whether this renderer's pipelines were created with `options`.
+    ///
+    /// [`crate::RenderState`]'s renderer slot is first-call-wins, so a second caller cannot
+    /// tell from the outside whether its own options are the ones in use. A `false` answer
+    /// means its options never reached a pipeline and never will.
+    pub fn was_created_with(&self, options: RendererOptions) -> bool {
+        self.options == options
     }
 
     /// Creates a renderer for a egui UI.
@@ -1697,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn subpixel_capability_fails_closed_on_an_invalidated_lcd_shader() {
+    fn subpixel_capability_requires_the_blend_and_a_valid_shader() {
         let dual_source = wgpu::Features::DUAL_SOURCE_BLENDING;
         assert!(subpixel_text_supported(dual_source, true));
 
@@ -1709,6 +1720,28 @@ mod tests {
 
         assert!(!subpixel_text_supported(wgpu::Features::empty(), true));
         assert!(!subpixel_text_supported(wgpu::Features::empty(), false));
+    }
+
+    #[test]
+    fn an_unusable_lcd_shader_source_is_rejected() {
+        // The capability predicate trusts `lcd_shader_validation`, so its fail-closed half
+        // only holds if a broken source really is rejected. A source that does not resolve at
+        // all:
+        let unresolved = "enable dual_source_blending;\nfn fs_main() { dpdx_missing(1.0); }";
+        assert!(validate_lcd_shader_source(unresolved).is_err());
+
+        // The second is a source that parses but does not validate: `@blend_src` may only be
+        // 0 or 1.
+        let broken = lcd_shader_source().replace("@blend_src(1)", "@blend_src(2)");
+        assert_ne!(broken, lcd_shader_source(), "the shader must use @blend_src(1)");
+        let validation = validate_lcd_shader_source(&broken);
+        assert!(validation.is_err(), "an out-of-range blend source must fail");
+
+        // End to end: the same device, with this source's validation outcome, is not capable.
+        assert!(!subpixel_text_supported(
+            wgpu::Features::DUAL_SOURCE_BLENDING,
+            validation.is_ok()
+        ));
     }
 
     #[test]
