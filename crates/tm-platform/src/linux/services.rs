@@ -4,30 +4,73 @@ use super::launch;
 use crate::actions::ServiceAction;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tm_core::error::{Result, TmError};
 use tm_core::model::{ServiceInfo, ServiceStatus};
+
+/// The read-only unit query is one daemon round trip, not work systemd
+/// performs, so it gets the same order of bound as `loginctl`.
+const QUERY_DEADLINE: Duration = Duration::from_secs(5);
+/// Service control waits for a job the daemon runs, so it needs room for a
+/// slow unit. The bound only exists so a wedged systemd or D-Bus cannot park
+/// one of the two action lanes forever; systemd itself reports the job failure.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 
 pub fn available() -> bool {
     Path::new("/run/systemd/system").is_dir() && systemctl_path().is_ok()
 }
 
 pub fn list_systemd_units() -> Result<Vec<ServiceInfo>> {
-    let out = Command::new(systemctl_path()?)
-        .args([
+    let out = run_systemctl(
+        &systemctl_path()?,
+        &[
             "list-units",
             "--type=service",
             "--all",
             "--no-pager",
             "--no-legend",
             "--plain",
-        ])
-        .output()
-        .map_err(|e| TmError::platform("spawn systemctl", e.to_string()))?;
+        ],
+        QUERY_DEADLINE,
+        "systemctl list-units",
+    )?;
     // Without systemd as PID 1 (containers, WSL without systemd, other
     // inits) systemctl fails with empty stdout; that is "unavailable", not
     // an empty service list.
     check_exit(out.status, &out.stderr)?;
     Ok(parse_units(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Run one `systemctl` invocation under an absolute deadline.
+///
+/// `Command::output()` waits for the child without a bound, and `systemctl`
+/// blocks while its D-Bus connection waits for a daemon that may be wedged.
+/// The shared pidfd/`poll` wait turns that into a bounded failure: a child
+/// that outlives its deadline is killed and reaped, and the error names the
+/// program and context instead of freezing an action lane.
+fn run_systemctl(
+    systemctl: &Path,
+    arguments: &[&str],
+    deadline: Duration,
+    context: &'static str,
+) -> Result<std::process::Output> {
+    let mut child = Command::new(systemctl)
+        .args(arguments)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| TmError::platform(context, format!("could not start: {error}")))?;
+    let deadline = Instant::now() + deadline;
+    if let Err(error) = launch::wait_for_exit(&mut child, deadline, "systemctl") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(TmError::platform(context, error.to_string()));
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| TmError::platform(context, error.to_string()))
 }
 
 fn check_exit(status: std::process::ExitStatus, stderr: &[u8]) -> Result<()> {
@@ -107,13 +150,12 @@ pub(crate) fn control_unit_direct(unit: &str, action: ServiceAction) -> Result<(
         Restart => "restart",
     };
     let systemctl = systemctl_path()?;
-    let out = Command::new(systemctl)
-        .env("LC_ALL", "C")
-        .arg("--no-ask-password")
-        .arg(verb)
-        .arg(unit)
-        .output()
-        .map_err(|e| TmError::platform("spawn systemctl", e.to_string()))?;
+    let out = run_systemctl(
+        &systemctl,
+        &["--no-ask-password", verb, unit],
+        CONTROL_DEADLINE,
+        "systemctl control service",
+    )?;
     if out.status.success() {
         tracing::info!(unit, verb, "systemd unit controlled");
         Ok(())
@@ -214,6 +256,25 @@ mod tests {
                 ("idle.service", "", ServiceStatus::Stopped),
             ]
         );
+    }
+
+    #[test]
+    fn systemctl_runner_enforces_its_absolute_deadline() {
+        let started = Instant::now();
+        let error = run_systemctl(
+            Path::new("/bin/sh"),
+            &["-c", "while :; do :; done"],
+            Duration::from_millis(100),
+            "systemctl test",
+        )
+        .expect_err("the busy child must hit the deadline");
+        assert!(
+            error
+                .to_string()
+                .contains("systemctl exceeded its deadline"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

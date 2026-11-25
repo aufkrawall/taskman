@@ -540,8 +540,12 @@ fn parse_environment(raw: &[u8]) -> Option<DesktopHints> {
     if raw.len() > MAX_ENVIRON_BYTES {
         return None;
     }
+    // A zero-length `environ` is redaction, not a headless environment: the
+    // kernel reports no bytes for a zombie (its mm is gone) and for a process
+    // whose environment region it will not expose. Only bytes that were
+    // actually read may say what the environment held.
     if raw.is_empty() {
-        return Some(DesktopHints::default());
+        return None;
     }
     // execve stores NUL-terminated entries. A short read without that final
     // terminator is partial evidence and must not drive classification.
@@ -1154,6 +1158,11 @@ mod tests {
     fn partial_oversized_and_conflicting_environments_are_rejected() {
         let partial = b"FLATPAK_ID=org.example.App";
         assert_eq!(parse_environment(partial), None);
+        assert_eq!(
+            parse_environment(b""),
+            None,
+            "an empty environ is unobservable evidence, not a headless one"
+        );
         let evidence = DesktopEvidence {
             user_session: true,
             user_scope: Some("/user.slice/user-1000.slice/session-4.scope".into()),

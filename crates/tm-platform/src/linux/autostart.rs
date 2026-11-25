@@ -211,18 +211,20 @@ fn write_owned_entry(path: &Path, contents: &str) -> Result<()> {
     };
     if let Some(file) = existing.as_mut() {
         validate_owned_regular_file(file)?;
-        if file.metadata().map_err(TmError::from)?.mode() & 0o7777 != 0o600 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| {
-                    TmError::platform("secure XDG autostart entry", error.to_string())
-                })?;
-        }
         let existing = read_entry(file)?;
         if !is_owned_entry(&existing) {
             return Err(TmError::platform(
                 "XDG autostart",
                 "refusing to replace an entry not owned by TaskMan",
             ));
+        }
+        // Tighten the mode only after TaskMan's marker proved ownership: a
+        // foreign file at this name must stay untouched, permission bits too.
+        if file.metadata().map_err(TmError::from)?.mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    TmError::platform("secure XDG autostart entry", error.to_string())
+                })?;
         }
         if existing == contents {
             return Ok(());
@@ -471,11 +473,17 @@ mod tests {
         let path = dir.join(ENTRY_FILE_NAME);
         let original = "[Desktop Entry]\nType=Application\nName=Someone else\nExec=other\n";
         fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(set_enabled_at(&config, Path::new("/opt/taskman"), false).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode() & 0o777,
+            0o644,
+            "a foreign entry keeps its permission bits as well as its content"
+        );
         let _ = fs::remove_dir_all(config);
     }
 
