@@ -68,6 +68,16 @@ pub struct State {
     poll: Poll<ProcessFileIoSnapshot>,
     pub files: Vec<TrackedFileIo>,
     pub accounting: Option<FileIoAccounting>,
+    /// Whether this view ever dropped rows at [`MAX_RETAINED_IO_ROWS`].
+    ///
+    /// The cap is a presentation limit, so the table is incomplete from then
+    /// on — and the flag has to live HERE rather than only in
+    /// [`Self::accounting`], because every poll replaces that copy wholesale:
+    /// a `handles_complete = false` written by the trim survived exactly one
+    /// frame and the page then reported a trimmed list as complete. Sticky on
+    /// purpose: a dropped row's per-file bytes are never re-derived, so an
+    /// empty spot in the list cannot be filled in again later.
+    retention_truncated: bool,
     pub file_filter: String,
     pub file_sort_column: FileSortColumn,
     pub file_sort_ascending: bool,
@@ -87,6 +97,7 @@ impl Default for State {
             poll: Poll::default(),
             files: Vec::new(),
             accounting: None,
+            retention_truncated: false,
             file_filter: String::new(),
             file_sort_column: FileSortColumn::Written,
             file_sort_ascending: false,
@@ -296,6 +307,10 @@ impl State {
                 // itself succeeded.
                 accounting.handles_complete = false;
             }
+            // ...and the reason has to outlive this snapshot: the next poll
+            // assigns a fresh accounting over this one. See
+            // [`State::retention_truncated`].
+            self.retention_truncated = true;
             let mut open = Vec::new();
             let mut closed = Vec::new();
             for file in self.files.drain(..) {
@@ -980,10 +995,14 @@ pub fn show(
     }
 
     let display_files = state.sorted_and_filtered_files();
-    let handles_incomplete = state
-        .accounting
-        .as_ref()
-        .is_some_and(|accounting| !accounting.handles_complete);
+    // A trimmed list is incomplete for as long as this view lives, not only for
+    // the frame the trim happened in: `merge_files` keeps that in the tab state
+    // because every poll replaces `accounting`.
+    let handles_incomplete = state.retention_truncated
+        || state
+            .accounting
+            .as_ref()
+            .is_some_and(|accounting| !accounting.handles_complete);
     if handles_incomplete && !display_files.is_empty() {
         ui.add_space(6.0);
         ui.label(
@@ -2416,6 +2435,30 @@ mod tests {
         assert_eq!(
             state.accounting.as_ref().map(|a| a.handles_complete),
             Some(false)
+        );
+        assert!(
+            state.retention_truncated,
+            "the trimmed list is flagged as incomplete"
+        );
+
+        // Every poll replaces `accounting` wholesale, so the flag has to live
+        // in the tab state: a complete snapshot one frame later must not make
+        // the page report the trimmed list as complete again.
+        state.merge_files(ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                handles_complete: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            state.accounting.as_ref().map(|a| a.handles_complete),
+            Some(true),
+            "the new snapshot really does report itself complete"
+        );
+        assert!(
+            state.retention_truncated,
+            "a complete snapshot does not undo a trim that already dropped rows"
         );
     }
 
