@@ -72,6 +72,30 @@ fn elapsed_ms(since: Instant) -> u64 {
     since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// Why a platform snapshot is not plausible enough to report, or `None` when it
+/// is.
+///
+/// This is the sanity gate, and both the summary's `ok` and the process exit
+/// code come from it: one decision, so the JSON line cannot claim a success the
+/// run does not stand behind. `--mock` skips it — the mock snapshot is not
+/// meant to describe a real machine.
+fn snapshot_implausibility(snap: &tm_core::model::Snapshot, mock: bool) -> Option<String> {
+    if mock {
+        return None;
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if snap.processes.len() < 5 {
+        reasons.push(format!("only {} processes", snap.processes.len()));
+    }
+    if snap.cpu.logical_count == 0 {
+        reasons.push("no logical processors".to_string());
+    }
+    if !snap.cpu.utilization_pct_available {
+        reasons.push("no measured CPU share".to_string());
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
 /// One sample of the per-file trace, and how long the check waited for it.
 #[derive(Debug)]
 struct FileIoWait {
@@ -361,6 +385,15 @@ pub fn run(mock: bool) -> i32 {
         let _ = join.join();
         return 1;
     };
+    // Taken here, not at the print: the file-I/O probe below waits up to
+    // `FILE_IO_DELIVERY_BUDGET` for a trace to deliver, and timing the summary
+    // instead reported that wait as startup time.
+    let startup_to_snapshot_ms = elapsed_ms(t0);
+    // The sanity gate, evaluated before the summary exists. It used to run
+    // after the JSON was printed, so a run that failed it published
+    // `"ok": true` and exited 1: a consumer reading the line instead of the
+    // exit code saw a success claim from a failed probe.
+    let implausible = snapshot_implausibility(&snap, mock);
 
     // Unknown telemetry is reported as null, never as a fabricated zero — the
     // same invariant the UI renders as "—".
@@ -372,9 +405,10 @@ pub fn run(mock: bool) -> i32 {
     let (memory_used_gb, memory_total_gb) = memory_gb(&snap.memory);
     let file_io = probe_file_io(mock, &snap);
     let summary = serde_json::json!({
-        "ok": true,
+        "ok": implausible.is_none(),
+        "error": implausible.as_deref(),
         "backend": if mock { "mock".to_string() } else { "platform".to_string() },
-        "startup_to_snapshot_ms": t0.elapsed().as_millis() as u64,
+        "startup_to_snapshot_ms": startup_to_snapshot_ms,
         "ticks": handle.tick_count(),
         "sample_duration_ms": snap.sample_duration_ms,
         "cpu": {
@@ -485,13 +519,9 @@ pub fn run(mock: bool) -> i32 {
     handle.shutdown();
     let _ = join.join();
 
-    // Basic sanity gates.
-    if !mock
-        && (snap.processes.len() < 5
-            || snap.cpu.logical_count == 0
-            || !snap.cpu.utilization_pct_available)
-    {
-        eprintln!("selfcheck: implausible snapshot; failing");
+    // Basic sanity gates, already reflected in the summary's `ok`.
+    if let Some(reason) = implausible {
+        eprintln!("selfcheck: implausible snapshot ({reason}); failing");
         return 1;
     }
     0
@@ -650,6 +680,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(memory_gb(&measured), (Some(3.0), Some(16.0)));
+    }
+
+    /// One platform snapshot carrying `processes` real rows and a `logical`
+    /// core count whose CPU share is (un)measured.
+    fn snapshot_with(
+        processes: usize,
+        logical: usize,
+        cpu_available: bool,
+    ) -> tm_core::model::Snapshot {
+        tm_core::model::Snapshot {
+            processes: (0..processes)
+                .map(|i| tm_core::model::ProcessEntry::new(1000 + i as u32, "probe.exe"))
+                .collect(),
+            cpu: tm_core::model::CpuInfo {
+                logical_count: logical,
+                utilization_pct_available: cpu_available,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The summary's `ok` and the exit code come from one gate, so a snapshot
+    /// the run rejects cannot be published as a success. Regression: `ok` was
+    /// hard-coded `true` in the printed JSON and the gate only ran afterwards,
+    /// so a run that failed it still wrote a success line.
+    #[test]
+    fn an_implausible_snapshot_is_rejected_before_it_is_published() {
+        assert_eq!(
+            snapshot_implausibility(&snapshot_with(40, 8, true), false),
+            None
+        );
+        // A mock run describes no real machine, so the gate does not apply.
+        assert_eq!(
+            snapshot_implausibility(&snapshot_with(0, 0, false), true),
+            None
+        );
+
+        let empty = snapshot_implausibility(&snapshot_with(0, 8, true), false)
+            .expect("no processes is not plausible");
+        assert!(empty.contains("processes"), "{empty}");
+        let no_cores = snapshot_implausibility(&snapshot_with(40, 0, true), false)
+            .expect("no logical processors is not plausible");
+        assert!(no_cores.contains("logical processors"), "{no_cores}");
+        let no_share = snapshot_implausibility(&snapshot_with(40, 8, false), false)
+            .expect("an unmeasured CPU share is not plausible");
+        assert!(no_share.contains("CPU share"), "{no_share}");
     }
 
     /// One answer of the sampled process in `state`.
