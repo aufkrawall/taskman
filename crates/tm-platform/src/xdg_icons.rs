@@ -1527,6 +1527,10 @@ mod tests {
     /// The text parsers are capped, not only the icon decoders: every one of
     /// these files lives in the user's own XDG tree and is parsed on the icon
     /// worker, so one of them must not be able to make that thread read it whole.
+    ///
+    /// The cap is exact on both sides — a file of exactly `MAX_TEXT_BYTES` is
+    /// still a text file, one byte more is not — so a future `>=` slip fails
+    /// here instead of rejecting every full-size theme.
     #[test]
     fn an_oversized_text_file_is_unusable_instead_of_allocated() {
         let sb = Sandbox::new("text-cap");
@@ -1537,12 +1541,25 @@ mod tests {
             "a normal entry is still read"
         );
 
+        let exact = sb.root.join("exact.desktop");
+        let head = "[Desktop Entry]\nName=Exact\nIcon=exact\n";
+        let mut body = String::from(head);
+        body.push_str(&"#".repeat(MAX_TEXT_BYTES - head.len() - 1));
+        body.push('\n');
+        assert_eq!(body.len(), MAX_TEXT_BYTES);
+        std::fs::write(&exact, &body).unwrap();
+        assert!(
+            read_text_capped(&exact).is_some_and(|text| text.contains("Icon=exact")),
+            "exactly the cap is still a text file"
+        );
+
         let big = sb.root.join("big.desktop");
-        std::fs::write(&big, vec![b'x'; MAX_TEXT_BYTES + 1]).unwrap();
+        body.push('\n');
+        std::fs::write(&big, &body).unwrap();
         assert_eq!(
             read_text_capped(&big),
             None,
-            "a file over the cap is unusable, not an allocation"
+            "one byte over the cap is unusable, not an allocation"
         );
         // Over the cap resolves to no icon, the same answer a parse failure
         // gives, rather than to an error the worker would have to report.

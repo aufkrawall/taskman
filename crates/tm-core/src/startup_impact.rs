@@ -274,7 +274,16 @@ impl ImpactStore {
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(_) => {
+            Err(error) => {
+                // Name the reason before `set_aside` logs what it did: an
+                // oversized or non-UTF-8 store is otherwise indistinguishable
+                // from a permissions problem when someone reports that their
+                // measurements keep disappearing.
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "startup-impact store could not be read; keeping it aside"
+                );
                 crate::persist::set_aside(&path, "startup-impact store");
                 BTreeMap::new()
             }
@@ -560,40 +569,64 @@ mod tests {
         );
     }
 
-    /// A file over the read cap takes the same "kept aside" path as a
-    /// structurally corrupt one. It was read with `read_to_string`, i.e.
-    /// allocated whole on the GUI's deferred startup path, so a runaway or
-    /// hostile file could exhaust memory before this branch was ever reached.
-    #[test]
-    fn an_oversized_store_is_kept_aside_instead_of_allocated() {
+    /// `path` holding a valid, empty store padded with spaces to exactly `len`
+    /// bytes. The JSON is real at any size, so the only thing a load can fail on
+    /// is the cap.
+    fn write_padded_store(path: &Path, len: usize) {
         use std::io::Write;
 
+        let head = b"{\"version\":1,\"entries\":{}}";
+        assert!(len >= head.len(), "{len} cannot hold the head");
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(head).unwrap();
+        let padding = [b' '; 64 * 1024];
+        let mut written = head.len();
+        while written < len {
+            let chunk = (len - written).min(padding.len());
+            file.write_all(&padding[..chunk]).unwrap();
+            written += chunk;
+        }
+        file.flush().unwrap();
+    }
+
+    /// The cap is exact: a store of exactly [`MAX_STORE_BYTES`] still loads, one
+    /// byte more is kept aside. That `>` is the whole difference between "read
+    /// it" and "don't", so both sides of it are pinned — a future `>=` slip
+    /// fails here instead of quietly refusing every full-size store.
+    ///
+    /// The oversized half is also the regression: the file used to be read with
+    /// `read_to_string`, i.e. allocated whole on the GUI's deferred startup path,
+    /// so a runaway or hostile file could exhaust memory before the corrupt-file
+    /// branch that keeps it aside was ever reached.
+    #[test]
+    fn the_store_read_cap_is_exact_and_an_oversized_file_is_kept_aside() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("startup-impact.json");
         let aside = dir.path().join("startup-impact.json.bad");
-        let written = {
-            let mut file = std::fs::File::create(&path).unwrap();
-            // In chunks: what matters is the size on disk, not this process's
-            // heap. One byte over the cap is what the reader must refuse.
-            let chunk = [b'x'; 64 * 1024];
-            let mut written = 0usize;
-            while written <= MAX_STORE_BYTES {
-                file.write_all(&chunk).unwrap();
-                written += chunk.len();
-            }
-            written
-        };
 
+        write_padded_store(&path, MAX_STORE_BYTES);
         let store = ImpactStore::open(path.clone());
+        assert!(store.is_empty(), "the padded store holds no entries");
+        assert!(
+            path.exists(),
+            "a store of exactly the cap is read, not kept aside"
+        );
+        assert!(
+            !aside.exists(),
+            "a readable store leaves no recovery copy behind"
+        );
 
+        std::fs::remove_file(&path).unwrap();
+        write_padded_store(&path, MAX_STORE_BYTES + 1);
+        let store = ImpactStore::open(path.clone());
         assert!(store.is_empty());
         assert!(
             !path.exists(),
             "a file the loader refuses must not stay where the next save writes"
         );
         assert_eq!(
-            std::fs::metadata(&aside).unwrap().len() as usize,
-            written,
+            std::fs::metadata(&aside).unwrap().len(),
+            (MAX_STORE_BYTES + 1) as u64,
             "real bytes are kept for recovery, not deleted"
         );
     }
