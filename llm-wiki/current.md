@@ -579,6 +579,10 @@ batches (see `log/recent.md` 2026-09-17 for the commit-level detail).
 - **Chart frames are pixel-snapped** (one physical pixel wide, rounded rects,
   hairlines on pixel centres). The per-core grid was the visible case: its
   cell size is `(width - gaps) / columns` and therefore always fractional.
+  Table column guides follow the same rule (`tablekit::guide_width` +
+  `GuiRounding::round_to_pixel_center`) and so do the heat band's own cell
+  separators (`heat_separator_x`): the band paints over the row divider, so
+  inside the numeric block those are the lines a reader sees.
 - **Ethernet reads in bytes.** Card, chart scale, readout and Receive/Send
   stats use KB/s and MB/s; only the negotiated link speed stays in bits, now
   switching to Gbps above 1000 Mbps. Byte-rate charts also scale to a rounded
@@ -1302,7 +1306,18 @@ rebase runbook.
   old (a resume after a suspend, not a normal tick) is not a plausible entry
   slope and is dropped, because clamping it onto the edge and joining it to
   the first in-window sample draws the bridging stroke that looked like graph
-  garbage. See `log/recent.md` 2026-09-11.
+  garbage. The RIGHT end has the same rule for the mirror case: the axis'
+  right edge is the newest ARRIVAL, not the largest stamp, so after a clock
+  step forward that is later corrected the samples already buffered are
+  stamped past the window. `placeable_on_axis` drops those too instead of
+  pinning them onto the edge, where they read as the newest measurement (or
+  joined the in-window sample before them). The READOUT obeys the same rule
+  through `ChartGeometry::placeable_index`: whatever the pointer or the pin
+  picked, the marker and the value describe a sample the axis can place (or the
+  readout is dropped), because `x_on_axis` clamps a refused stamp onto the edge
+  and `sample_age` would saturate it to "Now". The keyboard cursor additionally
+  clamps to `first_on_axis` on both charts, so `Home` cannot land on the
+  off-axis lead-in. See `log/recent.md` 2026-09-11.
 - Build: `build.py` release driver (host + Linux by default), profiles
   tuned for compile speed (thin LTO, parallel codegen, line-tables-only
   debuginfo).

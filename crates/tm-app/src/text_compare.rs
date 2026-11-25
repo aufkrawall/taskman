@@ -54,17 +54,64 @@ fn hinting_target(smoothing: TextSmoothing) -> HintingTarget {
     }
 }
 
+/// Largest font face the comparison will load.
+///
+/// A UI face is about two MiB (Segoe UI Variable is 1.9 MiB, Segoe UI 0.9 MiB on
+/// the reference Windows 11 build), so this leaves headroom for a larger variable
+/// font while still bounding the read. The shape is what matters: the path is
+/// fixed, so a file replaced or redirected there — a multi-gigabyte one, a device,
+/// a FIFO — has to fail honestly instead of being pulled into memory and rendered
+/// as a comparison that "found no differences". Same bounded read as the app's own
+/// readers (`settings::read_capped`): at most `limit + 1` bytes, and an overrun is
+/// an error rather than a truncated face.
+const MAX_FONT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The UI face for the comparison, or why there is none.
+enum UiFont {
+    /// The face was read and the comparison can run.
+    Loaded(Vec<u8>),
+    /// No candidate UI face on this machine (a non-Windows host, or an install
+    /// without the Segoe UI files). Callers skip: there is nothing to compare
+    /// against, which is not the same answer as "the profiles match".
+    Absent,
+    /// A candidate exists but cannot be used, with the reason. Callers report it
+    /// as a failure — a comparison that rendered nothing would otherwise read
+    /// exactly like one that found no differences.
+    Unusable(String),
+}
+
+/// Read at most `limit` bytes of `path`.
+///
+/// Asks for one byte more than the limit so an overrun is visible without reading
+/// the whole file, the way `settings::read_capped` and the Linux text readers do.
+fn read_capped(path: &str, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{path} is larger than the {limit}-byte font limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The real UI font, so the comparison reflects what the app actually draws.
-fn ui_font() -> Option<Vec<u8>> {
+fn ui_font() -> UiFont {
     for path in [
         r"C:\Windows\Fonts\SegUIVar.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
     ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Some(bytes);
+        match read_capped(path, MAX_FONT_BYTES) {
+            Ok(bytes) => return UiFont::Loaded(bytes),
+            // Not installed here: try the next candidate.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return UiFont::Unusable(format!("{path}: {error}")),
         }
     }
-    None
+    UiFont::Absent
 }
 
 fn definitions(bytes: &[u8], smoothing: TextSmoothing) -> FontDefinitions {
@@ -276,6 +323,77 @@ fn write_zoomed(path: &std::path::Path, buf: &[u32]) {
 mod tests {
     use super::*;
 
+    /// The face, or `None` when this host simply has no UI font.
+    ///
+    /// An unusable face is a FAILURE, never a skip: a comparison that rendered
+    /// nothing reads exactly like one that found no differences between the
+    /// profiles, which is the answer these tests exist to give honestly.
+    fn font_or_skip() -> Option<Vec<u8>> {
+        match ui_font() {
+            UiFont::Loaded(bytes) => Some(bytes),
+            UiFont::Absent => None,
+            UiFont::Unusable(reason) => panic!("the UI font cannot be used: {reason}"),
+        }
+    }
+
+    /// A clean directory this test owns, matching the repo's temp-file convention
+    /// (PID plus a per-test sequence number, removed afterwards).
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tm-text-compare-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp directory this test owns");
+        dir
+    }
+
+    /// A normal face comes back byte-identical, a bigger one is refused AFTER the
+    /// cap and not truncated, and a missing file stays "not installed".
+    ///
+    /// Regression: the face was read with `std::fs::read`, so whatever sat at the
+    /// fixed font path was pulled into memory whole — a replaced multi-gigabyte
+    /// file (or a device/FIFO) instead of a comparison. An overrun used to be
+    /// indistinguishable from "no font installed", i.e. from a comparison that
+    /// rendered nothing.
+    #[test]
+    fn the_font_read_is_capped_and_reports_an_unusable_face() {
+        let dir = temp_dir("capped");
+        let path = dir.join("face.ttf");
+        std::fs::write(&path, b"a real face").expect("write the fixture");
+        let path = path.to_string_lossy().into_owned();
+
+        // A normal file is unchanged, byte for byte.
+        let loaded = read_capped(&path, 1024).expect("a small face is readable");
+        assert_eq!(loaded.as_slice(), b"a real face".as_slice());
+
+        // Exactly at the limit still loads; one byte over is an error, not a
+        // truncated face that the parser would then reject for the wrong reason.
+        assert_eq!(
+            read_capped(&path, loaded.len() as u64).expect("at the limit"),
+            loaded
+        );
+        let error = read_capped(&path, loaded.len() as u64 - 1).expect_err("over the limit");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        assert!(
+            error.to_string().contains(path.as_str()),
+            "the diagnostic must name the file: {error}"
+        );
+
+        // Not installed is its own answer, and the caller treats it as "skip".
+        let missing = dir.join("absent.ttf").to_string_lossy().into_owned();
+        assert_eq!(
+            read_capped(&missing, 1024)
+                .expect_err("no such file")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Write one magnified PNG per profile. Off unless `TASKMAN_TEXT_COMPARE` names a
     /// path prefix, so a normal `cargo test` writes nothing.
     #[test]
@@ -283,7 +401,7 @@ mod tests {
         let Ok(prefix) = std::env::var("TASKMAN_TEXT_COMPARE") else {
             return;
         };
-        let Some(bytes) = ui_font() else {
+        let Some(bytes) = font_or_skip() else {
             eprintln!("no system UI font found; skipping");
             return;
         };
@@ -362,7 +480,7 @@ mod tests {
     /// come out visibly wrong -- this pins the current behaviour down.
     #[test]
     fn the_profiles_differ_only_by_hinting_and_binning_under_subpixel() {
-        let Some(bytes) = ui_font() else { return };
+        let Some(bytes) = font_or_skip() else { return };
         let sharp = render(&bytes, TextSmoothing::Sharp, SubpixelMode::Rgb);
         let standard = render(&bytes, TextSmoothing::Standard, SubpixelMode::Rgb);
         assert_ne!(
@@ -395,7 +513,7 @@ mod tests {
     /// Measured at 150% scaling, where taskman is actually used on a 4K display.
     #[test]
     fn sharp_renders_thinner_than_standard_under_subpixel() {
-        let Some(bytes) = ui_font() else { return };
+        let Some(bytes) = font_or_skip() else { return };
         let at = |sm| {
             ink(&render_cfg(
                 &bytes,
@@ -431,7 +549,7 @@ mod tests {
     /// than `Standard` — lowering gamma blindly would thicken dark-on-light text.
     #[test]
     fn sharp_renders_thinner_than_standard_under_subpixel_in_light_mode() {
-        let Some(bytes) = ui_font() else { return };
+        let Some(bytes) = font_or_skip() else { return };
         let at = |sm| {
             dark_ink(&render_cfg(
                 &bytes,
