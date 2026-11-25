@@ -2547,16 +2547,31 @@ mod tests {
     /// stopped accumulating its widths, would move one of them and reopen the
     /// seam the previous fix closed — a guide hanging beside the body divider
     /// underneath it.
+    ///
+    /// Compared with a tolerance, not `assert_eq!`: the header adds the
+    /// offsets one by one from `rect.left()`, the body adds the sum to it, and
+    /// the two round differently once the widths are fractional — an f32 ulp,
+    /// far below anything visible, but enough to fail the equality on a
+    /// fixture this one does not use.
     #[test]
     fn the_header_boundaries_match_the_body_layout() {
         let t = table();
         let rect = Rect::from_min_size(Pos2::new(37.0, 10.0), egui::vec2(t.total_width(), 32.0));
         for i in 0..t.cols.len() {
-            assert_eq!(t.header_column_x(rect, i), t.boundary_x(rect, i));
+            let (header, body) = (t.header_column_x(rect, i), t.boundary_x(rect, i));
+            assert!(
+                (header - body).abs() < 0.01,
+                "column {i}: header {header} and body {body} disagree"
+            );
         }
         // The end of the last column is the table's own right edge on both
         // sides, which is what keeps the row dividers inside the header.
-        assert_eq!(t.header_column_x(rect, t.cols.len()), rect.left() + t.total_width());
+        let header = t.header_column_x(rect, t.cols.len());
+        let body = rect.left() + t.total_width();
+        assert!(
+            (header - body).abs() < 0.01,
+            "right edge: header {header} and body {body} disagree"
+        );
 
         // One PHYSICAL pixel at every scale: the header guide and the body
         // divider may never be different widths, or the same boundary kinks at

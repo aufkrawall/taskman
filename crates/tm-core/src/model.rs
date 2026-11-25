@@ -84,7 +84,10 @@ pub struct MemoryInfo {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
-    /// OS file cache standing on top of used memory (Windows standby / Linux cached).
+    /// OS file cache standing on top of used memory (Windows standby / Linux
+    /// cached). 0 = not reported, not an empty cache: macOS reports none and a
+    /// kernel without a `Cached` line the same, so the page drops the row
+    /// rather than stating a measured zero.
     pub cached_bytes: u64,
     /// Page-list breakdown for the composition bar (Windows
     /// `SystemMemoryListInformation`): modified pages awaiting write-back,
@@ -94,9 +97,17 @@ pub struct MemoryInfo {
     pub modified_bytes: u64,
     pub standby_bytes: u64,
     pub free_bytes: u64,
-    /// Committed (pagefile-backed + RAM-backed) charge.
+    /// Committed (pagefile-backed + RAM-backed) charge. 0 = not reported, not
+    /// an idle commitment: macOS zeroes both fields, and a Linux kernel
+    /// without `CommitLimit` leaves the limit at 0 even when `Committed_AS` is
+    /// real. The page keys its Committed chart and rows on
+    /// `commit_total_bytes > 0`, so the limit is what decides whether either
+    /// number is shown.
     pub commit_total_bytes: u64,
     pub commit_used_bytes: u64,
+    /// Paged / non-paged kernel pool bytes (Windows `PERFORMANCE_INFORMATION`).
+    /// 0 = not reported: no other platform fills them in, and the page drops
+    /// the rows instead of claiming empty pools.
     pub paged_pool_bytes: u64,
     pub non_paged_pool_bytes: u64,
     pub swap_total_bytes: u64,
