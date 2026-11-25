@@ -488,6 +488,10 @@ keys! {
         "Dateiereignisse kamen an, konnten aber nicht dekodiert werden",
         "file events arrived but could not be decoded"
     ],
+    PropIoPerFileKernelLoggerInUse => [
+        "Eine andere Anwendung verwendet den NT-Kernel-Logger, daher kann die Datei-E/A nicht erfasst werden",
+        "another application is using the NT Kernel Logger, so per-file I/O cannot be traced"
+    ],
     PropIoEventsLost => ["Ereignisse verloren", "events lost"],
     PropIoPathsDropped => ["Pfade verworfen", "paths dropped"],
     PropIoFileNamesCleared => ["Dateinamen verworfen", "file names cleared"],

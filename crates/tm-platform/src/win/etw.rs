@@ -29,11 +29,11 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG,
-    EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD,
-    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
-    EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
-    WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_FLAG_PROFILE,
+    EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    ProcessTrace, StartTraceW, SystemTraceControlGuid, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -47,10 +47,11 @@ const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
 
 /// Every session name this program can ever start.
 ///
-/// Fixed and exhaustive by design (see the module docs): ten names, five
-/// features times two hosting roles. Knowing them all is what lets a crashed
-/// run be cleaned up without a per-process registry.
-pub(crate) const SESSION_NAMES: [&str; 10] = [
+/// Fixed and exhaustive by design (see the module docs): the ten per-feature
+/// names — five features times two hosting roles — plus the one global session
+/// name in [`KERNEL_LOGGER`] if this program ever starts it. Knowing them all
+/// is what lets a crashed run be cleaned up without a per-process registry.
+pub(crate) const SESSION_NAMES: [&str; 11] = [
     "TaskMan-Net-Service",
     "TaskMan-Net-App",
     "TaskMan-Disk-Service",
@@ -61,7 +62,14 @@ pub(crate) const SESSION_NAMES: [&str; 10] = [
     "TaskMan-Profile-App",
     "TaskMan-Modules-Service",
     "TaskMan-Modules-App",
+    KERNEL_LOGGER,
 ];
+
+/// The single global kernel session, spelled the way the API spells it.
+///
+/// `KERNEL_LOGGER_NAMEW` from the SDK is the same string; a test compares the
+/// two so a typo here cannot turn into a session that never starts.
+pub(crate) const KERNEL_LOGGER: &str = "NT Kernel Logger";
 
 /// Which of [`SESSION_NAMES`] THIS process started and has not stopped.
 ///
@@ -184,7 +192,91 @@ pub(crate) enum LoggerKind {
     /// GUID is the record's identity). Like the loader and profile kinds this
     /// is the highest-rate stream in the program, so it asks for the larger
     /// buffer set.
+    ///
+    /// This is the FALLBACK for the per-file trace; [`LoggerKind::KernelFile`]
+    /// is tried first.
     SystemFile,
+    /// The single global kernel session — [`KERNEL_LOGGER`] — which is the one
+    /// place the classic `FileIo` class is actually delivered.
+    ///
+    /// Three things about it are unlike every kind above:
+    ///
+    /// * **Its enable flags ARE the subscription.** `EVENT_TRACE_FLAG_FILE_IO`
+    ///   turns on the whole `FileIo` class (Create, Cleanup, Close, Read, Write
+    ///   and the rest of the family), which is how Process Hacker-style tools
+    ///   have always subscribed. On a PRIVATE system logger the same flag is
+    ///   accepted and delivers nothing (that is the `undelivered` /
+    ///   `events_lost` 0 report [`LoggerKind::SystemFile`] documents), so the
+    ///   two mechanisms are not interchangeable.
+    /// * **It is identified by `SystemTraceControlGuid`**, so `Wnode.Guid`
+    ///   carries it the way the SDK's kernel-logger example sets it. The named
+    ///   kinds above are identified by their session name alone.
+    /// * **It is EXCLUSIVE, and it is usually someone else's.**
+    ///   `EVENT_TRACE_SYSTEM_LOGGER_MODE` is deliberately NOT set: the kernel
+    ///   logger IS the system logger, and that bit marks a PRIVATE
+    ///   SystemTraceProvider session — which is what the kinds above are. There
+    ///   is exactly one of these on the machine, so when another application
+    ///   owns it `StartTraceW` returns `ERROR_ALREADY_EXISTS` and this kind
+    ///   must NOT reclaim the name the way a per-role session does: stopping it
+    ///   would tear down that application's trace. That is why Process
+    ///   Hacker-style tools coordinate on this one session, and why the failure
+    ///   is surfaced to the caller ([`StartError::AlreadyExists`]) instead of
+    ///   being papered over.
+    KernelFile,
+}
+
+impl LoggerKind {
+    /// Whether a session of this kind may reclaim a same-named session it did
+    /// not start.
+    ///
+    /// The per-role kinds may: their names are ours by construction (see
+    /// [`TraceRole`]), so finding one already running means a previous run of
+    /// OURS crashed without stopping it. The kernel logger may NOT: its name is
+    /// a machine-wide singleton any tracing tool can own, so a session already
+    /// running under it belongs to somebody else and stopping it would end
+    /// their trace. [`StartError::AlreadyExists`] reports that instead.
+    pub(crate) fn reclaims_a_stale_session(self) -> bool {
+        self != Self::KernelFile
+    }
+}
+
+/// Why a session could not be started.
+///
+/// The distinction exists because the two failures need different words on
+/// screen: "no rights" is the ordinary unelevated case, while "already exists"
+/// means another application owns the single global session and the user has
+/// to close it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartError {
+    /// `StartTraceW` reported `ERROR_ALREADY_EXISTS` for a kind that must not
+    /// reclaim (only the kernel logger): another process owns that session.
+    AlreadyExists,
+    /// Anything else: no rights, no free logger slot, a refused provider
+    /// enable, a consumer that could not be opened.
+    Failed(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists => formatter.write_str("the session is owned by another process"),
+            Self::Failed(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl From<StartError> for String {
+    fn from(error: StartError) -> Self {
+        error.to_string()
+    }
+}
+
+/// The [`StartError`] for one `StartTraceW` status.
+fn start_error(status: WIN32_ERROR) -> StartError {
+    if status == ERROR_ALREADY_EXISTS {
+        return StartError::AlreadyExists;
+    }
+    StartError::Failed(format!("StartTrace failed (Win32 {})", status.0))
 }
 
 /// State shared between an ETW callback thread and the sampler.
@@ -239,7 +331,7 @@ impl<T: TraceContext> Session<T> {
         }
     }
 
-    /// Start a session while preserving the exact Win32/OS failure for a
+    /// Start a session while preserving the exact kind of failure for a
     /// diagnostic caller. Ordinary callers use [`Self::start`] and render
     /// unavailability as unknown.
     pub(crate) fn try_start(
@@ -249,13 +341,12 @@ impl<T: TraceContext> Session<T> {
         shared: Arc<T>,
         callback: unsafe extern "system" fn(*mut EVENT_RECORD),
         thread_name: &str,
-    ) -> std::result::Result<Self, String> {
+    ) -> std::result::Result<Self, StartError> {
         let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         if kind == LoggerKind::SystemProfile {
             enable_system_profile_privilege();
         }
-        let (session, mut properties) = start_session(&name, kind)
-            .map_err(|error| format!("StartTrace failed (Win32 {})", error.0))?;
+        let (session, mut properties) = start_session(&name, kind).map_err(start_error)?;
 
         for provider in providers {
             let enable = unsafe {
@@ -272,10 +363,10 @@ impl<T: TraceContext> Session<T> {
             };
             if enable != ERROR_SUCCESS {
                 stop_session(session, &name, &mut properties);
-                return Err(format!(
+                return Err(StartError::Failed(format!(
                     "EnableTraceEx2 failed for {:?} (Win32 {})",
                     provider.guid, enable.0
-                ));
+                )));
             }
         }
 
@@ -298,7 +389,10 @@ impl<T: TraceContext> Session<T> {
             stop_session(session, &name, &mut properties);
             // Reclaim the reference the callback would have owned.
             drop(unsafe { Arc::from_raw(context) });
-            return Err(format!("OpenTraceW failed (Win32 {})", error.0));
+            return Err(StartError::Failed(format!(
+                "OpenTraceW failed (Win32 {})",
+                error.0
+            )));
         }
 
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -316,7 +410,9 @@ impl<T: TraceContext> Session<T> {
                 stop_session(session, &name, &mut properties);
                 let _ = unsafe { CloseTrace(trace) };
                 drop(unsafe { Arc::from_raw(context) });
-                return Err(format!("ProcessTrace worker spawn failed: {error}"));
+                return Err(StartError::Failed(format!(
+                    "ProcessTrace worker spawn failed: {error}"
+                )));
             }
         };
 
@@ -470,6 +566,12 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         // QPC timestamps: cheapest clock, and we only need ordering.
         (*properties).Wnode.ClientContext = 1;
+        // The kernel logger is identified by the system trace control GUID, the
+        // way the SDK's own kernel-logger example sets it; every other kind is
+        // a named private session and is identified by its name alone.
+        if kind == LoggerKind::KernelFile {
+            (*properties).Wnode.Guid = SystemTraceControlGuid;
+        }
         (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE
             | match kind {
                 LoggerKind::Manifest => 0,
@@ -481,6 +583,11 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
                 | LoggerKind::SystemLoader
                 | LoggerKind::SystemProfile
                 | LoggerKind::SystemFile => EVENT_TRACE_SYSTEM_LOGGER_MODE,
+                // Deliberately absent for the kernel logger: it IS the system
+                // logger, and this bit is what marks a PRIVATE
+                // SystemTraceProvider session. Setting it on the kernel logger
+                // asks `StartTraceW` for a shape that does not exist.
+                LoggerKind::KernelFile => 0,
             };
         // EnableTraceEx2 can enable these providers after the session starts,
         // but the initial DCStart rundown is emitted while StartTrace creates
@@ -488,21 +595,28 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
         // loader/sample session reliably receives that initial state.
         // `SystemFile` asks for no flag at all: its subscription is the
         // SystemIo provider enable (see [`LoggerKind::SystemFile`]), and the
-        // legacy file flag was one of the shapes that delivered nothing.
+        // legacy file flag was one of the shapes that delivered nothing on a
+        // private system logger. `KernelFile` is the kind where that flag IS
+        // the subscription (see [`LoggerKind::KernelFile`]).
         (*properties).EnableFlags = match kind {
             LoggerKind::Manifest | LoggerKind::System | LoggerKind::SystemFile => {
                 EVENT_TRACE_FLAG::default()
             }
             LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
             LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
+            LoggerKind::KernelFile => EVENT_TRACE_FLAG_FILE_IO,
         };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
         // sampling tick without reserving much non-paged memory. The profile
         // stream, the initial loader rundown and the file I/O stream have much
-        // higher event rates, so they ask for a larger set.
+        // higher event rates, so they ask for a larger set. The kernel logger
+        // carries the same class as the system-logger file session but is
+        // machine-wide WINDOWS-visible, so it gets the sparse disk session's
+        // smaller set: it is the shared global session, not ours to size for a
+        // burst.
         let (buffer_kb, minimum, maximum) = match kind {
-            LoggerKind::Manifest | LoggerKind::System => (64, 4, 16),
+            LoggerKind::Manifest | LoggerKind::System | LoggerKind::KernelFile => (64, 4, 16),
             LoggerKind::SystemLoader | LoggerKind::SystemProfile | LoggerKind::SystemFile => {
                 (256, 8, 32)
             }
@@ -517,6 +631,12 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
 
 /// Start the session, retrying once after clearing a stale session of the
 /// same name (left behind by a crash).
+///
+/// Only for a kind whose name is OURS — [`LoggerKind::reclaims_a_stale_session`].
+/// The kernel logger's name is a machine-wide singleton, so an
+/// `ERROR_ALREADY_EXISTS` there is reported to the caller instead of being
+/// reclaimed: stopping a session we did not start would end another
+/// application's trace.
 fn start_session(
     name: &[u16],
     kind: LoggerKind,
@@ -530,7 +650,7 @@ fn start_session(
             properties.as_mut_ptr().cast(),
         )
     };
-    if status == ERROR_ALREADY_EXISTS {
+    if status == ERROR_ALREADY_EXISTS && kind.reclaims_a_stale_session() {
         let mut stale = properties_buffer(name, kind);
         let _ = unsafe {
             ControlTraceW(
@@ -711,6 +831,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The kernel logger is the ONE session where the legacy file flag is the
+    /// subscription, so it must ask for it — and it must be the system trace
+    /// control GUID, be real-time only (its whole point, as opposed to a
+    /// private system logger), and keep the sparse buffer set the shared global
+    /// session gets.
+    #[test]
+    fn the_kernel_logger_carries_the_file_io_flag_on_the_system_trace_control_guid() {
+        let name: Vec<u16> = KERNEL_LOGGER
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let buffer = properties_buffer(&name, LoggerKind::KernelFile);
+        let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        unsafe {
+            assert_eq!((*properties).Wnode.Guid, SystemTraceControlGuid);
+            assert!(
+                (*properties).EnableFlags.contains(EVENT_TRACE_FLAG_FILE_IO),
+                "the flag IS the subscription for this session"
+            );
+            // Only the file class: the kernel logger is shared, so asking for
+            // more would multiply the rate for every other consumer's session
+            // as well as ours.
+            assert_eq!((*properties).EnableFlags, EVENT_TRACE_FLAG_FILE_IO);
+            assert_eq!(
+                (*properties).LogFileMode,
+                EVENT_TRACE_REAL_TIME_MODE,
+                "the kernel logger IS the system logger; the mode bit marks a PRIVATE one"
+            );
+            assert_eq!((*properties).Wnode.Flags, WNODE_FLAG_TRACED_GUID);
+            // Buffers like the disk session: the global session is not ours to
+            // size for a burst.
+            assert_eq!((*properties).BufferSize, 64);
+            assert_eq!((*properties).MinimumBuffers, 4);
+            assert_eq!((*properties).MaximumBuffers, 16);
+            assert_eq!((*properties).FlushTimer, 1);
+        }
+        // A private session does NOT get the system trace control GUID: it is
+        // identified by its name, and the GUID would make `StartTraceW` try to
+        // start the global session instead.
+        let buffer = properties_buffer(&name, LoggerKind::System);
+        let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        unsafe {
+            assert_ne!((*properties).Wnode.Guid, SystemTraceControlGuid);
+        }
+    }
+
+    /// The literal has to be the string the API expects, or the session never
+    /// starts and the failure reads as "no rights".
+    #[test]
+    fn the_kernel_logger_name_is_the_one_the_api_defines() {
+        let sdk = windows::Win32::System::Diagnostics::Etw::KERNEL_LOGGER_NAMEW;
+        let mut wide = Vec::new();
+        for index in 0..64 {
+            // SAFETY: the SDK constant is a static NUL-terminated wide string;
+            // the bound keeps this from running past a missing terminator.
+            let unit = unsafe { *sdk.0.add(index) };
+            if unit == 0 {
+                break;
+            }
+            wide.push(unit);
+        }
+        assert_eq!(
+            String::from_utf16_lossy(&wide),
+            KERNEL_LOGGER,
+            "KERNEL_LOGGER must spell KERNEL_LOGGER_NAMEW"
+        );
+        // The crash teardown stops sessions BY NAME from this list, so the
+        // global session has to be in it too: a run that owned it and aborted
+        // would otherwise leave the machine's kernel logger taken.
+        assert!(SESSION_NAMES.contains(&KERNEL_LOGGER));
+    }
+
+    /// Only a session whose name is ours may be reclaimed. Reclaiming the
+    /// kernel logger would stop somebody else's trace, which is the failure
+    /// this whole distinction exists to prevent.
+    #[test]
+    fn only_our_own_session_names_are_reclaimed() {
+        assert!(LoggerKind::Manifest.reclaims_a_stale_session());
+        assert!(LoggerKind::System.reclaims_a_stale_session());
+        assert!(LoggerKind::SystemLoader.reclaims_a_stale_session());
+        assert!(LoggerKind::SystemProfile.reclaims_a_stale_session());
+        assert!(LoggerKind::SystemFile.reclaims_a_stale_session());
+        assert!(
+            !LoggerKind::KernelFile.reclaims_a_stale_session(),
+            "the global session belongs to whoever started it"
+        );
+    }
+
+    /// `ERROR_ALREADY_EXISTS` has to survive as its own answer: it is the
+    /// difference between "no rights" and "another application owns the single
+    /// kernel session", and the UI says different things for each.
+    #[test]
+    fn a_start_that_reports_already_exists_is_its_own_failure() {
+        assert_eq!(start_error(ERROR_ALREADY_EXISTS), StartError::AlreadyExists);
+        assert_eq!(
+            start_error(windows::Win32::Foundation::ERROR_ACCESS_DENIED),
+            StartError::Failed("StartTrace failed (Win32 5)".to_string())
+        );
+        // The message a log line prints stays readable.
+        assert_eq!(
+            StartError::AlreadyExists.to_string(),
+            "the session is owned by another process"
+        );
+        assert_eq!(
+            String::from(start_error(
+                windows::Win32::Foundation::ERROR_INVALID_PARAMETER
+            )),
+            "StartTrace failed (Win32 87)"
+        );
     }
 
     #[test]

@@ -418,6 +418,11 @@ const ELEVATION_IS_A_REMEDY: bool = cfg!(windows);
 ///   of an unexplained dash.
 /// * `Undecodable` — records arrived and none of them parsed: the payload layout
 ///   is not what this build expects.
+/// * `KernelLoggerInUse` — no session could be started because another
+///   application owns the single global NT Kernel Logger, the one session that
+///   carries the classic `FileIo` class. Nothing is running, so this must not
+///   read as a silent window: it is the one state here that names an owner the
+///   user can close.
 ///
 /// Before, one line covered `Unavailable` only, so a trace that started and
 /// delivered nothing looked exactly like a working session on a quiet process.
@@ -447,6 +452,9 @@ fn per_file_accounting_note(
         FileIoAccountingState::Unavailable => i18n::tr_in(lang, K::PropIoPerFileNoTrace),
         FileIoAccountingState::Undelivered => i18n::tr_in(lang, K::PropIoPerFileUndelivered),
         FileIoAccountingState::Undecodable => i18n::tr_in(lang, K::PropIoPerFileUndecodable),
+        FileIoAccountingState::KernelLoggerInUse => {
+            i18n::tr_in(lang, K::PropIoPerFileKernelLoggerInUse)
+        }
     };
     match accounting_losses(accounting, lang) {
         Some(losses) => Some(format!("{state} ({losses})")),
@@ -1482,6 +1490,13 @@ mod tests {
                 FileIoAccountingState::Undecodable,
                 Some("file events arrived but could not be decoded"),
             ),
+            (
+                FileIoAccountingState::KernelLoggerInUse,
+                Some(
+                    "another application is using the NT Kernel Logger, \
+                     so per-file I/O cannot be traced",
+                ),
+            ),
             (FileIoAccountingState::Measured, None),
         ];
         for (state, expected) in cases {
@@ -1591,6 +1606,7 @@ mod tests {
             FileIoAccountingState::Unavailable,
             FileIoAccountingState::Undelivered,
             FileIoAccountingState::Undecodable,
+            FileIoAccountingState::KernelLoggerInUse,
         ] {
             // merge_files keeps the larger of two row counts while replacing the
             // accounting, so an unmeasured snapshot can arrive over measured
@@ -1613,11 +1629,12 @@ mod tests {
             ),
             None
         );
-        // The other two states say a trace exists, not that it needs rights, so
-        // they do not depend on the remedy.
+        // The remaining states describe what the trace could not do, not that
+        // the token needs rights, so they do not depend on the remedy.
         for state in [
             FileIoAccountingState::Undelivered,
             FileIoAccountingState::Undecodable,
+            FileIoAccountingState::KernelLoggerInUse,
         ] {
             assert!(
                 per_file_accounting_note(Some(&with(state)), false, false, Lang::En).is_some(),

@@ -20,21 +20,41 @@
 //! ## What is subscribed, and how it is decoded
 //!
 //! The events come from the KERNEL's file I/O hooks and arrive as classic
-//! (MOF) `FileIo` records. They are subscribed to through the SystemIo
-//! provider: an `EnableTraceEx2` of `SystemIoProviderGuid` with the
-//! `SYSTEM_IO_KW_FILE` keyword against a system logger
-//! ([`LoggerKind::SystemFile`]) — see [`PROVIDERS`]. That is the documented
-//! SystemIo keyword set, and the same shape [`super::disk_etw`] already uses
-//! live for `SYSTEM_IO_KW_DISK`.
+//! (MOF) `FileIo` records. Which session delivers them is the whole problem,
+//! and it is answered by three ordered attempts ([`sources`]):
 //!
-//! Two shapes that look equivalent deliver nothing, and a live elevated
-//! selfcheck reported `undelivered` with `events_lost` at 0 on each of them:
-//! enabling the MANIFEST GUID of `Microsoft-Windows-Kernel-File` on an ordinary
-//! manifest session (what this module originally did), and asking the system
-//! logger for `EVENT_TRACE_FLAG_FILE_IO` through `EnableFlags` (the legacy flag
-//! of the same group). `EnableTraceEx2` returns success both ways, the session
-//! runs, and not one record ever arrives. The enable therefore has to be the
-//! provider call, and this session's `EnableFlags` are empty.
+//! 1. **The single global kernel session — [`etw::KERNEL_LOGGER`]** with
+//!    `EnableFlags = EVENT_TRACE_FLAG_FILE_IO`
+//!    ([`LoggerKind::KernelFile`]). This is the session the classic `FileIo`
+//!    class has always been delivered by, and the flag IS the subscription:
+//!    it is the kernel logger's own enable mechanism. Enabled with no provider
+//!    calls ([`KERNEL_PROVIDERS`] is empty) and decoded by class GUID + opcode
+//!    like every other classic kernel record.
+//! 2. **A private system logger** ([`LoggerKind::SystemFile`]) subscribing to
+//!    the SystemIo GROUP with `SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME`
+//!    ([`PROVIDERS`]) — the documented SystemIo keyword set, and the same
+//!    shape [`super::disk_etw`] uses live for `SYSTEM_IO_KW_DISK`. This exists
+//!    because the kernel logger is EXCLUSIVE: when another tracing tool owns
+//!    it (Process Hacker-style monitors, `wpr`, an installer's logger), a
+//!    private session is the only session left that may still carry the class.
+//! 3. **Nothing left**, and then the answer is a state, never a number:
+//!    [`FileTraceRefusal::KernelLoggerInUse`] when attempt 1 reported
+//!    `ERROR_ALREADY_EXISTS` and attempt 2 was refused as well, which
+//!    [`attach_refusal`] turns into
+//!    [`crate::actions::FileIoAccountingState::KernelLoggerInUse`], or
+//!    [`FileTraceRefusal::Unavailable`] for every other refusal (no elevation,
+//!    no free logger slot, a provider enable Windows said no to).
+//!
+//! Three shapes that look right deliver nothing, and a live elevated selfcheck
+//! reported `undelivered` with `events_lost` at 0 on each of them: enabling the
+//! MANIFEST GUID of `Microsoft-Windows-Kernel-File` on an ordinary manifest
+//! session (what this module originally did), the same provider on a system
+//! logger changed to a provider enable of the manifest GUID, and asking a
+//! PRIVATE system logger for `EVENT_TRACE_FLAG_FILE_IO` through `EnableFlags`.
+//! `EnableTraceEx2` returns success on all three, the session runs, and not one
+//! record ever arrives. That is why attempt 1 uses the flag on the kernel
+//! logger — where it is the mechanism — and attempt 2 uses a provider enable
+//! with empty `EnableFlags`. The two are NOT interchangeable.
 //!
 //! Records are identified the way every classic kernel record is — the enable
 //! names a GROUP, each record names its class: the MOF class GUID in
@@ -43,21 +63,25 @@
 //! provider's manifest lists as event ids (`Create` 12, `Cleanup` 13,
 //! `Close` 14, `Read` 15, `Write` 16 — the same kernel hooks, so the
 //! id-to-operation mapping is unchanged). Every other operation is ignored, but
-//! the FILE keyword cannot select a subset of the class: directory enumeration,
-//! flush, information classes and deletes are delivered too and discarded in
-//! the callback, which is why this session gets the largest buffer set in
-//! [`super::etw`].
+//! neither subscription can select a subset of the class: directory
+//! enumeration, flush, information classes and deletes are delivered too and
+//! discarded in the callback, which is why the private session gets the
+//! largest buffer set in [`super::etw`].
 //!
-//! The subscription rides its own system logger rather than the single global
-//! "NT Kernel Logger" or the disk session's: Windows multiplexes the
-//! SystemTraceProvider over up to eight logger sessions and reserves only the
-//! first two for the NT Kernel Logger and the Circular Kernel Context Logger
-//! (SystemTraceProvider session documentation), so the disk, loader, profile
-//! and file traces each host one of the remaining slots without taking the
-//! global one from anything else on the machine. One session per feature is
-//! also what lets this trace live exactly as long as the I/O page needs it:
-//! adding the FILE keyword to the disk session would trace every file on the
-//! machine for as long as the Performance page samples disks.
+//! The correlation, decoding and accounting below are shared by both attempts
+//! on purpose: the records are the same class whichever session carried them,
+//! so a byte measured through the kernel logger and a byte measured through
+//! the private session mean the same thing — and the callback accepts either.
+//!
+//! Beyond the kernel logger, the fallback rides its own system logger rather
+//! than the disk session's: Windows multiplexes the SystemTraceProvider over up
+//! to eight logger sessions and reserves only the first two for the NT Kernel
+//! Logger and the Circular Kernel Context Logger (SystemTraceProvider session
+//! documentation), so the disk, loader, profile and file traces each host one
+//! of the remaining slots. One session per feature is also what lets this
+//! trace live exactly as long as the I/O page needs it: adding the FILE
+//! keyword to the disk session would trace every file on the machine for as
+//! long as the Performance page samples disks.
 //!
 //! Payloads are decoded by hand, at offsets taken from the provider's manifest
 //! templates — `wevtutil gp Microsoft-Windows-Kernel-File /ge:true` lists the
@@ -129,32 +153,43 @@
 //!   when no file event arrived at all or none of them attributed a read or a
 //!   write to the process being asked about, and
 //!   [`FileIoAccountingState::Undecodable`] when records arrived and none of
-//!   them parsed.
+//!   them parsed. A session that never STARTED is neither: it is
+//!   [`FileIoAccountingState::KernelLoggerInUse`] when another application owns
+//!   the kernel logger ([`attach_refusal`]), and
+//!   [`FileIoAccountingState::Unavailable`] for every other refusal. Collapsing
+//!   a refusal into `Undelivered` would report a session that does not exist.
 //! * **These are REQUESTED sizes.** The record is written when the file system
 //!   receives the request, so a request that fails or completes short counts at
 //!   its requested size. It is what every consumer of this provider reports,
 //!   and it is not a file size or an offset.
 //! * The session lifetime rules (fixed names, orphan reclamation, the
-//!   administrator requirement) live in [`super::etw`].
+//!   administrator requirement) live in [`super::etw`]. The kernel logger is the
+//!   one name that is NOT ours to reclaim; see [`LoggerKind::KernelFile`].
 //!
 //! ## What is verified here, and what is not
 //!
 //! The ids, versions and field offsets above were read from the installed
-//! provider manifest; the enable is the one [`super::disk_etw`] already uses
-//! live for the `DiskIo` class (`SystemIoProviderGuid` with a keyword, records
-//! decoded by their class GUID, on a system logger), and the decode/accounting
-//! path is covered by tests with synthetic records, including records driven
-//! through the real callback under the classic identity.
+//! provider manifest. The fallback enable is the one [`super::disk_etw`] already
+//! uses live for the `DiskIo` class (`SystemIoProviderGuid` with a keyword,
+//! records decoded by their class GUID, on a system logger); the preferred
+//! session is the kernel logger with `EVENT_TRACE_FLAG_FILE_IO`, the shape
+//! Process Hacker-style tools have always used and the SDK's kernel-logger
+//! example documents (`SystemTraceControlGuid` in `Wnode.Guid`, real-time,
+//! no `EVENT_TRACE_SYSTEM_LOGGER_MODE`). The decode/accounting path is covered
+//! by tests with synthetic records, including records driven through the real
+//! callback under the classic identity — and both attempts share that path, so
+//! the same synthetic `FileIo` record proves either session's records decode.
 //!
-//! What a synthetic record cannot prove is that the kernel accepts this session
-//! shape on a given build, that names really arrive as device paths, and that
-//! ETW delivers every record at machine rates. A run that delivers nothing
+//! What a synthetic record cannot prove is that a given Windows build ACCEPTS
+//! one of these session shapes, that names really arrive as device paths, and
+//! that ETW delivers every record at machine rates. A run that delivers nothing
 //! reports [`FileIoAccountingState::Undelivered`] and a run that delivers
 //! records this decoder rejects reports
 //! [`FileIoAccountingState::Undecodable`] with the rejected opcode, version and
 //! payload length logged, so a broken subscription shows up as a state rather
 //! than as zeros. `--selfcheck` reports that state headlessly (see
-//! `llm-wiki/debug-tools.md`).
+//! `llm-wiki/debug-tools.md`), including which attempt ran, since the log line
+//! names the session and its kind.
 //!
 //! ## What this module publishes
 //!
@@ -172,37 +207,107 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_RECORD, FileIoGuid, SYSTEM_IO_KW_FILE, SystemIoProviderGuid,
+    EVENT_RECORD, FileIoGuid, SYSTEM_IO_KW_FILE, SYSTEM_IO_KW_FILENAME, SystemIoProviderGuid,
 };
 use windows::core::PCWSTR;
 
-use super::etw::{self, LoggerKind, Provider, Session, TraceContext, TraceRole};
+use super::etw::{
+    self, KERNEL_LOGGER, LoggerKind, Provider, Session, StartError, TraceContext, TraceRole,
+};
 use crate::actions::FileIoAccountingState;
 
-/// The session shape this module needs; see the module docs.
+/// The FALLBACK session shape see the module docs: the private system logger.
 ///
 /// Named so a test can pin the wiring: the kind is the system logger half of
 /// the subscription, and the manifest kind this module used before delivers
 /// nothing at all.
 pub(super) const LOGGER_KIND: LoggerKind = LoggerKind::SystemFile;
 
-/// What the session enables: the SystemIo provider with the FILE keyword.
+/// What the FALLBACK session enables: the SystemIo group with the file
+/// keywords.
 ///
 /// This is a PROVIDER call, not a legacy `EnableFlags` flag — `EnableTraceEx2`
-/// with `SystemIoProviderGuid` and `SYSTEM_IO_KW_FILE` against a system logger
-/// (System Providers documentation). Both other shapes are accepted and deliver
-/// no record: the manifest GUID of `Microsoft-Windows-Kernel-File`, and the
-/// `EVENT_TRACE_FLAG_FILE_IO` flag (a live elevated selfcheck reported
-/// `undelivered` with `events_lost` 0 on them). The enable is therefore the
-/// shape [`super::disk_etw`] already uses live, one keyword bit at a time so the
-/// FILE class is the only thing this stream carries.
+/// with `SystemIoProviderGuid` and the keywords against a system logger (System
+/// Providers documentation). Other shapes are accepted and deliver no record:
+/// the manifest GUID of `Microsoft-Windows-Kernel-File`, and
+/// `EVENT_TRACE_FLAG_FILE_IO` on a PRIVATE system logger (a live elevated
+/// selfcheck reported `undelivered` with `events_lost` 0 on them). The enable is
+/// therefore the shape [`super::disk_etw`] already uses live, a keyword set at a
+/// time so the FILE class is the only thing this stream carries.
 ///
-/// The keyword names the GROUP; the records still arrive under their classic
+/// `SYSTEM_IO_KW_FILE` is the class; `SYSTEM_IO_KW_FILENAME` is its name
+/// companion, kept because a Create is only useful when its name arrives.
+///
+/// The keywords name the GROUP; the records still arrive under their classic
 /// class GUID ([`FileIoGuid`]) — see [`on_event`].
 pub(super) const PROVIDERS: [Provider; 1] = [Provider {
     guid: SystemIoProviderGuid,
-    match_any_keyword: SYSTEM_IO_KW_FILE,
+    match_any_keyword: SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME,
 }];
+
+/// What the PREFERRED session enables: nothing through a provider.
+///
+/// The kernel logger's subscription is its `EnableFlags`
+/// (`EVENT_TRACE_FLAG_FILE_IO`), set in [`super::etw::LoggerKind::KernelFile`].
+/// Enabling a provider on it as well would subscribe twice and deliver the
+/// class twice.
+pub(super) const KERNEL_PROVIDERS: [Provider; 0] = [];
+
+/// Why no per-file session could be started.
+///
+/// The distinction is what keeps the dialog honest: neither of these is a
+/// measurement, and they are not the same failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTraceRefusal {
+    /// The kernel logger is owned by another application
+    /// (`ERROR_ALREADY_EXISTS` from `StartTraceW`) AND the private fallback was
+    /// refused as well, so there is no session at all.
+    ///
+    /// Reported as its own state because it is actionable and because it must
+    /// never be mistaken for a silent window: nothing started, so nothing can
+    /// arrive later without the owner going away first.
+    KernelLoggerInUse,
+    /// No session for any other reason: no elevation, no free
+    /// SystemTraceProvider slot, a refused provider enable.
+    Unavailable,
+}
+
+/// One ordered attempt at a session: what to start, and what that shape
+/// subscribes with.
+///
+/// A table rather than two inline calls so the ORDER — which is the design —
+/// is data a test can read, instead of control flow it has to infer.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FileSource {
+    /// ETW session name to start. The kernel logger's is fixed and global; the
+    /// fallback's is per role, so the two hosts never share one.
+    pub name: &'static str,
+    pub kind: LoggerKind,
+    /// Provider enables. Empty for the kernel logger, whose `EnableFlags` are
+    /// the subscription.
+    pub providers: &'static [Provider],
+}
+
+/// The ordered attempts for one host role, best first; see the module docs.
+///
+/// Attempt 1 comes first every time a session is (re)started, not just at
+/// startup: the kernel logger can be released by its owner at any moment, and
+/// the next restart should prefer it again rather than stay on the fallback
+/// for the life of the process.
+pub(super) fn sources(role: TraceRole) -> [FileSource; 2] {
+    [
+        FileSource {
+            name: KERNEL_LOGGER,
+            kind: LoggerKind::KernelFile,
+            providers: &KERNEL_PROVIDERS,
+        },
+        FileSource {
+            name: session_name(role),
+            kind: LOGGER_KIND,
+            providers: &PROVIDERS,
+        },
+    ]
+}
 
 /// Opcodes of the five operations this module reads, in the classic `FileIo`
 /// class. They are the provider's task values too, which is why the manifest
@@ -461,6 +566,33 @@ pub(super) fn attach_file_io(
     accounting.unnamed_write_bytes = unnamed.write_bytes;
     accounting.omitted_read_bytes = sample.omitted.read_bytes;
     accounting.omitted_write_bytes = sample.omitted.write_bytes;
+}
+
+/// Say why no session could start, without inventing anything.
+///
+/// This is the counterpart of [`attach_file_io`] for the case where there is no
+/// sample at all. The snapshot keeps every number the handle walk produced —
+/// none of them per-file byte counts — and gains only a state, which is what
+/// the dialog keys its explanation off.
+///
+/// Only [`FileTraceRefusal::KernelLoggerInUse`] needs saying: the snapshot
+/// already starts at [`FileIoAccountingState::Unavailable`], and that is
+/// exactly what [`FileTraceRefusal::Unavailable`] means. A caller that never
+/// got to try (a throttled app-side start) passes `None` and gets the same
+/// treatment, because "we did not ask" is not "another application has it".
+///
+/// Nothing here touches a byte count, so a refusal can never become a zero.
+pub(super) fn attach_refusal(
+    snapshot: &mut crate::actions::ProcessFileIoSnapshot,
+    refusal: Option<FileTraceRefusal>,
+) {
+    if refusal != Some(FileTraceRefusal::KernelLoggerInUse) {
+        return;
+    }
+    let accounting = &mut snapshot.accounting;
+    accounting.state = FileIoAccountingState::KernelLoggerInUse;
+    // No session ran, so no count covers any span of time.
+    accounting.since_ms = 0;
 }
 
 /// One decoded record.
@@ -966,42 +1098,93 @@ fn volume_devices() -> Vec<(String, String)> {
 pub struct FileEtw {
     session: Session<Shared>,
     started: Instant,
+    /// Which of [`sources`] actually started. Kept because "which session is
+    /// carrying this" is the first question any report about the feature has to
+    /// answer, and it cannot be re-derived from a live session afterwards.
+    source: FileSource,
 }
 
 impl FileEtw {
+    /// Which session is carrying this trace; see [`sources`].
+    ///
+    /// The kernel logger is the one that delivers the classic `FileIo` class
+    /// machine-wide; the private fallback only runs because that one was taken.
+    pub(super) fn source(&self) -> FileSource {
+        self.source
+    }
+
     /// Whether events are still arriving; see [`Session::is_running`].
     pub fn is_running(&self) -> bool {
         self.session.is_running()
     }
 
-    /// Start a real-time session for `role`.
+    /// Start a session, trying [`sources`] in order.
     ///
-    /// Returns `None` when ETW is unavailable to this token, which keeps
-    /// per-file bytes reported as unavailable rather than as zero. A
-    /// Kernel-File session needs elevation, so in practice this succeeds only
-    /// in the LocalSystem service.
-    pub fn start(role: TraceRole) -> Option<Self> {
+    /// The first shape that starts wins and is logged, because which one is
+    /// running is the fact an operator needs: the kernel logger carries the
+    /// class machine-wide, the private fallback only for as long as Windows
+    /// keeps multiplexing it. A refusal is only the answer once EVERY shape was
+    /// refused, and [`FileTraceRefusal::KernelLoggerInUse`] is preferred over
+    /// [`FileTraceRefusal::Unavailable`] in that case: "another application
+    /// owns the kernel logger" is the fact that explains the whole failure and
+    /// the only one a user can act on.
+    ///
+    /// One [`Shared`] serves every attempt. A refused attempt never published a
+    /// counter (it delivered no record), so a fallback starts from a clean
+    /// slate under the same accounting, and the sample a caller already holds
+    /// stays valid either way.
+    pub fn try_start(role: TraceRole) -> Result<Self, FileTraceRefusal> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             devices: Mutex::new(DeviceCache::default()),
             live: AtomicBool::new(true),
         });
-        let session = Session::start(
-            session_name(role),
-            // The subscription is the provider enable below: this session's
-            // EnableFlags are empty, because neither the manifest GUID's enable
-            // nor the legacy file flag delivered a record. See the module docs.
-            LOGGER_KIND,
-            &PROVIDERS,
-            shared,
-            on_event,
-            "tm-file-etw",
-        )?;
-        tracing::info!("per-file I/O trace started");
-        Some(Self {
-            session,
-            started: Instant::now(),
-        })
+        let mut refusal = FileTraceRefusal::Unavailable;
+        for source in sources(role) {
+            match Session::try_start(
+                source.name,
+                source.kind,
+                source.providers,
+                Arc::clone(&shared),
+                on_event,
+                "tm-file-etw",
+            ) {
+                Ok(session) => {
+                    tracing::info!(
+                        session = source.name,
+                        kind = ?source.kind,
+                        providers = source.providers.len(),
+                        "per-file I/O trace started"
+                    );
+                    return Ok(Self {
+                        session,
+                        started: Instant::now(),
+                        source,
+                    });
+                }
+                Err(error) => {
+                    // `ERROR_ALREADY_EXISTS` on the PER-ROLE name would mean a
+                    // session that keeps being taken back by another process,
+                    // not that the kernel logger is somebody else's; only the
+                    // kernel attempt can report the state that names an owner.
+                    if source.kind == LoggerKind::KernelFile && error == StartError::AlreadyExists {
+                        tracing::warn!(
+                            session = source.name,
+                            "the NT Kernel Logger is owned by another application"
+                        );
+                        refusal = FileTraceRefusal::KernelLoggerInUse;
+                    } else {
+                        tracing::debug!(
+                            session = source.name,
+                            kind = ?source.kind,
+                            %error,
+                            "per-file I/O session attempt refused"
+                        );
+                    }
+                }
+            }
+        }
+        Err(refusal)
     }
 
     /// Everything the trace has attributed to `pid` since it started.
@@ -1460,26 +1643,180 @@ mod tests {
         assert_eq!(sample_of(&shared, 20), sample);
     }
 
+    /// The record shape the PREFERRED session delivers: a classic `FileIo`
+    /// record, whose identity is the class GUID in `ProviderId` and the
+    /// operation in the opcode (no manifest event id, no provider enable —
+    /// `EVENT_TRACE_FLAG_FILE_IO` is the whole subscription). Driven through the
+    /// real callback, the four operations the decoder keeps must add up to a
+    /// measured sample.
+    #[test]
+    fn a_kernel_logger_file_io_record_decodes_into_a_measured_sample() {
+        let shared = shared();
+        let pid = 4_692;
+        let object = 0xff_ff_9a_00_12_34_00_00u64;
+        deliver_kernel_record(
+            &shared,
+            EVENT_CREATE,
+            1,
+            pid,
+            &create_payload(
+                KERNEL_FILE_POINTER_BYTES,
+                object,
+                r"\Device\HarddiskVolume3\Users\me\kernel.dat",
+            ),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_WRITE,
+            1,
+            pid,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 8_192),
+        );
+        deliver_kernel_record(
+            &shared,
+            EVENT_READ,
+            1,
+            pid,
+            &transfer_payload(KERNEL_FILE_POINTER_BYTES, object, 1_024),
+        );
+        let sample = sample_of(&shared, pid);
+        assert_eq!(
+            bytes(&sample, r"C:\Users\me\kernel.dat"),
+            Some(FileBytes {
+                read_bytes: 1_024,
+                write_bytes: 8_192,
+            }),
+            "the device path is translated exactly as on the fallback session"
+        );
+        assert_eq!(sample.state(), FileIoAccountingState::Measured);
+        assert_eq!(sample.events_seen, 3);
+        assert_eq!(sample.events_decoded, 3);
+        deliver_kernel_record(
+            &shared,
+            EVENT_CLEANUP,
+            1,
+            pid,
+            &close_payload(KERNEL_FILE_POINTER_BYTES, object),
+        );
+        // Cleanup ends the handle's accounting; the measurement stands.
+        let sample = sample_of(&shared, pid);
+        assert_eq!(sample.events_decoded, 4);
+        assert_eq!(
+            bytes(&sample, r"C:\Users\me\kernel.dat"),
+            Some(FileBytes {
+                read_bytes: 1_024,
+                write_bytes: 8_192,
+            })
+        );
+        assert!(!shared.state.lock().unwrap().open.contains_key(&object));
+    }
+
     /// The session kind plus the provider enable ARE the subscription: a
     /// manifest session delivers no `FileIo` record however it is enabled, and
-    /// the legacy `EVENT_TRACE_FLAG_FILE_IO` shape delivered none either — a
-    /// live elevated selfcheck reported `undelivered` with `events_lost` at 0
-    /// on both. What is left is the documented SystemIo provider path: the
-    /// group GUID with the FILE keyword alone, on a system logger.
+    /// the legacy `EVENT_TRACE_FLAG_FILE_IO` shape delivered none either on a
+    /// PRIVATE system logger — a live elevated selfcheck reported `undelivered`
+    /// with `events_lost` at 0 on both. What is left there is the documented
+    /// SystemIo provider path: the group GUID with the file keywords, on a system
+    /// logger.
     #[test]
-    fn the_file_session_enables_the_system_io_provider_with_the_file_keyword() {
+    fn the_fallback_session_enables_the_system_io_provider_with_the_file_keywords() {
         assert_eq!(LOGGER_KIND, LoggerKind::SystemFile);
         assert_eq!(PROVIDERS.len(), 1, "one keyword set, not a broad enable");
         assert_eq!(PROVIDERS[0].guid, SystemIoProviderGuid);
-        assert_eq!(PROVIDERS[0].match_any_keyword, SYSTEM_IO_KW_FILE);
         assert_eq!(
-            PROVIDERS[0].match_any_keyword & !SYSTEM_IO_KW_FILE,
+            PROVIDERS[0].match_any_keyword,
+            SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME
+        );
+        assert_eq!(
+            PROVIDERS[0].match_any_keyword & !(SYSTEM_IO_KW_FILE | SYSTEM_IO_KW_FILENAME),
             0,
             "no other SystemIo keyword may ride this session"
+        );
+        assert!(
+            PROVIDERS[0].match_any_keyword & SYSTEM_IO_KW_FILE != 0,
+            "the class keyword stays: it is what makes the transfers arrive"
         );
         // The class the decoder accepts is the FILE class, not the group's
         // disk class: the enable and the record identity are different GUIDs.
         assert_ne!(PROVIDERS[0].guid, FileIoGuid);
+    }
+
+    /// The attempt order IS the design, so it is data a test reads.
+    ///
+    /// The kernel logger comes first because it is the session that actually
+    /// delivers the classic `FileIo` class; the private SystemIo session is the
+    /// fallback for when another tracing tool owns that one. The kernel attempt
+    /// enables NO provider — its `EnableFlags` are the subscription — and it
+    /// keeps the global name whatever the role, while the fallback's name is
+    /// per role so the two hosts never share a session.
+    #[test]
+    fn the_kernel_logger_is_tried_before_the_private_system_io_session() {
+        for role in [TraceRole::Service, TraceRole::App] {
+            let [primary, fallback] = sources(role);
+            assert_eq!(primary.kind, LoggerKind::KernelFile);
+            assert_eq!(primary.name, KERNEL_LOGGER);
+            assert!(
+                primary.providers.is_empty(),
+                "the kernel logger subscribes through EnableFlags, not a provider"
+            );
+            assert_eq!(
+                primary.providers.len(),
+                KERNEL_PROVIDERS.len(),
+                "and that is what KERNEL_PROVIDERS says"
+            );
+            assert_eq!(fallback.kind, LOGGER_KIND);
+            assert_eq!(fallback.name, session_name(role));
+            assert_ne!(fallback.name, KERNEL_LOGGER);
+            assert_eq!(fallback.providers.len(), 1);
+            assert_eq!(fallback.providers[0].guid, SystemIoProviderGuid);
+        }
+        // The two hosts must not share the FALLBACK name; only the kernel
+        // logger is global, and that is exactly why it is exclusive.
+        assert_ne!(
+            sources(TraceRole::Service)[1].name,
+            sources(TraceRole::App)[1].name
+        );
+    }
+
+    /// A refusal from the kernel attempt becomes the state that names an owner,
+    /// and no byte count is invented: the snapshot keeps the handle walk's rows
+    /// exactly as they were and gains only a state.
+    #[test]
+    fn a_kernel_logger_refusal_becomes_the_state_that_names_its_owner() {
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![file_row(r"C:\data\a.bin"), file_row(r"C:\data\b.bin")],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_refusal(&mut snapshot, Some(FileTraceRefusal::KernelLoggerInUse));
+        for file in &snapshot.files {
+            assert_eq!(file.read_bytes, None, "never a fabricated zero");
+            assert_eq!(file.write_bytes, None);
+            assert_eq!(file.read_ops, None);
+            assert_eq!(file.write_ops, None);
+        }
+        let accounting = &snapshot.accounting;
+        assert_eq!(accounting.state, FileIoAccountingState::KernelLoggerInUse);
+        assert_eq!(accounting.since_ms, 0, "no session ran for any span");
+        assert_eq!(accounting.read_bytes, 0);
+        assert_eq!(accounting.write_bytes, 0);
+        assert_eq!(accounting.unnamed_read_bytes, 0);
+        assert_eq!(accounting.omitted_write_bytes, 0);
+
+        // Every other answer leaves the snapshot at `Unavailable`: "we did not
+        // get to ask" and "no elevation" are not somebody else's ownership.
+        for refusal in [Some(FileTraceRefusal::Unavailable), None] {
+            let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+                files: vec![file_row(r"C:\data\a.bin")],
+                accounting: crate::actions::FileIoAccounting::default(),
+            };
+            attach_refusal(&mut snapshot, refusal);
+            assert_eq!(
+                snapshot.accounting.state,
+                FileIoAccountingState::Unavailable,
+                "{refusal:?}"
+            );
+            assert_eq!(snapshot.files[0].read_bytes, None);
+        }
     }
 
     /// A read-only handle reports bytes in Read and none in Write, and the

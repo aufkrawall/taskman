@@ -1332,6 +1332,82 @@ fn sampled_profile_attributes_code_to_this_process() {
     );
 }
 
+/// Diagnostic (run elevated): WHICH session carries the per-file `FileIo` class
+/// on this machine, and does it deliver anything?
+///
+/// Three outcomes are all real and must not be confused, so this reports the one
+/// it got instead of assuming:
+///
+/// * the global `NT Kernel Logger` started (the preferred mechanism);
+/// * it was already owned by another application, so the private SystemIo
+///   subscription started instead — the fallback;
+/// * neither started, and the refusal names why (no rights, or
+///   `KernelLoggerInUse`).
+///
+/// What only a live range can prove is that Windows ACCEPTS one of these shapes
+/// on this build and emits the classic records through it. The synthetic unit
+/// tests pin the decoder; this pins the subscription hypothesis, which is the
+/// part a previous release got wrong while every test passed.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "starts a machine-wide ETW session; needs elevation and live file traffic"]
+fn the_file_trace_reports_which_session_started() {
+    use tm_platform::actions::FileIoAccountingState;
+
+    let (trace, session) = match tm_platform::win::file_etw_test_start() {
+        Ok(started) => started,
+        Err(refusal) => {
+            // Still an answer: say it rather than pass silently.
+            eprintln!("no per-file session was started: {refusal:?}");
+            return;
+        }
+    };
+    eprintln!("per-file trace session = {session}");
+    let pid = std::process::id();
+    let victim = std::env::temp_dir().join(format!("tm_file_etw_{pid}.bin"));
+    let payload = vec![0x5Au8; 256 * 1_024];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut sample = trace.sample(pid, 0, &tm_platform::win::live_pids_for_test());
+    while std::time::Instant::now() < deadline {
+        // Give the session something of ours to attribute through the 1 s flush
+        // timer, so a measured answer is possible rather than lucky.
+        let _ = std::fs::write(&victim, &payload);
+        let _ = std::fs::read(&victim);
+        sample = trace.sample(pid, 0, &tm_platform::win::live_pids_for_test());
+        if sample.state() == FileIoAccountingState::Measured && !sample.files.is_empty() {
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&victim);
+    eprintln!(
+        "state={:?} seen={} decoded={} files={} lost={:?} since={} ms",
+        sample.state(),
+        sample.events_seen,
+        sample.events_decoded,
+        sample.files.len(),
+        sample.events_lost,
+        sample.since_ms
+    );
+    assert!(
+        sample.events_seen > 0,
+        "session {session} delivered no FileIo record at all - the subscription shape is wrong"
+    );
+    assert!(
+        sample.events_decoded > 0,
+        "records arrived and none decoded - the payload layout changed"
+    );
+    assert!(
+        matches!(
+            sample.state(),
+            FileIoAccountingState::Measured
+                | FileIoAccountingState::Undelivered
+                | FileIoAccountingState::Undecodable
+        ),
+        "a running session must never report a state that means no session: {:?}",
+        sample.state()
+    );
+}
+
 #[test]
 fn list_process_file_io_for_system_process_succeeds_without_error() {
     let actions = tm_platform::win::WinActions;

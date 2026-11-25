@@ -56,35 +56,36 @@ blanked.
 
 `file_io` reports the per-file byte accounting of the binary's own process, which
 is the headless equivalent of the I/O page's state line: `state`
-(`unavailable`/`undelivered`/`undecodable`/`measured`), `since_ms`, `waited_ms`,
-`decoded_bytes`, and the session's `events_lost`, `unnamed_creates`,
-`dropped_paths` and `cleared_file_objects`. Read `state` together with
-`waited_ms`: the check starts the session, issues file I/O of its own (a
-temporary file in `TASKMAN_DATA_DIR` is created, written, flushed, read back and
-deleted), and then polls for up to 3 s until the state leaves `undelivered`, so
-`undelivered` with `waited_ms` near 3000 is a real negative while a short wait
-is not a verdict at all. `decoded_bytes` is the read-plus-write total the trace
-decoded for the process and stays `null` unless the state is `measured` — never
-a zero that would read as "measured nothing". `own_io_error` is non-null when
-the check could not issue its own I/O, which makes a silent trace the check's
-fault rather than the trace's. `unavailable` on an unelevated run is the expected
-answer — a `Microsoft-Windows-Kernel-File` session needs administrator rights or
-the installed service — while `undelivered`/`undecodable` mean a session started
-and delivered nothing usable. The two are worth telling apart: the session is a
-system logger that enables the SystemIo provider with `SYSTEM_IO_KW_FILE`, so
+(`unavailable`/`undelivered`/`undecodable`/`kernel_logger_in_use`/`measured`),
+`since_ms`, and the
+session's `events_lost`, `unnamed_creates`, `dropped_paths` and
+`cleared_file_objects`. `unavailable` on an unelevated run is the expected answer
+— a per-file ETW session needs administrator rights or the
+installed service — while `undelivered`/`undecodable` mean a session started and
+delivered nothing usable. The two are worth telling apart: the session is either
+the global NT Kernel Logger (`EVENT_TRACE_FLAG_FILE_IO`, tried first) or a
+fallback system logger that enables the SystemIo provider with
+`SYSTEM_IO_KW_FILE`/`SYSTEM_IO_KW_FILENAME`, so
 `undelivered` means the kernel accepted the session and delivered no `FileIo`
 record at all, while `undecodable` means records arrived and the payload layout
-did not match (the logged opcode, version and payload length say which). `null`
+did not match (the logged opcode, version and payload length say which).
+`kernel_logger_in_use` is the third answer: neither session started because
+another application owns the kernel logger, so the machine — not the token, and
+not the payload — is why there is no number. `null`
 means the question could not be asked (no verified process identity, or
 `--mock`), and an unqueried `events_lost` stays `null` instead of a zero.
 
-Three ignored ETW diagnostics validate real Windows payloads rather than only
+Four ignored ETW diagnostics validate real Windows payloads rather than only
 synthetic records: `disk_trace_attributes_real_requests_to_the_issuing_process`,
-`protected_process_modules_include_csrss_images`, and
-`sampled_profile_attributes_code_to_this_process`. Run each with
+`protected_process_modules_include_csrss_images`,
+`sampled_profile_attributes_code_to_this_process`, and
+`the_file_trace_reports_which_session_started`. Run each with
 `cargo test -p tm-platform --test integration <name> -- --ignored --nocapture`
 from an elevated token or an account with the required performance-trace
-rights. The protected-module and profile probes print an explicit privilege
+rights. The per-file probe prints which of the ordered attempts actually started
+(`NT Kernel Logger` or the private fallback) or the refusal that stopped both,
+which is the only way to tell a wrong subscription shape from an owned session.
+The protected-module and profile probes print an explicit privilege
 boundary skip when the system-logger session cannot start. Set
 `TASKMAN_ETW_LIVE_REQUIRED=1` in a privileged diagnostic run to turn that skip
 into a failure, so an unavailable profile/session cannot masquerade as a pass.

@@ -2304,12 +2304,17 @@ fn keep_watched<T>(
 /// retry window and the snapshot is the part that needs pinning, and a window
 /// set by hand cannot show it. The tests drive the production entry with this
 /// replaced by a stub, so everything but the kernel call is the real path.
-fn start_file_trace(role: super::etw::TraceRole) -> Option<super::file_etw::FileEtw> {
-    super::file_etw::FileEtw::start(role)
+fn start_file_trace(
+    role: super::etw::TraceRole,
+) -> std::result::Result<super::file_etw::FileEtw, super::file_etw::FileTraceRefusal> {
+    super::file_etw::FileEtw::try_start(role)
 }
 
 /// How a request starts a session; see [`start_file_trace`].
-type FileTraceStarter<'a> = dyn Fn(super::etw::TraceRole) -> Option<super::file_etw::FileEtw> + 'a;
+type FileTraceStarter<'a> = dyn Fn(
+        super::etw::TraceRole,
+    ) -> std::result::Result<super::file_etw::FileEtw, super::file_etw::FileTraceRefusal>
+    + 'a;
 
 /// What one request got from a host's session.
 struct FileTraceAnswer {
@@ -2321,6 +2326,12 @@ struct FileTraceAnswer {
     /// Whether this request tried to start a session and was refused — for a
     /// dead session that needed replacing as much as for a missing one.
     start_refused: bool,
+    /// WHY the last start was refused, when one was attempted and failed.
+    ///
+    /// Carried to the snapshot so the dialog can say "another application owns
+    /// the NT Kernel Logger" instead of the generic "no trace is running": the
+    /// two need different words, and only one of them is about rights.
+    refusal: Option<super::file_etw::FileTraceRefusal>,
 }
 
 impl FileTraceAnswer {
@@ -2356,6 +2367,7 @@ fn file_trace_sample(
         Err(poisoned) => poisoned.into_inner(),
     };
     let mut refused = false;
+    let mut refusal = None;
     if slot.as_ref().is_some_and(|trace| !trace.usage.is_running()) {
         // Stopped underneath us: its counters are frozen. Replace the session
         // in place so the slot's one watchdog keeps covering it, then report
@@ -2372,17 +2384,20 @@ fn file_trace_sample(
             }
         }
         match start(host.role()) {
-            Some(usage) => {
+            Ok(usage) => {
                 if let Some(trace) = slot.as_mut() {
                     trace.usage = usage;
                 }
             }
-            None => refused = true,
+            Err(reason) => {
+                refused = true;
+                refusal = Some(reason);
+            }
         }
     }
     if slot.is_none() {
         match start(host.role()) {
-            Some(usage) => {
+            Ok(usage) => {
                 let kept = keep_watched(
                     &mut slot,
                     FileTrace {
@@ -2402,10 +2417,14 @@ fn file_trace_sample(
                     return FileTraceAnswer {
                         sample: None,
                         start_refused: true,
+                        // The session DID start; it just was not kept. That is
+                        // not something the snapshot should attribute to an
+                        // owner.
+                        refusal: None,
                     };
                 }
             }
-            None => {
+            Err(reason) => {
                 // LocalSystem should always be able to start a session; if it
                 // cannot, report unavailable rather than a fabricated zero.
                 // An unelevated GUI cannot, and that is its ordinary state.
@@ -2422,6 +2441,7 @@ fn file_trace_sample(
                 return FileTraceAnswer {
                     sample: None,
                     start_refused: true,
+                    refusal: Some(reason),
                 };
             }
         }
@@ -2430,6 +2450,7 @@ fn file_trace_sample(
         return FileTraceAnswer {
             sample: None,
             start_refused: refused,
+            refusal,
         };
     };
     trace.last_request = std::time::Instant::now();
@@ -2437,18 +2458,18 @@ fn file_trace_sample(
     FileTraceAnswer {
         sample: Some(trace.usage.sample(pid, start_epoch_s, &live)),
         start_refused: refused,
+        refusal,
     }
 }
 
 /// The broker's answer for one request: LocalSystem's own session.
-fn file_io_accounting(pid: u32, start_epoch_s: i64) -> Option<super::file_etw::FileIoSample> {
+fn file_io_accounting(pid: u32, start_epoch_s: i64) -> FileTraceAnswer {
     file_trace_sample(
         FileTraceHost::Service,
         pid,
         start_epoch_s,
         &start_file_trace,
     )
-    .sample
 }
 
 /// How long an app-side trace start is given up for after it failed.
@@ -2518,22 +2539,29 @@ fn app_file_io_accounting(
     pid: u32,
     start_epoch_s: i64,
     start: &FileTraceStarter<'_>,
-) -> Option<super::file_etw::FileIoSample> {
+) -> FileTraceAnswer {
     let now = std::time::Instant::now();
     if !app_trace_start_due(app_trace_last_failure(), now) {
-        return None;
+        // Inside the retry window: nothing is attempted, so this request has
+        // no refusal to report and the snapshot keeps its `Unavailable`.
+        return FileTraceAnswer {
+            sample: None,
+            start_refused: false,
+            refusal: None,
+        };
     }
     let answer = file_trace_sample(FileTraceHost::App, pid, start_epoch_s, start);
     remember_app_trace_failure(answer.failure_at(now));
-    answer.sample
+    answer
 }
 
 /// Attach the GUI's own per-file bytes to `snapshot`, when it can host them.
 ///
 /// The snapshot is left exactly as the handle walk produced it when no session
 /// exists: every per-file number stays `None` (rendered as unavailable), and
-/// the dialog explains why. The service must never call this — it has its own
-/// session under [`FileTraceHost::Service`].
+/// the dialog explains why — including the one refusal it can name, a kernel
+/// logger another application owns. The service must never call this — it has
+/// its own session under [`FileTraceHost::Service`].
 pub(super) fn attach_app_file_io(
     snapshot: &mut crate::actions::ProcessFileIoSnapshot,
     pid: u32,
@@ -2549,8 +2577,10 @@ fn attach_app_file_io_with(
     start_epoch_s: i64,
     start: &FileTraceStarter<'_>,
 ) {
-    if let Some(sample) = app_file_io_accounting(pid, start_epoch_s, start) {
-        super::file_etw::attach_file_io(snapshot, &sample);
+    let answer = app_file_io_accounting(pid, start_epoch_s, start);
+    match answer.sample {
+        Some(sample) => super::file_etw::attach_file_io(snapshot, &sample),
+        None => super::file_etw::attach_refusal(snapshot, answer.refusal),
     }
 }
 
@@ -2828,12 +2858,16 @@ fn dispatch(
             };
             let mut snapshot =
                 super::process_file_io::list_process_file_io(pid, Some(start_epoch_s))?;
-            // The handle walk names the files; only the Kernel-File trace knows
+            // The handle walk names the files; only the kernel file trace knows
             // how many bytes went through them. Attached before the response is
             // trimmed, so rows dropped by the frame budget add to the omitted
-            // remainder instead of vanishing from the totals.
-            if let Some(sample) = file_io_accounting(pid, start_epoch_s) {
-                super::file_etw::attach_file_io(&mut snapshot, &sample);
+            // remainder instead of vanishing from the totals. With no session
+            // at all, the refusal (if the start got an actionable one) becomes
+            // the snapshot's state — never a number.
+            let answer = file_io_accounting(pid, start_epoch_s);
+            match answer.sample {
+                Some(sample) => super::file_etw::attach_file_io(&mut snapshot, &sample),
+                None => super::file_etw::attach_refusal(&mut snapshot, answer.refusal),
             }
             if snapshot.files.len() > MAX_FILES_PER_RESPONSE {
                 let omitted = snapshot.files.split_off(MAX_FILES_PER_RESPONSE);
@@ -5372,7 +5406,7 @@ mod tests {
         let asked = std::sync::Mutex::new(Vec::new());
         let record = |role: super::super::etw::TraceRole| {
             asked.lock().unwrap().push(role);
-            None
+            Err(super::super::file_etw::FileTraceRefusal::Unavailable)
         };
         assert!(
             file_trace_sample(FileTraceHost::App, std::process::id(), 1, &record)
@@ -5443,7 +5477,7 @@ mod tests {
         let attempts = std::cell::Cell::new(0u32);
         let refuse = |_: super::super::etw::TraceRole| {
             attempts.set(attempts.get() + 1);
-            None
+            Err(super::super::file_etw::FileTraceRefusal::Unavailable)
         };
         let mut snapshot = crate::actions::ProcessFileIoSnapshot {
             files: vec![file_row(r"C:\data\a.bin"), file_row(r"C:\data\b.bin")],
@@ -5481,6 +5515,46 @@ mod tests {
         remember_app_trace_failure(None);
     }
 
+    /// The one refusal the snapshot can NAME is another application owning the
+    /// NT Kernel Logger.
+    ///
+    /// Driven through the production app-side entry with a stub start, because
+    /// the failure travels: start → answer → refusal → snapshot state → the
+    /// dialog's line. Every per-file number stays unmeasured, since there is no
+    /// session to measure with and a zero here would be a fabricated count.
+    #[test]
+    fn a_kernel_logger_owned_elsewhere_reaches_the_snapshot_as_its_own_state() {
+        let _serial = TEST_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        remember_app_trace_failure(None);
+        let refuse = |_: super::super::etw::TraceRole| {
+            Err(super::super::file_etw::FileTraceRefusal::KernelLoggerInUse)
+        };
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![file_row(r"C:\data\a.bin"), file_row(r"C:\data\b.bin")],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        attach_app_file_io_with(&mut snapshot, std::process::id(), 1, &refuse);
+        for file in &snapshot.files {
+            assert_eq!(file.read_bytes, None, "never a fabricated zero");
+            assert_eq!(file.write_bytes, None);
+            assert_eq!(file.read_ops, None);
+            assert_eq!(file.write_ops, None);
+        }
+        let accounting = &snapshot.accounting;
+        assert_eq!(
+            accounting.state,
+            crate::actions::FileIoAccountingState::KernelLoggerInUse,
+            "the dialog names the owner instead of claiming a silent window"
+        );
+        assert_eq!(accounting.read_bytes, 0);
+        assert_eq!(accounting.write_bytes, 0);
+        assert_eq!(accounting.since_ms, 0);
+        assert_eq!(accounting.events_lost, None, "no session, no loss count");
+        remember_app_trace_failure(None);
+    }
+
     /// A refusal is a refusal even when a dead session still answers it.
     ///
     /// This is the persistent-restart case: the slot holds a session that
@@ -5498,6 +5572,7 @@ mod tests {
         let refused = FileTraceAnswer {
             sample: Some(frozen.clone()),
             start_refused: true,
+            refusal: Some(super::super::file_etw::FileTraceRefusal::Unavailable),
         };
         assert_eq!(
             refused.failure_at(now),
@@ -5507,6 +5582,7 @@ mod tests {
         let answered = FileTraceAnswer {
             sample: Some(frozen),
             start_refused: false,
+            refusal: None,
         };
         assert_eq!(
             answered.failure_at(now),
