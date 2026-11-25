@@ -164,32 +164,44 @@ pub(crate) fn control_unit_direct(unit: &str, action: ServiceAction) -> Result<(
     }
 }
 
-/// Absolute `systemctl` locations this backend trusts, in resolution order.
+/// Absolute directories that hold the systemd client tools this backend uses.
 ///
-/// The two profile paths are the same ones `pkexec` and `fc-match` resolution
-/// already carries: without them a NixOS host resolves its Polkit helper but
-/// reports the whole service surface as unavailable because `/usr/bin` and
-/// `/bin` do not hold `systemctl` there. Every candidate still has to pass the
-/// root-owned, non-writable ancestor rule in `trusted_system_program`.
-pub(super) const SYSTEMCTL_CANDIDATES: [&str; 4] = [
-    "/usr/bin/systemctl",
-    "/bin/systemctl",
-    "/run/current-system/sw/bin/systemctl",
-    "/nix/var/nix/profiles/default/bin/systemctl",
+/// The two profile paths are the NixOS locations, the same ones
+/// `PKEXEC_CANDIDATES` and `fc-match` resolution carry: without them a NixOS
+/// host resolves its Polkit helper but reports the whole service surface as
+/// unavailable because `/usr/bin` and `/bin` do not hold `systemctl` there.
+/// `systemctl` and `loginctl` both resolve from this one list, so the two cannot
+/// drift apart the way their separate copies did.
+pub(super) const SYSTEM_TOOL_DIRS: [&str; 4] = [
+    "/usr/bin",
+    "/bin",
+    "/run/current-system/sw/bin",
+    "/nix/var/nix/profiles/default/bin",
 ];
 
-fn systemctl_path() -> Result<PathBuf> {
-    for candidate in SYSTEMCTL_CANDIDATES {
-        let candidate = Path::new(candidate);
+/// Resolve a systemd client tool from [`SYSTEM_TOOL_DIRS`].
+///
+/// Every candidate still has to pass the rule in `launch::trusted_system_program`:
+/// an executable regular file whose own path and every ancestor are root-owned
+/// and not group/other writable, so the added locations cannot widen what may be
+/// executed or elevated.
+pub(super) fn trusted_system_tool(tool: &str) -> Result<PathBuf> {
+    for directory in SYSTEM_TOOL_DIRS {
+        let candidate = Path::new(directory).join(tool);
         if candidate.is_file()
-            && let Ok(path) = launch::trusted_system_program(candidate)
+            && let Ok(path) = launch::trusted_system_program(&candidate)
         {
             return Ok(path);
         }
     }
     Err(TmError::Unsupported(
-        "systemd service control (trusted systemctl path)",
+        "required system utility is not installed at a trusted path",
     ))
+}
+
+fn systemctl_path() -> Result<PathBuf> {
+    trusted_system_tool("systemctl")
+        .map_err(|_| TmError::Unsupported("systemd service control (trusted systemctl path)"))
 }
 
 fn control_failure(output: &std::process::Output, verb: &str, unit: &str) -> TmError {

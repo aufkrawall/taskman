@@ -108,7 +108,7 @@ pub(super) fn run_privileged_action(action: &PrivilegedAction) -> Result<()> {
     }
     match action {
         PrivilegedAction::Service { unit, action } => {
-            let systemctl = trusted_program(&services::SYSTEMCTL_CANDIDATES)?;
+            let systemctl = services::trusted_system_tool("systemctl")?;
             let verb = match action {
                 crate::actions::ServiceAction::Start => "start",
                 crate::actions::ServiceAction::Stop => "stop",
