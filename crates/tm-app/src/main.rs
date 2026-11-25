@@ -2495,12 +2495,12 @@ mod tests {
     /// after it has handed a frame over.
     #[cfg(target_os = "windows")]
     #[test]
-    fn a_restore_paint_is_marked_only_after_a_frame_really_painted() {
+    fn a_restore_paint_is_marked_only_after_a_frame_was_handed_over() {
         // Nothing armed: a taskbar un-minimize the app never asked for.
         assert!(!restore_paint_seen(false, false, 3, 2));
         // Armed this pass: `ui` has not bumped the counter since.
         assert!(!restore_paint_seen(true, false, 2, 2));
-        // The pass after that frame ran: it has been presented by now.
+        // The pass after that frame ran: it has been handed over by now.
         assert!(restore_paint_seen(true, false, 3, 2));
         // Once per restore, however many frames follow.
         assert!(!restore_paint_seen(true, true, 4, 2));

@@ -786,14 +786,17 @@ impl Settings {
     /// Read `path` and report whether its contents could be used. A file that
     /// is present but unreadable (oversized, corrupt, locked), or readable but
     /// holding no settings at all (empty, zero-filled, garbage after a failed
-    /// save) is kept aside and reported unusable, so [`Settings::load`] can
-    /// still fall back to the legacy JSON settings instead of letting defaults
-    /// shadow them.
+    /// save), is unusable and does not stay where it is: one that holds bytes
+    /// is kept aside, an empty one is dropped. Reporting it unusable lets
+    /// [`Settings::load`] still fall back to the legacy JSON settings instead
+    /// of letting defaults shadow them.
     ///
-    /// One `key=value` pair is enough to be usable: a hand-edited INI
-    /// legitimately sets a subset of the keys, and every key it omits keeps
-    /// its default. Only a file that says nothing is indistinguishable from
-    /// one whose write lost its data.
+    /// One pair under a section header is enough to be usable: a hand-edited
+    /// INI legitimately sets a subset of the keys, and every key it omits
+    /// keeps its default. A pair before the first header belongs to no section
+    /// and is dropped by the parser, so a file with only those still counts as
+    /// nothing. Only a file that says nothing is indistinguishable from one
+    /// whose write lost its data.
     fn load_from_checked(path: &Path) -> (Self, bool) {
         let bytes = read_capped(path, MAX_SETTINGS_BYTES);
         match bytes {
@@ -801,7 +804,10 @@ impl Settings {
                 // Tolerate a UTF-8 BOM (e.g. files edited with PowerShell).
                 let text = String::from_utf8_lossy(&bytes);
                 let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-                if parse_ini(text).is_empty() {
+                // Parsed once: the emptiness check and the field mapping read
+                // the same map, so a large config is not walked twice.
+                let kv = parse_ini(text);
+                if kv.is_empty() {
                     // Nothing to restore. Reporting this as usable would skip
                     // the JSON migration and let the first autosave of
                     // defaults overwrite what the user actually chose.
@@ -813,7 +819,7 @@ impl Settings {
                     crate::persist::set_aside(path, "settings file");
                     (Self::default(), false)
                 } else {
-                    let s = Self::from_ini_text(text);
+                    let s = Self::from_ini_map(&kv);
                     tracing::debug!(path = %path.display(), "settings loaded");
                     (s, true)
                 }
@@ -835,7 +841,12 @@ impl Settings {
     /// Build settings from INI text. Unknown keys/values are ignored and the
     /// corresponding fields keep their defaults.
     pub fn from_ini_text(text: &str) -> Self {
-        let kv = parse_ini(text);
+        Self::from_ini_map(&parse_ini(text))
+    }
+
+    /// Build settings from an already parsed INI map, so the loader can decide
+    /// whether the file holds anything and map its keys from one parse.
+    fn from_ini_map(kv: &BTreeMap<(String, String), String>) -> Self {
         let get = |section: &str, key: &str| kv.get(&(section.to_string(), key.to_string()));
         let b = |section: &str, key: &str, dflt: bool| {
             get(section, key)
@@ -1001,7 +1012,7 @@ impl Settings {
         // column ids are preserved verbatim (harmless) rather than
         // corrupting anything.
         let mut saw_legacy = false;
-        for ((section, key), value) in &kv {
+        for ((section, key), value) in kv {
             if section == "columns" {
                 saw_legacy = true;
             } else if section == "sort" {
@@ -1657,7 +1668,9 @@ text_smoothing=banana
     /// An empty config.ini is readable, which used to be mistaken for usable:
     /// the JSON migration was skipped and the next autosave wrote defaults
     /// over the user's JSON-era settings. It holds nothing, so it is unusable
-    /// like any other failed write — and kept, not deleted.
+    /// like any other failed write, and it is dropped instead of being kept
+    /// aside: an empty file must never land on a `.bad` that still holds
+    /// settings.
     #[test]
     fn empty_ini_still_migrates_the_legacy_json_settings() {
         let dir = tempfile::tempdir().unwrap();
@@ -1675,13 +1688,53 @@ text_smoothing=banana
         assert_eq!(loaded.theme, ThemeMode::Dark);
         assert_eq!(loaded.update_speed, UpdateSpeed::High);
         assert_eq!(loaded.graph_seconds, 90);
-        // Kept aside instead of being left for the first autosave to overwrite.
+        // Dropped instead of being left for the first autosave to overwrite.
+        assert!(!path.exists());
+        assert!(
+            !dir.path().join("config.ini.bad").exists(),
+            "an empty file holds nothing worth keeping aside"
+        );
+    }
+
+    /// The aside copy is the user's last recoverable settings, so an empty
+    /// config.ini must not replace it — that was the data loss this guards.
+    #[test]
+    fn an_empty_ini_does_not_replace_an_existing_aside_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let aside = dir.path().join("config.ini.bad");
+        let recoverable = "[general]\ntheme=dark\nupdate_speed=high\n";
+        std::fs::write(&aside, recoverable).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        let (loaded, usable) = Settings::load_from_checked(&path);
+
+        assert_eq!(loaded, Settings::default());
+        assert!(!usable, "a file that holds no settings is not usable");
+        assert!(!path.exists(), "the empty INI must leave the load path");
+        assert_eq!(
+            std::fs::read_to_string(&aside).unwrap(),
+            recoverable,
+            "an empty INI must not clobber the recoverable copy"
+        );
+    }
+
+    /// A non-empty unusable INI is real data, so it still takes the aside
+    /// name: the newest recoverable file wins, without versioning.
+    #[test]
+    fn a_non_empty_unusable_ini_replaces_the_aside_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let aside = dir.path().join("config.ini.bad");
+        std::fs::write(&aside, "stale").unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_SETTINGS_BYTES + 1]).unwrap();
+
+        assert_eq!(Settings::load_from(&path), Settings::default());
+
         assert!(!path.exists());
         assert_eq!(
-            std::fs::metadata(dir.path().join("config.ini.bad"))
-                .unwrap()
-                .len(),
-            0
+            std::fs::metadata(&aside).unwrap().len(),
+            (MAX_SETTINGS_BYTES + 1) as u64
         );
     }
 

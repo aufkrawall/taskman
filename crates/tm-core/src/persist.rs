@@ -121,7 +121,26 @@ pub(crate) fn replace_file(
 /// UTF-8 or merely unreadable right now still holds the user's settings or
 /// history, so it is kept for recovery instead of being overwritten. Best
 /// effort: failing to move it is logged, never fatal.
+///
+/// A zero-byte source is removed instead of moved: it holds nothing to
+/// recover, and moving it would replace the `.bad` copy that an earlier, real
+/// failure kept aside — the one file the user can still restore from. Either
+/// way the source stops sitting where the next load would re-read it.
 pub(crate) fn set_aside(path: &Path, what: &str) {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "{what} held nothing; removed it instead of keeping it aside"
+            ),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "{what} held nothing and could not be removed; the next save replaces it"
+            ),
+        }
+        return;
+    }
     let mut aside = path.as_os_str().to_owned();
     aside.push(".bad");
     match std::fs::rename(path, &aside) {
@@ -177,6 +196,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("store.json.bad")).unwrap(),
             "second"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing aside copy is the user's last recoverable file. A zero-byte
+    /// source holds nothing, so it is discarded instead of being moved over
+    /// that copy — and it still leaves the load path for the next start.
+    #[test]
+    fn an_empty_source_never_replaces_an_existing_aside_copy() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-persist-aside-{}-{}",
+            std::process::id(),
+            NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("store.json");
+        let aside = dir.join("store.json.bad");
+        std::fs::write(&aside, b"the last recoverable copy").unwrap();
+        std::fs::write(&dest, b"").unwrap();
+
+        set_aside(&dest, "test store");
+
+        assert!(!dest.exists(), "the unusable file must not be left for the next load");
+        assert_eq!(
+            std::fs::read_to_string(&aside).unwrap(),
+            "the last recoverable copy",
+            "an empty file must not replace the copy kept aside earlier"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
