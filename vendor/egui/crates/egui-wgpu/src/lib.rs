@@ -67,6 +67,12 @@ pub enum WgpuError {
     #[cfg(feature = "winit")]
     #[error(transparent)]
     HandleError(#[from] ::winit::raw_window_handle::HandleError),
+
+    #[error("No render state: call `Painter::set_window` before painting")]
+    NoRenderState,
+
+    #[error("No surface for this viewport: call `Painter::set_window` before painting")]
+    NoSurface,
 }
 
 /// Runtime-mutable subset of [`WgpuConfiguration`].
@@ -133,7 +139,12 @@ pub struct RenderState {
     pub target_format: wgpu::TextureFormat,
 
     /// Egui renderer responsible for drawing the UI.
-    pub renderer: Arc<RwLock<Renderer>>,
+    ///
+    /// `None` until the pipelines have been compiled by [`Self::ensure_renderer`] (or by
+    /// `Painter::ensure_renderer` on the winit path). Device creation has to happen before a
+    /// window can present anything; pipeline compilation does not, so it is kept out of the
+    /// path that ends in the window becoming visible.
+    pub renderer: Option<Arc<RwLock<Renderer>>>,
 
     /// Runtime-mutable subset of the wgpu configuration.
     ///
@@ -204,6 +215,11 @@ async fn request_adapter(
 impl RenderState {
     /// Creates a new [`RenderState`], containing everything needed for drawing egui with wgpu.
     ///
+    /// The renderer (and with it the pipelines) is created right away, which is what callers
+    /// that own their own frame loop want. The winit `Painter` uses
+    /// [`Self::create_without_renderer`] instead: a window should appear before the driver
+    /// compiles its pipelines.
+    ///
     /// # Errors
     /// Wgpu initialization may fail due to incompatible hardware or driver for a given config.
     pub async fn create(
@@ -211,6 +227,26 @@ impl RenderState {
         instance: &wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'static>>,
         options: RendererOptions,
+    ) -> Result<Self, WgpuError> {
+        let mut render_state =
+            Self::create_without_renderer(config, instance, compatible_surface).await?;
+        render_state.ensure_renderer(options);
+        Ok(render_state)
+    }
+
+    /// Like [`Self::create`], but leaves `renderer` unset.
+    ///
+    /// The instance, adapter, device, queue and target format are decided here; the pipelines
+    /// are compiled on demand via [`Self::ensure_renderer`]. Callers that must present
+    /// something before anything has been drawn — a window's first frames — can therefore
+    /// keep pipeline compilation out of that window's reveal path.
+    ///
+    /// # Errors
+    /// Wgpu initialization may fail due to incompatible hardware or driver for a given config.
+    pub async fn create_without_renderer(
+        config: &WgpuConfiguration,
+        instance: &wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'static>>,
     ) -> Result<Self, WgpuError> {
         profiling::scope!("RenderState::create"); // async yield give bad names using `profile_function`
 
@@ -282,8 +318,6 @@ impl RenderState {
         };
         let target_format = crate::preferred_framebuffer_format(&surface_formats)?;
 
-        let renderer = Renderer::new(&device, target_format, options);
-
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.
         #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
@@ -295,9 +329,44 @@ impl RenderState {
             device,
             queue,
             target_format,
-            renderer: Arc::new(RwLock::new(renderer)),
+            renderer: None,
             surface_config: config.surface,
         })
+    }
+
+    /// The renderer, if its pipelines have been compiled yet.
+    pub fn renderer(&self) -> Option<&Arc<RwLock<Renderer>>> {
+        self.renderer.as_ref()
+    }
+
+    /// Compile the renderer's pipelines, unless that already happened.
+    ///
+    /// Returns the renderer's lock. Cloning the `Arc` is cheap and lets a caller write through
+    /// it while the rest of this state stays borrowed immutably. Idempotent: calling it on
+    /// every frame costs one `Arc` clone.
+    #[allow(clippy::allow_attributes, clippy::arc_with_non_send_sync)] // For wasm
+    pub fn ensure_renderer(&mut self, options: RendererOptions) -> Arc<RwLock<Renderer>> {
+        profiling::function_scope!();
+
+        if let Some(renderer) = &self.renderer {
+            return Arc::clone(renderer);
+        }
+
+        let renderer = Renderer::new(&self.device, self.target_format, options);
+        log::debug!("Created the egui-wgpu renderer");
+
+        let renderer = Arc::new(RwLock::new(renderer));
+        self.renderer = Some(Arc::clone(&renderer));
+        renderer
+    }
+
+    /// Whether this device can draw sub-pixel text through dual-source blending.
+    ///
+    /// A property of the device, so it is known before the renderer exists.
+    /// [`Renderer::has_subpixel_pipeline`] additionally reports that the pipeline really
+    /// validated and was created for this target format.
+    pub fn supports_subpixel_text(&self) -> bool {
+        Renderer::supports_subpixel_text(&self.device)
     }
 }
 

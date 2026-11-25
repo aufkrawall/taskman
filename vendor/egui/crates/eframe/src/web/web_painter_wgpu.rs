@@ -45,6 +45,18 @@ impl egui_wgpu::wgpu::rwh::HasDisplayHandle for WebDisplay {
     }
 }
 
+/// The painter's renderer lock.
+///
+/// `RenderState::create` builds the renderer eagerly, so the web painter always has one; the
+/// error mirrors the missing-render-state case in `paint_and_update_textures`.
+fn renderer_lock(
+    render_state: &RenderState,
+) -> Result<&Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>, JsValue> {
+    render_state
+        .renderer()
+        .ok_or_else(|| JsValue::from_str("Can't paint, the wgpu renderer was already disposed"))
+}
+
 impl WebPainterWgpu {
     pub fn render_state(&self) -> Option<RenderState> {
         self.render_state.clone()
@@ -209,7 +221,7 @@ impl WebPainter for WebPainterWgpu {
         };
 
         let user_cmd_bufs = {
-            let mut renderer = render_state.renderer.write();
+            let mut renderer = renderer_lock(render_state)?.write();
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {
@@ -283,7 +295,7 @@ impl WebPainter for WebPainterWgpu {
             };
 
             {
-                let renderer = render_state.renderer.read();
+                let renderer = renderer_lock(render_state)?.read();
 
                 let target_texture = if capture {
                     let capture_state = self.screen_capture_state.get_or_insert_with(|| {
@@ -390,7 +402,7 @@ impl WebPainter for WebPainterWgpu {
         // Calling `wgpu::Texture::destroy` on a texture that is still in use would invalidate the command buffer(s) it is used in.
         // However, once we called `wgpu::Queue::submit`, it is up for wgpu to determine how long the underlying gpu resource has to live.
         {
-            let mut renderer = render_state.renderer.write();
+            let mut renderer = renderer_lock(render_state)?.write();
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for id in textures_delta.free.drain() {
                 renderer.free_texture(&id);
