@@ -1427,8 +1427,14 @@ impl PlatformActions for BrokeredActions {
                 "unexpected process file I/O response type",
             )),
             Err(BrokerCallError::Unavailable(_)) => local(),
+            // The service declining is a decision, and the local arm is no
+            // longer a plain read: it starts a per-file session under this
+            // process's own token, machine-wide, whenever that token is
+            // elevated. Working a policy decision around by hosting the same
+            // measurement locally is exactly what every other rejection arm in
+            // this file refuses to do, so this one propagates the reason.
             Err(BrokerCallError::Rejected(detail)) => {
-                local().map_err(|_| TmError::platform("core service", detail))
+                Err(TmError::platform("core service", detail))
             }
         }
     }
