@@ -142,8 +142,12 @@ schedule a 50 ms retry. `EventResult::Wait` (not `RepaintNow`) is returned from 
 sub-pixel mode, gamma/contrast, `round_rects_to_pixels`, `round_text_to_pixels`,
 `round_line_segments_to_pixels`, `coarse_tessellation_culling`, `feathering`,
 `feathering_size_in_pixels`, `prerasterized_discs`, `bezier_tolerance`, `epsilon` and the
-font atlas size. The `debug_*` toggles are the deliberate exception: they change the shapes
-that get emitted, which the per-shape hash already covers. `Shape::Circle` is hashed
+font atlas size, and all three `debug_*` toggles. The toggles are keyed because they are
+applied after `plan()` hashed the input shapes: `debug_paint_text_rects` injects its stroke
+inside `tessellate_shape`, which reaches the default `Blit` path for rotated text, and the two
+clip-rect toggles are applied at the end of `tessellate_shapes`, which `Blit` reaches for the
+underline stroke. Without them in the key a runtime toggle repaints nothing and the new
+primitives land outside the tiles that claim to be current. `Shape::Circle` is hashed
 together with the font atlas even though it names no texture, because a small filled circle
 can be tessellated through a prerasterized disc that lives in that atlas. A missing entry
 does not fail a test — it shows up as a stale region — so

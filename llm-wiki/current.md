@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-11-25 (Linux sampling cost and telemetry demand)
+Last cross-checked: 2026-11-25 (four-week review round; Linux sampling cost and telemetry demand)
 
 ## Summary
 
@@ -16,6 +16,39 @@ in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 Linux can elevate only a trusted `systemctl` for service control; elevated
 process actions and GUI relaunch fail closed until a protected helper exists.
+
+## Four-week review round (2026-11-25)
+
+Every commit from 2026-10-28..2026-11-25 was reviewed by area (Win32 platform, app
+shell/settings, tabs and widgets, eframe/egui-wgpu/egui-winit, egui_software/epaint/winit,
+Linux platform/installer), and each review was followed by an independent verification
+pass. The durable outcomes that outlive the individual fixes:
+
+- **A missing-telemetry sweep found the memory column last.** `MemoryInfo::used_pct` now
+  returns `None` for an unreported total and `Aggregates::mem_pct` is optional, so the
+  Processes/Users users column, the Performance memory card and page header, the memory
+  sparkline and the Committed/Cached/Pool rows all render `—` or a graph gap instead of a
+  fabricated zero. The same rule now governs the Process Properties file totals. Treat any
+  new average, total or percentage as suspect until it can distinguish "unmeasured".
+- **`set_aside` has one rule in both directions:** a file that says something replaces
+  `<name>.bad` (newest byte-bearing copy wins), a file that says nothing never replaces
+  one. Settings makes the decision where it already knows the INI parsed to no pairs,
+  because zero length is not the same question as "holds no settings".
+- **`set_aside`'s callers** (`settings`, `app_history`, `startup_impact`) share that rule;
+  a contentless store is dropped rather than preserved, and no caller depended on the old
+  keep-everything behavior.
+- **The software damage frame key must list every global input that changes pixels,
+  including the three `debug_*` toggles.** They run after `plan()` hashes the input shapes:
+  `debug_paint_text_rects` injects a stroke inside `tessellate_shape` (reached by rotated
+  text on the default blit path) and the two clip-rect toggles are applied at the end of
+  `tessellate_shapes` (reached by underline strokes). See `render-pipeline.md`.
+- **GL device requests are validated against the adapter, not against the target.**
+  `gui_device_limits` requests `min(8192, adapter.max_texture_dimension_{1,2}d)`; an
+  unconditional requirement fails `request_device` outright and leaves the app with no
+  window, which is worse than a smaller working surface.
+- **Win32 teardown order is clear-while-alive, destroy, then free.** Clearing
+  `GWLP_USERDATA` after `DestroyWindow` (or before the `IsWindow` guard) either loses the
+  pointer to a freed box or writes into a recycled handle.
 
 ## GPU LCD text and Linux fontconfig (2026-11-23)
 

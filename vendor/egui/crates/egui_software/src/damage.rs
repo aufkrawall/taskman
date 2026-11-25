@@ -107,8 +107,10 @@ impl FrameKey {
             // default path: `tessellate_shape` injects its stroke while tessellating, and
             // rotated text -- which cannot be blitted -- is tessellated there. The two
             // clip-rect toggles are applied at the end of `tessellate_shapes` instead, which
-            // the default `Blit` mode never reaches because it tessellates shape by shape
-            // through `tessellate_clipped_shape`.
+            // `Blit` reaches only for underlined text (its underline stroke is tessellated
+            // there); everything else on that path goes through `tessellate_clipped_shape`.
+            // They therefore bite exactly when underlined or rotated text is on screen, which
+            // is why all three are keyed.
             debug_paint_clip_rects: ctx.options.debug_paint_clip_rects,
             debug_ignore_clip_rects: ctx.options.debug_ignore_clip_rects,
             debug_paint_text_rects: ctx.options.debug_paint_text_rects,
