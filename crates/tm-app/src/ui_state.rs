@@ -44,6 +44,12 @@ fn read_state_text(path: &std::path::Path) -> Option<String> {
         .read_to_end(&mut bytes)
         .ok()?;
     if bytes.len() > MAX_STATE_BYTES {
+        tracing::debug!(
+            path = %path.display(),
+            len = bytes.len(),
+            limit = MAX_STATE_BYTES,
+            "window placement file is over the cap; using the OS placement"
+        );
         return None;
     }
     String::from_utf8(bytes).ok()
@@ -220,7 +226,7 @@ mod tests {
         too_long.push('\n');
         std::fs::write(&over, &too_long).unwrap();
         assert_eq!(read_state_text(&over), None);
-        // Absent and unreadable take the same path: nothing to apply.
+        // An absent file takes the same path: nothing to apply.
         assert_eq!(read_state_text(&dir.join("missing.ini")), None);
 
         let _ = std::fs::remove_dir_all(&dir);
