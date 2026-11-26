@@ -244,6 +244,41 @@ passing. It is deliberately **not** part of `--check`: that gate must stay
 offline-capable and tool-independent. Run `--audit` before a release, and see
 `debug-tools-security-audit.md` for the tool inventory and fallbacks.
 
+## Building where cargo cannot reach crates.io (agent sandbox)
+
+Symptom, seen in the agent sandbox: every `cargo` invocation that has to resolve
+a dependency stops at `Updating crates.io index` with
+`schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`, and
+`--offline` then fails selection for any crate the local registry lacks
+(concretely `resvg 0.49`, which `tm-platform` added for SVG icons — a fresh
+checkout of this tree cannot build offline without it). The cause is the
+sandbox's TLS block: cargo on Windows uses Schannel, which the sandbox denies.
+Python's HTTPS and WSL's own TLS stack are not affected, so there are two
+working routes.
+
+**Linux: run it in WSL, which has real crates.io access.** This is the better
+route for anything touching the Linux backend, and it is how the Linux half is
+verified without a second machine:
+
+```
+wsl.exe -d <distro> -- bash -lc 'cd /mnt/c/<checkout> && cargo test -p tm-platform -p tm-app'
+```
+
+A copy inside the distro (`rsync -a --exclude target --exclude .git /mnt/c/<checkout>/ ~/tm-verify/`)
+builds faster than running cargo across the 9p mount.
+
+**Windows: `python tools/offline-crates.py -- <command>`.** It diffs `Cargo.lock`
+against `~/.cargo/registry/src`, downloads the missing `.crate` files with
+Python (verifying the sha256 the lock records), unpacks them under
+`target/agent-crates/`, adds a temporary `[patch.crates-io]` block, runs the
+command, and restores `Cargo.toml` and `Cargo.lock` byte for byte on every exit
+path — including Ctrl-C. Nothing it writes is committable, and the crates are the
+same bytes a normal build would download. Use a plain `cargo`/`build.py` run
+wherever crates.io is reachable; this exists for the sandbox only.
+
+Both routes work: the release artifact builds, and the resolver benchmark below
+ran inside WSL against the host's real theme tree.
+
 ## Binary hardening flags
 
 Windows release builds (both `cargo build --release` through

@@ -23,13 +23,17 @@
   from their rebuild (`IconPrefetch` gates the three pages that rebuild every frame),
   and `taskman --selfcheck-icons` prints one JSON line with cold/warm per-key
   timings — the only way to measure icon cost without a GUI.
-- Verification: `cargo test -p tm-platform -p tm-app` (1121 tests) green after the
-  three branches merged; the new `a_warm_lookup_performs_no_filesystem_probes` test
-  pins the zero-probe warm path directly. Re-running the instrumented model with the
-  fixed algorithm's caching on the same theme tree: 21 names cost 752 directory reads
-  in total (one per distinct directory) and **0** probes, a warm pass costs **0**
-  filesystem calls, and 400 distinct missing executables cost 0 (was ~4.9 M probes and
-  554 k `read_dir`s).
+- Verification: the suite is green on Windows, and the same suite runs green inside
+  WSL against the Linux backend. The decisive number is the ignored
+  `bench_host_theme_icon_lookup`, run in release **inside WSL against the host's real
+  theme tree** (`default → Adwaita → AdwaitaLegacy → hicolor`): 26 names cost 761
+  directory reads and 165 ms on the cold pass — one read per directory and no `stat`
+  probes at all — then **0 directory reads, 0 walks, 0.0 ms** on the warm pass.
+  Residency was 757 listings (2,713 file names) against the raised 4,096 cap, which is
+  exactly why the original 1,024 would have thrashed to a zero hit rate. Baseline for
+  comparison, the same walk before the fix: ~12,300 probes and ~1,400 `read_dir`s for
+  ONE name, i.e. ~4.9 M probes and 554 k directory reads for 400 distinct missing
+  executables. `a_warm_lookup_rereads_no_directory` pins the zero-read warm path.
 - Rejected: caching a name miss for the process lifetime (it cancels the "an icon or
   theme installed later must appear" recovery), and re-reading XSettings or walking
   `index.theme` per lookup to soften the process-lifetime theme snapshot.

@@ -74,6 +74,12 @@
 - **Environment gotchas:**
   - Long inline heredocs (>6 KB) get truncated in some shells here — write
     patch scripts to a file first, then execute them.
+  - In the agent sandbox cargo cannot reach crates.io (Schannel TLS is blocked):
+    a plain build dies at `Updating crates.io index`, and `--offline` fails for
+    any crate the local registry lacks. Run the Linux half in WSL (real network),
+    and on Windows wrap the command as
+    `python tools/offline-crates.py -- cargo test -p tm-app`; see
+    `llm-wiki/build.md` § "Building where cargo cannot reach crates.io".
   - Write multi-line scripts with the Write tool and change them with Edit;
     avoid `sed -i` for replacements that contain backslashes or quotes
     (Git Bash escaping mangles them).
