@@ -722,6 +722,7 @@ pub(super) fn taskbar_thread_main(
                 last_pos: None,
                 state: WidgetState::default(),
                 last_present_error: None,
+                last_cross_mismatch: None,
                 last_anchor_slot: None,
                 last_compact: false,
                 last_stacked: false,

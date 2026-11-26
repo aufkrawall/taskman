@@ -90,10 +90,38 @@ impl Gap1D {
     }
 }
 
+/// Clamps `rect` into `bar` and reports whether the result still fills the
+/// bar's cross axis (its full height on a horizontal bar, its full width on a
+/// vertical one). Every edge that escapes the bar lands on the bar's edge and
+/// an edge already inside is returned untouched, so the clamp only ever
+/// shrinks: it can never enlarge the widget past the bar or past itself.
+///
+/// Filling the cross axis exactly is the placement contract, not a nicety: a
+/// shorter box leaves a dead band where clicks land on the taskbar instead of
+/// the widget, and a taller one overlaps the bar it was placed on.
+pub(super) fn clamp_into_taskbar(rect: PixelRect, bar: PixelRect) -> (PixelRect, bool) {
+    if bar.is_empty() {
+        return (rect, false);
+    }
+    let clamped = PixelRect {
+        left: rect.left.clamp(bar.left, bar.right),
+        top: rect.top.clamp(bar.top, bar.bottom),
+        right: rect.right.clamp(bar.left, bar.right),
+        bottom: rect.bottom.clamp(bar.top, bar.bottom),
+    };
+    let fills_cross = if bar.width() >= bar.height() {
+        clamped.height() == bar.height()
+    } else {
+        clamped.width() == bar.width()
+    };
+    (clamped, fills_cross)
+}
+
 /// Computes collision-free widget coordinates inside `taskbar_rect` from out-of-process
 /// UIA obstacle rectangles plus `tray_notify_rect`, preferring the tray-adjacent slot
 /// and falling back to an alternate open gap before reporting `None` (hide).
-/// Unknown or empty UIA occupancy keeps the widget hidden.
+/// Unknown or empty UIA occupancy keeps the widget hidden, and so does any widget
+/// that cannot fit the bar's cross axis without escaping it.
 pub(super) fn solve_taskbar_placement(
     taskbar_rect: PixelRect,
     tray_notify_rect: Option<PixelRect>,
@@ -124,24 +152,17 @@ pub(super) fn solve_taskbar_placement(
         }
     };
     let (bar_start, bar_end) = project(taskbar_rect);
-    let (cross_pos, widget_len, cross_avail, widget_cross) = if horizontal {
-        (
-            taskbar_rect.top + (taskbar_rect.height() - h) / 2,
-            w,
-            taskbar_rect.height(),
-            h,
-        )
+    // The widget is placed at the bar's cross start whenever it fills the bar's
+    // cross axis, which is the normal case: equality is not a tolerance here.
+    let (cross_start, cross_avail, widget_len, widget_cross) = if horizontal {
+        (taskbar_rect.top, taskbar_rect.height(), w, h)
     } else {
-        (
-            taskbar_rect.left + (taskbar_rect.width() - w) / 2,
-            h,
-            taskbar_rect.width(),
-            w,
-        )
+        (taskbar_rect.left, taskbar_rect.width(), h, w)
     };
     if widget_cross > cross_avail {
         return None;
     }
+    let cross_pos = cross_start + (cross_avail - widget_cross) / 2;
     let bar_len = bar_end - bar_start;
     let req_len = if prefer_keep_compact {
         widget_len + hysteresis
@@ -284,6 +305,18 @@ pub(super) fn solve_taskbar_placement(
     } else {
         (cross_pos, primary)
     };
+    // Total contract: no returned placement puts the widget outside the bar on
+    // either axis. Verify it here instead of trusting the arithmetic above.
+    let candidate = PixelRect {
+        left: pos.0,
+        top: pos.1,
+        right: pos.0.saturating_add(w),
+        bottom: pos.1.saturating_add(h),
+    };
+    let (fitted, _) = clamp_into_taskbar(candidate, taskbar_rect);
+    if fitted != candidate {
+        return None;
+    }
     Some(PlacementResult { pos, slot })
 }
 
@@ -553,6 +586,189 @@ mod tests {
         .expect("vertical tray-adjacent gap above 830 should fit");
         assert_eq!(vert_res.slot, AnchorSlot::TrayAdjacent);
         assert_eq!(vert_res.pos.1, 830 - 38 - 6);
+    }
+
+    #[test]
+    fn clamp_into_taskbar_shrinks_escapes_and_never_grows() {
+        let bar = rect(-1_000, -10_000, -200, -9_952);
+
+        // Already inside: untouched, and it fills the bar's cross axis.
+        let inside = rect(-700, -10_000, -540, -9_952);
+        assert_eq!(clamp_into_taskbar(inside, bar), (inside, true));
+
+        // Every escaped edge (and a box escaping all four) lands on the bar's
+        // edge without ever growing the rect.
+        for (raw, expected) in [
+            (
+                rect(-1_010, -10_000, -540, -9_952),
+                rect(-1_000, -10_000, -540, -9_952),
+            ),
+            (
+                rect(-700, -10_000, -190, -9_952),
+                rect(-700, -10_000, -200, -9_952),
+            ),
+            (
+                rect(-700, -10_004, -540, -9_952),
+                rect(-700, -10_000, -540, -9_952),
+            ),
+            (
+                rect(-700, -10_000, -540, -9_940),
+                rect(-700, -10_000, -540, -9_952),
+            ),
+            (
+                rect(-1_010, -10_004, -190, -9_940),
+                rect(-1_000, -10_000, -200, -9_952),
+            ),
+        ] {
+            let (clamped, fills_cross) = clamp_into_taskbar(raw, bar);
+            assert_eq!(clamped, expected, "{raw:?} clamped into {bar:?}");
+            assert_eq!(
+                fills_cross,
+                clamped.height() == bar.height(),
+                "{raw:?} cross-axis report"
+            );
+            assert!(bar.covers(clamped), "{raw:?} must stay inside {bar:?}");
+            assert!(
+                clamped.width() <= raw.width() && clamped.height() <= raw.height(),
+                "{raw:?} must never be enlarged"
+            );
+        }
+
+        // Inside but shorter than the bar: kept as is and reported (dead band),
+        // which is what the window-side diagnostic keys on.
+        let short = rect(-700, -10_000, -540, -9_968);
+        assert_eq!(clamp_into_taskbar(short, bar), (short, false));
+
+        // Vertical bar: the cross axis is the width.
+        let vertical = rect(1_840, 0, 1_920, 1_080);
+        let full_width = rect(1_840, 400, 1_920, 550);
+        assert_eq!(clamp_into_taskbar(full_width, vertical), (full_width, true));
+        let narrow = rect(1_840, 400, 1_904, 550);
+        assert_eq!(clamp_into_taskbar(narrow, vertical), (narrow, false));
+
+        // A degenerate bar has nothing to fit into: the rect is left alone.
+        let empty = rect(0, 0, 0, 0);
+        assert_eq!(clamp_into_taskbar(inside, empty), (inside, false));
+    }
+
+    #[test]
+    fn placement_fills_the_taskbar_cross_axis_at_every_geometry() {
+        #[derive(Clone, Copy, Debug)]
+        enum Edge {
+            Bottom,
+            Top,
+            Left,
+            Right,
+        }
+
+        let mut checked = 0;
+        for edge in [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right] {
+            let horizontal = matches!(edge, Edge::Bottom | Edge::Top);
+            for (ox, oy) in [(0, 0), (-1920, 0)] {
+                for dpi in [96, 120, 144, 168, 192, 216, 240] {
+                    for cross in [24, 30, 40, 48, 60, 72, 75] {
+                        for tray_at_end in [true, false] {
+                            let (bar, notify) = if horizontal {
+                                let (top, bottom) = if matches!(edge, Edge::Bottom) {
+                                    (oy + 720 - cross, oy + 720)
+                                } else {
+                                    (oy, oy + cross)
+                                };
+                                let bar = rect(ox, top, ox + 1200, bottom);
+                                let notify = if tray_at_end {
+                                    rect(bar.right - 220, top, bar.right, bottom)
+                                } else {
+                                    rect(bar.left, top, bar.left + 220, bottom)
+                                };
+                                (bar, notify)
+                            } else {
+                                let (left, right) = if matches!(edge, Edge::Left) {
+                                    (ox, ox + cross)
+                                } else {
+                                    (ox + 1200 - cross, ox + 1200)
+                                };
+                                let bar = rect(left, oy, right, oy + 720);
+                                let notify = if tray_at_end {
+                                    rect(left, bar.bottom - 220, right, bar.bottom)
+                                } else {
+                                    rect(left, bar.top, right, bar.top + 220)
+                                };
+                                (bar, notify)
+                            };
+                            let (widget_w, widget_h) = if horizontal {
+                                (150, cross)
+                            } else {
+                                (cross, 150)
+                            };
+                            let uia = [notify];
+                            let case = format!(
+                                "{edge:?} cross={cross} dpi={dpi} origin=({ox},{oy}) \
+                                 tray_at_end={tray_at_end}"
+                            );
+
+                            let Some(res) = solve_taskbar_placement(
+                                bar,
+                                Some(notify),
+                                Some(&uia),
+                                (widget_w, widget_h),
+                                dpi,
+                                None,
+                                false,
+                            ) else {
+                                panic!("{case}: a widget equal to the bar cross axis must fit");
+                            };
+                            let (x, y) = res.pos;
+                            let placed = rect(x, y, x + widget_w, y + widget_h);
+                            let (cross_pos, cross_start) = if horizontal {
+                                (y, bar.top)
+                            } else {
+                                (x, bar.left)
+                            };
+                            assert_eq!(
+                                cross_pos, cross_start,
+                                "{case}: the widget must start at the bar's cross edge, \
+                                 not leave a dead band"
+                            );
+                            assert!(
+                                bar.covers(placed),
+                                "{case}: {placed:?} must stay inside {bar:?}"
+                            );
+                            assert!(
+                                placed.width() <= bar.width() && placed.height() <= bar.height(),
+                                "{case}: {placed:?} must not exceed {bar:?}"
+                            );
+                            assert!(
+                                clamp_into_taskbar(placed, bar).1,
+                                "{case}: {placed:?} must fill the bar's cross axis"
+                            );
+
+                            // One pixel over the bar's cross extent must hide
+                            // instead of producing an out-of-bar rect.
+                            let (over_w, over_h) = if horizontal {
+                                (150, cross + 1)
+                            } else {
+                                (cross + 1, 150)
+                            };
+                            assert!(
+                                solve_taskbar_placement(
+                                    bar,
+                                    Some(notify),
+                                    Some(&uia),
+                                    (over_w, over_h),
+                                    dpi,
+                                    None,
+                                    false,
+                                )
+                                .is_none(),
+                                "{case}: an oversized widget must hide, not escape the bar"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 2 * 7 * 7 * 2, "the whole matrix must run");
     }
 
     #[test]
