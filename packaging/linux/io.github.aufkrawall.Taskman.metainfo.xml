@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.aufkrawall.Taskman</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>TaskMan</name>
+  <summary>Native task manager and system monitor</summary>
+
+  <developer id="io.github.aufkrawall">
+    <name>aufkrawall</name>
+  </developer>
+
+  <description>
+    <p>
+      TaskMan is a fast, native task manager: processes with their CPU, memory,
+      disk, network and GPU activity, per-core performance graphs, services,
+      startup entries and detailed per-process evidence, rendered by its own
+      CPU renderer or by the GPU.
+    </p>
+    <p>
+      On Linux the application runs as an ordinary user. Privileged actions
+      (ending another user's process, changing its priority, controlling a
+      service) and the kernel evidence an unelevated process cannot read are
+      served by the optional TaskMan core service, a systemd unit that accepts
+      a fixed allowlist of requests over a local socket from the user the
+      package was installed for.
+    </p>
+    <ul>
+      <li>Process list with apps, background processes and hierarchy</li>
+      <li>Performance history for CPU, memory, disks, network and GPUs</li>
+      <li>Service, startup and user-session management</li>
+      <li>Hardware sensors: temperatures, fans, voltages, power draw</li>
+      <li>No telemetry and no network access</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.aufkrawall.Taskman.desktop</launchable>
+  <url type="homepage">https://github.com/aufkrawall/taskman</url>
+  <url type="bugtracker">https://github.com/aufkrawall/taskman/issues</url>
+  <url type="vcs-browser">https://github.com/aufkrawall/taskman</url>
+
+  <provides>
+    <binary>taskman</binary>
+  </provides>
+
+  <categories>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.34" date="2026-11-26">
+      <description>
+        <p>
+          Per-file read and written bytes on Windows, a Linux core service with
+          elevated process evidence and actions, and a large pass of Linux
+          probes that now report "unavailable" instead of a measurement nobody
+          made.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

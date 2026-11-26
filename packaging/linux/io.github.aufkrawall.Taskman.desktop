@@ -1,10 +1,17 @@
 [Desktop Entry]
 Type=Application
-Name=Taskman
+Name=TaskMan
+GenericName=Task Manager
 Comment=Cross-platform task manager and system monitor
 Exec=taskman
-Icon=utilities-system-monitor
+TryExec=taskman
+Icon=io.github.aufkrawall.Taskman
 Terminal=false
 Categories=System;Monitor;
-Keywords=task;manager;process;system;monitor;
+Keywords=task;manager;process;system;monitor;performance;service;
 StartupNotify=true
+# Wayland matches the window's app_id (io.github.aufkrawall.Taskman, set by
+# tm-app) against this file's own id; X11 matches WM_CLASS, which egui-winit
+# leaves at the executable's basename. Both paths therefore name the same file.
+StartupWMClass=taskman
+SingleMainWindow=true
