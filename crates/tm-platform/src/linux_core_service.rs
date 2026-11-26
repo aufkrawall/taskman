@@ -69,9 +69,18 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Largest manifest file. The manifest is a dozen short fields.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-/// How long a client waits for one response before treating the broker as
-/// unavailable. Sampling must never park on a wedged service.
+/// How long a client waits for one response. A read (status, sensors, process
+/// evidence) answers in milliseconds, and sampling must never park on a wedged
+/// broker, so this is deliberately short.
 pub const CLIENT_DEADLINE_MS: u64 = 3_000;
+
+/// How long a client waits for a privileged ACTION.
+///
+/// `systemctl restart` may take tens of seconds (the service's own control
+/// deadline is 30 s). A client that gave up at the read deadline would classify
+/// a still-running action as `Unavailable` and, because that is the only
+/// fallback-eligible class, retry it — a duplicated privileged mutation.
+pub const ACTION_DEADLINE_MS: u64 = 35_000;
 
 // ---------------------------------------------------------------- manifest
 
@@ -203,15 +212,23 @@ impl Manifest {
     }
 
     /// Whether `path` is an installed client path this manifest trusts.
+    ///
+    /// This is a manifest-shape check only. Peer trust is decided on the
+    /// installed client's `(st_dev, st_ino)`, because a path is not an
+    /// identity: a mount namespace can make any executable appear at an
+    /// installed path.
     pub fn allows_client_path(&self, path: &str) -> bool {
-        self.clients.iter().any(|entry| {
-            if let Some(directory) = entry.strip_suffix('/') {
-                path.strip_prefix(directory)
-                    .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
-            } else {
-                entry == path
-            }
-        })
+        self.clients
+            .iter()
+            .any(|entry| match entry.strip_suffix('/') {
+                Some(directory) => path.strip_prefix(directory).is_some_and(|tail| {
+                    tail.strip_prefix('/').is_some_and(|rest| {
+                        // A directory entry must never reach outside its own tree.
+                        !rest.is_empty() && !rest.split('/').any(|segment| segment == "..")
+                    })
+                }),
+                None => entry == path,
+            })
     }
 }
 
@@ -277,13 +294,37 @@ pub struct PeerCredentials {
 }
 
 /// What the service observed about the peer's executable.
+///
+/// The path is diagnostic only. A peer can arrange for an arbitrary
+/// executable to appear at an installed path — `unshare -m` plus a bind mount
+/// is unprivileged on a default-configured distribution — so comparing path
+/// strings would hand the broker's allowlist to any code the user can run.
+/// The identity is the `(st_dev, st_ino)` of the executable the kernel reports
+/// for that task, compared against the installed client the service stat'ed in
+/// its own namespace at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientImage {
-    /// Resolved `/proc/<pid>/exe` target. Absolute.
+    /// Resolved `/proc/<pid>/exe` target, for diagnostics and logging.
     pub path: String,
+    /// `st_dev` of the opened executable.
+    pub device: u64,
+    /// `st_ino` of the opened executable.
+    pub inode: u64,
     pub owner_uid: u32,
     /// Permission bits (`st_mode & 0o7777`).
     pub mode: u32,
+}
+
+/// One client the service resolved from the manifest at startup.
+///
+/// Resolution happens once, in the broker's own mount namespace, so the
+/// recorded identity is the protected installed image; a peer's namespace
+/// cannot change what these inodes are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledClient {
+    pub path: String,
+    pub device: u64,
+    pub inode: u64,
 }
 
 /// Outcome of the peer policy.
@@ -344,10 +385,13 @@ impl Refusal {
 
 /// The whole peer policy, as one pure function.
 ///
-/// `image` is `None` when `/proc/<pid>/exe` could not be resolved. uid 0 is
-/// accepted without an image because it needs no grant.
+/// `installed` is what the service resolved from the manifest in its own
+/// namespace at startup; `image` is the executable the kernel reports for the
+/// peer, or `None` when it could not be opened. uid 0 is accepted without an
+/// image because it needs no grant.
 pub fn evaluate_peer(
     manifest: &Manifest,
+    installed: &[InstalledClient],
     peer: &PeerCredentials,
     image: Option<&ClientImage>,
 ) -> PeerVerdict {
@@ -360,11 +404,17 @@ pub fn evaluate_peer(
     let Some(image) = image else {
         return PeerVerdict::Refused(Refusal::MissingClientImage);
     };
-    if !manifest.allows_client_path(&image.path) {
+    // Identity, not path: an aliased path in the peer's mount namespace
+    // reports a different inode than the protected installed client.
+    if !installed
+        .iter()
+        .any(|client| client.device == image.device && client.inode == image.inode)
+    {
         return PeerVerdict::Refused(Refusal::ClientNotListed);
     }
-    // A writable client image would let its owner put arbitrary code behind
-    // the authorized path, so the trust check applies to the resolved file.
+    // A writable client image would let its owner replace the code behind the
+    // authorized path, so the trust check applies to the executable the
+    // kernel actually reports.
     if image.owner_uid != 0 || image.mode & 0o022 != 0 {
         return PeerVerdict::Refused(Refusal::UnprotectedClient);
     }
@@ -866,9 +916,19 @@ mod tests {
     fn protected_image() -> ClientImage {
         ClientImage {
             path: "/usr/bin/taskman".into(),
+            device: 1,
+            inode: 2,
             owner_uid: 0,
             mode: 0o755,
         }
+    }
+
+    fn installed_clients() -> Vec<InstalledClient> {
+        vec![InstalledClient {
+            path: "/usr/bin/taskman".into(),
+            device: 1,
+            inode: 2,
+        }]
     }
 
     #[test]
@@ -962,7 +1022,12 @@ mod tests {
     #[test]
     fn authorized_uid_with_protected_client_is_allowed() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&protected_image())),
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&protected_image())
+            ),
             PeerVerdict::Allowed
         );
     }
@@ -970,7 +1035,7 @@ mod tests {
     #[test]
     fn unauthorized_uid_is_refused_before_any_image_read() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1001), None),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(1001), None),
             PeerVerdict::Refused(Refusal::UnauthorizedUser)
         );
     }
@@ -978,7 +1043,7 @@ mod tests {
     #[test]
     fn root_is_always_allowed() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(0), None),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(0), None),
             PeerVerdict::Allowed
         );
     }
@@ -988,24 +1053,56 @@ mod tests {
         let mut writable = protected_image();
         writable.mode = 0o775;
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&writable)),
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&writable)
+            ),
             PeerVerdict::Refused(Refusal::UnprotectedClient)
         );
 
         let mut foreign = protected_image();
         foreign.owner_uid = 1000;
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&foreign)),
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&foreign)
+            ),
             PeerVerdict::Refused(Refusal::UnprotectedClient)
         );
     }
 
     #[test]
     fn unlisted_client_is_refused_even_when_protected() {
+        // A different executable, even one wearing an installed path.
         let mut other = protected_image();
         other.path = "/usr/bin/bash".into();
+        other.inode = 99;
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&other)),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(1000), Some(&other)),
+            PeerVerdict::Refused(Refusal::ClientNotListed)
+        );
+    }
+
+    #[test]
+    fn an_aliased_path_with_a_foreign_inode_is_refused() {
+        // `unshare -m` plus a bind mount is unprivileged: the peer's
+        // /proc/<pid>/exe then reads as an installed path while the task runs
+        // attacker code. The inode is what settles it.
+        let mut aliased = protected_image();
+        aliased.path = "/usr/bin/taskman".into();
+        aliased.device = 7;
+        aliased.inode = 8;
+        assert_eq!(
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&aliased)
+            ),
             PeerVerdict::Refused(Refusal::ClientNotListed)
         );
     }
@@ -1013,12 +1110,15 @@ mod tests {
     #[test]
     fn missing_client_image_is_refused_in_strict_mode_only() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), None),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(1000), None),
             PeerVerdict::Refused(Refusal::MissingClientImage)
         );
         let mut dev = manifest();
         dev.allow_user_writable_client = true;
-        assert_eq!(evaluate_peer(&dev, &peer(1000), None), PeerVerdict::Allowed);
+        assert_eq!(
+            evaluate_peer(&dev, &installed_clients(), &peer(1000), None),
+            PeerVerdict::Allowed
+        );
     }
 
     #[test]
