@@ -8,7 +8,7 @@ use super::occlusion::is_rect_occluded_above_taskbar;
 use super::occlusion::{
     PrecheckedOcclusion, occlusion_check_with_rects, occlusion_leaves_unclipped,
 };
-use super::placement::{AnchorSlot, solve_taskbar_placement};
+use super::placement::{AnchorSlot, clamp_into_taskbar, solve_taskbar_placement};
 use super::render::{LayoutBounds, RenderedDisplay, Renderer, build_display};
 use super::uia::UiaScanner;
 use super::visibility::{HideReason, WidgetState};
@@ -48,6 +48,8 @@ pub(super) struct WindowCtx {
     pub(super) last_size: (i32, i32),
     pub(super) last_pos: Option<(i32, i32)>,
     pub(super) last_present_error: Option<Instant>,
+    /// Last cross-axis mismatch warning (see `fit_target_rect`).
+    pub(super) last_cross_mismatch: Option<Instant>,
     pub(super) last_anchor_slot: Option<AnchorSlot>,
     pub(super) last_compact: bool,
     pub(super) last_stacked: bool,
@@ -249,6 +251,41 @@ impl WindowCtx {
         (!r.is_empty()).then_some(r)
     }
 
+    /// Belt and braces for the placement contract: the box handed to
+    /// `SetWindowPos`, `UpdateLayeredWindow` and the occlusion check is clamped
+    /// into the taskbar here as well, so no code path can place or present the
+    /// widget outside the bar. `None` means the box would have to be cut down
+    /// to fit and must be hidden instead of clipped.
+    ///
+    /// A box that stays inside but does not fill the bar's cross axis is
+    /// diagnosed once per 30 s rather than silently accepted: that dead band is
+    /// exactly where clicks reach the taskbar instead of the widget.
+    fn fit_target_rect(&mut self, rect: PixelRect, bar: PixelRect) -> Option<PixelRect> {
+        let (fitted, fills_cross) = clamp_into_taskbar(rect, bar);
+        if fitted != rect {
+            return None;
+        }
+        if !fills_cross {
+            let (expected, actual) = if bar.width() >= bar.height() {
+                (bar.height(), fitted.height())
+            } else {
+                (bar.width(), fitted.width())
+            };
+            if self
+                .last_cross_mismatch
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+            {
+                tracing::warn!(
+                    expected,
+                    actual,
+                    "taskbar monitor box does not fill the taskbar cross axis"
+                );
+                self.last_cross_mismatch = Some(Instant::now());
+            }
+        }
+        Some(fitted)
+    }
+
     #[cfg(test)]
     pub(super) fn ensure_visible_order(
         &self,
@@ -425,8 +462,6 @@ impl WindowCtx {
         };
 
         if let Some(placement) = cached_normal_placement {
-            self.last_anchor_slot = Some(placement.slot);
-            self.last_compact = false;
             let (w, h) = self.last_size;
             let (x, y) = placement.pos;
             let target_rect = PixelRect {
@@ -435,6 +470,12 @@ impl WindowCtx {
                 right: x.saturating_add(w),
                 bottom: y.saturating_add(h),
             };
+            let Some(target_rect) = self.fit_target_rect(target_rect, env.taskbar_rect) else {
+                self.hide(HideReason::NoPlacementSlot);
+                return;
+            };
+            self.last_anchor_slot = Some(placement.slot);
+            self.last_compact = false;
             let mut deferred_occlusion = None;
             if self.in_elevated_band {
                 let (check, rects) = match prechecked_occlusion.as_ref() {
@@ -532,8 +573,6 @@ impl WindowCtx {
             (compact_display, compact_layout, placement)
         };
 
-        self.last_anchor_slot = Some(placement.slot);
-        self.last_compact = display.compact;
         let layout_stacked = layout.stacked;
         let (w, h) = (layout.px_w, layout.px_h);
         let (x, y) = placement.pos;
@@ -543,6 +582,12 @@ impl WindowCtx {
             right: x.saturating_add(w),
             bottom: y.saturating_add(h),
         };
+        let Some(target_rect) = self.fit_target_rect(target_rect, env.taskbar_rect) else {
+            self.hide(HideReason::NoPlacementSlot);
+            return;
+        };
+        self.last_anchor_slot = Some(placement.slot);
+        self.last_compact = display.compact;
         // Clipping mutates the window and its tracked occluder, and must run
         // before `finish_show` restores that handle on show. A cut-out that
         // appears or grows (or a hide) is applied before the new frame is
@@ -644,6 +689,18 @@ impl WindowCtx {
             return;
         }
         let bounds = LayoutBounds::from_taskbar(env.taskbar_rect, env.dpi);
+        // The current footprint was fitted when it was placed; a bar that has
+        // shrunk since then waits for the next full refresh instead of being
+        // repainted over the taskbar here.
+        let current = PixelRect {
+            left: x,
+            top: y,
+            right: x.saturating_add(self.last_size.0),
+            bottom: y.saturating_add(self.last_size.1),
+        };
+        if self.fit_target_rect(current, env.taskbar_rect).is_none() {
+            return;
+        }
         let hwnd_raw = self.hwnd.0 as isize;
         let Some(renderer) = self.renderer.as_mut() else {
             return;

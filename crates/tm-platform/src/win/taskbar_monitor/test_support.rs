@@ -113,6 +113,7 @@ pub(super) fn test_window_ctx(hwnd: HWND, in_elevated_band: bool) -> WindowCtx {
         last_pos: None,
         state: WidgetState::default(),
         last_present_error: None,
+        last_cross_mismatch: None,
         last_anchor_slot: None,
         last_compact: false,
         last_stacked: false,

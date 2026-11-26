@@ -1356,3 +1356,44 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
         "layout must be remeasured after core taskbar geometry changes across a UIA wait"
     );
 }
+
+#[test]
+fn fit_target_rect_keeps_the_box_inside_the_bar_and_diagnoses_a_short_cross_axis() {
+    // Pure geometry: no window is needed, only a `WindowCtx` to hold the
+    // diagnostic rate limit.
+    let mut ctx = test_window_ctx(HWND::default(), false);
+    let bar = rect(-10_000, -10_000, -8_800, -9_952);
+
+    // A box that fills the bar's cross axis is placed unchanged, silently.
+    let full = rect(-9_400, -10_000, -9_240, -9_952);
+    assert_eq!(ctx.fit_target_rect(full, bar), Some(full));
+    assert!(ctx.last_cross_mismatch.is_none());
+
+    // A shorter box keeps its size (it is still wanted), but the dead band is
+    // diagnosed once per rate-limit window instead of passing unnoticed.
+    let short = rect(-9_400, -10_000, -9_240, -9_968);
+    assert_eq!(ctx.fit_target_rect(short, bar), Some(short));
+    let first = ctx
+        .last_cross_mismatch
+        .expect("a box shorter than the bar must be diagnosed");
+    assert_eq!(ctx.fit_target_rect(short, bar), Some(short));
+    assert_eq!(
+        ctx.last_cross_mismatch,
+        Some(first),
+        "the cross-axis diagnostic must be rate-limited"
+    );
+
+    // A box taller than the bar, or one escaping it on the main axis, cannot be
+    // shown without leaving the bar: hide instead of clipping it.
+    let tall = rect(-9_400, -10_004, -9_240, -9_952);
+    assert_eq!(ctx.fit_target_rect(tall, bar), None);
+    let overlong = rect(-10_010, -10_000, -8_850, -9_952);
+    assert_eq!(ctx.fit_target_rect(overlong, bar), None);
+
+    // Vertical bar: the cross axis is the width.
+    let vertical = rect(-9_000, -10_000, -8_920, -9_000);
+    let narrow = rect(-8_984, -9_900, -8_920, -9_800);
+    assert_eq!(ctx.fit_target_rect(narrow, vertical), Some(narrow));
+    let full_width = rect(-9_000, -9_900, -8_920, -9_800);
+    assert_eq!(ctx.fit_target_rect(full_width, vertical), Some(full_width));
+}
