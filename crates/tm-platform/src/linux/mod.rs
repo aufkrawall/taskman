@@ -24,10 +24,16 @@ mod shell;
 mod startup;
 mod x11_windows;
 
+use self::core_service::client::{self, ClientError};
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
+use crate::linux_core_service::{
+    ActionRequest, MANIFEST_PATH, Request, Response, ServiceStatusInfo, ServiceVerb,
+    WireConnection, WireModule, WireThread, WireThreadState, WireThreads,
+};
 use crate::linux_telemetry;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -836,6 +842,14 @@ pub struct LinuxActions;
 
 impl PlatformActions for LinuxActions {
     fn capabilities(&self) -> Capabilities {
+        // The process read/action flags describe surfaces this backend
+        // delivers with the user's own token through procfs and syscalls, and
+        // for other users' processes through the broker when it is installed.
+        // They stay independent of the broker's presence on purpose: a missing
+        // service must neither blank a tab nor disable an action the direct
+        // path still delivers, and no flag here promises something only a
+        // future protocol revision can carry (per-file I/O accounting, module
+        // unloading, a whole-machine network view).
         Capabilities {
             services_list: services::available(),
             services_control: services::available(),
@@ -870,13 +884,40 @@ impl PlatformActions for LinuxActions {
     }
     fn control_service(&self, name: &str, action: ServiceAction) -> Result<()> {
         let direct = services::control_unit_direct(name, action);
-        polkit::direct_or_elevated(
-            direct,
-            PrivilegedAction::Service {
+        if direct.is_ok() {
+            return direct;
+        }
+        // Only a real authorization failure is worth asking anyone else: a
+        // missing unit or a broken systemctl must not become a prompt.
+        if !direct
+            .as_ref()
+            .err()
+            .is_some_and(polkit::is_permission_denied)
+        {
+            return direct;
+        }
+        let request = Request::Action {
+            action: ActionRequest::Service {
                 unit: name.to_string(),
-                action,
+                verb: service_verb(action),
             },
-        )
+        };
+        match client::request(&request) {
+            // The broker runs as root, so its answer is the privileged one.
+            Ok(Response::Done) => Ok(()),
+            Ok(other) => Err(unexpected_response("service control", &other)),
+            // No broker installed or answering: today's Polkit path, unchanged.
+            Err(error) if error.may_fall_back() => polkit::direct_or_elevated(
+                direct,
+                PrivilegedAction::Service {
+                    unit: name.to_string(),
+                    action,
+                },
+            ),
+            // Root itself declined. A Polkit prompt would only ask the user to
+            // repeat what the privileged path already refused.
+            Err(error) => Err(core_service_error("service control", &error)),
+        }
     }
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
         Ok(startup::list_autostart())
@@ -924,6 +965,19 @@ impl PlatformActions for LinuxActions {
     ) -> Result<()> {
         validate_mutation_target(pid)?;
         let direct = process_tree::kill_process(pid, expected_start_epoch_s, tree);
+        // The broker is the only path that can signal another user's process,
+        // and it re-reads the creation ticks itself. The tree case is included:
+        // the service walks the descendants as root, which a portable,
+        // user-writable GUI image can never do safely.
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            ActionRequest::Kill {
+                pid,
+                start_ticks,
+                tree,
+            }
+        }) {
+            return result;
+        }
         match (expected_start_epoch_s, tree) {
             (Some(start_ticks), false) => {
                 polkit::direct_or_elevated(direct, PrivilegedAction::Kill { pid, start_ticks })
@@ -947,6 +1001,15 @@ impl PlatformActions for LinuxActions {
             libc::SIGCONT
         };
         let direct = send_signal_checked(pid, expected_start_epoch_s, signal);
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            if suspend {
+                ActionRequest::Suspend { pid, start_ticks }
+            } else {
+                ActionRequest::Resume { pid, start_ticks }
+            }
+        }) {
+            return result;
+        }
         match (expected_start_epoch_s, suspend) {
             (Some(start_ticks), true) => {
                 polkit::direct_or_elevated(direct, PrivilegedAction::Suspend { pid, start_ticks })
@@ -965,6 +1028,15 @@ impl PlatformActions for LinuxActions {
     ) -> Result<()> {
         validate_mutation_target(pid)?;
         let direct = set_priority_direct(pid, expected_start_epoch_s, priority);
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            ActionRequest::SetPriority {
+                pid,
+                start_ticks,
+                priority,
+            }
+        }) {
+            return result;
+        }
         match expected_start_epoch_s {
             Some(start_ticks) => polkit::direct_or_elevated(
                 direct,
@@ -1013,6 +1085,15 @@ impl PlatformActions for LinuxActions {
     ) -> Result<()> {
         validate_mutation_target(pid)?;
         let direct = set_affinity_direct(pid, expected_start_epoch_s, mask);
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            ActionRequest::SetAffinity {
+                pid,
+                start_ticks,
+                mask,
+            }
+        }) {
+            return result;
+        }
         match expected_start_epoch_s {
             Some(start_ticks) => polkit::direct_or_elevated(
                 direct,
@@ -1040,6 +1121,16 @@ impl PlatformActions for LinuxActions {
         polkit::relaunch_elevated()
     }
 
+    fn core_service_state(&self) -> CoreServiceState {
+        // Both inputs are cheap: the manifest is one `stat`, and the status
+        // answer is cached for ten seconds with a deadline-bounded probe. The
+        // probe itself only runs on an installed machine, and the caller polls
+        // this off the render path, as the Windows surface does.
+        let installed = manifest_installed();
+        let status = if installed { client::status() } else { None };
+        core_service_state_from(installed, status)
+    }
+
     fn open_file_location(&self, path: &str) -> Result<()> {
         shell::open_file_location(path)
     }
@@ -1058,9 +1149,38 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
         let before = process_start_for_read(pid, expected_start_epoch_s)?;
-        let modules = process_modules::list_process_modules(pid)?;
-        ensure_process_generation(pid, before)?;
-        Ok(modules)
+        match process_modules::list_process_modules(pid) {
+            Ok(modules) => {
+                ensure_process_generation(pid, before)?;
+                Ok(modules)
+            }
+            // `/proc/<pid>/maps` is readable only by the process' own user, so
+            // another user's process is exactly the case the broker answers.
+            // The request carries the generation bracketed above, so the
+            // service re-checks the same process instead of a recycled pid.
+            Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
+                match client::request(&Request::ProcessModules {
+                    pid,
+                    start_ticks: before,
+                }) {
+                    Ok(Response::Modules(wire)) => {
+                        // The service checked the generation itself; closing our
+                        // own bracket as well proves the answer still describes
+                        // the process this read asked about.
+                        ensure_process_generation(pid, before)?;
+                        Ok(wire.into_iter().map(process_module_from_wire).collect())
+                    }
+                    Ok(other) => Err(unexpected_response("process modules", &other)),
+                    // A broker that never answered leaves the direct reason in
+                    // place: it is the honest one for this token.
+                    Err(ClientError::Unavailable(_)) => Err(direct_error),
+                    // A refusal is a decision and names itself; it must never
+                    // read like the process had no modules.
+                    Err(error) => Err(core_service_error("process modules", &error)),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn list_process_threads(
@@ -1069,16 +1189,52 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<ProcessThreads> {
         let before = process_start_for_read(pid, expected_start_epoch_s)?;
-        let threads = process_threads::list_process_threads(pid, Some(before))?;
-        ensure_process_generation(pid, before)?;
-        Ok(threads)
+        match process_threads::list_process_threads(pid, Some(before)) {
+            Ok(threads) => {
+                ensure_process_generation(pid, before)?;
+                Ok(threads)
+            }
+            Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
+                match client::request(&Request::ProcessThreads {
+                    pid,
+                    start_ticks: before,
+                }) {
+                    Ok(Response::Threads(wire)) => {
+                        ensure_process_generation(pid, before)?;
+                        Ok(process_threads_from_wire(wire))
+                    }
+                    Ok(other) => Err(unexpected_response("process threads", &other)),
+                    Err(ClientError::Unavailable(_)) => Err(direct_error),
+                    Err(error) => Err(core_service_error("process threads", &error)),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn list_process_connections(&self, pid: u32) -> Result<Vec<ProcessConnection>> {
         let before = process_start_for_read(pid, None)?;
-        let connections = process_connections::list_process_connections(pid)?;
-        ensure_process_generation(pid, before)?;
-        Ok(connections)
+        match process_connections::list_process_connections(pid) {
+            Ok(connections) => {
+                ensure_process_generation(pid, before)?;
+                Ok(connections)
+            }
+            Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
+                match client::request(&Request::ProcessConnections { pid }) {
+                    Ok(Response::Connections(wire)) => {
+                        // The connections request carries no creation identity,
+                        // so this bracket is what keeps a recycled pid from
+                        // inheriting another process' endpoints.
+                        ensure_process_generation(pid, before)?;
+                        Ok(connections_from_wire(wire))
+                    }
+                    Ok(other) => Err(unexpected_response("process connections", &other)),
+                    Err(ClientError::Unavailable(_)) => Err(direct_error),
+                    Err(error) => Err(core_service_error("process connections", &error)),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn backend_name(&self) -> &'static str {
@@ -1103,8 +1259,279 @@ impl PlatformActions for LinuxActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
+        // Per-file I/O has no broker arm yet: the wire protocol declares
+        // `WireFileIo` but neither a request nor a response variant carries it,
+        // so this walk stays on the GUI token and another user's process keeps
+        // reporting `handles_complete = false` instead of a fabricated empty
+        // list. Closing that needs a protocol revision, not a client change.
         process_io::list_process_file_io(pid, expected_start_epoch_s)
     }
+}
+
+// -------------------------------------------------------- core service bridge
+//
+// The broker is the only path that can reach another user's or a protected
+// process: `/proc/<pid>/maps` is readable only by its owner, `/proc/<pid>/fd`
+// and `/proc/<pid>/task` need CAP_SYS_PTRACE for a foreign process, and
+// signalling one needs the same. Every call site above therefore keeps the
+// direct procfs/syscall attempt first — a direct attempt that worked never pays
+// a round trip — and asks the broker only where the kernel answered
+// EPERM/EACCES.
+//
+// Two rules hold everywhere:
+//
+// - Only a permission failure escalates. A vanished process, a malformed record
+//   or an exhausted budget is the same answer under either identity.
+// - The broker's answer ends the decision. A refusal is returned with the
+//   service's own reason; it never becomes a Polkit prompt or a local retry.
+
+/// Whether a failed direct attempt may be handed to the broker.
+///
+/// Both conditions are necessary: the kernel refused for lack of privilege, and
+/// the caller knows the creation identity the service has to re-check. An
+/// action without one could address a recycled pid, so it stays local.
+fn may_escalate(direct: &Result<()>, start_ticks: Option<i64>) -> bool {
+    start_ticks.is_some()
+        && direct
+            .as_ref()
+            .err()
+            .is_some_and(polkit::is_permission_denied)
+}
+
+/// Ask the broker for an action the direct attempt could not perform.
+///
+/// `None` means "continue with the pre-service path": no other identity would
+/// change the outcome, or no broker is installed and answering. `Some(result)`
+/// is final — the service either did it or gave its reason, and a reason must
+/// never degrade into a second privileged attempt.
+fn brokered_action(
+    direct: &Result<()>,
+    start_ticks: Option<i64>,
+    action: impl FnOnce(i64) -> ActionRequest,
+) -> Option<Result<()>> {
+    if !may_escalate(direct, start_ticks) {
+        return None;
+    }
+    // `start_ticks` is known here; `?` is the compiler's proof of it.
+    let start_ticks = start_ticks?;
+    let request = Request::Action {
+        action: action(start_ticks),
+    };
+    match client::request(&request) {
+        Ok(Response::Done) => Some(Ok(())),
+        Ok(other) => Some(Err(unexpected_response("process action", &other))),
+        // The broker never answered, so the caller's own path may still deliver
+        // the operation the way it did before this service existed.
+        Err(error) if error.may_fall_back() => None,
+        Err(error) => Some(Err(core_service_error("process action", &error))),
+    }
+}
+
+/// A broker failure as a caller-visible error, keeping the service's reason.
+fn core_service_error(context: &'static str, error: &ClientError) -> tm_core::TmError {
+    tm_core::TmError::platform(context, error.to_string())
+}
+
+fn unexpected_response(context: &'static str, response: &Response) -> tm_core::TmError {
+    tm_core::TmError::platform(
+        context,
+        format!(
+            "the core service answered with an unexpected {} payload",
+            response_label(response)
+        ),
+    )
+}
+
+fn response_label(response: &Response) -> &'static str {
+    match response {
+        Response::Status(_) => "status",
+        Response::Sensors(_) => "sensors",
+        Response::Modules(_) => "modules",
+        Response::Threads(_) => "threads",
+        Response::Connections(_) => "connections",
+        Response::Evidence(_) => "evidence",
+        Response::Done => "done",
+        Response::Error(_) => "error",
+    }
+}
+
+fn service_verb(action: ServiceAction) -> ServiceVerb {
+    match action {
+        ServiceAction::Start => ServiceVerb::Start,
+        ServiceAction::Stop => ServiceVerb::Stop,
+        ServiceAction::Restart => ServiceVerb::Restart,
+    }
+}
+
+/// Whether the installer wrote the protected manifest. Its absence is the only
+/// proof this machine has no core service; the socket alone could be stale.
+fn manifest_installed() -> bool {
+    std::fs::metadata(MANIFEST_PATH).is_ok()
+}
+
+/// Classify the broker for the Settings surface.
+///
+/// `Running` needs a live Status answer, `NotInstalled` needs the missing
+/// manifest, and everything else is installed but not serving. `Unsupported` is
+/// never reported: every Linux build carries this client, whether or not the
+/// machine has the service.
+fn core_service_state_from(
+    manifest_installed: bool,
+    status: Option<ServiceStatusInfo>,
+) -> CoreServiceState {
+    match (manifest_installed, status) {
+        (false, _) => CoreServiceState::NotInstalled,
+        (true, Some(info)) => CoreServiceState::Running {
+            version: info.service_version,
+        },
+        // Installed, but nothing answered the status probe: the unit is
+        // stopped, crashed, or its socket is wedged. A restart is the fix, and
+        // that is what this state offers.
+        (true, None) => CoreServiceState::Stopped,
+    }
+}
+
+fn process_module_from_wire(wire: WireModule) -> ProcessModule {
+    ProcessModule {
+        name: wire.name,
+        path: wire.path,
+        base_address: wire.base_address,
+        size_bytes: wire.size_bytes,
+    }
+}
+
+fn process_threads_from_wire(wire: WireThreads) -> ProcessThreads {
+    let base = wire.process_base_priority;
+    ProcessThreads {
+        process_base_priority: base,
+        threads: wire
+            .threads
+            .into_iter()
+            .map(|thread| process_thread_from_wire(thread, base))
+            .collect(),
+    }
+}
+
+fn process_thread_from_wire(wire: WireThread, process_base_priority: i32) -> ProcessThread {
+    ProcessThread {
+        tid: wire.tid,
+        // Procfs exposes no thread entry routine on either path.
+        start_address: None,
+        priority: wire.priority,
+        // The baseline is the thread's own nice value; when the service could
+        // not read one, the thread group's baseline stands in rather than a
+        // fabricated zero.
+        base_priority: wire.nice.unwrap_or(process_base_priority),
+        nice: wire.nice,
+        context_switches: wire.context_switches,
+        kernel_time_100ns: wire.kernel_time_100ns,
+        user_time_100ns: wire.user_time_100ns,
+        created_epoch_s: wire.created_epoch_s,
+        state: thread_state_from_wire(wire.state),
+        // Linux wait channels are names/addresses, not KWAIT_REASON ids.
+        wait_reason: None,
+        cycles: wire.cycles,
+    }
+}
+
+/// The same Linux state letters, mapped onto the model's vocabulary.
+///
+/// `Running` collapses onto `Runnable` because Linux' `R` covers both on-CPU and
+/// queued threads, exactly as the direct `/proc` reader maps it, so a row read
+/// through the broker renders like the same row read directly.
+fn thread_state_from_wire(state: WireThreadState) -> ThreadState {
+    match state {
+        WireThreadState::Running => ThreadState::Runnable,
+        WireThreadState::Sleeping => ThreadState::Sleeping,
+        WireThreadState::DiskSleep => ThreadState::Waiting,
+        WireThreadState::Stopped | WireThreadState::Tracing => ThreadState::Stopped,
+        WireThreadState::Zombie | WireThreadState::Dead => ThreadState::Terminated,
+        WireThreadState::Idle => ThreadState::Idle,
+        WireThreadState::Parked => ThreadState::Parked,
+        // The protocol keeps no raw state byte, so an unnamed state has no raw
+        // value to show; 0 is this variant's "unnamed", never a measured state.
+        WireThreadState::Other => ThreadState::Other(0),
+    }
+}
+
+fn connections_from_wire(wire: Vec<WireConnection>) -> Vec<ProcessConnection> {
+    wire.into_iter().filter_map(connection_from_wire).collect()
+}
+
+fn connection_from_wire(wire: WireConnection) -> Option<ProcessConnection> {
+    let protocol = match wire.protocol.as_str() {
+        "tcp" => ConnectionProtocol::Tcp,
+        "tcp6" => ConnectionProtocol::Tcp6,
+        "udp" => ConnectionProtocol::Udp,
+        "udp6" => ConnectionProtocol::Udp6,
+        // A Unix endpoint has no `SocketAddr`, which is what this model carries;
+        // the direct procfs reader lists the four IP tables only, so dropping
+        // these keeps both paths on the same vocabulary.
+        _ => return None,
+    };
+    let local = parse_socket_addr(&wire.local)?;
+    // Only TCP has a state; a datagram endpoint has none, exactly as the direct
+    // `/proc/net/udp*` walk leaves it unset.
+    let state = if matches!(protocol, ConnectionProtocol::Tcp | ConnectionProtocol::Tcp6) {
+        wire.state.as_deref().and_then(tcp_state_from_wire)
+    } else {
+        None
+    };
+    let remote = wire
+        .remote
+        .as_deref()
+        .and_then(parse_socket_addr)
+        .filter(|remote| named_remote(state, *remote));
+    Some(ProcessConnection {
+        protocol,
+        local,
+        remote,
+        state,
+    })
+}
+
+/// A peer the model can name: not a listener, not the all-zero placeholder the
+/// kernel writes into a socket that was never connected.
+fn named_remote(state: Option<TcpState>, remote: SocketAddr) -> bool {
+    state != Some(TcpState::Listen) && remote.port() != 0 && !remote.ip().is_unspecified()
+}
+
+/// Parse one endpoint the broker wrote as a string.
+///
+/// `SocketAddr`'s own grammar (`1.2.3.4:80`, `[::1]:80`) is tried first; an
+/// unbracketed IPv6 pair (`::1:80`) is accepted too, because a formatter that
+/// prints address and port separately produces exactly that.
+fn parse_socket_addr(text: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    let (address, port) = text.rsplit_once(':')?;
+    let ip = address.parse::<std::net::IpAddr>().ok()?;
+    Some(SocketAddr::new(ip, port.parse().ok()?))
+}
+
+/// Map the broker's state name onto the model's vocabulary.
+///
+/// The wire spells enum variants in kebab-case, which is what `TcpState`'s own
+/// names become; an unknown name is not guessed at, because a row can show its
+/// endpoint without inventing a state for it.
+fn tcp_state_from_wire(name: &str) -> Option<TcpState> {
+    let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
+    Some(match normalized.as_str() {
+        "closed" => TcpState::Closed,
+        "listen" | "listening" => TcpState::Listen,
+        "syn-sent" => TcpState::SynSent,
+        "syn-received" | "syn-recv" => TcpState::SynReceived,
+        "established" => TcpState::Established,
+        "fin-wait-1" => TcpState::FinWait1,
+        "fin-wait-2" => TcpState::FinWait2,
+        "close-wait" => TcpState::CloseWait,
+        "closing" => TcpState::Closing,
+        "last-ack" => TcpState::LastAck,
+        "time-wait" => TcpState::TimeWait,
+        "delete-tcb" => TcpState::DeleteTcb,
+        _ => return None,
+    })
 }
 
 fn set_priority_direct(
@@ -1719,5 +2146,255 @@ mod tests {
         assert_ne!(process.start_epoch_s, corrected_time);
         process.start_epoch_s = corrected_time;
         assert_eq!(process.creation_identity(), Some(ticks));
+    }
+
+    fn status_info(version: &str) -> ServiceStatusInfo {
+        ServiceStatusInfo {
+            protocol: crate::linux_core_service::PROTOCOL_VERSION,
+            service_version: version.into(),
+            pid: 900,
+            uid: 0,
+            started_unix_s: 1_700_000_000,
+            uptime_s: 60,
+            socket: crate::linux_core_service::SOCKET_PATH.into(),
+            authorized_uids: vec![1000],
+            sensors_available: false,
+            nvml_available: false,
+            install_verified: true,
+            last_sensor_sample_unix_ms: 0,
+            requests_served: 1,
+            refusals: 0,
+        }
+    }
+
+    #[test]
+    fn only_a_permission_failure_with_a_known_identity_reaches_the_broker() {
+        let denied: Result<()> = Err(tm_core::TmError::platform(
+            "read /proc/pid/maps",
+            "/proc/4242/maps: Permission denied (os error 13)",
+        ));
+        assert!(may_escalate(&denied, Some(9)));
+        assert!(
+            !may_escalate(&denied, None),
+            "an action without a creation identity must stay local"
+        );
+        let io_denied: Result<()> = Err(tm_core::TmError::Io(std::io::Error::from_raw_os_error(
+            libc::EPERM,
+        )));
+        assert!(may_escalate(&io_denied, Some(9)));
+        assert!(
+            !may_escalate(&Ok(()), Some(9)),
+            "a direct success must never pay a round trip"
+        );
+        let vanished: Result<()> = Err(tm_core::TmError::ProcessNotFound { pid: 4242 });
+        assert!(
+            !may_escalate(&vanished, Some(9)),
+            "a vanished target answers the same under any identity"
+        );
+    }
+
+    #[test]
+    fn a_broker_refusal_keeps_its_own_reason_in_the_error() {
+        let refused = ClientError::Refused {
+            code: crate::linux_core_service::Refusal::Rejected,
+            detail: "creation identity changed".into(),
+        };
+        assert!(!refused.may_fall_back());
+        let message = core_service_error("terminate process", &refused).to_string();
+        assert!(message.contains("terminate process"), "{message}");
+        assert!(message.contains("rejected"), "{message}");
+        assert!(
+            message.contains("creation identity changed"),
+            "the service's own reason must survive: {message}"
+        );
+
+        let unavailable = ClientError::Unavailable("connect: No such file or directory".into());
+        assert!(unavailable.may_fall_back());
+        let message = core_service_error("process modules", &unavailable).to_string();
+        assert!(message.contains("unavailable"), "{message}");
+    }
+
+    #[test]
+    fn core_service_state_never_reports_something_this_backend_cannot_have() {
+        assert_eq!(
+            core_service_state_from(false, Some(status_info("0.1.34"))),
+            CoreServiceState::NotInstalled,
+            "a manifest-less machine is not installed even if a socket lingers"
+        );
+        assert_eq!(
+            core_service_state_from(true, None),
+            CoreServiceState::Stopped
+        );
+        assert_eq!(
+            core_service_state_from(true, Some(status_info("0.1.34"))),
+            CoreServiceState::Running {
+                version: "0.1.34".into()
+            }
+        );
+        assert_ne!(
+            core_service_state_from(false, None),
+            CoreServiceState::Unsupported,
+            "every Linux build carries this client"
+        );
+    }
+
+    #[test]
+    fn brokered_threads_keep_their_evidence_and_fill_a_missing_baseline() {
+        let threads = process_threads_from_wire(WireThreads {
+            process_base_priority: 5,
+            threads: vec![
+                WireThread {
+                    tid: 41,
+                    priority: 20,
+                    nice: Some(-5),
+                    context_switches: Some(9),
+                    kernel_time_100ns: 11,
+                    user_time_100ns: 12,
+                    created_epoch_s: Some(1_700_000_123),
+                    state: WireThreadState::Running,
+                    cycles: Some(13),
+                },
+                WireThread {
+                    tid: 42,
+                    priority: 25,
+                    nice: None,
+                    context_switches: None,
+                    kernel_time_100ns: 0,
+                    user_time_100ns: 0,
+                    created_epoch_s: None,
+                    state: WireThreadState::DiskSleep,
+                    cycles: None,
+                },
+            ],
+        });
+        assert_eq!(threads.process_base_priority, 5);
+        let first = &threads.threads[0];
+        assert_eq!(first.tid, 41);
+        assert_eq!(first.state, ThreadState::Runnable);
+        assert_eq!(first.base_priority, -5);
+        assert_eq!(first.nice, Some(-5));
+        assert_eq!(first.context_switches, Some(9));
+        assert_eq!(first.cycles, Some(13));
+        assert_eq!(first.created_epoch_s, Some(1_700_000_123));
+        let second = &threads.threads[1];
+        assert_eq!(
+            second.base_priority, 5,
+            "the thread group's baseline stands in for a missing nice value"
+        );
+        assert_eq!(second.nice, None);
+        assert_eq!(second.state, ThreadState::Waiting);
+        assert_eq!(
+            second.context_switches, None,
+            "an unavailable switch count must not become zero"
+        );
+        assert_eq!(second.cycles, None);
+    }
+
+    #[test]
+    fn linux_state_letters_survive_the_broker_round_trip() {
+        for (wire, expected) in [
+            // Linux 'R' covers both on-CPU and queued threads.
+            (WireThreadState::Running, ThreadState::Runnable),
+            (WireThreadState::Sleeping, ThreadState::Sleeping),
+            (WireThreadState::DiskSleep, ThreadState::Waiting),
+            (WireThreadState::Stopped, ThreadState::Stopped),
+            (WireThreadState::Tracing, ThreadState::Stopped),
+            (WireThreadState::Zombie, ThreadState::Terminated),
+            (WireThreadState::Dead, ThreadState::Terminated),
+            (WireThreadState::Idle, ThreadState::Idle),
+            (WireThreadState::Parked, ThreadState::Parked),
+        ] {
+            assert_eq!(thread_state_from_wire(wire), expected, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn brokered_connections_keep_only_what_the_model_can_name() {
+        let connections = connections_from_wire(vec![
+            WireConnection {
+                protocol: "tcp".into(),
+                local: "127.0.0.1:8080".into(),
+                remote: Some("10.0.0.2:443".into()),
+                state: Some("established".into()),
+            },
+            WireConnection {
+                protocol: "tcp".into(),
+                local: "0.0.0.0:22".into(),
+                // The kernel's all-zero placeholder is not a peer.
+                remote: Some("0.0.0.0:0".into()),
+                state: Some("listen".into()),
+            },
+            WireConnection {
+                protocol: "tcp6".into(),
+                local: "[::1]:9100".into(),
+                remote: None,
+                state: Some("time_wait".into()),
+            },
+            WireConnection {
+                protocol: "udp".into(),
+                local: "0.0.0.0:53".into(),
+                remote: None,
+                state: None,
+            },
+            // A Unix endpoint has no `SocketAddr` in this model.
+            WireConnection {
+                protocol: "unix".into(),
+                local: "/run/user/1000/bus".into(),
+                remote: None,
+                state: None,
+            },
+            // An address the row cannot name is dropped, not guessed at.
+            WireConnection {
+                protocol: "tcp".into(),
+                local: "not an address".into(),
+                remote: None,
+                state: Some("listen".into()),
+            },
+        ]);
+        assert_eq!(connections.len(), 4);
+        assert_eq!(connections[0].state, Some(TcpState::Established));
+        assert_eq!(
+            connections[0].remote,
+            Some("10.0.0.2:443".parse().expect("peer"))
+        );
+        assert_eq!(connections[1].remote, None, "a listener has no peer");
+        assert_eq!(connections[2].protocol, ConnectionProtocol::Tcp6);
+        assert_eq!(connections[2].state, Some(TcpState::TimeWait));
+        assert_eq!(connections[3].protocol, ConnectionProtocol::Udp);
+        assert_eq!(
+            connections[3].state, None,
+            "a datagram endpoint has no state"
+        );
+    }
+
+    #[test]
+    fn tcp_state_names_are_read_in_the_wire_spelling() {
+        assert_eq!(tcp_state_from_wire("Listen"), Some(TcpState::Listen));
+        assert_eq!(tcp_state_from_wire("syn_sent"), Some(TcpState::SynSent));
+        assert_eq!(tcp_state_from_wire("close-wait"), Some(TcpState::CloseWait));
+        assert_eq!(
+            tcp_state_from_wire("something-new"),
+            None,
+            "an unknown name must not be guessed at"
+        );
+        assert_eq!(tcp_state_from_wire(""), None);
+    }
+
+    #[test]
+    fn endpoints_are_parsed_in_every_address_form_the_wire_can_carry() {
+        assert_eq!(
+            parse_socket_addr("127.0.0.1:80"),
+            Some("127.0.0.1:80".parse().expect("ipv4 endpoint"))
+        );
+        assert_eq!(
+            parse_socket_addr("[::1]:80"),
+            Some("[::1]:80".parse().expect("bracketed endpoint"))
+        );
+        assert_eq!(
+            parse_socket_addr("::1:80"),
+            Some("[::1]:80".parse().expect("unbracketed endpoint"))
+        );
+        assert_eq!(parse_socket_addr("127.0.0.1"), None);
+        assert_eq!(parse_socket_addr(""), None);
     }
 }
