@@ -238,13 +238,14 @@ fn main() {
     let code_sample_selfcheck = args
         .iter()
         .any(|argument| argument == "--selfcheck-code-samples");
+    let icon_selfcheck = args.iter().any(|argument| argument == "--selfcheck-icons");
 
     #[cfg(all(target_os = "windows", not(debug_assertions)))]
-    if selfcheck || code_sample_selfcheck || verbose {
+    if selfcheck || code_sample_selfcheck || icon_selfcheck || verbose {
         attach_parent_console();
     }
 
-    if selfcheck || code_sample_selfcheck || verbose {
+    if selfcheck || code_sample_selfcheck || icon_selfcheck || verbose {
         // The appender guard is owned by `tm_core::logging` for the process
         // lifetime. It used to be returned here and bound to a `let _log_guard`
         // inside this block, which dropped it one line later and shut the
@@ -266,6 +267,10 @@ fn main() {
     }
     if code_sample_selfcheck {
         let code = selfcheck::run_code_samples();
+        std::process::exit(code);
+    }
+    if icon_selfcheck {
+        let code = selfcheck::run_icons();
         std::process::exit(code);
     }
 

@@ -1136,9 +1136,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let mut cache = app.details_state.cache.take();
     let stale = cache.as_ref().is_none_or(|c| c.key != key);
     if stale {
+        let rows = build_rows(&snap, &key.2, key.3, key.4, &app.details_state.collapsed);
+        // Warm every icon the rebuilt rows will ask for, once, before their
+        // first paint: the paint path may only ask for the rows it shows, and
+        // a row whose icon is still pending paints an empty cell.
+        let keys = crate::app::icon_prefetch_keys(rows.iter().map(|row| row.icon_path.as_deref()));
+        app.prefetch_icons(keys);
         cache = Some(Cache {
             key: key.clone(),
-            rows: build_rows(&snap, &key.2, key.3, key.4, &app.details_state.collapsed),
+            rows,
         });
         app.note_table_model_rebuild();
     }

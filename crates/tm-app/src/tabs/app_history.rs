@@ -252,6 +252,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .collect();
     rows.sort_by(|a, b| compare_rows(a, b, app.app_history_sort));
 
+    // Warm the icons of the rows this rebuild just produced. The page
+    // re-derives its rows every frame, so `IconPrefetch` — not the frame —
+    // decides when the cache is asked again: a new sample or a new search.
+    let sample_ms = latest_snap
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.timestamp_ms);
+    if app.icons_prefetch.app_history_due(sample_ms, &app.search) {
+        let keys = crate::app::icon_prefetch_keys(rows.iter().map(|row| row.icon_path.as_deref()));
+        app.prefetch_icons(keys);
+    }
+
     let mut table = app.make_table("apphistory", columns());
     if tablekit::auto_fit_wanted(ui) {
         let mut fit = [

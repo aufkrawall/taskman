@@ -516,6 +516,9 @@ pub struct TaskManApp {
     last_viewport_rects: Option<(Option<egui::Rect>, Option<egui::Rect>)>,
     /// Input/frame diagnostics enabled via `TASKMAN_INPUT_STATS=1`.
     input_stats: InputStatsRecorder,
+    /// Icon prefetch gates for the pages that rebuild their rows every frame;
+    /// see [`IconPrefetch`].
+    pub icons_prefetch: IconPrefetch,
     accesskit_logged: bool,
 }
 
@@ -537,6 +540,13 @@ struct InputStatsRecorder {
     /// two numbers. The remaining pages paint no row icon at all.
     icon_memo_hits: u64,
     icon_lookups: u64,
+    /// Icon prefetch calls the pages made their row model rebuild, and the
+    /// keys they handed the cache. On a cold cache a row paints an EMPTY icon
+    /// cell until its answer arrives, so a prefetch is what moves that work off
+    /// the paint path; the pair says how much of it left. Saturating like the
+    /// rebuild count: they are only reset while the probe is enabled.
+    icon_prefetch_calls: u32,
+    icon_prefetch_keys: u64,
     /// Clipped-text measurements spent only to answer "is this cell clipped?".
     /// Details is the only page that reports them: Connections, Hosted
     /// services, Modules, Services, Startup, Threads and Users still measure
@@ -558,8 +568,105 @@ impl InputStatsRecorder {
             model_rebuilds: 0,
             icon_memo_hits: 0,
             icon_lookups: 0,
+            icon_prefetch_calls: 0,
+            icon_prefetch_keys: 0,
             text_measures: 0,
         }
+    }
+}
+
+/// Most icon keys one prefetch call hands over.
+///
+/// The cache keeps a bounded number of textures (`CACHE_CAP` in `icon_cache`)
+/// and every key costs a platform icon resolution, so warming more keys than it
+/// can hold would evict the icons this rebuild just resolved. The cap cuts in
+/// row order, which is the paint order: the rows the user sees first are the
+/// ones that get warmed.
+const ICON_PREFETCH_LIMIT: usize = 512;
+
+/// The icon cache keys a page's row model asks for: its distinct image paths,
+/// in row order, capped at [`ICON_PREFETCH_LIMIT`].
+///
+/// The prefetch rides the model rebuild rather than the paint, so this runs
+/// once per rebuild: it dedups with one set instead of asking the cache per
+/// row, and skips rows without an image (they paint the platform's default
+/// application icon and have no key of their own).
+pub(crate) fn icon_prefetch_keys<'a>(
+    paths: impl IntoIterator<Item = Option<&'a str>>,
+) -> Vec<String> {
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut keys: Vec<String> = Vec::new();
+    for path in paths.into_iter().flatten() {
+        if !seen.insert(path) {
+            continue;
+        }
+        keys.push(path.to_string());
+        if keys.len() == ICON_PREFETCH_LIMIT {
+            break;
+        }
+    }
+    keys
+}
+
+/// The icon prefetch gates of the pages that rebuild their rows every frame.
+///
+/// The Processes and Details pages rebuild their row model behind a cache key,
+/// so their prefetch rides that rebuild and needs no gate of its own. App
+/// History, Startup and Users re-derive their rows from the live data on every
+/// frame instead, so handing the cache their keys unconditionally would put the
+/// work this prefetch exists to remove back on the frame path. Each of them
+/// remembers the data it last warmed and prefetches only when that changed: a
+/// new sample or a new search.
+#[derive(Default)]
+pub struct IconPrefetch {
+    /// App History: the sample and the search its rows were last warmed for.
+    app_history: Option<(u64, String)>,
+    /// Startup: the fetched list (its fetch timestamp, the list's only
+    /// identity) and the search its rows were last warmed for.
+    startup: Option<(std::time::Instant, String)>,
+    /// Users: the sample and the search its rows were last warmed for.
+    users: Option<(u64, String)>,
+}
+
+/// Does `slot` hold anything other than `(generation, search)`?
+///
+/// The page prefetches when it does, and the gate then remembers what it
+/// warmed. `generation` is whatever identifies the page's data: a sample
+/// timestamp for a page built from the live snapshot, the fetch timestamp for
+/// one built from a fetched list. Both comparisons are cheap enough to run on
+/// every frame; the string copy happens only on the rebuild.
+fn prefetch_due<G: PartialEq + Copy>(
+    slot: &mut Option<(G, String)>,
+    generation: G,
+    search: &str,
+) -> bool {
+    if slot
+        .as_ref()
+        .is_some_and(|(warmed, query)| *warmed == generation && query.as_str() == search)
+    {
+        return false;
+    }
+    *slot = Some((generation, search.to_string()));
+    true
+}
+
+impl IconPrefetch {
+    /// Whether the App History page's rows changed since the cache was warmed
+    /// for them.
+    pub fn app_history_due(&mut self, sample_ms: u64, search: &str) -> bool {
+        prefetch_due(&mut self.app_history, sample_ms, search)
+    }
+
+    /// Whether the Startup page's rows changed since the cache was warmed for
+    /// them.
+    pub fn startup_due(&mut self, fetched_at: std::time::Instant, search: &str) -> bool {
+        prefetch_due(&mut self.startup, fetched_at, search)
+    }
+
+    /// Whether the Users page's rows changed since the cache was warmed for
+    /// them.
+    pub fn users_due(&mut self, sample_ms: u64, search: &str) -> bool {
+        prefetch_due(&mut self.users, sample_ms, search)
     }
 }
 
@@ -1009,6 +1116,7 @@ impl TaskManApp {
             last_taskbar_interval_active: false,
             last_viewport_rects: None,
             input_stats,
+            icons_prefetch: IconPrefetch::default(),
             accesskit_logged: false,
         };
         // The creator is about to return: everything from here on is the first
@@ -3187,6 +3295,28 @@ impl TaskManApp {
         self.input_stats.text_measures += measures;
     }
 
+    /// Warm the icon cache for the rows a page just rebuilt.
+    ///
+    /// A row whose icon is still being resolved paints an EMPTY icon cell, so
+    /// a list that only ever asks on the paint path grows its icons one
+    /// answer per frame while the user watches. Handing the model's keys over
+    /// here starts the extractions before those rows are first painted. Called
+    /// from the rebuild, never from the paint path, and gated by
+    /// [`IconPrefetch`] on the pages that rebuild every frame.
+    pub fn prefetch_icons(&mut self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        let prefetched = keys.len() as u64;
+        self.input_stats.icon_prefetch_calls =
+            self.input_stats.icon_prefetch_calls.saturating_add(1);
+        self.input_stats.icon_prefetch_keys = self
+            .input_stats
+            .icon_prefetch_keys
+            .saturating_add(prefetched);
+        self.shared.icons.prefetch(&self.actions, keys);
+    }
+
     /// Input/render diagnostics (`TASKMAN_INPUT_STATS=1`): logs `CursorMoved`
     /// and `MouseWheel` decisions, software-renderer pass/paint/present timings,
     /// tile-damage skip ratio, AccessKit activation, and top repaint causes
@@ -3222,6 +3352,13 @@ impl TaskManApp {
         let frames = sw.frames.max(1) as f64;
         let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
         let painted_frames = sw.frames.saturating_sub(sw.skipped_damage).max(1) as f64;
+        // The icon cache's own counters ride this window: `ready`, `failed`,
+        // `queued` and `in_flight` are what the cache holds right now, while
+        // `prefetched` and the per-window prefetch counts are this window's
+        // work. A window with icon lookups but no prefetch call, and a `queued`
+        // that keeps growing, is a page still resolving icons from the paint
+        // path.
+        let icons = self.shared.icons.stats();
         tracing::info!(
             moves_s = format_args!("{:.0}", moves.total_moves as f64 / secs),
             dup = moves.skipped_dup_pos,
@@ -3247,6 +3384,13 @@ impl TaskManApp {
             model_rebuilds = self.input_stats.model_rebuilds,
             icon_lookups = self.input_stats.icon_lookups,
             icon_memo_hits = self.input_stats.icon_memo_hits,
+            icon_ready = icons.ready,
+            icon_failed = icons.failed,
+            icon_queued = icons.queued,
+            icon_in_flight = icons.in_flight,
+            icon_prefetched = icons.prefetched,
+            icon_prefetch_calls = self.input_stats.icon_prefetch_calls,
+            icon_prefetch_keys = self.input_stats.icon_prefetch_keys,
             text_measures = self.input_stats.text_measures,
             accesskit = ctx.is_accesskit_enabled(),
             causes = %causes_summary.join(","),
@@ -3256,6 +3400,8 @@ impl TaskManApp {
         self.input_stats.model_rebuilds = 0;
         self.input_stats.icon_memo_hits = 0;
         self.input_stats.icon_lookups = 0;
+        self.input_stats.icon_prefetch_calls = 0;
+        self.input_stats.icon_prefetch_keys = 0;
         self.input_stats.text_measures = 0;
     }
 }
@@ -3287,6 +3433,57 @@ mod tests {
         // Non-divisible windows round UP so the requested span always fits
         // (240 s / 1.5 s = exactly 160 here).
         assert_eq!(history_cap_for(241, 1.5), 161);
+    }
+
+    /// The prefetch hands the cache a page's DISTINCT image paths in row
+    /// order: a repeated image is one key, a row without an image is skipped
+    /// (it paints the platform default), and the cap stops at what the cache
+    /// can actually keep.
+    #[test]
+    fn icon_prefetch_keys_dedups_skips_and_caps() {
+        assert!(icon_prefetch_keys(Vec::<Option<&str>>::new()).is_empty());
+        assert!(icon_prefetch_keys([None, None]).is_empty());
+        let keys = icon_prefetch_keys([Some("/apps/a"), None, Some("/apps/b"), Some("/apps/a")]);
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert_eq!(keys[0], "/apps/a");
+        assert_eq!(keys[1], "/apps/b");
+
+        // One list longer than the cap: the tail of the model is not handed
+        // over, and the rows the paint order shows first are the ones kept.
+        let mut paths: Vec<String> = Vec::new();
+        for i in 0..ICON_PREFETCH_LIMIT + 8 {
+            paths.push(format!("/apps/app{i}"));
+        }
+        let mut refs: Vec<Option<&str>> = Vec::with_capacity(paths.len());
+        for path in &paths {
+            refs.push(Some(path.as_str()));
+        }
+        let keys = icon_prefetch_keys(refs);
+        assert_eq!(keys.len(), ICON_PREFETCH_LIMIT);
+        assert_eq!(keys.first().map(String::as_str), Some("/apps/app0"));
+        let last = format!("/apps/app{}", ICON_PREFETCH_LIMIT - 1);
+        assert_eq!(keys.last().map(String::as_str), Some(last.as_str()));
+    }
+
+    /// The pages that rebuild their rows every frame prefetch on a new sample
+    /// or a new search and on nothing else — asking the cache for the same
+    /// keys on every frame is exactly the hot-path work the prefetch removes.
+    #[test]
+    fn the_frame_built_pages_prefetch_only_when_their_rows_changed() {
+        let mut gates = IconPrefetch::default();
+        assert!(gates.users_due(10, ""), "the first frame prefetches");
+        assert!(!gates.users_due(10, ""));
+        assert!(gates.users_due(11, ""), "a new sample rebuilds the rows");
+        assert!(!gates.users_due(11, ""));
+        assert!(gates.users_due(11, "chr"), "a new search rebuilds them too");
+        assert!(!gates.users_due(11, "chr"));
+
+        // Each page keeps its own gate: another page's prefetch must not spend
+        // this one's.
+        assert!(gates.app_history_due(11, "chr"));
+        assert!(gates.startup_due(std::time::Instant::now(), ""));
+        assert!(!gates.users_due(11, "chr"));
+        assert!(!gates.app_history_due(11, "chr"));
     }
 
     /// Regression: the Processes and Users pages state the machine's disk
