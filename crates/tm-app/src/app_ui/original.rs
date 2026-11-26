@@ -1440,7 +1440,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 app.save_settings();
             }
 
-            #[cfg(target_os = "windows")]
+            // Both desktops have a tray icon to close into, so this toggle is
+            // not Windows-specific; everything else in the block below is.
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 let mut close_to_tray = app.shared.settings.close_to_tray;
                 if crate::widgets::controls::checkbox(
@@ -1454,7 +1456,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.shared.settings.close_to_tray = close_to_tray;
                     app.save_settings();
                 }
+            }
 
+            #[cfg(target_os = "windows")]
+            {
                 // Opt-in for the SSID/signal rows. OFF means the
                 // location-gated WLAN query is never called at all — no
                 // Windows location permission prompt, no "location in use"
@@ -1897,8 +1902,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             actions.relaunch_elevated()?;
                             // The action succeeds only after the replacement
                             // process was handed off. Close this instance so
-                            // its settings and history flush exactly once.
-                            #[cfg(target_os = "windows")]
+                            // its settings and history flush exactly once, and
+                            // mark it as a handover: close-to-tray must not
+                            // swallow this close on any desktop.
                             crate::request_programmatic_exit();
                             close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             Ok(())
