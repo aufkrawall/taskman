@@ -502,14 +502,21 @@ impl BrokerGate {
     /// A broker that has been seen gone and then answers again is a different
     /// peer — restarted, reinstalled, or started after the GUI — so a refusal
     /// recorded before that no longer applies.
-    pub fn observe(self, liveness: BrokerLiveness) -> Self {
-        match self {
-            Self::Ask | Self::Disabled => self,
-            Self::Refused {
-                saw_unreachable: true,
-            } if liveness == BrokerLiveness::Reachable => Self::Ask,
-            Self::Refused { saw_unreachable } => Self::Refused {
-                saw_unreachable: saw_unreachable || liveness == BrokerLiveness::Unreachable,
+    ///
+    /// `liveness` is `None` when the probe is still pending, which is no
+    /// observation at all: it neither proves the broker gone (that would let a
+    /// latched gate re-ask and re-latch) nor proves it back.
+    pub fn observe(self, liveness: Option<BrokerLiveness>) -> Self {
+        match (self, liveness) {
+            (Self::Ask | Self::Disabled, _) => self,
+            (
+                Self::Refused {
+                    saw_unreachable: true,
+                },
+                Some(BrokerLiveness::Reachable),
+            ) => Self::Ask,
+            (Self::Refused { saw_unreachable }, liveness) => Self::Refused {
+                saw_unreachable: saw_unreachable || liveness == Some(BrokerLiveness::Unreachable),
             },
         }
     }
@@ -521,16 +528,20 @@ impl BrokerGate {
 
     /// One window of the brokered fallback, as one pure step.
     ///
-    /// `liveness` is this window's observation of the broker, and `last` is what
-    /// the previous window's request produced (`None` when it did not ask). The
-    /// result is the gate to carry into the next window and whether this window
-    /// should ask at all.
+    /// `liveness` is this window's observation of the broker (`None` while the
+    /// probe is still pending), and `last` is what the previous window's request
+    /// produced (`None` when it did not ask). The result is the gate to carry
+    /// into the next window and whether this window should ask at all.
     ///
     /// A request that never reached a broker is transient, so the next window
     /// asks again. A refusal latches: it is a decision about this client, and
     /// repeating it every window would only spam the log until the broker is seen
     /// gone and back (or the process restarts).
-    pub fn step(self, liveness: BrokerLiveness, last: Option<BrokerAttempt>) -> (Self, bool) {
+    pub fn step(
+        self,
+        liveness: Option<BrokerLiveness>,
+        last: Option<BrokerAttempt>,
+    ) -> (Self, bool) {
         // A fallback that cannot run keeps its state whatever the wire says.
         if self == Self::Disabled {
             return (Self::Disabled, false);
@@ -549,7 +560,9 @@ impl BrokerGate {
 /// Whether the broker answered a liveness observation.
 ///
 /// What it answered does not matter: an answered probe, even a refusal, proves
-/// the service is there, while a probe that reached nobody proves it is not.
+/// the service is there, while a probe that reached nobody proves it is not. A
+/// probe that is still pending is neither, and is passed to [`BrokerGate`] as
+/// `None` rather than as a value here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerLiveness {
     /// The broker answered.
@@ -1060,7 +1073,7 @@ mod tests {
     #[test]
     fn a_broker_refusal_stops_the_fallback_until_it_restarts() {
         // First window: nothing was attempted yet, so it asks.
-        let (gate, ask) = BrokerGate::Ask.step(BrokerLiveness::Unreachable, None);
+        let (gate, ask) = BrokerGate::Ask.step(Some(BrokerLiveness::Unreachable), None);
         assert!(ask, "a window that never asked must ask");
         // The request reached nobody: transient, so the next window asks again.
         let (gate, ask) = gate.step(
@@ -1075,23 +1088,29 @@ mod tests {
         assert!(ask);
         assert_eq!(gate, BrokerGate::Ask);
         // Readings arrived: nothing latches.
-        let (gate, ask) = gate.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Answered));
+        let (gate, ask) = gate.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Answered),
+        );
         assert!(ask);
         // The broker refused: the very next window must not ask, and ten more
         // windows of a reachable broker must not reopen it.
-        let (gate, ask) = gate.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Refused));
+        let (gate, ask) = gate.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Refused),
+        );
         assert!(!ask, "a refusal must latch before the next ask");
         let mut latched = gate;
         for _ in 0..10 {
-            let (next, ask) = latched.step(BrokerLiveness::Reachable, None);
+            let (next, ask) = latched.step(Some(BrokerLiveness::Reachable), None);
             assert!(!ask, "a refused policy does not change by asking again");
             latched = next;
         }
         // It went away: still latched, but remembered.
-        let (latched, ask) = latched.step(BrokerLiveness::Unreachable, None);
+        let (latched, ask) = latched.step(Some(BrokerLiveness::Unreachable), None);
         assert!(!ask);
         // It answered again: a different peer, so ask once more.
-        let (gate, ask) = latched.step(BrokerLiveness::Reachable, None);
+        let (gate, ask) = latched.step(Some(BrokerLiveness::Reachable), None);
         assert!(ask, "a restarted broker reopens the fallback");
         assert_eq!(gate, BrokerGate::Ask);
     }
@@ -1100,8 +1119,10 @@ mod tests {
     fn an_unusable_answer_latches_without_being_retried() {
         // The broker answered a sensor poll with another payload: not a
         // transport failure, so the next window stays quiet.
-        let (gate, ask) =
-            BrokerGate::Ask.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Refused));
+        let (gate, ask) = BrokerGate::Ask.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Refused),
+        );
         assert!(!ask);
         assert_eq!(
             gate,
@@ -1110,20 +1131,48 @@ mod tests {
             }
         );
         // A window that did not ask keeps whatever it had.
-        let (gate, ask) = BrokerGate::Ask.step(BrokerLiveness::Reachable, None);
+        let (gate, ask) = BrokerGate::Ask.step(Some(BrokerLiveness::Reachable), None);
         assert!(ask);
         assert_eq!(gate, BrokerGate::Ask);
+    }
+
+    #[test]
+    fn a_pending_probe_is_not_an_observation() {
+        // "Still finding out" is neither reachable nor unreachable: it must not
+        // count as the broker being gone, which is what let a latched gate
+        // re-ask and re-latch on every window.
+        let (gate, ask) = BrokerGate::Ask.step(None, None);
+        assert!(ask, "a pending probe leaves an asking gate asking");
+        assert_eq!(gate, BrokerGate::Ask);
+        // A latch survives any number of pending windows.
+        let latched = BrokerGate::Refused {
+            saw_unreachable: false,
+        };
+        let (gate, ask) = latched.step(None, None);
+        assert!(!ask);
+        assert_eq!(gate, latched);
+        // Pending is not the "gone" half of a restart either: a gate that already
+        // saw the broker leave stays latched until a probe really answers.
+        let saw_gone = BrokerGate::Refused {
+            saw_unreachable: true,
+        };
+        let (gate, ask) = saw_gone.step(None, None);
+        assert!(!ask, "a pending probe cannot reopen a latch");
+        assert_eq!(gate, saw_gone);
     }
 
     #[test]
     fn a_fallback_that_could_not_start_never_asks() {
         // The worker thread could not be spawned, so there is nothing left that
         // could ask: no observation and no outcome reopens it.
-        let (gate, ask) = BrokerGate::Disabled.step(BrokerLiveness::Reachable, None);
+        let (gate, ask) = BrokerGate::Disabled.step(Some(BrokerLiveness::Reachable), None);
         assert!(!ask);
-        let (gate, ask) = gate.step(BrokerLiveness::Unreachable, None);
+        let (gate, ask) = gate.step(Some(BrokerLiveness::Unreachable), None);
         assert!(!ask);
-        let (gate, ask) = gate.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Answered));
+        let (gate, ask) = gate.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Answered),
+        );
         assert!(!ask);
         assert_eq!(gate, BrokerGate::Disabled);
     }

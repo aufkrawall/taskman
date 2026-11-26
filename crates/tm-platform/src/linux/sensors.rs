@@ -19,9 +19,9 @@
 //! per window there and nothing on the sampling path, so a sample can never
 //! wait on a socket.
 
-use super::core_service::client::{self, ClientError};
+use super::core_service::client::{self, ClientError, StatusProbe};
 use super::{hwmon, nvml};
-use crate::linux_core_service::{Request, Response, ServiceStatusInfo};
+use crate::linux_core_service::{Request, Response};
 use crate::linux_sensors::{
     BrokerAttempt, BrokerGate, BrokerLiveness, GpuSensors, SensorSnapshot, normalize_pci_slot,
 };
@@ -177,8 +177,8 @@ fn broker_worker() {
             // The gate's liveness input is observed here, by the owner of the
             // gate: `client::status()` is a cache read that starts the client's
             // single background probe, so a broker nobody probes is never
-            // mistaken for one that is gone, and a refusal sees the service
-            // leave and return instead of following a cache somebody else fills.
+            // mistaken for one that is gone. A probe still in flight yields no
+            // observation, which leaves the gate exactly as it is.
             let liveness = liveness_of(&client::status());
             let mut readings = tm_core::sync::lock(broker_readings());
             let (gate, ask) = readings.gate.step(liveness, attempt);
@@ -229,15 +229,20 @@ fn attempt_of(outcome: &Result<Response, ClientError>) -> BrokerAttempt {
     }
 }
 
-/// Whether the status answer proves a broker is there.
+/// Whether the status probe proves anything about the broker.
 ///
-/// An answered probe proves it whatever it said, including a refusal; only a
-/// probe that reached nobody means the service is gone.
-fn liveness_of(status: &Result<ServiceStatusInfo, ClientError>) -> BrokerLiveness {
-    match status {
-        Ok(_) => BrokerLiveness::Reachable,
-        Err(error) if error.may_fall_back() => BrokerLiveness::Unreachable,
-        Err(_) => BrokerLiveness::Reachable,
+/// An answered probe proves it is there whatever it said, including a refusal;
+/// only an answer that reached nobody means the service is gone. A probe that is
+/// still pending proves neither, so it yields no observation at all — reading it
+/// as "gone" is what made a latched gate re-ask and re-latch.
+fn liveness_of(probe: &StatusProbe) -> Option<BrokerLiveness> {
+    match probe {
+        StatusProbe::Pending => None,
+        StatusProbe::Answered(Ok(_)) => Some(BrokerLiveness::Reachable),
+        StatusProbe::Answered(Err(error)) if error.may_fall_back() => {
+            Some(BrokerLiveness::Unreachable)
+        }
+        StatusProbe::Answered(Err(_)) => Some(BrokerLiveness::Reachable),
     }
 }
 
