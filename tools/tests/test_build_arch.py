@@ -84,7 +84,9 @@ class ArchPackageHostTests(unittest.TestCase):
                 "--",
                 "bash",
                 "-lc",
-                "cd /mnt/c/repo/packaging/arch && makepkg --printsrcinfo",
+                "cd /mnt/c/repo/packaging/arch && "
+                "BUILDDIR=/var/tmp/taskman-arch/build SRCDEST=/var/tmp/taskman-arch/src "
+                "PKGDEST=/mnt/c/repo/dist makepkg --printsrcinfo",
             ],
         )
 
@@ -106,8 +108,27 @@ class ArchPackageHostTests(unittest.TestCase):
         self.assertEqual(
             host.argv(["--force", "--noconfirm"], {"PKGDEST": host.dist_dir})[-1],
             "cd '/mnt/c/My Repo/packaging/arch' && "
+            "BUILDDIR=/var/tmp/taskman-arch/build SRCDEST=/var/tmp/taskman-arch/src "
             "PKGDEST='/mnt/c/My Repo/dist' makepkg --force --noconfirm",
         )
+
+    @patch.object(build, "log")
+    @patch.object(build.shutil, "which", side_effect=wsl_only)
+    @patch.object(build.platform, "system", return_value="Windows")
+    def test_build_tree_stays_out_of_the_checkout(self, *_):
+        """A read-only or 9p checkout must not be where the build tree lives."""
+        fake_run, _ = fake_wsl_run({"arch"}, b"arch\r\n")
+        with patch.object(build.subprocess, "run", side_effect=fake_run):
+            host = build.arch_package_host()
+        self.assertEqual(
+            host.environment({"PKGDEST": host.dist_dir}),
+            {
+                "BUILDDIR": "/var/tmp/taskman-arch/build",
+                "SRCDEST": "/var/tmp/taskman-arch/src",
+                "PKGDEST": host.dist_dir,
+            },
+        )
+        self.assertNotIn(host.arch_dir, host.env["BUILDDIR"])
 
     @patch.object(build, "log")
     @patch.object(build.shutil, "which", side_effect=wsl_only)
@@ -186,7 +207,7 @@ class FakeHost:
             text = (build.ARCH_PACKAGING / ".SRCINFO").read_text(encoding="utf-8")
         return completed(args, 0, text)
 
-    def run(self, args, env):
+    def run(self, args, env=None):
         self.runs.append((args, env))
         return self.ok
 
@@ -210,7 +231,7 @@ class BuildArchPackageTests(unittest.TestCase):
             self.assertTrue(build.build_arch_package(build.read_version()))
         self.assertEqual(
             host.runs,
-            [(["--force", "--noconfirm"], {"PKGDEST": host.dist_dir})],
+            [(["--force", "--noconfirm"], None)],
         )
 
     @patch.object(build, "log")

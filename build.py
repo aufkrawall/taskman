@@ -37,9 +37,9 @@ import subprocess
 import sys
 import tarfile
 import zipfile
-from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
@@ -622,10 +622,18 @@ def linux_payload_files(
 # Names the distro that provides `makepkg` when the host has none. Setting it
 # skips the discovery below, which has to start each candidate to look inside.
 ARCH_WSL_DISTRO_ENV = "TASKMAN_ARCH_WSL_DISTRO"
+# Where makepkg builds when the checkout is reached through WSL. Its own
+# default is `$startdir`, i.e. `packaging/arch` inside the checkout, which is
+# the wrong place for a second copy of the whole target tree: the checkout is
+# on a 9p mount (slow for the thousands of object files a cold build writes,
+# and not necessarily writable at all from inside the distro), and the build
+# would leave gigabytes in the repository. /var/tmp survives a distro restart,
+# so a rebuilt package only relinks instead of recompiling 900 crates.
+ARCH_WSL_BUILD_DIR = "/var/tmp/taskman-arch/build"
+ARCH_WSL_SRC_DIR = "/var/tmp/taskman-arch/src"
 
 
-@dataclass(frozen=True)
-class ArchPackageHost:
+class ArchPackageHost(NamedTuple):
     """A `makepkg` this run can package with, and the paths it understands.
 
     `wsl is None` is a native `makepkg` on an Arch host, where the working
@@ -633,12 +641,14 @@ class ArchPackageHost:
     `makepkg` runs inside that distro and every path is the `/mnt/<drive>/...`
     spelling `wslpath` gave it: makepkg writes the package where PKGDEST
     points, so handing it a Windows path would fail the run instead of filling
-    `dist/`.
+    `dist/`. `env` is the environment that route always needs (build tree,
+    source cache); it is merged under the per-call one.
     """
 
     makepkg: str
     arch_dir: str
     dist_dir: str
+    env: dict[str, str] | None = None
     wsl: str | None = None
     distro: str | None = None
 
@@ -647,6 +657,9 @@ class ArchPackageHost:
         if self.distro is None:
             return self.makepkg
         return f"makepkg in WSL distro {self.distro}"
+
+    def environment(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        return {**(self.env or {}), **(extra or {})}
 
     def argv(self, args: list[str], env: dict[str, str] | None = None) -> list[str]:
         """The command that runs `makepkg args` from `arch_dir`."""
@@ -657,7 +670,10 @@ class ArchPackageHost:
         # the Windows side would never reach the distro.
         command = " ".join(
             [
-                *(f"{name}={shlex.quote(value)}" for name, value in (env or {}).items()),
+                *(
+                    f"{name}={shlex.quote(value)}"
+                    for name, value in self.environment(env).items()
+                ),
                 self.makepkg,
                 *(shlex.quote(arg) for arg in args),
             ]
@@ -677,6 +693,7 @@ class ArchPackageHost:
             return subprocess.run(
                 [self.makepkg, *args],
                 cwd=ARCH_PACKAGING,
+                env={**os.environ, **self.environment()},
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -690,9 +707,13 @@ class ArchPackageHost:
             errors="replace",
         )
 
-    def run(self, args: list[str], env: dict[str, str]) -> bool:
+    def run(self, args: list[str], env: dict[str, str] | None = None) -> bool:
         if self.wsl is None:
-            return run([self.makepkg, *args], env=env, cwd=ARCH_PACKAGING)
+            return run(
+                [self.makepkg, *args],
+                env=self.environment(env),
+                cwd=ARCH_PACKAGING,
+            )
         return run(self.argv(args, env))
 
 
@@ -785,7 +806,9 @@ def arch_package_host() -> ArchPackageHost | None:
     """
     native = shutil.which("makepkg")
     if native:
-        return ArchPackageHost(native, str(ARCH_PACKAGING), str(DIST))
+        return ArchPackageHost(
+            native, str(ARCH_PACKAGING), str(DIST), {"PKGDEST": str(DIST)}
+        )
     if platform.system() != "Windows":
         return None
     wsl = shutil.which("wsl.exe") or shutil.which("wsl")
@@ -798,7 +821,22 @@ def arch_package_host() -> ArchPackageHost | None:
         dist_dir = wsl_path(wsl, distro, DIST)
         if arch_dir is None or dist_dir is None:
             continue
-        return ArchPackageHost("makepkg", arch_dir, dist_dir, wsl=wsl, distro=distro)
+        # PKGDEST belongs here and not only on the build call: makepkg refuses
+        # to run at all when its destination is not writable, and a checkout
+        # mounted read-only inside the distro would otherwise fail even the
+        # `--printsrcinfo` check.
+        return ArchPackageHost(
+            "makepkg",
+            arch_dir,
+            dist_dir,
+            {
+                "BUILDDIR": ARCH_WSL_BUILD_DIR,
+                "SRCDEST": ARCH_WSL_SRC_DIR,
+                "PKGDEST": dist_dir,
+            },
+            wsl=wsl,
+            distro=distro,
+        )
     return None
 
 
@@ -886,7 +924,7 @@ def build_arch_package(version: str) -> bool:
     log(f"building the arch package with {host.label}")
     # PKGDEST keeps the package next to the other artifacts instead of littering
     # the packaging directory.
-    return host.run(["--force", "--noconfirm"], {"PKGDEST": host.dist_dir})
+    return host.run(["--force", "--noconfirm"])
 
 
 def package_zip(name: str, files: list[tuple[Path, str]]) -> Path:

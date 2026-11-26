@@ -59,7 +59,10 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    The pacman package is part of the same run: `makepkg` runs from
    `packaging/arch` with `PKGDEST` pointed at `dist/`, natively on an Arch
    host or through `wsl.exe` in an Arch WSL distro on Windows
-   (`TASKMAN_ARCH_WSL_DISTRO` names one instead of searching). It runs
+   (`TASKMAN_ARCH_WSL_DISTRO` names one instead of searching). The WSL route
+   builds in `/var/tmp/taskman-arch` inside the distro, not in the checkout:
+   the 9p mount makes a cold build slow, the checkout may be mounted
+   read-only there, and a rebuild then only relinks. It runs
    after checking that `pkgver` matches `Cargo.toml` and that the committed
    `.SRCINFO` matches `makepkg --printsrcinfo`; a host with no `makepkg`
    anywhere is a logged skip, never a failed build, and `--no-arch-package`

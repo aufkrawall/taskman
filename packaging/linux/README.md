@@ -188,7 +188,11 @@ records.
 `makepkg`. Windows has no pacman at all, so there it uses the first Arch WSL
 distro that has `makepkg` — set `TASKMAN_ARCH_WSL_DISTRO` to name one instead
 of searching. The build happens inside that distro, so a first run compiles
-the Linux binaries a second time there; `--no-arch-package` skips the step, and
+the Linux binaries a second time there; its build tree lives in
+`/var/tmp/taskman-arch` inside the distro rather than in `packaging/arch/src`,
+which keeps gigabytes off the checkout, survives a distro restart so a rebuild
+only relinks, and leaves the checkout free to be mounted read-only there.
+`--no-arch-package` skips the step, and
 `--no-package`/`--host-only` skip it with the rest. A host with neither
 `makepkg` nor an Arch WSL distro is a logged skip, never a failed build
 (pacman is Arch-only). Before building it checks that the PKGBUILD's `pkgver`
