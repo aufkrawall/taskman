@@ -50,6 +50,22 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    built by the same workspace build (`taskman-setup.exe` is linked for the
    artifact's target) and gets its payload appended by the HOST
    `taskman-payload` tool, so `--no-package` also skips it.
+   The glibc Linux archive carries `bin/taskman`, `bin/taskman-service` and
+   the whole `packaging/linux` tree at the archive root (the installer, the
+   unit, the manifest template, the desktop entry, the icon, the AppStream
+   metadata and the README), which is what
+   `packaging/linux/install-linux.sh` expects to find next to `bin/`. The
+   musl archive stays headless: two binaries and the README only.
+   `--arch-package` additionally runs `makepkg` from `packaging/arch` after
+   checking that `pkgver` matches `Cargo.toml` and that the committed
+   `.SRCINFO` matches `makepkg --printsrcinfo`; a missing `makepkg` is a
+   logged skip, never a failed build.
+
+`cross_check()` type-checks every non-host target with `--all-targets` on
+purpose: without it, `#[cfg(test)]` code behind `cfg(target_os = "linux")`
+is compiled by nothing on this host, and a broken Linux test would only
+surface on a Linux machine. It still skips a target whose std is not
+installed (CI installs them), and it never links.
 
 Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
 `--no-package`, `--require-all-targets`, `--check`, `--audit`,

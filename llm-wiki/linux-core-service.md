@@ -95,28 +95,55 @@ NVML access lives in `linux/sensors.rs`.
 
 ## Desktop integration
 
-- Tray: a StatusNotifierItem over the session bus (pure-Rust `zbus`, no
-  GTK/libappindicator at build time) with a `com.canonical.dbusmenu` menu
-  (Open / Settings / Exit), left-click activation, and the same lifecycle
-  contract as the Windows tray thread: the window is only hidden when the
-  icon is ready, and a failed icon leaves the window visible.
+- Tray: a `StatusNotifierItem` at `/StatusNotifierItem` plus
+  `com.canonical.dbusmenu` at `/MenuBar` on the session bus (pure-Rust `zbus`,
+  no GTK/libappindicator at build time). Three items — Open / Settings / Exit —
+  and a left click that activates Open. The served `Status` is `Active` or
+  `Passive` following the requested visibility, and the UI thread only stores
+  the desire and wakes the tray thread, which owns the connection and emits
+  `NewStatus`.
+- The tray lifecycle is the Windows one: the window is hidden only once the
+  icon is registered, `--minimized-to-tray` falls back to showing the window
+  when there is no icon, and a tray click restores it.
+- Wayland cannot hide a window (winit ignores `ViewportCommand::Visible(false)`
+  and refuses to un-minimize), so the backend is detected once from the
+  window's display handle with `WAYLAND_DISPLAY` as the fallback, and a Wayland
+  session refuses to close-to-tray rather than leaving the window on screen
+  while the app believes it is hidden.
+- A panel restart replaces the watcher; the tray thread records the watcher's
+  unique owner and re-registers on every 30 s tick when it changed or vanished.
+  A failed re-registration stores `FAILED` and wakes the UI, so an already
+  hidden window is restored instead of becoming unreachable.
+- GNOME without the AppIndicator extension has no watcher. Registration fails
+  once with a single explanatory log line, the state becomes `FAILED`, and the
+  window stays visible.
 - Install layout (`packaging/linux/install-linux.sh`):
-  - `/usr/lib/taskman/taskman-service` (root:root 0755)
+  - `/usr/bin/taskman` (the GUI)
+  - `/usr/lib/taskman/taskman-service` (root:root 0755) and the two support
+    files the scriptlet needs: `install-linux.sh` and `core-service.json.in`
   - `/usr/lib/systemd/system/taskman-core.service`
-  - `/etc/taskman/core-service.json` (root:root 0644)
+  - `/etc/taskman/core-service.json` (root:root 0644) — a pacman `backup`
+    file, so an upgrade keeps the live policy instead of replacing it; the
+    new placeholder arrives as `.pacnew` and is removed after the merge
   - `/usr/share/applications/io.github.aufkrawall.Taskman.desktop`
   - `/usr/share/icons/hicolor/scalable/apps/io.github.aufkrawall.Taskman.svg`
     (one scalable icon: both KDE and GNOME's icon themes load SVG, and it
     needs no raster size table; `*.png` stays gitignored in this repository)
   - `/usr/share/metainfo/io.github.aufkrawall.Taskman.metainfo.xml`
-  - `/run/taskman` via the unit's `RuntimeDirectory=`
+  - `/run/taskman` via the unit's `RuntimeDirectory=`, and `/var/log/taskman`
+    via `LogsDirectory=` (the unit runs with `ProtectSystem=strict`, so the
+    service cannot create that directory itself)
 - Arch package: `packaging/arch/PKGBUILD` + `taskman.install`. `package()`
   runs the installer into `$pkgdir`, so the package contents and the tarball
-  install cannot drift; the `.install` scriptlet enables and starts the unit
-  and refreshes the desktop/icon caches after pacman writes the files.
+  install cannot drift; the `.install` scriptlet refreshes the desktop/icon
+  caches and enables the unit. With no known invoker (a root login, a chroot)
+  it warns, leaves the unit disabled and names the one command that fixes it —
+  a scriptlet must never fail the pacman transaction, and enabling a unit with
+  an empty policy would only burn its start limit.
 - `build.py` ships the packaging tree with the Linux artifact and can build
   the Arch package when the packaging tools exist; a missing tool is a skip,
-  not a failure.
+  not a failure. The musl artifact stays headless: it carries the two binaries
+  and the README, no desktop entry and no unit.
 
 ## Invariants
 

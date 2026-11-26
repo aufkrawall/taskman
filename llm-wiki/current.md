@@ -14,8 +14,41 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
-Linux can elevate only a trusted `systemctl` for service control; elevated
-process actions and GUI relaunch fail closed until a protected helper exists.
+Linux has the same split since 2026-11-26: `taskman-core.service` runs a root
+broker over a Unix socket (kernel peer credentials + a root-owned manifest,
+client image identified by device/inode), while the GUI stays unelevated and
+asks it only after its own token is denied. Linux also has a StatusNotifierItem
+tray, NVML-based NVIDIA telemetry, full hwmon/thermal/RAPL polling, a one-command
+installer and an Arch package — see `linux-core-service.md`.
+
+## Linux parity round (2026-11-26)
+
+Five parallel branches (broker, sensors, client wiring, tray, packaging), each
+followed by an independent review and 1-3 fix rounds, then merged and compiled
+once (`cargo check --workspace --all-targets` for the host and for
+`x86_64-unknown-linux-gnu`). Durable outcomes:
+
+- **A path is not an identity.** The Linux broker authorizes a peer by the
+  kernel's `SO_PEERCRED` uid plus the executable's `(st_dev, st_ino)` compared
+  against the manifest clients resolved in the broker's own namespace; an
+  earlier path-string check was defeated by `unshare -m` + a bind mount. The
+  Windows broker already had the equivalent guarantee through its protected
+  path + hash manifest.
+- **Only transport failure may fall back.** `ClientError::Unavailable` is the
+  single fallback-eligible case; a refusal, a failure, or an action frame that
+  was fully written is final, so a privileged mutation is never repeated under
+  another token. A partially delivered tree kill never escalates at all.
+- **A privilege request may not become a stall.** Reads use a 3 s deadline and
+  actions 35 s; `status()` is a cache read (no lock across I/O) with a
+  single-flighted background probe; the GUI's sensor fallback runs on its own
+  thread; the accept path authorizes before queueing; and a refusal is written
+  and the request drained inside one 250 ms budget.
+- **Honest availability survived every new source.** NVML, hwmon, RAPL, the
+  brokered per-file rows and the service status all keep "not measured" as
+  absent (never 0), and the first-paint state is `Starting`, not `Stopped`.
+- **Linux-only test code needs a compiler in the gate.** `cross_check()` now
+  type-checks with `--all-targets`, which is the only thing that compiles
+  `cfg(target_os = "linux")` test modules on the Windows host.
 
 ## Four-week review round (2026-11-25)
 

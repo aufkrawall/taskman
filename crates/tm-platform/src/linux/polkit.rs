@@ -1,9 +1,13 @@
 //! On-demand Linux elevation through the desktop's Polkit `pkexec` helper.
 //!
-//! Normal startup never elevates. systemd service control is retried through
-//! a trusted absolute `systemctl` path after a real authorization failure.
-//! The portable TaskMan image is deliberately never executed as root: privileged
-//! process actions and GUI relaunch fail closed until a protected helper ships.
+//! Normal startup never elevates. The installed core service is the primary
+//! privileged path (see `linux_core_service`); this module is what remains
+//! when it is absent, and it deliberately executes only trusted absolute
+//! system tools (`systemctl`) after a real authorization failure. Privileged
+//! process actions and the GUI relaunch never elevate the portable image: the
+//! first go through the broker, and the second stays refused because executing
+//! a user-writable image as root would turn the Polkit prompt into privilege
+//! escalation for mutable code.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -64,9 +68,10 @@ pub fn handle_helper(args: &[String]) -> Option<i32> {
 }
 
 /// Elevating the portable, user-writable TaskMan image would turn the Polkit
-/// prompt into privilege escalation for mutable code, so this path fails
-/// closed until a protected helper image exists. The refusal text is the same
-/// constructor the hidden helper's own arm uses.
+/// prompt into privilege escalation for mutable code, so this path stays
+/// refused even with the core service installed: the service takes one narrow
+/// request, not a whole root GUI. The refusal text is the same constructor the
+/// hidden helper's own arm uses.
 pub fn relaunch_elevated() -> Result<()> {
     Err(unsupported_relaunch())
 }
