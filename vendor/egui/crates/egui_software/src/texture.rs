@@ -60,10 +60,31 @@ impl Texture {
         let fy = y - y0;
         let (x0, y0) = (x0 as i64, y0 as i64);
 
-        let c00 = self.texel_wrapped(x0, y0, gray_lcd);
-        let c10 = self.texel_wrapped(x0 + 1, y0, gray_lcd);
-        let c01 = self.texel_wrapped(x0, y0 + 1, gray_lcd);
-        let c11 = self.texel_wrapped(x0 + 1, y0 + 1, gray_lcd);
+        let (w, h) = (self.width as i64, self.height as i64);
+        let [c00, c10, c01, c11] = if x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h {
+            // The whole 2x2 footprint is inside the texture, where every wrap mode is
+            // the identity: read the four texels directly instead of wrapping each
+            // coordinate of each one. That is every sample of an image drawn inside its
+            // own bounds -- the row icons, scaled down from 48 px, on every frame.
+            let top = (y0 * w + x0) as usize;
+            let bottom = top + self.width;
+            let fetch = |i: usize| {
+                let texel = self.pixels.get(i).copied().unwrap_or(Color32::TRANSPARENT);
+                if gray_lcd {
+                    gray_lcd_texel(texel)
+                } else {
+                    texel
+                }
+            };
+            [fetch(top), fetch(top + 1), fetch(bottom), fetch(bottom + 1)]
+        } else {
+            [
+                self.texel_wrapped(x0, y0, gray_lcd),
+                self.texel_wrapped(x0 + 1, y0, gray_lcd),
+                self.texel_wrapped(x0, y0 + 1, gray_lcd),
+                self.texel_wrapped(x0 + 1, y0 + 1, gray_lcd),
+            ]
+        };
 
         let lerp = |a: u8, b: u8, t: f32| a as f32 + (b as f32 - a as f32) * t;
         let mut out = [0u8; 4];

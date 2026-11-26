@@ -164,8 +164,8 @@ normal GUI log.
   `WGPU_POWER_PREF=high` is the opt-in discrete/high-performance override.
 - `TASKMAN_FPS_PROBE=1` forces continuous repaint and displays frame rate, but
   it requires launching the GUI and should be reserved for an interactive run.
-- `TASKMAN_SCROLL_PROBE=<seconds per page>` injects a 3-line wheel scroll at
-  the window centre every frame, reverses direction every 2 s, and cycles through
+- `TASKMAN_SCROLL_PROBE=<seconds per page>` scrolls at the window centre by
+  1,200 pt/s of elapsed time (independent of frame rate), reverses every 1 s, and cycles through
   Processes → Details → Users → App history → Startup → Services. It works in a
   headless sway, where synthetic pointer input never reaches the client. Pair it
   with `TASKMAN_INPUT_STATS=1` (paint/pass ms) and per-thread CPU from

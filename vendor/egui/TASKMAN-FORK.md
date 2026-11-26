@@ -467,6 +467,28 @@ bilinear sampling ~13 %.
 
 **Coverage:** the unit tests above, plus the existing renderer parity and
 watertightness tests. Measured at 1650×1080: 8.8 → 7.0 ms paint per scrolling frame.
+Follow-ups in the same files: `round_exact` (vertex snapping, three per triangle) and
+a direct 2×2 fetch in `bilinear` when the footprint is inside the texture, where every
+wrap mode is the identity.
+
+### 20. `egui_software` + `eframe`: incremental repaint into an older buffer (Wayland)
+
+softbuffer's Wayland backend alternates two `wl_shm` buffers, so every leased buffer
+reports age 2. `should_force_full_paint` treated any age other than 1 as a full
+repaint, so on Wayland every frame repainted the whole window, an idle one-cell
+telemetry tick included.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui_software/src/damage.rs` | `DamageTracker` keeps `history`: the tiles each of the last `MAX_BUFFER_AGE - 1` planned frames changed. `plan(.., buffer_age, ..)` repaints this frame's changes ∪ the last `age - 1` entries; age 0, an age beyond the record, or a geometry change is a full repaint. `coalesce_dirty_rects` paints a fragmented set (> 6 rects, or ≥ 3/4 of its box dirty) as its bounding box. | A buffer of age `n` holds the frame `n` presents ago, so it lacks exactly those changes. This is a record per buffer slot, read through softbuffer's own age, not a "we presented" flag (the trap `llm-wiki/known-debt.md` warns about). The painter walks every shape once per rect, so a ragged union cost more than the box. |
+| `crates/egui_software/src/lib.rs` | `paint_shapes_damaged_aged` (the old entry point delegates with age 1) and `forget_unpresented_frame`. | The record must count presents; a frame that is not presented takes its entry back. |
+| `crates/eframe/src/native/software_integration.rs` | Passes the buffer age; `should_force_full_paint` forces full only for age 0. An unchanged frame on a visible Wayland window is committed with a 1×1 damage rect; any frame that is not presented calls `forget_unpresented_frame`. | Without the token commit, a repaint request that changes no pixel got no frame callback and spun the loop (the scroll probe hit ~3,500 fps). |
+
+**Coverage:** `tests/buffer_age.rs` simulates 2- and 3-buffer rings (softbuffer's
+aging rule), with unchanged frames presented and skipped, and requires every
+presented buffer to equal a full repaint bit for bit. The 2-buffer test also
+requires the steady-state frames to be partial. Measured (headless sway, 4K at 1.5×):
+idle Processes page UI thread 1.4 % → 0.3 %, scripted scroll 45 % → 29 %.
 
 ## Rebase runbook
 

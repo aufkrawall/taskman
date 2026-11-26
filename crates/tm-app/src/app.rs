@@ -583,8 +583,10 @@ impl InputStatsRecorder {
 /// Scripted input for measuring the cost of scrolling and switching pages
 /// without a pointer (`TASKMAN_SCROLL_PROBE=<seconds per page>`).
 ///
-/// Every frame it moves the pointer to the middle of the window and scrolls
-/// three lines, reversing every [`ScrollProbe::REVERSE`], and it walks the
+/// Every frame it moves the pointer to the middle of the window and scrolls by
+/// [`ScrollProbe::SPEED`] points per second of elapsed time (so the distance does
+/// not depend on the frame rate and a fast renderer does not just pin the list
+/// at one end), reversing every [`ScrollProbe::REVERSE`], and it walks the
 /// row-icon pages in turn. Together with continuous repaints this is the
 /// worst case a wheel or a scrollbar drag produces, and it works in a headless
 /// compositor where synthetic pointer input never reaches the client — the
@@ -592,11 +594,14 @@ impl InputStatsRecorder {
 struct ScrollProbe {
     per_tab: std::time::Duration,
     started: std::time::Instant,
+    last: std::time::Instant,
     page: usize,
 }
 
 impl ScrollProbe {
-    const REVERSE: std::time::Duration = std::time::Duration::from_secs(2);
+    const REVERSE: std::time::Duration = std::time::Duration::from_secs(1);
+    /// A brisk wheel: about 40 rows a second.
+    const SPEED: f32 = 1200.0;
     const PAGES: [Tab; 6] = [
         Tab::Processes,
         Tab::Details,
@@ -616,6 +621,7 @@ impl ScrollProbe {
             Self {
                 per_tab: std::time::Duration::from_secs_f32(secs),
                 started: std::time::Instant::now(),
+                last: std::time::Instant::now(),
                 page: usize::MAX,
             }
         })
@@ -631,14 +637,17 @@ impl ScrollProbe {
             tracing::info!(page = ?Self::PAGES[page], "scroll probe: page switch");
             Self::PAGES[page]
         });
+        let now = std::time::Instant::now();
+        let step = Self::SPEED * now.duration_since(self.last).as_secs_f32().min(0.1);
+        self.last = now;
         if let Some(rect) = raw_input.screen_rect {
             let down = (elapsed.as_millis() / Self::REVERSE.as_millis()).is_multiple_of(2);
             raw_input
                 .events
                 .push(egui::Event::PointerMoved(rect.center()));
             raw_input.events.push(egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, if down { -3.0 } else { 3.0 }),
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, if down { -step } else { step }),
                 phase: egui::TouchPhase::Move,
                 modifiers: egui::Modifiers::NONE,
             });

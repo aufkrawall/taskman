@@ -16,6 +16,20 @@
   headless sway scrolled at ~164 fps for 14 % main thread / 21 % process. A
   full-window software repaint at 4K/144 Hz cannot be cheap; Vulkan is the right
   renderer there.
+- Follow-up the same day (egui fork §20): Wayland's software surface always
+  reported buffer age 2, which forced a full repaint per frame. A per-present
+  damage record now repaints exactly what the older buffer lacks. Idle UI thread
+  1.4 % → 0.3 %, scroll probe 45 % → 29 %. Two traps found while measuring:
+  (1) skipping the present of an unchanged frame removed the only frame-callback
+  pacing on Wayland, and the loop spun at ~3,500 fps; now an unchanged frame is
+  committed with a 1×1 damage rect. (2) A ragged damage union painted as many
+  strips cost more than a full repaint (Services 7.5 → 17 ms), since the painter
+  walks every shape per rect; `coalesce_dirty_rects` paints such a set as its
+  bounding box.
+- Vulkan per-frame CPU could not be profiled here: callgrind under the NVIDIA
+  driver never warms up, and ptrace/perf are restricted. callgrind on the CPU path
+  puts the egui pass at about 1.4 M instructions per frame (~0.35 ms), so the
+  remaining Vulkan cost is mostly wgpu/driver submission.
 - Open: integer/SIMD blending in `egui_software` (the remaining per-pixel float
   pipeline), and a texture dedupe for executables that share one icon file.
 

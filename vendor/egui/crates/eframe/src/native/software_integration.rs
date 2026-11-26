@@ -118,12 +118,19 @@ fn is_wayland(window: &winit::window::Window) -> bool {
         .is_ok_and(|handle| matches!(handle.as_raw(), RawWindowHandle::Wayland(_)))
 }
 
+/// Whether this frame must repaint every pixel before the painter even looks at the
+/// buffer's age.
+///
+/// An age of 0 means undefined contents; an older buffer (Wayland alternates two, so
+/// it reports 2 on every frame) is repainted incrementally by
+/// `paint_shapes_damaged_aged` from its record of what the frames since changed, and
+/// falls back to a full repaint on its own when that record is too short.
 fn should_force_full_paint(
     has_presented_once: bool,
     presented_while_visible: bool,
     buffer_age: u8,
 ) -> bool {
-    !has_presented_once || !presented_while_visible || buffer_age != 1
+    !has_presented_once || !presented_while_visible || buffer_age == 0
 }
 
 /// Clamp `rect` to `[0..width, 0..height]`, returning `None` when the intersection is empty.
@@ -1158,10 +1165,11 @@ impl SoftwareWinitRunning<'_> {
                 } else {
                     let paint_outcome = match state.buffer_mut() {
                         Ok(mut buffer) => {
+                            let buffer_age = buffer.age();
                             let force_full = should_force_full_paint(
                                 self.has_presented_once,
                                 self.presented_while_visible,
-                                buffer.age(),
+                                buffer_age,
                             );
                             let paint_start = Instant::now();
                             let damage = if let Some(mut target) = egui_software::Target::new(
@@ -1175,12 +1183,13 @@ impl SoftwareWinitRunning<'_> {
                                     byte(clear[1]),
                                     byte(clear[2]),
                                 );
-                                self.painter.paint_shapes_damaged(
+                                self.painter.paint_shapes_damaged_aged(
                                     &mut target,
                                     &shape_ctx,
                                     shapes,
                                     clear_color,
                                     force_full,
+                                    buffer_age,
                                 )
                             } else {
                                 egui_software::DamageStats::default()
@@ -1220,16 +1229,36 @@ impl SoftwareWinitRunning<'_> {
                             );
                         }
 
-                        let (present_rects, full_screen) = rects_to_present(
+                        let (mut present_rects, full_screen) = rects_to_present(
                             &damage.dirty_rects,
                             os_dirty,
                             size.width,
                             size.height,
                         );
+                        if present_rects.is_empty() && !hidden && is_wayland(&self.window) {
+                            // Wayland paces redraws by the frame callback that only a
+                            // commit earns, so an unchanged frame that skipped its present
+                            // left nothing to wait on: a repaint request that changes no
+                            // pixel (a tooltip timer, an animation at rest) spun the loop.
+                            // The back buffer already holds this frame -- nothing changed
+                            // since its own -- so commit it with a token damage rect.
+                            SOFTWARE_FRAME_STATS
+                                .skipped_damage
+                                .fetch_add(1, Ordering::Relaxed);
+                            present_rects.push(egui_software::PixelRect {
+                                min_x: 0,
+                                min_y: 0,
+                                max_x: 1,
+                                max_y: 1,
+                            });
+                        }
                         if present_rects.is_empty() {
                             SOFTWARE_FRAME_STATS
                                 .skipped_damage
                                 .fetch_add(1, Ordering::Relaxed);
+                            // No present, so no buffer aged: the painter's record of
+                            // per-present changes must not count this frame.
+                            self.painter.forget_unpresented_frame();
                         } else {
                             let present_start = Instant::now();
                             // TaskMan fork: announce the present so winit can
@@ -1253,6 +1282,7 @@ impl SoftwareWinitRunning<'_> {
                                 }
                                 Err(err) => {
                                     log::warn!("software renderer present failed: {err}");
+                                    self.painter.forget_unpresented_frame();
                                     self.presented_while_visible = false;
                                     self.integration.egui_ctx.request_repaint_after(
                                         std::time::Duration::from_millis(50),
@@ -1557,36 +1587,13 @@ mod tests {
         assert!(should_force_full_paint(true, false, 1));
         // Once presented while visible and buffer age is 1, incremental damage is valid.
         assert!(!should_force_full_paint(true, true, 1));
-        // Any buffer age other than 1 (new/resized/failed present) forces full.
+        // Undefined contents (new/resized/failed present) force full.
         assert!(should_force_full_paint(true, true, 0));
-        assert!(should_force_full_paint(true, true, 2));
-    }
-
-    /// `softbuffer`'s Wayland backend keeps two `wl_shm` buffers and swaps them on every
-    /// present, so after the first present no buffer is ever one age old: the one it hands
-    /// back holds pixels from two presents ago, or nothing at all. Only `age == 1` may be
-    /// painted incrementally, so a ring needs a full paint on every frame -- painting just
-    /// the changed tiles into a buffer that never held the rest of the frame is what left
-    /// black boxes and stale regions on Linux.
-    #[test]
-    fn a_two_buffer_ring_always_needs_a_full_paint() {
-        let mut front_age = 0u8;
-        let mut back_age = 0u8;
-        let mut presented_while_visible = false;
-        for frame in 0..6 {
-            assert!(
-                should_force_full_paint(frame > 0, presented_while_visible, back_age),
-                "frame {frame}: a buffer of age {back_age} was painted incrementally"
-            );
-            presented_while_visible = true;
-            // Exactly what `softbuffer` does on a present: swap, then age both buffers.
-            let mut next_back = front_age;
-            if next_back != 0 {
-                next_back += 1;
-            }
-            front_age = 1;
-            back_age = next_back;
-        }
+        // An older buffer is left to the painter, which repaints what the frames
+        // since changed (`egui_software/tests/buffer_age.rs` pins that pixel for pixel)
+        // and paints in full past its record.
+        assert!(!should_force_full_paint(true, true, 2));
+        assert!(!should_force_full_paint(true, true, 3));
     }
 
     #[test]

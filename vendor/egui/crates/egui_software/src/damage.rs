@@ -23,6 +23,13 @@ use crate::{ShapeContext, TextMode};
 
 pub const TILE_SIZE: u32 = 64;
 
+/// The oldest buffer [`crate::Painter::paint_shapes_damaged_aged`] can repaint incrementally.
+///
+/// Wayland's `wl_shm` swapchain hands back age 2 on every frame (two
+/// buffers that alternate) and 3 while the compositor holds one; anything older, or an
+/// age of 0, is painted in full.
+pub const MAX_BUFFER_AGE: u8 = 4;
+
 const TILE_SEED: u64 = 0x517c_c1b7_2722_0a95;
 const MIX_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -133,6 +140,10 @@ pub(crate) struct DamageTracker {
     // content instead, because callers rebuild identical `Arc<Mesh>` charts.)
     prev_galleys: Vec<Arc<Galley>>,
     frame_nonce: u64,
+    /// The tiles each of the last presented frames changed, newest first, at most
+    /// `MAX_BUFFER_AGE - 1` of them. A buffer of age `n` holds the frame `n` presents
+    /// ago, so it lacks exactly the changes of the `n - 1` frames since plus this one.
+    history: std::collections::VecDeque<Vec<bool>>,
 }
 
 impl DamageTracker {
@@ -144,6 +155,7 @@ impl DamageTracker {
         ctx: &ShapeContext,
         textures: &TextureStore,
         force_full: bool,
+        buffer_age: u8,
         bounds: PixelRect,
         out_shape_bounds: &mut Vec<PixelRect>,
     ) -> DamageStats {
@@ -158,6 +170,7 @@ impl DamageTracker {
             self.last_key = Some(key);
             self.tile_hashes.clear();
             self.prev_galleys.clear();
+            self.history.clear();
             return DamageStats::default();
         }
 
@@ -193,11 +206,21 @@ impl DamageTracker {
             }
         }
 
-        let full_invalidate =
-            force_full || self.last_key != Some(key) || self.tile_hashes.len() != total_tiles;
+        let geometry_changed = self.last_key != Some(key) || self.tile_hashes.len() != total_tiles;
+        if geometry_changed {
+            // Recorded changes are per tile of the old grid: none of them carries over.
+            self.history.clear();
+        }
+        // An older buffer is incremental only while every frame it lacks is on record.
+        let missing_frames = usize::from(buffer_age.saturating_sub(1));
+        let full_invalidate = force_full
+            || geometry_changed
+            || buffer_age == 0
+            || buffer_age > MAX_BUFFER_AGE
+            || self.history.len() < missing_frames;
 
         self.dirty_flags.clear();
-        let dirty_tiles = if full_invalidate {
+        let changed_tiles = if full_invalidate {
             self.dirty_flags.resize(total_tiles, true);
             total_tiles
         } else {
@@ -217,13 +240,35 @@ impl DamageTracker {
                 );
             count
         };
+        // What this frame changed is what the next frames' buffers will lack; what
+        // this buffer lacks on top of that is what the frames since it changed.
+        let changed = (!full_invalidate && missing_frames > 0).then(|| self.dirty_flags.clone());
+        let mut dirty_tiles = changed_tiles;
+        if changed.is_some() {
+            for past in self.history.iter().take(missing_frames) {
+                for (flag, &was) in self.dirty_flags.iter_mut().zip(past) {
+                    if was && !*flag {
+                        *flag = true;
+                        dirty_tiles += 1;
+                    }
+                }
+            }
+        }
+        // One entry per planned frame; a frame the caller does not present takes its
+        // entry back (`forget_last_frame`), so the record always counts presents.
+        let entry = changed.unwrap_or_else(|| self.dirty_flags.clone());
+        self.history.push_front(entry);
+        self.history.truncate(usize::from(MAX_BUFFER_AGE - 1));
 
         let dirty_rects = if dirty_tiles == 0 {
             Vec::new()
         } else if dirty_tiles == total_tiles {
             vec![bounds]
         } else {
-            merge_dirty_tiles(&self.dirty_flags, tiles_x, tiles_y, key.width, key.height)
+            coalesce_dirty_rects(
+                merge_dirty_tiles(&self.dirty_flags, tiles_x, tiles_y, key.width, key.height),
+                dirty_tiles,
+            )
         };
 
         std::mem::swap(&mut self.tile_hashes, &mut self.curr_hashes);
@@ -235,6 +280,48 @@ impl DamageTracker {
             dirty_tiles,
             total_tiles,
         }
+    }
+}
+
+impl DamageTracker {
+    /// Drop the record of the last planned frame: it was not presented, so no buffer
+    /// aged and none lacks its changes.
+    pub(crate) fn forget_last_frame(&mut self) {
+        self.history.pop_front();
+    }
+}
+
+/// Most separate rectangles a frame repaints before they are painted as one.
+const MAX_DIRTY_RECTS: usize = 6;
+
+/// Trade a fragmented damage set for its bounding box when that is cheaper.
+///
+/// The painter walks every shape once per dirty rectangle -- an intersection test per
+/// shape, and the clipped part of each one rasterized again per rectangle it touches --
+/// so a scattered set costs per *rectangle*, not per pixel. A scrolled table changes
+/// most of its tiles but not all of them (a blank column, an unchanged header cell),
+/// and with a swapchain the union of two frames' changes is more ragged still: the
+/// merge then yields dozens of strips, and painting them cost more than repainting the
+/// whole window. Repainting clean pixels inside the box produces the same pixels, so
+/// the box is always correct; it is chosen when the strips are many, or cover at least
+/// half of it anyway.
+fn coalesce_dirty_rects(rects: Vec<PixelRect>, dirty_tiles: usize) -> Vec<PixelRect> {
+    if rects.len() <= 1 {
+        return rects;
+    }
+    let bbox = rects.iter().skip(1).fold(rects[0], |acc, r| PixelRect {
+        min_x: acc.min_x.min(r.min_x),
+        min_y: acc.min_y.min(r.min_y),
+        max_x: acc.max_x.max(r.max_x),
+        max_y: acc.max_y.max(r.max_y),
+    });
+    let tile_area = i64::from(TILE_SIZE) * i64::from(TILE_SIZE);
+    let dirty_area = dirty_tiles as i64 * tile_area;
+    let bbox_area = i64::from(bbox.width()) * i64::from(bbox.height());
+    if rects.len() > MAX_DIRTY_RECTS || dirty_area * 4 >= bbox_area * 3 {
+        vec![bbox]
+    } else {
+        rects
     }
 }
 

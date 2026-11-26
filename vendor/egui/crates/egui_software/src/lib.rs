@@ -54,7 +54,7 @@ mod target;
 mod text;
 mod texture;
 
-pub use damage::{DamageStats, TILE_SIZE};
+pub use damage::{DamageStats, MAX_BUFFER_AGE, TILE_SIZE};
 pub use gamma::TextGamma;
 pub use target::{PixelRect, Target, clip_rect_to_pixels, pack_rgb};
 pub use text::TextBlend;
@@ -267,6 +267,28 @@ impl Painter {
         clear: Color32,
         force_full: bool,
     ) -> DamageStats {
+        self.paint_shapes_damaged_aged(target, ctx, shapes, clear, force_full, 1)
+    }
+
+    /// [`Painter::paint_shapes_damaged`] into a buffer that holds the frame presented
+    /// `buffer_age` presents ago (`softbuffer::Buffer::age()`), not necessarily the
+    /// last one.
+    ///
+    /// Such a buffer lacks the changes of every frame since, so those tiles are
+    /// repainted too, from a short record of what each presented frame changed. Up to
+    /// [`MAX_BUFFER_AGE`]; an age of 0 (contents undefined) or beyond what is on
+    /// record is painted in full. This is what keeps Wayland incremental: its `wl_shm`
+    /// buffers alternate, so every frame reports age 2, and treating that as "repaint
+    /// everything" made a one-cell telemetry update cost a whole window.
+    pub fn paint_shapes_damaged_aged(
+        &mut self,
+        target: &mut Target<'_>,
+        ctx: &ShapeContext,
+        shapes: Vec<ClippedShape>,
+        clear: Color32,
+        force_full: bool,
+        buffer_age: u8,
+    ) -> DamageStats {
         let mut flat_shapes = Vec::with_capacity(shapes.len());
         flatten_clipped_shapes(shapes, &mut flat_shapes);
         let bounds = target.bounds();
@@ -288,6 +310,7 @@ impl Painter {
             ctx,
             &self.textures,
             force_full,
+            buffer_age,
             bounds,
             &mut shape_bounds,
         );
@@ -305,6 +328,17 @@ impl Painter {
         }
         self.damage_shape_bounds = shape_bounds;
         stats
+    }
+
+    /// Tell the painter the frame it just painted with
+    /// [`Painter::paint_shapes_damaged_aged`] was not presented (nothing to present, a
+    /// hidden window, a failed present).
+    ///
+    /// Its record of per-present changes must count presents, because a buffer's age
+    /// does: an unpresented frame left on record would make the next older buffer skip
+    /// tiles it still lacks. Dropping the entry only ever repaints more.
+    pub fn forget_unpresented_frame(&mut self) {
+        self.damage.forget_last_frame();
     }
 
     fn paint_flat_shapes_in_rects(

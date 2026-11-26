@@ -55,7 +55,7 @@ pub struct ScreenVertex {
 fn to_fixed(v: f32) -> i32 {
     // Clamp before converting: a NaN or a wildly out-of-range coordinate (egui can emit
     // these for degenerate layouts) must not wrap into a bogus in-range value.
-    let scaled = (v * SUB_ONE as f32).round();
+    let scaled = round_exact(v * SUB_ONE as f32);
     if scaled.is_nan() {
         0
     } else {
@@ -351,6 +351,29 @@ pub(crate) fn round_to_u8(x: f32) -> u32 {
     }
 }
 
+/// `x.round()` without the libm call, equal to it for every input but the sign of a zero
+/// (`-0.3` gives `+0.0`, which converts to the same integer).
+///
+/// Below 2^23 the truncation and `x - t` are exact, so the fraction decides
+/// round-half-away-from-zero exactly; larger magnitudes are already integral and NaN
+/// takes the library path. Three of these run per triangle, for its vertices.
+#[inline(always)]
+fn round_exact(x: f32) -> f32 {
+    if x.abs() < 8_388_608.0 {
+        let t = x as i32 as f32;
+        let f = x - t;
+        if f >= 0.5 {
+            t + 1.0
+        } else if f <= -0.5 {
+            t - 1.0
+        } else {
+            t
+        }
+    } else {
+        x.round()
+    }
+}
+
 /// The pixels of one row that lie inside the triangle, as `xs..xe` in target columns,
 /// clipped to `bounds`; `None` when the row misses it.
 ///
@@ -628,6 +651,34 @@ mod tests {
             check(half);
             check(f32::from_bits(half.to_bits() + 1));
             check(f32::from_bits(half.to_bits() - 1));
+        }
+    }
+
+    #[test]
+    fn round_exact_matches_round() {
+        for special in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, 1e20, -1e20] {
+            let (got, want) = (round_exact(special), special.round());
+            assert!(
+                got == want || (got.is_nan() && want.is_nan()),
+                "{special:?}"
+            );
+        }
+        for i in -400_000..400_000 {
+            let x = i as f32 / 1024.0;
+            assert_eq!(round_exact(x), x.round(), "x = {x:?}");
+        }
+        for k in -3000..3000 {
+            let half = k as f32 + 0.5;
+            for x in [
+                half,
+                f32::from_bits(half.to_bits() + 1),
+                f32::from_bits(half.to_bits() - 1),
+            ] {
+                assert_eq!(round_exact(x), x.round(), "x = {x:?}");
+            }
+        }
+        for big in [8_388_607.5f32, 8_388_608.0, -8_388_607.5, 16_777_215.0] {
+            assert_eq!(round_exact(big), big.round(), "x = {big:?}");
         }
     }
 

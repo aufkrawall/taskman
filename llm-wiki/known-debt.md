@@ -638,10 +638,12 @@ remain follow-up rather than being simulated in headless tests:
   comes from NVML's sampled SM/encoder/decoder utilization and framebuffer
   memory; NVML enumerates GPU users system-wide, so every process is covered
   (non-users read a measured 0 %).
-- **CPU renderer cost on Wayland is a full repaint per frame** (~3.4 ms at
-  1600×1000). The busy-wait that made scrolling cost a full core is fixed
-  (eframe fork §18); restoring partial repaints still needs per-buffer-slot
-  damage history (see the 2026-11-24 entry below).
+- **CPU renderer on Wayland repaints incrementally again since 2026-11-26**
+  (egui fork §20: per-present damage record, read through softbuffer's buffer
+  age). A full-window software repaint at 4K/144 Hz still cannot be cheap: a
+  scroll repaints most of the window every frame, about 5–7 ms per frame at
+  1650×1080. The Vulkan renderer is the right choice on such displays. Open:
+  integer/SIMD blending in `egui_software`, which still blends in `f32`.
 - **A second launch on Wayland while the window is visible opens a new
   window.** Restoring from the tray is acknowledged (remap), but raising a
   visible window needs the launcher's xdg-activation token forwarded over the
@@ -653,11 +655,11 @@ remain follow-up rather than being simulated in headless tests:
   paint incrementally into a buffer whose contents are exactly one frame old,
   and softbuffer's Wayland backend keeps two `wl_shm` buffers and swaps them per
   present, so a leased buffer is 0 or 2 frames old and never 1. Wayland
-  therefore full-paints every frame and the 64×64 damage path only saves work on
-  X11 and Windows. Restoring tile skipping there needs a damage cache PER buffer
-  slot, not a per-frame one; do not "fix" it by reintroducing a local
-  "we presented something" flag, which is exactly what left black boxes and
-  stale regions on screen.
+  therefore full-painted every frame until 2026-11-26, when egui fork §20 added
+  the per-buffer-slot record this entry asked for (one entry per present, read
+  through the buffer's age). Do not replace it with a local "we presented
+  something" flag, which is exactly what left black boxes and stale regions on
+  screen.
 - **X11 and Wayland have no OS invalid-update region.** Windows merges
   `GetUpdateRect` into the present set, so a frame with zero changed egui tiles
   still blits what the compositor asked for. Neither softbuffer backend offers an
