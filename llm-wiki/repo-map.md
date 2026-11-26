@@ -230,13 +230,18 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     boot-relative start-tick guard against PID reuse, skipped-reading
     detection, regressing-counter rejection and a never-exceeds-machine clamp.
     Anything unmeasurable is `None`, never 0 % — including the first window of
-    a process. One `/proc/<pid>/stat` read feeds both the identity bracket and
-    the accountant. Per-process network is `linux/process_net.rs` (netlink
+    a process. One `/proc/<pid>/stat` read feeds the identity bracket, the
+    accountant and the thread count (`num_threads`; sysinfo runs
+    `without_tasks()` -- its per-thread walk was most of the tick). Handles are
+    the `/proc/<pid>/fd` directory size (Linux 6.2+, known even where listing
+    is refused); socket coverage asks `access()` separately. Per-process network is `linux/process_net.rs` (netlink
     `sock_diag` TCP dumps, socket-inode → pid ownership cached and rescanned
     only for unowned active sockets) over the platform-neutral
     `linux_net_accounting.rs` (message decoding, per-cookie deltas). Per-process
-    GPU is `linux/process_gpu.rs` (DRM fd discovery cached per process for 5 s,
-    fdinfo reads per tick, NVML `…RunningProcesses_v3` +
+    GPU is `linux/process_gpu.rs` (DRM fd discovery only when some render node's
+    driver reports per-client fdinfo -- probed once per node set, so the
+    proprietary NVIDIA driver skips it; cached per process, rescanned after 5 s
+    only when its descriptor count moved, else after 60 s; fdinfo reads per tick, NVML `…RunningProcesses_v3` +
     `nvmlDeviceGetProcessUtilization` from `linux/nvml.rs`, adapter engine
     lists) over the neutral `linux_gpu_clients.rs` (fdinfo parsing, engine
     deltas, engine naming). Physical disks are `linux_disks.rs` (drives from

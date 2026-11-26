@@ -644,6 +644,14 @@ remain follow-up rather than being simulated in headless tests:
   scroll repaints most of the window every frame, about 5–7 ms per frame at
   1650×1080. The Vulkan renderer is the right choice on such displays. Open:
   integer/SIMD blending in `egui_software`, which still blends in `f32`.
+- **The Linux sample still pays for sysinfo's generic process walk.** After
+  the 2026-11-26 cuts (engine 2.7 % → 1.3 % of a core idle, ~140 processes),
+  most of the remaining time is kernel time in `/proc`: sysinfo keeps stat
+  files open and re-reads `statm`, and retries `exe`/`status` every tick for
+  processes where they stay unset (kernel threads, other users). The collector
+  adds its own `status` (VmHWM) and `io` reads per process. A collector-owned
+  `/proc` walk (one stat read, `statm`, `exe` once per generation) would
+  remove sysinfo from the hot path.
 - **A second launch on Wayland while the window is visible opens a new
   window.** Restoring from the tray is acknowledged (remap), but raising a
   visible window needs the launcher's xdg-activation token forwarded over the

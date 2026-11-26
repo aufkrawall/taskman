@@ -1,3 +1,32 @@
+## 2026-11-26 - Linux sampling-engine cost
+
+- After the renderer work, an idle window's main cost was `tm-engine`: 2.7 % of
+  a core (4 ‰ user, 22 ‰ kernel) with ~140 processes. Kernel time dominated, so
+  callgrind (userspace only) undercounts it; `valgrind --tool=none
+  --trace-syscalls=yes` counts syscalls per thread when strace is absent (it was
+  ~8,300 per tick).
+- Causes and fixes: sysinfo's default `tasks` walked and parsed every thread
+  (`without_tasks()`, thread count from stat field 20); `System::new_all()` read
+  every process' environ/cwd/threads at startup (narrow `new_with_specifics`,
+  still filling the process list for the first tick's bracket); the per-process
+  DRM descriptor walk ran on an NVIDIA-only box where fdinfo has no
+  `drm-driver` key (render-node probe gates it); `fd_count` listed every
+  descriptor (directory `st_size`, Linux 6.2+); the desktop-evidence cache
+  re-read stat for a generation the caller had just validated.
+- Trap: `stat` reports the fd count of other users' processes whose fd
+  directory cannot be listed, and `apply_process_net` had used
+  `handles.is_some()` as "sockets attributable", so root daemons would have shown
+  a fabricated 0 B/s. It now asks `descriptors_listable` (`access(R_OK|X_OK)`).
+  `--selfcheck` `process_net_readings` is the cross-check (it must match the
+  previous build).
+- Result: engine 2.7 % → 1.3 %, `sample_duration_ms` 24 → 10. Remaining: sysinfo
+  still retries `exe`/`status` every tick for processes where they stay unset
+  (kernel threads, other users), plus per-process `status` (VmHWM) and `io`
+  reads. Replacing sysinfo's process walk with the collector's own reader would
+  be the next step.
+- MangoHud: `MANGOHUD=1` in the session environment loads the overlay into the
+  Vulkan renderer (4.5 % of a core by itself). Measure with `MANGOHUD=0`.
+
 ## 2026-11-26 - Icon wake-up and CPU-renderer scroll cost
 
 - The user's follow-up report ("scroll CPU still high, icons now delayed") came

@@ -123,12 +123,25 @@ fn parse_kib(value: &str) -> Option<u64> {
 /// positional fields are counted from the record's final `')'`. `None` when the
 /// record is truncated or the field is not a number.
 pub fn parse_proc_stat_nice(stat: &[u8]) -> Option<i32> {
+    proc_stat_field(stat, 19)
+}
+
+/// Thread count (`num_threads`, field 20) from a `/proc/<pid>/stat` record,
+/// the leader included -- the Windows count. Read from the record the sample
+/// loop already holds, so no walk of `/proc/<pid>/task` is needed for it.
+pub fn parse_proc_stat_num_threads(stat: &[u8]) -> Option<u32> {
+    proc_stat_field(stat, 20)
+}
+
+/// Numeric field `field` (1-based, as in proc(5)) of a `/proc/<pid>/stat`
+/// record; fields are counted from the record's final `')'`, past `comm`.
+fn proc_stat_field<T: std::str::FromStr>(stat: &[u8], field: usize) -> Option<T> {
     let after_comm = stat.iter().rposition(|&byte| byte == b')')? + 1;
-    let nice = stat[after_comm..]
+    let value = stat[after_comm..]
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|part| !part.is_empty())
-        .nth(16)?;
-    std::str::from_utf8(nice).ok()?.parse().ok()
+        .nth(field.checked_sub(3)?)?;
+    std::str::from_utf8(value).ok()?.parse().ok()
 }
 
 /// Distinct physical-core and package counts from a CPU topology tree
@@ -629,6 +642,16 @@ Committed_AS:   12345 kB
             None
         );
         assert_eq!(parse_proc_stat_nice(b""), None);
+    }
+
+    #[test]
+    fn thread_count_is_read_from_the_sample_loop_stat_record() {
+        assert_eq!(parse_proc_stat_num_threads(PID_STAT), Some(4));
+        assert_eq!(
+            parse_proc_stat_num_threads(b"7 (a) S 1 7 7 0 -1 4194304 0 0 0 0 0 0 0 0 20 0"),
+            None
+        );
+        assert_eq!(parse_proc_stat_num_threads(b""), None);
     }
 
     struct Sysfs {

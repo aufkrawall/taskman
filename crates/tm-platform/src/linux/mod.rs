@@ -141,14 +141,8 @@ impl SystemCollector for LinuxCollector {
         // (`cpu_stat` for the machine, `process_cpu` for each process). Asking
         // sysinfo for CPU as well would keep a second, differently-windowed
         // accumulator whose gate skips refreshes closer than 200 ms.
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_memory()
-                .with_user(UpdateKind::OnlyIfNotSet)
-                .with_exe(UpdateKind::OnlyIfNotSet),
-        );
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
         self.disks.refresh(true);
         self.networks.refresh(true);
 
@@ -211,14 +205,15 @@ impl SystemCollector for LinuxCollector {
         let mut block_bytes: HashMap<u32, u64> = HashMap::new();
         // One logind record read per user per tick, not per process.
         let mut display_sessions: HashMap<u32, Option<u32>> = HashMap::new();
+        let mut thread_total = 0usize;
         for (pid, p) in self.sys.processes() {
-            // sysinfo 0.39 keeps `tasks` enabled even in
-            // `ProcessRefreshKind::nothing()`, so every Linux task (thread) is
-            // inserted into the process map as its own entry. Windows Task
-            // Manager never lists threads as processes, and each thread entry
-            // repeats the parent's memory while splitting its CPU. Skip them;
-            // `p.tasks()` on the real process still feeds the Details thread
-            // count.
+            // sysinfo inserts every Linux task (thread) into the process map as
+            // its own entry whenever tasks are refreshed (its default, even in
+            // `ProcessRefreshKind::nothing()`). The refresh above opts out, and
+            // this guard keeps any entry a task-enabled refresh left behind out
+            // of the list: Windows Task Manager never lists threads as
+            // processes, and each thread entry repeats the parent's memory
+            // while splitting its CPU.
             if p.thread_kind().is_some() {
                 continue;
             }
@@ -314,9 +309,10 @@ impl SystemCollector for LinuxCollector {
                     })
                 });
             }
-            // sysinfo's task set excludes the leader; Windows' count includes
-            // it, so add the main thread back for parity.
-            entry.threads = p.tasks().map(|tasks| tasks.len() as u32 + 1);
+            entry.threads = stat_bytes
+                .as_deref()
+                .and_then(linux_telemetry::parse_proc_stat_num_threads);
+            thread_total += entry.threads.map_or(1, |n| n as usize);
             entry.handles = fd_count(pid_u);
             entry.command_line = command_line;
             entry.priority = proc_priority(stat_bytes.as_deref());
@@ -480,7 +476,7 @@ impl SystemCollector for LinuxCollector {
                 uptime_s: System::uptime(),
                 boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
-                thread_count: threads_total(&self.sys),
+                thread_count: thread_total,
                 handle_count: open_file_handles(),
             },
         };
@@ -513,7 +509,11 @@ fn apply_process_net(
     };
     net_totals.retain(|pid, _| live_pids.contains(pid));
     for process in processes.iter_mut() {
-        if process.handles.is_none() {
+        // Socket ownership comes from the descriptor walk, so only a process
+        // whose descriptors this token can list is measured; for any other the
+        // window's missing entry means unknown, not idle. (Its handle count may
+        // still be known: `stat` reports it where listing is refused.)
+        if !descriptors_listable(process.pid) {
             continue;
         }
         let (received, sent) = window.get(&process.pid).copied().unwrap_or((0, 0));
@@ -810,8 +810,28 @@ fn proc_status_kb(pid: u32, field: &str) -> Option<u64> {
     None
 }
 
+/// Whether this token may list `/proc/<pid>/fd` -- the access the socket and
+/// GPU descriptor walks need. One `access` call, no listing.
+fn descriptors_listable(pid: u32) -> bool {
+    let Ok(path) = std::ffi::CString::new(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string.
+    unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::X_OK) == 0 }
+}
+
 fn fd_count(pid: u32) -> Option<u32> {
-    let count = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count();
+    let dir = format!("/proc/{pid}/fd");
+    // Linux 6.2+ reports the number of open descriptors as the directory's
+    // size, one `stat` instead of listing every descriptor. Older kernels
+    // report 0, which is also what a process with no descriptors shows, so 0
+    // falls back to counting.
+    let size = std::fs::metadata(&dir).ok()?.len();
+    let count = if size > 0 {
+        usize::try_from(size).ok()?
+    } else {
+        std::fs::read_dir(&dir).ok()?.count()
+    };
     u32::try_from(count).ok()
 }
 
@@ -1126,14 +1146,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn threads_total(sys: &System) -> usize {
-    sys.processes()
-        .values()
-        .filter(|p| p.thread_kind().is_none())
-        .map(|p| p.tasks().map_or(1, |tasks| tasks.len() + 1))
-        .sum()
 }
 
 /// System-wide open file handles: allocated `struct file`s (every fd,
@@ -2040,9 +2052,32 @@ fn ensure_process_generation(pid: u32, before: i64) -> Result<()> {
     Ok(())
 }
 
+/// What each tick asks sysinfo for per process. Everything else (CPU, command
+/// line, identity) is read from `/proc` by the collector itself.
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_memory()
+        .with_user(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        // Tasks would make sysinfo list and parse every thread of every
+        // process each tick (thousands of `/proc/<pid>/task/<tid>/stat`
+        // reads); the thread count comes from the process' own stat record.
+        .without_tasks()
+}
+
 pub fn create_collector() -> LinuxCollector {
     LinuxCollector {
-        sys: System::new_all(),
+        // Not `System::new_all()`: that also reads every process' environment,
+        // working directory and threads, none of which a tick uses. The process
+        // list is still filled here, so the first tick's identity bracket has
+        // a generation to compare against; the CPU list feeds the core-count
+        // fallback and the frequency probe.
+        sys: System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(sysinfo::CpuRefreshKind::nothing())
+                .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap())
+                .with_processes(process_refresh_kind()),
+        ),
         disks: Disks::new_with_refreshed_list(),
         networks: Networks::new_with_refreshed_list(),
         users: sysinfo::Users::new_with_refreshed_list(),
@@ -2361,6 +2396,66 @@ mod tests {
             tm_core::model::epoch_timestamp_to_unix_seconds(ts_a),
             1_700_000_123
         );
+    }
+
+    /// A child blocked reading its stdin: a process nothing else in this
+    /// test binary touches, whose descriptors and threads hold still.
+    fn quiet_child() -> std::process::Child {
+        std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cat")
+    }
+
+    /// The Handles column counts the process' open descriptors, whether the
+    /// kernel reports them as the directory size or they are listed.
+    #[test]
+    fn descriptor_count_matches_the_descriptor_list() {
+        let mut child = quiet_child();
+        let pid = child.id();
+        let listed = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .expect("child descriptors")
+            .count();
+        assert!(listed >= 3, "{listed}");
+        assert_eq!(fd_count(pid), Some(listed as u32));
+        drop(child.stdin.take());
+        child.wait().expect("cat exits");
+    }
+
+    /// A count is not a listing: another user's process reports its handle
+    /// count through `stat` while its descriptors stay unlistable, so the
+    /// network column must not treat a known count as socket coverage.
+    #[test]
+    fn a_known_handle_count_does_not_imply_listable_descriptors() {
+        let mut child = quiet_child();
+        assert!(descriptors_listable(child.id()));
+        drop(child.stdin.take());
+        child.wait().expect("cat exits");
+        // SAFETY: plain getter.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!descriptors_listable(1));
+            assert!(std::fs::read_dir("/proc/1/fd").is_err());
+        }
+    }
+
+    /// The thread count read from a live stat record matches the kernel's
+    /// task list -- the source sysinfo's per-thread walk used to provide.
+    #[test]
+    fn thread_count_comes_from_the_stat_record() {
+        let mut child = quiet_child();
+        let pid = child.id();
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).expect("stat");
+        let listed = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("tasks")
+            .count();
+        assert_eq!(
+            linux_telemetry::parse_proc_stat_num_threads(&stat),
+            Some(listed as u32)
+        );
+        drop(child.stdin.take());
+        child.wait().expect("cat exits");
     }
 
     #[test]

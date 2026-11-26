@@ -88,7 +88,8 @@ struct CachedEvidence {
 }
 
 /// Collector-owned per-tick cache. The key includes the process generation,
-/// and every hit revalidates that generation against `/proc/<pid>/stat`.
+/// and every hit is for a generation the caller validated this tick against
+/// `/proc/<pid>/stat` (the collector's identity bracket).
 /// `execve` preserves that token and may replace the environment, while cgroup
 /// movement preserves both, so those two facts can trail until the jittered
 /// TTL expires. A short TTL avoids rereading both files on every tick.
@@ -103,12 +104,17 @@ impl DesktopEvidenceCache {
         Self::default()
     }
 
+    /// Evidence for the generation `start_ticks` of `pid`, which the caller
+    /// has just validated against the process' current stat record: the
+    /// collector reads that record once per tick and calls only with a
+    /// generation the bracket around sysinfo's refresh confirmed, so a cache
+    /// hit needs no third read of the same file.
     pub(super) fn evidence(&mut self, pid: u32, start_ticks: i64, now: Instant) -> DesktopEvidence {
         self.evidence_with(
             pid,
             start_ticks,
             now,
-            super::linux_proc_start_ticks,
+            move |_| Some(start_ticks),
             systemd_system_manager_available,
             inspect,
         )
