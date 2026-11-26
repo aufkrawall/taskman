@@ -232,49 +232,118 @@ pub(crate) fn may_retry_elsewhere(request: &Request, frame_written: bool) -> boo
     !(frame_written && matches!(request, Request::Action { .. }))
 }
 
+/// What the client knows about the broker right now.
+///
+/// A status probe is asynchronous, so "no answer yet" and "the broker did not
+/// answer" are different facts and must not share a state: the first is a
+/// pending probe, the second is a completed negative. Collapsing them is what
+/// made a healthy, running broker read as "stopped" until the first probe
+/// landed.
+///
+/// Public (and re-exported by the client) because the client's `status()`
+/// returns it: a public function cannot expose a crate-private type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusProbe {
+    /// No probe has completed yet. The answer is still being fetched.
+    Pending,
+    /// A probe finished and produced this outcome.
+    Answered(Result<ServiceStatusInfo, ClientError>),
+}
+
+/// The cache state one status read observed.
+pub(crate) enum StatusCache {
+    /// The last completed answer, and how long ago it was taken.
+    Answered(Result<ServiceStatusInfo, ClientError>, Duration),
+    /// No probe has completed yet.
+    Empty,
+    /// The cache could not be read: a probe is replacing the entry right now.
+    Unreadable,
+}
+
+/// What one status read should do, decided from [`StatusCache`] alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatusDecision {
+    /// Report the cached answer; nothing needs to happen.
+    Answer(Result<ServiceStatusInfo, ClientError>),
+    /// Report the cached answer and refresh it behind the caller.
+    AnswerAndProbe(Result<ServiceStatusInfo, ClientError>),
+    /// Nothing usable is cached: start a probe and report it as pending.
+    Probe,
+}
+
+/// Decide what one status read does.
+///
+/// The rules are deliberately boring, because the interesting part is what they
+/// avoid: an expired answer is still an answer (a version does not change
+/// between two frames), and an unreadable cache is *not* an answer — reporting
+/// it as "no broker" would be a claim nobody made.
+pub(crate) fn status_decision(cache: StatusCache, ttl: Duration) -> StatusDecision {
+    match cache {
+        StatusCache::Answered(result, age) if age < ttl => StatusDecision::Answer(result),
+        StatusCache::Answered(result, _) => StatusDecision::AnswerAndProbe(result),
+        StatusCache::Empty | StatusCache::Unreadable => StatusDecision::Probe,
+    }
+}
+
 /// Classify the broker for the Settings surface.
 ///
 /// The whole mapping lives here so it is decided once and table-tested:
 ///
 /// - a missing manifest means the installer never ran: `NotInstalled`;
+/// - a probe that has not finished yet is `Starting`, never `Stopped`;
 /// - a live Status answer is `Running` with the service's own version;
-/// - no answer at all is `Stopped`, because the manifest proves the install and
-///   starting the unit is the fix;
+/// - a completed probe with no answer is `Stopped`, because the manifest proves
+///   the install and starting the unit is the fix;
 /// - a refusal that names this client or this user (`unauthorized-user`,
 ///   `missing-client-image`, `client-not-listed`, `unprotected-client`) is
 ///   `ForeignClient`: reinstall or reauthorize this binary, do not start a
 ///   service that is running fine and will keep refusing;
-/// - a protocol mismatch and every other answer are `Degraded` in the service's
-///   own words.
+/// - every other refusal and every failure are `Degraded` in the service's own
+///   words, with the code's name only when the service gave no detail.
 ///
 /// A missing *socket* is deliberately `Stopped` rather than `NotInstalled`: only
 /// systemd knows whether the unit exists, and "install" would offer the wrong
 /// remedy for a service that is simply not running.
-pub(crate) fn core_service_state(
-    manifest_installed: bool,
-    status: Result<ServiceStatusInfo, ClientError>,
-) -> CoreServiceState {
+pub(crate) fn core_service_state(manifest_installed: bool, probe: StatusProbe) -> CoreServiceState {
     if !manifest_installed {
         return CoreServiceState::NotInstalled;
     }
-    match status {
-        Ok(info) => CoreServiceState::Running {
+    match probe {
+        StatusProbe::Pending => CoreServiceState::Starting,
+        StatusProbe::Answered(Ok(info)) => CoreServiceState::Running {
             version: info.service_version,
         },
-        Err(ClientError::Unavailable(_)) => CoreServiceState::Stopped,
-        Err(ClientError::Failed(detail)) => CoreServiceState::Degraded(detail),
-        Err(ClientError::Refused { code, detail }) => match code {
+        StatusProbe::Answered(Err(ClientError::Unavailable(_))) => CoreServiceState::Stopped,
+        StatusProbe::Answered(Err(ClientError::Failed(detail))) => {
+            CoreServiceState::Degraded(detail)
+        }
+        StatusProbe::Answered(Err(ClientError::Refused { code, detail })) => match code {
             Refusal::UnauthorizedUser
             | Refusal::MissingClientImage
             | Refusal::ClientNotListed
             | Refusal::UnprotectedClient => CoreServiceState::ForeignClient,
-            Refusal::ProtocolMismatch => CoreServiceState::Degraded("protocol mismatch".into()),
-            // Every other refusal still says why, but an empty detail would
-            // render as a blank state, so the code names itself instead.
+            // Every other refusal keeps the service's own words; an empty
+            // detail would render as a blank state, so the code names itself.
             _ if detail.is_empty() => CoreServiceState::Degraded(code.as_str().to_string()),
             _ => CoreServiceState::Degraded(detail),
         },
     }
+}
+
+/// The broker's rows with the counters only the direct read could measure.
+///
+/// The wire reports files, not `/proc/<pid>/io` totals, so the local counters
+/// are the only source for them: a brokered answer must not blank a number the
+/// GUI could already read. Nothing is ever filled in the other direction — a
+/// value the direct read did not have stays unknown.
+pub(crate) fn merge_file_io(
+    brokered: ProcessFileIoSnapshot,
+    direct: &ProcessFileIoSnapshot,
+) -> ProcessFileIoSnapshot {
+    let mut merged = brokered;
+    merged.accounting.counter_read_bytes = direct.accounting.counter_read_bytes;
+    merged.accounting.counter_write_bytes = direct.accounting.counter_write_bytes;
+    merged
 }
 
 pub(crate) fn module_from_wire(wire: WireModule) -> ProcessModule {
@@ -788,23 +857,91 @@ mod tests {
     }
 
     #[test]
+    fn a_status_read_answers_from_the_cache_or_asks_for_a_probe() {
+        let ttl = Duration::from_secs(10);
+        let fresh = Ok(status_info());
+        let old = Err(ClientError::Unavailable("no socket".into()));
+        let cases: Vec<(StatusCache, StatusDecision)> = vec![
+            // A fresh answer is reported without touching the wire.
+            (
+                StatusCache::Answered(fresh.clone(), Duration::from_secs(0)),
+                StatusDecision::Answer(fresh.clone()),
+            ),
+            (
+                StatusCache::Answered(fresh.clone(), Duration::from_secs(9)),
+                StatusDecision::Answer(fresh.clone()),
+            ),
+            // Expired is still an answer, and it refreshes behind the caller.
+            (
+                StatusCache::Answered(fresh.clone(), ttl),
+                StatusDecision::AnswerAndProbe(fresh.clone()),
+            ),
+            (
+                StatusCache::Answered(fresh.clone(), Duration::from_secs(3_600)),
+                StatusDecision::AnswerAndProbe(fresh.clone()),
+            ),
+            // A cached negative expires on the same rule, so a broker that
+            // appears later is picked up.
+            (
+                StatusCache::Answered(old.clone(), Duration::from_secs(60)),
+                StatusDecision::AnswerAndProbe(old.clone()),
+            ),
+            // Nothing has been answered, or the answer cannot be read right
+            // now: probe, and report it as pending rather than as a negative.
+            (StatusCache::Empty, StatusDecision::Probe),
+            (StatusCache::Unreadable, StatusDecision::Probe),
+        ];
+        for (cache, expected) in cases {
+            assert_eq!(status_decision(cache, ttl), expected);
+        }
+    }
+
+    #[test]
+    fn a_brokered_file_list_keeps_the_counters_only_the_direct_read_had() {
+        let direct = ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                counter_read_bytes: Some(4096),
+                counter_write_bytes: Some(512),
+                handles_complete: false,
+                ..FileIoAccounting::default()
+            },
+        };
+        let brokered = file_io_from_wire(WireFileIo { files: Vec::new() });
+        let merged = merge_file_io(brokered, &direct);
+        assert_eq!(merged.accounting.counter_read_bytes, Some(4096));
+        assert_eq!(merged.accounting.counter_write_bytes, Some(512));
+        // Nothing is invented in the other direction.
+        assert_eq!(merged.accounting.state, FileIoAccountingState::Unavailable);
+        assert!(!merged.accounting.handles_complete);
+        assert_eq!(merged.accounting.events_lost, None);
+
+        // A direct read that could not measure them leaves them unknown.
+        let empty = ProcessFileIoSnapshot::default();
+        let merged = merge_file_io(file_io_from_wire(WireFileIo { files: Vec::new() }), &empty);
+        assert_eq!(merged.accounting.counter_read_bytes, None);
+        assert_eq!(merged.accounting.counter_write_bytes, None);
+    }
+
+    #[test]
     fn the_core_service_state_mapping_is_decided_in_one_place() {
-        let ok = || Ok(status_info());
+        let ok = || StatusProbe::Answered(Ok(status_info()));
         let refused = |code: Refusal| {
-            Err(ClientError::Refused {
+            StatusProbe::Answered(Err(ClientError::Refused {
                 code,
                 detail: "service said why".into(),
-            })
+            }))
         };
-        let unavailable = || Err(ClientError::Unavailable("no socket".into()));
-        let cases: Vec<(
-            bool,
-            Result<ServiceStatusInfo, ClientError>,
-            CoreServiceState,
-        )> = vec![
+        let unavailable =
+            || StatusProbe::Answered(Err(ClientError::Unavailable("no socket".into())));
+        let cases: Vec<(bool, StatusProbe, CoreServiceState)> = vec![
             // A manifest-less machine is not installed, whatever arrived.
             (false, ok(), CoreServiceState::NotInstalled),
             (false, unavailable(), CoreServiceState::NotInstalled),
+            (false, StatusProbe::Pending, CoreServiceState::NotInstalled),
+            // A probe that has not finished is NOT a negative: the row says
+            // starting, so a healthy broker is never painted as stopped.
+            (true, StatusProbe::Pending, CoreServiceState::Starting),
             // A live answer is the only running evidence, and it carries the
             // version the service reports.
             (
@@ -814,7 +951,7 @@ mod tests {
                     version: "0.1.34".into(),
                 },
             ),
-            // Installed but not answering: starting the unit is the fix.
+            // A completed probe with no answer: starting the unit is the fix.
             (true, unavailable(), CoreServiceState::Stopped),
             // A refusal that names this binary or this user is not a start
             // problem: reinstalling or reauthorizing is.
@@ -838,11 +975,15 @@ mod tests {
                 refused(Refusal::UnprotectedClient),
                 CoreServiceState::ForeignClient,
             ),
-            // A version gap is its own condition; an OS failure keeps its words.
+            // Any other refusal keeps the service's own words, including the
+            // protocol one.
             (
                 true,
-                refused(Refusal::ProtocolMismatch),
-                CoreServiceState::Degraded("protocol mismatch".into()),
+                StatusProbe::Answered(Err(ClientError::Refused {
+                    code: Refusal::ProtocolMismatch,
+                    detail: "service speaks protocol 2".into(),
+                })),
+                CoreServiceState::Degraded("service speaks protocol 2".into()),
             ),
             (
                 true,
@@ -851,22 +992,30 @@ mod tests {
             ),
             (
                 true,
-                Err(ClientError::Failed("EPERM".into())),
+                StatusProbe::Answered(Err(ClientError::Failed("EPERM".into()))),
                 CoreServiceState::Degraded("EPERM".into()),
             ),
             // An empty detail would render as a blank state, so the code speaks.
             (
                 true,
-                Err(ClientError::Refused {
+                StatusProbe::Answered(Err(ClientError::Refused {
+                    code: Refusal::ProtocolMismatch,
+                    detail: String::new(),
+                })),
+                CoreServiceState::Degraded("protocol mismatch".into()),
+            ),
+            (
+                true,
+                StatusProbe::Answered(Err(ClientError::Refused {
                     code: Refusal::Busy,
                     detail: String::new(),
-                }),
+                })),
                 CoreServiceState::Degraded("busy".into()),
             ),
         ];
-        for (manifest_installed, status, expected) in cases {
+        for (manifest_installed, probe, expected) in cases {
             assert_eq!(
-                core_service_state(manifest_installed, status),
+                core_service_state(manifest_installed, probe),
                 expected,
                 "manifest={manifest_installed}"
             );

@@ -82,7 +82,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use crate::linux_core_bridge::{may_retry_elsewhere, request_deadline, response_label};
+use crate::linux_core_bridge::{
+    StatusCache, StatusDecision, may_retry_elsewhere, request_deadline, response_label,
+    status_decision,
+};
 use crate::linux_core_service::{
     CLIENT_DEADLINE_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Request,
     RequestEnvelope, Response, ResponseEnvelope, SOCKET_PATH, ServiceStatusInfo, decode_frame,
@@ -110,6 +113,8 @@ const STATUS_TTL: Duration = Duration::from_secs(10);
 /// The broker client's error type, defined once in the neutral bridge so its
 /// decisions and their tests are not Linux-only.
 pub use crate::linux_core_bridge::ClientError;
+/// What a status read can answer: a completed outcome or a pending probe.
+pub use crate::linux_core_bridge::StatusProbe;
 
 /// The one connection, held across an exchange.
 struct Connection {
@@ -188,12 +193,16 @@ pub fn request(request: &Request) -> Result<Response, ClientError> {
     exchange(&mut connection, request)
 }
 
-/// The last status answer, refreshed behind the caller.
+/// What the broker looks like right now, refreshing it behind the caller.
 ///
 /// This never touches the connection mutex and never waits for an exchange: a
 /// status row is drawn on the render path, and a wedged broker must not freeze
-/// a frame. An empty or expired entry starts one background probe — at most one
-/// at a time — and the previous answer is returned unchanged.
+/// a frame. The cache decision itself lives in the neutral bridge's
+/// `status_decision`, where the ordinary gate tests it; this function only reads
+/// the lock and starts a probe when that decision asks for one.
+///
+/// `StatusProbe::Pending` is a distinct answer, not a negative: a caller must
+/// report "still finding out" rather than "stopped".
 ///
 /// Only the probe writes the cache, so a per-process read cannot overwrite the
 /// status row; conversely a broker that dies between two probes keeps reporting
@@ -201,40 +210,31 @@ pub fn request(request: &Request) -> Result<Response, ClientError> {
 ///
 /// The probe needs no privilege, so this is also what an unelevated
 /// `--selfcheck`-style diagnostic uses.
-pub fn status() -> Result<ServiceStatusInfo, ClientError> {
-    let cached = match STATUS.try_lock() {
-        Ok(cache) => cache
-            .as_ref()
-            .map(|entry| (entry.at.elapsed(), entry.result.clone())),
-        // A probe is replacing the entry right now. Waiting would put a caller
-        // behind a deadline, and inventing an answer is worse than none.
-        Err(TryLockError::WouldBlock) => {
-            return Err(ClientError::Unavailable(
-                "the service status is being refreshed".into(),
-            ));
-        }
-        // A panic while writing the cache must not disable the status surface:
-        // the entry is one value, so it is dropped and the next probe rebuilds
-        // it.
-        Err(TryLockError::Poisoned(poisoned)) => {
-            let mut cache = poisoned.into_inner();
-            *cache = None;
-            None
-        }
+pub fn status() -> StatusProbe {
+    // A poisoned entry is still a readable value (one struct), so it is used;
+    // only a lock another thread holds right now is unreadable.
+    let cache = match STATUS.try_lock() {
+        Ok(cache) => cache_view(&cache),
+        Err(TryLockError::Poisoned(poisoned)) => cache_view(&poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => StatusCache::Unreadable,
     };
-    match cached {
-        Some((age, result)) if age < STATUS_TTL => result,
-        // Expired: answer with what is known and refresh behind the caller.
-        Some((_, stale)) => {
+    match status_decision(cache, STATUS_TTL) {
+        StatusDecision::Answer(result) => StatusProbe::Answered(result),
+        StatusDecision::AnswerAndProbe(result) => {
             request_probe();
-            stale
+            StatusProbe::Answered(result)
         }
-        None => {
+        StatusDecision::Probe => {
             request_probe();
-            Err(ClientError::Unavailable(
-                "the service has not answered a status probe yet".into(),
-            ))
+            StatusProbe::Pending
         }
+    }
+}
+
+fn cache_view(cache: &Option<CachedStatus>) -> StatusCache {
+    match cache {
+        Some(entry) => StatusCache::Answered(entry.result.clone(), entry.at.elapsed()),
+        None => StatusCache::Empty,
     }
 }
 
@@ -256,7 +256,20 @@ fn request_probe() {
     }
 }
 
+/// Clears the probe flag however the probe ends, a panic included.
+///
+/// Without this, one panic inside a probe would leave the flag set for the rest
+/// of the process, freezing the status row at its last answer.
+struct ProbeSlot;
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        PROBING.store(false, Ordering::Release);
+    }
+}
+
 fn probe_once() {
+    let _slot = ProbeSlot;
     let result = match request(&Request::Status) {
         Ok(Response::Status(info)) => Ok(*info),
         // A payload that is not a status is a protocol defect, not "no broker".
@@ -274,27 +287,6 @@ fn probe_once() {
         at: Instant::now(),
         result,
     });
-    PROBING.store(false, Ordering::Release);
-}
-
-/// Whether the last status probe reached a broker.
-///
-/// A pure cache read that never connects, so a caller on the UI thread cannot
-/// park on a wedged socket. A lock that cannot be taken and a lock a panic
-/// poisoned both prove nothing and therefore answer `false`; the poisoned case
-/// also drops the broken entry so the next probe rebuilds it.
-pub fn available() -> bool {
-    match STATUS.try_lock() {
-        Ok(cache) => cache.as_ref().is_some_and(|entry| entry.result.is_ok()),
-        // A probe is swapping one value right now: nothing is known yet.
-        Err(TryLockError::WouldBlock) => false,
-        // A poisoned cache is never evidence of a live broker.
-        Err(TryLockError::Poisoned(poisoned)) => {
-            let mut cache = poisoned.into_inner();
-            *cache = None;
-            false
-        }
-    }
 }
 
 fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, ClientError> {
