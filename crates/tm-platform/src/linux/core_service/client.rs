@@ -36,17 +36,41 @@
 //! [`ClientError::may_fall_back`] is the one predicate a caller needs, and only
 //! the transport level satisfies it.
 //!
-//! ## Locking and the deadline
+//! ## Deadlines
+//!
+//! Reads and actions do not share a budget, because they do not share a risk. A
+//! read answers in milliseconds and must never park a sampling tick, so it gets
+//! [`CLIENT_DEADLINE_MS`]. A privileged action can legitimately run for tens of
+//! seconds — a `systemctl restart` is bounded by the service's own 30 s control
+//! deadline — so it gets `ACTION_DEADLINE_MS`. Both selections live in
+//! [`request_deadline`], where the ordinary gate tests them.
+//!
+//! Establishing the connection keeps the short budget in both cases: a connect
+//! is not server-side work, and nothing has been sent while it is failing.
+//! Inside one exchange the request's deadline is absolute — every read and write
+//! re-arms the socket timeout with what is left of it.
+//!
+//! ## Delivered versus not
+//!
+//! After the request frame is fully written, an action's outcome is unknown
+//! rather than absent, so a close before any answer byte, a truncated answer or
+//! a version mismatch is reported as [`ClientError::Failed`] for an action and
+//! nothing may retry it; the same failure on a read stays
+//! [`ClientError::Unavailable`] because repeating a read is harmless. A frame
+//! that was only partly written is *not* ambiguous: the service dispatches after
+//! the declared length has arrived, so a short write never started anything.
+//! [`may_retry_elsewhere`] is that decision, tested in the same neutral module.
+//!
+//! ## Locking
 //!
 //! The connection mutex is held from the start of an exchange until its answer
-//! arrives, so a second caller waits for the request in flight — bounded by the
-//! remaining part of one [`CLIENT_DEADLINE_MS`] budget that connect, write and
-//! read share. A `connect` that outlives that budget is left to its own thread,
-//! because a Unix `connect` blocks while a listener's backlog is full; the lock
-//! is NOT released while the wait continues, the helper thread only caps how
-//! long the caller can be held by it. Because a failure immediately starts the
-//! cooldown, callers queued behind a wedged broker short-circuit instead of
-//! each paying the deadline in turn.
+//! arrives, so a second caller waits for the request in flight. A `connect` that
+//! outlives its own budget is left to a helper thread, because a Unix `connect`
+//! blocks while a listener's backlog is full; the lock is NOT released while the
+//! wait continues — the helper thread only caps how long the caller can be held
+//! by it. Because a failure immediately starts the cooldown, callers queued
+//! behind a wedged broker short-circuit instead of each paying the deadline in
+//! turn.
 //!
 //! The status cache is a separate mutex that is only ever held for the moment
 //! it takes to read or replace one value, never across IO, and its probe runs on
@@ -58,16 +82,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-use crate::linux_core_bridge::response_label;
+use crate::linux_core_bridge::{may_retry_elsewhere, request_deadline, response_label};
 use crate::linux_core_service::{
     CLIENT_DEADLINE_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Request,
     RequestEnvelope, Response, ResponseEnvelope, SOCKET_PATH, ServiceStatusInfo, decode_frame,
     encode_frame, read_frame,
 };
 
-/// Hard ceiling for one request, connect included. Sampling must never park on
-/// a wedged service, so this bounds every blocking step of an exchange.
-const DEADLINE: Duration = Duration::from_millis(CLIENT_DEADLINE_MS);
+/// Hard ceiling for establishing a connection.
+///
+/// A connect is not server-side work, so it keeps the short budget even for an
+/// action: it either completes at once or there is nobody listening. The
+/// per-request deadline (see [`request_deadline`]) bounds the exchange that
+/// follows.
+const CONNECT_DEADLINE: Duration = Duration::from_millis(CLIENT_DEADLINE_MS);
 
 /// How long a transport failure keeps the client from trying again. Long enough
 /// that a sampler tick cannot pay a connect timeout on every frame, short
@@ -107,6 +135,17 @@ impl Connection {
         self.socket = None;
         self.retry_after = Some(Instant::now() + UNAVAILABLE_COOLDOWN);
         ClientError::Unavailable(detail)
+    }
+
+    /// Drop the socket after an ambiguous failure and start the cooldown.
+    ///
+    /// `Failed` is deliberate: the request reached the service, so its outcome
+    /// is unknown rather than absent, and [`ClientError::Failed`] is the class
+    /// that no caller may retry.
+    fn abort(&mut self, detail: String) -> ClientError {
+        self.socket = None;
+        self.retry_after = Some(Instant::now() + UNAVAILABLE_COOLDOWN);
+        ClientError::Failed(detail)
     }
 }
 
@@ -268,18 +307,18 @@ fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, 
         // Our own bug rather than the broker's decision: nothing was sent.
         return Err(ClientError::Failed(format!("invalid request: {problem}")));
     }
-    // One absolute budget for connect, write and read together.
-    let deadline = Instant::now() + DEADLINE;
     if connection.socket.is_none() {
-        let socket = match connect_bounded(deadline) {
+        // A connect has no server-side work behind it — it either completes or
+        // nobody is listening — so it keeps the short read budget even for an
+        // action. Nothing has been sent at this point, so a slow connect can
+        // never be mistaken for a mutation that started.
+        let connect_by = Instant::now() + CONNECT_DEADLINE;
+        let socket = match connect_bounded(connect_by) {
             Ok(socket) => socket,
             // Not installed, not running, or no search permission on the
             // socket directory: in every case there is nobody to ask.
             Err(error) => return Err(connection.fail(format!("connect {SOCKET_PATH}: {error}"))),
         };
-        if let Err(error) = configure(&socket) {
-            return Err(connection.fail(format!("socket setup failed: {error}")));
-        }
         connection.socket = Some(socket);
     }
     // Take the socket out so a failure can drop it without borrowing the
@@ -288,26 +327,47 @@ fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, 
         Some(socket) => socket,
         None => return Err(connection.fail("the connection lost its socket".into())),
     };
+    // The action budget starts here, where the service starts working: a
+    // `systemctl restart` is allowed to outlive the read deadline.
+    let deadline = Instant::now() + request_deadline(request);
     let body = match transact(&socket, request, deadline) {
         Ok(body) => {
             connection.socket = Some(socket);
             body
         }
-        Err(error) => {
-            return Err(connection.fail(format!("{} failed: {error}", request.label())));
+        Err(attempt) => {
+            return Err(transport_failure(
+                connection,
+                request,
+                attempt.sent,
+                format!("{} failed: {}", request.label(), attempt.error),
+            ));
         }
     };
     let envelope: ResponseEnvelope = match decode_frame(&body) {
         Ok(envelope) => envelope,
-        Err(error) => return Err(connection.fail(format!("unreadable response: {error}"))),
+        Err(error) => {
+            return Err(transport_failure(
+                connection,
+                request,
+                true,
+                format!("unreadable response: {error}"),
+            ));
+        }
     };
     if envelope.protocol != PROTOCOL_VERSION {
         // A version mismatch on the wire is a broken install, not a decision
-        // about this request: the caller may still use its own path.
-        return Err(connection.fail(format!(
-            "this client speaks protocol {PROTOCOL_VERSION}, the service answered with {}",
-            envelope.protocol
-        )));
+        // about this request — but the request was delivered, so an action may
+        // already have run.
+        return Err(transport_failure(
+            connection,
+            request,
+            true,
+            format!(
+                "this client speaks protocol {PROTOCOL_VERSION}, the service answered with {}",
+                envelope.protocol
+            ),
+        ));
     }
     match envelope.response {
         // The refusal-to-error split is a decision table, so it lives in the
@@ -319,10 +379,27 @@ fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, 
     }
 }
 
-fn configure(socket: &UnixStream) -> io::Result<()> {
-    socket.set_read_timeout(Some(DEADLINE))?;
-    socket.set_write_timeout(Some(DEADLINE))?;
-    Ok(())
+/// Classify one failed exchange, and drop the connection.
+///
+/// `frame_written` says whether the complete request reached the socket. A read
+/// can always be repeated, so it stays [`ClientError::Unavailable`] and the
+/// caller may fall back. An action that was fully written is a different case:
+/// the service may have executed it, and `Unavailable` is the one
+/// fallback-eligible class, so reporting it there would retry a mutation that
+/// already started. Such an action is reported as
+/// [`ClientError::Failed`] — final, with the reason kept.
+fn transport_failure(
+    connection: &mut Connection,
+    request: &Request,
+    frame_written: bool,
+    detail: String,
+) -> ClientError {
+    let retryable = may_retry_elsewhere(request, frame_written);
+    if retryable {
+        connection.fail(detail)
+    } else {
+        connection.abort(detail)
+    }
 }
 
 /// What is left of one request's budget, or the deadline error once it is gone.
@@ -423,24 +500,68 @@ impl Write for Deadlined<'_> {
     }
 }
 
-fn transact(socket: &UnixStream, request: &Request, deadline: Instant) -> io::Result<Vec<u8>> {
+/// A transport attempt that did not produce a frame.
+struct AttemptError {
+    /// The complete request frame reached the socket, so the service may have
+    /// parsed it and acted on it.
+    sent: bool,
+    error: io::Error,
+}
+
+/// Write the frame and read one answer.
+///
+/// `sent` is tracked by hand instead of trusting `write_all`: a frame is
+/// dispatched only after its declared length arrived, so a short write is a
+/// request the service discards — never an action that started. Every failure
+/// after the last byte is ambiguous by definition.
+fn transact(
+    socket: &UnixStream,
+    request: &Request,
+    deadline: Instant,
+) -> std::result::Result<Vec<u8>, AttemptError> {
     let frame = encode_frame(
         &RequestEnvelope {
             protocol: PROTOCOL_VERSION,
             request: request.clone(),
         },
         MAX_REQUEST_BYTES,
-    )?;
+    )
+    .map_err(|error| AttemptError { sent: false, error })?;
     let mut wire = Deadlined { socket, deadline };
-    wire.write_all(&frame)?;
-    wire.flush()?;
-    read_frame(&mut wire, MAX_RESPONSE_BYTES)?.ok_or_else(|| {
+    let mut written = 0usize;
+    while written < frame.len() {
+        match wire.write(&frame[written..]) {
+            Ok(0) => break,
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(AttemptError { sent: false, error });
+            }
+        }
+    }
+    if written < frame.len() {
+        return Err(AttemptError {
+            sent: false,
+            error: io::Error::new(
+                io::ErrorKind::WriteZero,
+                "the service accepted no complete request frame",
+            ),
+        });
+    }
+    let body = match read_frame(&mut wire, MAX_RESPONSE_BYTES) {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(AttemptError { sent: true, error });
+        }
+    };
+    body.ok_or_else(|| AttemptError {
+        sent: true,
         // A clean end of stream where the answer belongs is a lost answer, not
-        // an empty one: the service never said it did anything.
-        io::Error::new(
+        // an empty one: the service closed after the request was delivered.
+        error: io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "the service closed the connection without answering",
-        )
+        ),
     })
 }
 
@@ -475,5 +596,49 @@ mod tests {
         let cooled = exchange(&mut connection, &Request::Status).expect_err("cooled down");
         assert!(cooled.may_fall_back());
         assert!(cooled.to_string().contains("cooldown"), "{cooled}");
+    }
+
+    #[test]
+    fn a_delivered_action_failure_is_final_while_a_read_failure_is_not() {
+        let restart = Request::Action {
+            action: crate::linux_core_service::ActionRequest::Service {
+                unit: "sshd.service".into(),
+                verb: crate::linux_core_service::ServiceVerb::Restart,
+            },
+        };
+
+        // The frame was fully written, so the service may have restarted the
+        // unit: reporting "unavailable" here is what would retry it.
+        let error = transport_failure(
+            &mut Connection::new(),
+            &restart,
+            true,
+            "the service closed the connection without answering".into(),
+        );
+        assert!(matches!(error, ClientError::Failed(_)), "{error}");
+        assert!(
+            !error.may_fall_back(),
+            "an action that may have started must never be retried"
+        );
+
+        // Nothing reached the service: the caller's own path may still deliver.
+        let error = transport_failure(
+            &mut Connection::new(),
+            &restart,
+            false,
+            "connect: No such file or directory".into(),
+        );
+        assert!(matches!(error, ClientError::Unavailable(_)), "{error}");
+        assert!(error.may_fall_back());
+
+        // A read is always safe to repeat, so it keeps the fallback.
+        let error = transport_failure(
+            &mut Connection::new(),
+            &Request::Status,
+            true,
+            "the service closed the connection without answering".into(),
+        );
+        assert!(matches!(error, ClientError::Unavailable(_)), "{error}");
+        assert!(error.may_fall_back());
     }
 }

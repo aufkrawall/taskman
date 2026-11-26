@@ -16,10 +16,12 @@ use crate::actions::{
     ProcessThreads, ServiceAction, TcpState, ThreadState,
 };
 use crate::linux_core_service::{
-    Refusal, Response, ServiceFailure, ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo,
-    WireFileIoEntry, WireModule, WireThread, WireThreadState, WireThreads,
+    ACTION_DEADLINE_MS, CLIENT_DEADLINE_MS, Refusal, Request, Response, ServiceFailure,
+    ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo, WireFileIoEntry, WireModule,
+    WireThread, WireThreadState, WireThreads,
 };
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use tm_core::error::TmError;
 
 /// Why a request did not produce a response.
@@ -30,17 +32,23 @@ use tm_core::error::TmError;
 /// into permission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
-    /// No broker is reachable (not installed, not running, socket missing, or
-    /// the exchange ran past its deadline).
+    /// No broker is reachable (not installed, not running, socket missing), or a
+    /// READ ran past its deadline. A fully delivered action never lands here —
+    /// see [`Self::Failed`] — because it may already have run.
     Unavailable(String),
     /// The broker answered and refused. Callers must NOT fall back.
     Refused { code: Refusal, detail: String },
-    /// The broker answered a well-formed request with a failure.
+    /// The broker answered a well-formed request with a failure, or a delivered
+    /// request's outcome could not be determined. Never retried.
     Failed(String),
 }
 
 impl ClientError {
     /// Whether a caller may still attempt the operation under its own token.
+    ///
+    /// A fully delivered action never reports [`Self::Unavailable`], so this
+    /// predicate cannot authorize a second mutation; see
+    /// [`may_retry_elsewhere`].
     pub fn may_fall_back(&self) -> bool {
         matches!(self, Self::Unavailable(_))
     }
@@ -196,6 +204,32 @@ fn file_io_entry_from_wire(wire: WireFileIoEntry) -> ProcessFileIo {
         is_write: wire.is_write,
         open_handles: wire.open_handles,
     }
+}
+
+/// How long one request may block before its answer is treated as missing.
+///
+/// A privileged action can legitimately run for tens of seconds — a
+/// `systemctl restart` is bounded by the service's own 30 s control deadline —
+/// and giving up earlier would classify a still-running mutation as
+/// [`ClientError::Unavailable`], the one fallback-eligible class, and invite a
+/// retry of something that already started. Reads answer in milliseconds and
+/// must never park a sampling tick.
+pub(crate) fn request_deadline(request: &Request) -> Duration {
+    let millis = match request {
+        Request::Action { .. } => ACTION_DEADLINE_MS,
+        _ => CLIENT_DEADLINE_MS,
+    };
+    Duration::from_millis(millis)
+}
+
+/// Whether a failed exchange may still be attempted under another token.
+///
+/// A read can always be repeated: another identity only widens who may look. A
+/// privileged action cannot, once its frame is on the wire — the service may
+/// have executed it, so "I never got an answer" must be reported as a final
+/// failure instead of becoming a second mutation.
+pub(crate) fn may_retry_elsewhere(request: &Request, frame_written: bool) -> bool {
+    !(frame_written && matches!(request, Request::Action { .. }))
 }
 
 /// Classify the broker for the Settings surface.
@@ -432,8 +466,10 @@ fn tcp_state_from_wire(name: &str) -> Option<TcpState> {
 mod tests {
     use super::*;
     use crate::linux_core_service::{
-        ProcessEvidence, ServiceStatusInfo, WireConnection, WireFileIo, WireModule, WireThreads,
+        ActionRequest, ProcessEvidence, ServiceStatusInfo, WireConnection, WireFileIo, WireModule,
+        WireThreads,
     };
+    use tm_core::model::PriorityClass;
 
     fn failure(code: Refusal, detail: &str) -> ServiceFailure {
         ServiceFailure {
@@ -628,6 +664,127 @@ mod tests {
         assert_eq!(service_verb(ServiceAction::Start), ServiceVerb::Start);
         assert_eq!(service_verb(ServiceAction::Stop), ServiceVerb::Stop);
         assert_eq!(service_verb(ServiceAction::Restart), ServiceVerb::Restart);
+    }
+
+    fn every_action() -> Vec<Request> {
+        vec![
+            Request::Action {
+                action: ActionRequest::Kill {
+                    pid: 42,
+                    start_ticks: 1,
+                    tree: false,
+                },
+            },
+            Request::Action {
+                action: ActionRequest::Kill {
+                    pid: 42,
+                    start_ticks: 1,
+                    tree: true,
+                },
+            },
+            Request::Action {
+                action: ActionRequest::Suspend {
+                    pid: 42,
+                    start_ticks: 1,
+                },
+            },
+            Request::Action {
+                action: ActionRequest::Resume {
+                    pid: 42,
+                    start_ticks: 1,
+                },
+            },
+            Request::Action {
+                action: ActionRequest::SetPriority {
+                    pid: 42,
+                    start_ticks: 1,
+                    priority: PriorityClass::High,
+                },
+            },
+            Request::Action {
+                action: ActionRequest::SetAffinity {
+                    pid: 42,
+                    start_ticks: 1,
+                    mask: 0b11,
+                },
+            },
+            Request::Action {
+                action: ActionRequest::Service {
+                    unit: "sshd.service".into(),
+                    verb: ServiceVerb::Restart,
+                },
+            },
+        ]
+    }
+
+    fn every_read() -> Vec<Request> {
+        vec![
+            Request::Status,
+            Request::Sensors,
+            Request::ProcessModules {
+                pid: 42,
+                start_ticks: 1,
+            },
+            Request::ProcessThreads {
+                pid: 42,
+                start_ticks: 1,
+            },
+            Request::ProcessConnections {
+                pid: 42,
+                start_ticks: 1,
+            },
+            Request::ProcessFileIo {
+                pid: 42,
+                start_ticks: 1,
+            },
+            Request::ProcessEvidence {
+                pid: 42,
+                start_ticks: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn an_action_gets_the_long_deadline_and_a_read_keeps_the_short_one() {
+        // A `systemctl restart` outlives the read deadline by design, so the
+        // two must never be conflated: giving up on a running action is what
+        // turns it into a retryable "unavailable".
+        assert!(ACTION_DEADLINE_MS > CLIENT_DEADLINE_MS);
+        for request in every_action() {
+            assert_eq!(
+                request_deadline(&request),
+                Duration::from_millis(ACTION_DEADLINE_MS),
+                "{request:?}"
+            );
+        }
+        for request in every_read() {
+            assert_eq!(
+                request_deadline(&request),
+                Duration::from_millis(CLIENT_DEADLINE_MS),
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_written_action_frame_is_never_retried_elsewhere() {
+        for request in every_action() {
+            assert!(
+                may_retry_elsewhere(&request, false),
+                "an action that was never sent may still use the local path: {request:?}"
+            );
+            assert!(
+                !may_retry_elsewhere(&request, true),
+                "an action whose frame reached the service is final: {request:?}"
+            );
+        }
+        for request in every_read() {
+            assert!(may_retry_elsewhere(&request, false), "{request:?}");
+            assert!(
+                may_retry_elsewhere(&request, true),
+                "a read may always be repeated: {request:?}"
+            );
+        }
     }
 
     #[test]
