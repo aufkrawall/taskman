@@ -244,14 +244,16 @@ pub fn manifest_protection_problem(owner_uid: Option<u32>, mode: Option<u32>) ->
         return Some("manifest mode could not be read".into());
     };
     let writable = mode & 0o022;
-    (writable != 0).then(|| {
-        format!("manifest must not be group- or world-writable (mode {mode:o})")
-    })
+    (writable != 0)
+        .then(|| format!("manifest must not be group- or world-writable (mode {mode:o})"))
 }
 
 /// Protection rule for the service binary: a user-writable image must never
 /// run as root.
-pub fn service_image_protection_problem(owner_uid: Option<u32>, mode: Option<u32>) -> Option<String> {
+pub fn service_image_protection_problem(
+    owner_uid: Option<u32>,
+    mode: Option<u32>,
+) -> Option<String> {
     manifest_protection_problem(owner_uid, mode)
         .map(|problem| problem.replace("manifest", "service image"))
 }
@@ -737,7 +739,10 @@ pub fn encode_frame<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>
     if body.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame of {} bytes exceeds the {limit}-byte limit", body.len()),
+            format!(
+                "frame of {} bytes exceeds the {limit}-byte limit",
+                body.len()
+            ),
         ));
     }
     let mut frame = Vec::with_capacity(body.len() + 4);
@@ -884,14 +889,24 @@ mod tests {
     fn manifest_requires_at_least_one_authorized_uid() {
         let mut empty = manifest();
         empty.authorized_uids.clear();
-        assert!(empty.validate().expect_err("invalid").contains("authorized_uids"));
+        assert!(
+            empty
+                .validate()
+                .expect_err("invalid")
+                .contains("authorized_uids")
+        );
     }
 
     #[test]
     fn strict_manifest_requires_a_client_path() {
         let mut strict = manifest();
         strict.clients.clear();
-        assert!(strict.validate().expect_err("invalid").contains("clients is empty"));
+        assert!(
+            strict
+                .validate()
+                .expect_err("invalid")
+                .contains("clients is empty")
+        );
 
         strict.allow_user_writable_client = true;
         assert!(strict.validate().is_ok());
@@ -1043,7 +1058,11 @@ mod tests {
         assert_eq!(decoded, request);
 
         // A clean EOF between frames is not an error.
-        assert!(read_frame(&mut cursor, MAX_REQUEST_BYTES).expect("eof").is_none());
+        assert!(
+            read_frame(&mut cursor, MAX_REQUEST_BYTES)
+                .expect("eof")
+                .is_none()
+        );
 
         // A header that claims more than the limit is refused before allocating.
         let mut oversized = std::io::Cursor::new(u32::MAX.to_be_bytes().to_vec());
@@ -1058,12 +1077,15 @@ mod tests {
     fn encoding_refuses_a_body_over_the_limit() {
         let big = "x".repeat(MAX_REQUEST_BYTES);
         assert!(
-            encode_frame(&Request::Action {
-                action: ActionRequest::Service {
-                    unit: big,
-                    verb: ServiceVerb::Start
-                }
-            }, MAX_REQUEST_BYTES)
+            encode_frame(
+                &Request::Action {
+                    action: ActionRequest::Service {
+                        unit: big,
+                        verb: ServiceVerb::Start
+                    }
+                },
+                MAX_REQUEST_BYTES
+            )
             .is_err()
         );
     }
