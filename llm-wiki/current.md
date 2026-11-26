@@ -1273,9 +1273,12 @@ rebase runbook.
   work under console shells is identifiable. A windowed process folds into a
   windowless ancestor only when plausibly the same application (image or
   publisher; shell brokers + browsers are launch boundaries) — otherwise it
-  is its own app row. Busy absorbed external tasks (≥ 1 % CPU share,
-  different image, windowless) are promoted into Background
-  (`promote_busy_external_tasks`); windowed processes are never demoted.
+  is its own app row. Absorbed helpers stay in their app's nested tree
+  whatever their CPU load (the 2026-08-27 `promote_busy_external_tasks`
+  rule that lifted busy different-image helpers into Background was retired
+  on 2026-11-26: it split a build across sections — idle `cargo.exe` under
+  the app, busy `rustc.exe` in Background — and made rows flip at the 1 %
+  threshold; the expanded tree and the app aggregate cover visibility).
 
 - Window placement: "Remember window size and position" checkbox in the
   settings dialog (the flag previously had no UI); maximized state is

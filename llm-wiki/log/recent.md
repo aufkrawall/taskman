@@ -1,3 +1,22 @@
+## 2026-11-26 - Processes: retire busy-helper promotion into Background
+
+- User compared the Processes tree with the Details tree: under an editor,
+  idle `cargo.exe` stayed in the app tree while its busy `rustc.exe` children
+  were missing. Cause: `promote_busy_external_tasks` (2026-08-27) lifted any
+  windowless, different-image App member with >= 1 % CPU (plus its own
+  subtree, never its ancestors) into Background. It was written when app
+  helpers were folded and invisible; with nested app trees it only split
+  families and flipped rows at the threshold. Removed together with
+  `is_external_family_member`; the 1 % threshold survives as
+  `BUSY_HELPER_CPU_PCT` for Background `Name (N)` folding (`joins_family`).
+- Tests: `busy_grandchild_stays_nested_under_its_idle_parent` pins the
+  reported chain; `busy_external_helper_stays_in_its_app_tree` replaces the
+  promotion test.
+- Deliberately unchanged: `conhost.exe` stays a core OS image in Windows
+  processes (native Task Manager folds Console Window Host under its console
+  app; adopting that touches the sampler's System classification and app
+  totals — open question, not done).
+
 ## 2026-11-26 - Taskbar stats hit area: fill the bar's cross axis exactly
 
 - The taskbar widget's clickable box was the content plus at most 4 DIP of its own
