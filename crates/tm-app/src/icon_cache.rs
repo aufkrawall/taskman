@@ -1,8 +1,8 @@
 //! Shared cache of real process icons (shell-extracted) as egui textures.
 //!
-//! Extraction is expensive (~ms per icon), so it happens on a dedicated
-//! worker thread that starts lazily on first request — never during app
-//! construction (implement.md §5.5). The UI thread uploads at most
+//! Extraction is expensive (~ms per icon), so it happens on dedicated worker
+//! threads ([`ICON_WORKERS`]) that start lazily on first request — never during
+//! app construction (implement.md §5.5). The UI thread uploads at most
 //! [`UPLOAD_BUDGET`] textures per pass; if results remain queued it asks
 //! for one more repaint so the rest stream in without a frame hitch.
 //! The cache is bounded by a batched LRU cap and transient failures retry on a
@@ -77,6 +77,16 @@ const IN_FLIGHT_CAP: usize = 1024;
 /// commit whose whole point is that they stop doing that. A quarter leaves the
 /// paint path headroom even when a page warms everything it has.
 const PREFETCH_CAP: usize = IN_FLIGHT_CAP / 4;
+/// How many extraction threads run.
+///
+/// Windows extracts through the shell, which `win/icons.rs` serializes on one
+/// lock (`SHGetFileInfo` loads through the shell's image lists, which are not
+/// re-entrant), so extra threads there would queue behind that lock and pay the
+/// spawn cost for nothing. On Linux the work is pure CPU per image — decode a
+/// PNG, rasterize an SVG with `resvg` — and a desktop's few hundred distinct
+/// images *are* the first-open latency: one thread left a big list filling in
+/// over several hundred milliseconds, so it splits across cores instead.
+const ICON_WORKERS: usize = if cfg!(target_os = "linux") { 3 } else { 1 };
 /// Backoff between failed icon-worker spawn attempts. Every visible row asks
 /// for its icon on every frame, so an unconditional retry meant a `spawn`
 /// syscall, a channel allocation and a `tracing::warn!` per row per frame while
@@ -447,14 +457,28 @@ impl IconCache {
             return;
         }
         let (tx, rx): (Sender<String>, Receiver<String>) = std::sync::mpsc::channel();
+        // Shared, and locked only around the receive: whoever gets a key drops the
+        // guard before extracting, so the other workers wait for a *message*
+        // rather than for the work — which is what makes the pool a pool instead
+        // of a queue in front of one thread.
+        let rx = Arc::new(Mutex::new(rx));
         let results = self.results.clone();
         let has_results = self.has_results.clone();
-        let actions = actions.clone();
         *sync::lock(&self.tx) = Some(Arc::new(tx));
-        let spawned = std::thread::Builder::new()
-            .name("tm-icons".into())
-            .spawn(move || icon_worker(rx, actions.clone(), results, has_results));
-        if spawned.is_err() {
+        let mut started = 0usize;
+        for index in 0..ICON_WORKERS {
+            let rx = rx.clone();
+            let actions = actions.clone();
+            let results = results.clone();
+            let has_results = has_results.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("tm-icons-{index}"))
+                .spawn(move || icon_worker(rx, actions, results, has_results));
+            if spawned.is_ok() {
+                started += 1;
+            }
+        }
+        if started == 0 {
             self.spawn_deadline_ms.store(
                 spawn_retry_deadline(now),
                 std::sync::atomic::Ordering::Relaxed,
@@ -463,6 +487,14 @@ impl IconCache {
             *sync::lock(&self.tx) = None;
             self.worker_started
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+        } else if started < ICON_WORKERS {
+            // Fewer threads is slower, not broken: say so once instead of
+            // treating a partial pool as a spawn failure and backing off.
+            tracing::warn!(
+                started,
+                wanted = ICON_WORKERS,
+                "icon worker pool started short"
+            );
         }
     }
 
@@ -652,12 +684,19 @@ impl IconCache {
 }
 
 fn icon_worker(
-    rx: Receiver<String>,
+    rx: Arc<Mutex<Receiver<String>>>,
     actions: Arc<dyn tm_platform::actions::PlatformActions>,
     results: Arc<Mutex<Vec<Decoded>>>,
     has_results: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    while let Ok(path) = rx.recv() {
+    loop {
+        // The guard covers the wait, not the extraction: it is dropped at the end
+        // of the statement, so a worker that got a key extracts it while the next
+        // one waits for another.
+        let Ok(path) = sync::lock(&rx).recv() else {
+            // The cache dropped the sender: the worker is done for this process.
+            break;
+        };
         // The default application icon is a platform property, not a file
         // icon: ask for it directly instead of resolving it as a path.
         let icon = if path == DEFAULT_APP_ICON_KEY {
@@ -878,6 +917,41 @@ mod tests {
             );
         }
         assert_eq!(cache.stats().in_flight, 0);
+    }
+
+    /// A model rebuild hands a whole page's keys over at once, and every one of
+    /// them has to come back: the receive is shared behind a lock, so a mistake
+    /// there leaves keys queued forever — their rows simply stay empty, with no
+    /// error anywhere to notice.
+    #[test]
+    fn a_burst_of_keys_is_drained_completely() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        let keys: Vec<String> = (0..24).map(|i| format!("/apps/burst{i}")).collect();
+        cache.prefetch(&actions, keys.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            cache.drain_results(&ctx);
+            if cache.len() == keys.len() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the burst never drained: {} of {}",
+                cache.len(),
+                keys.len()
+            );
+            // The upload budget is per pass; advance one so a backlog larger than
+            // it can drain while the test waits.
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
+            std::thread::yield_now();
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.queued, 0, "no key is left waiting");
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(stats.ready, keys.len());
     }
 
     /// A prefetch only asks for what it can still learn: a key whose texture is

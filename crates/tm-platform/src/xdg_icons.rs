@@ -77,13 +77,19 @@ fn read_text_capped(path: &Path) -> Option<String> {
 }
 
 /// Bounds for the caches of a lookup's per-process static answers: a theme's
-/// layout, an icon name's file and a decoded PNG do not change while the
+/// layout, an icon name's file and a decoded image do not change while the
 /// process runs. The caps only keep a session that meets thousands of distinct
-/// names from growing them without limit; 128 decoded icons is at most ~2 MiB
-/// (the 64 px cap allows 16 KiB each, a 32 px theme icon is 4 KiB).
+/// names from growing them without limit.
+///
+/// The decode cap has to clear a desktop's whole distinct-image count, because a
+/// page rebuild asks for every one of them in a burst: 128 was under that (a few
+/// hundred on a normal Plasma session), so images shared by several executables —
+/// every Electron helper, every Qt/KDE app's helpers — were decoded again each
+/// time an evicted one came back. 512 is at most ~8 MiB (the 64 px cap allows
+/// 16 KiB each, a 32 px theme icon 4 KiB).
 const THEME_DIR_CACHE_CAP: usize = 64;
 const FILE_CACHE_CAP: usize = 1024;
-const DECODE_CACHE_CAP: usize = 128;
+const DECODE_CACHE_CAP: usize = 512;
 
 /// Bounds for the cache of directory contents.
 ///
