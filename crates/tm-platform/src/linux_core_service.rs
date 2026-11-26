@@ -38,8 +38,12 @@ use serde::{Deserialize, Serialize};
 use crate::linux_sensors::SensorSnapshot;
 use tm_core::model::PriorityClass;
 
-/// Version of the request/response schema. Bumped whenever a field changes
-/// meaning or a required field is added; the manifest pins it as well.
+/// Version of the request/response schema. This is the FIRST released schema,
+/// so it stays 1 while the feature is still being assembled: the GUI and the
+/// service always ship from one release. Every wire-shape change AFTER this
+/// release — a new variant, a field whose meaning shifts, a removed field —
+/// must bump it, because a GUI and a service from different releases then fail
+/// at the handshake instead of misreading each other.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Root-owned runtime directory that systemd creates for the service.
@@ -65,9 +69,18 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Largest manifest file. The manifest is a dozen short fields.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-/// How long a client waits for one response before treating the broker as
-/// unavailable. Sampling must never park on a wedged service.
+/// How long a client waits for one response. A read (status, sensors, process
+/// evidence) answers in milliseconds, and sampling must never park on a wedged
+/// broker, so this is deliberately short.
 pub const CLIENT_DEADLINE_MS: u64 = 3_000;
+
+/// How long a client waits for a privileged ACTION.
+///
+/// `systemctl restart` may take tens of seconds (the service's own control
+/// deadline is 30 s). A client that gave up at the read deadline would classify
+/// a still-running action as `Unavailable` and, because that is the only
+/// fallback-eligible class, retry it — a duplicated privileged mutation.
+pub const ACTION_DEADLINE_MS: u64 = 35_000;
 
 // ---------------------------------------------------------------- manifest
 
@@ -199,15 +212,23 @@ impl Manifest {
     }
 
     /// Whether `path` is an installed client path this manifest trusts.
+    ///
+    /// This is a manifest-shape check only. Peer trust is decided on the
+    /// installed client's `(st_dev, st_ino)`, because a path is not an
+    /// identity: a mount namespace can make any executable appear at an
+    /// installed path.
     pub fn allows_client_path(&self, path: &str) -> bool {
-        self.clients.iter().any(|entry| {
-            if let Some(directory) = entry.strip_suffix('/') {
-                path.strip_prefix(directory)
-                    .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
-            } else {
-                entry == path
-            }
-        })
+        self.clients
+            .iter()
+            .any(|entry| match entry.strip_suffix('/') {
+                Some(directory) => path.strip_prefix(directory).is_some_and(|tail| {
+                    tail.strip_prefix('/').is_some_and(|rest| {
+                        // A directory entry must never reach outside its own tree.
+                        !rest.is_empty() && !rest.split('/').any(|segment| segment == "..")
+                    })
+                }),
+                None => entry == path,
+            })
     }
 }
 
@@ -244,14 +265,16 @@ pub fn manifest_protection_problem(owner_uid: Option<u32>, mode: Option<u32>) ->
         return Some("manifest mode could not be read".into());
     };
     let writable = mode & 0o022;
-    (writable != 0).then(|| {
-        format!("manifest must not be group- or world-writable (mode {mode:o})")
-    })
+    (writable != 0)
+        .then(|| format!("manifest must not be group- or world-writable (mode {mode:o})"))
 }
 
 /// Protection rule for the service binary: a user-writable image must never
 /// run as root.
-pub fn service_image_protection_problem(owner_uid: Option<u32>, mode: Option<u32>) -> Option<String> {
+pub fn service_image_protection_problem(
+    owner_uid: Option<u32>,
+    mode: Option<u32>,
+) -> Option<String> {
     manifest_protection_problem(owner_uid, mode)
         .map(|problem| problem.replace("manifest", "service image"))
 }
@@ -271,13 +294,37 @@ pub struct PeerCredentials {
 }
 
 /// What the service observed about the peer's executable.
+///
+/// The path is diagnostic only. A peer can arrange for an arbitrary
+/// executable to appear at an installed path — `unshare -m` plus a bind mount
+/// is unprivileged on a default-configured distribution — so comparing path
+/// strings would hand the broker's allowlist to any code the user can run.
+/// The identity is the `(st_dev, st_ino)` of the executable the kernel reports
+/// for that task, compared against the installed client the service stat'ed in
+/// its own namespace at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientImage {
-    /// Resolved `/proc/<pid>/exe` target. Absolute.
+    /// Resolved `/proc/<pid>/exe` target, for diagnostics and logging.
     pub path: String,
+    /// `st_dev` of the opened executable.
+    pub device: u64,
+    /// `st_ino` of the opened executable.
+    pub inode: u64,
     pub owner_uid: u32,
     /// Permission bits (`st_mode & 0o7777`).
     pub mode: u32,
+}
+
+/// One client the service resolved from the manifest at startup.
+///
+/// Resolution happens once, in the broker's own mount namespace, so the
+/// recorded identity is the protected installed image; a peer's namespace
+/// cannot change what these inodes are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledClient {
+    pub path: String,
+    pub device: u64,
+    pub inode: u64,
 }
 
 /// Outcome of the peer policy.
@@ -338,10 +385,13 @@ impl Refusal {
 
 /// The whole peer policy, as one pure function.
 ///
-/// `image` is `None` when `/proc/<pid>/exe` could not be resolved. uid 0 is
-/// accepted without an image because it needs no grant.
+/// `installed` is what the service resolved from the manifest in its own
+/// namespace at startup; `image` is the executable the kernel reports for the
+/// peer, or `None` when it could not be opened. uid 0 is accepted without an
+/// image because it needs no grant.
 pub fn evaluate_peer(
     manifest: &Manifest,
+    installed: &[InstalledClient],
     peer: &PeerCredentials,
     image: Option<&ClientImage>,
 ) -> PeerVerdict {
@@ -354,11 +404,17 @@ pub fn evaluate_peer(
     let Some(image) = image else {
         return PeerVerdict::Refused(Refusal::MissingClientImage);
     };
-    if !manifest.allows_client_path(&image.path) {
+    // Identity, not path: an aliased path in the peer's mount namespace
+    // reports a different inode than the protected installed client.
+    if !installed
+        .iter()
+        .any(|client| client.device == image.device && client.inode == image.inode)
+    {
         return PeerVerdict::Refused(Refusal::ClientNotListed);
     }
-    // A writable client image would let its owner put arbitrary code behind
-    // the authorized path, so the trust check applies to the resolved file.
+    // A writable client image would let its owner replace the code behind the
+    // authorized path, so the trust check applies to the executable the
+    // kernel actually reports.
     if image.owner_uid != 0 || image.mode & 0o022 != 0 {
         return PeerVerdict::Refused(Refusal::UnprotectedClient);
     }
@@ -384,8 +440,13 @@ pub enum Request {
     /// Every thread of one exact process.
     ProcessThreads { pid: u32, start_ticks: i64 },
     /// Socket endpoints attributed to one process (`/proc/<pid>/fd` needs
-    /// CAP_SYS_PTRACE for another user's process).
-    ProcessConnections { pid: u32 },
+    /// CAP_SYS_PTRACE for another user's process). The creation identity is
+    /// required, like every other per-process request: the connection table
+    /// carries no creation time, so the identity must be pinned before the
+    /// read or a recycled pid would hand back another process's sockets.
+    ProcessConnections { pid: u32, start_ticks: i64 },
+    /// Files one exact process has open, with its per-file I/O totals.
+    ProcessFileIo { pid: u32, start_ticks: i64 },
     /// Container/hardening evidence the kernel withholds from other users.
     ProcessEvidence { pid: u32, start_ticks: i64 },
     /// One privileged mutation.
@@ -401,6 +462,7 @@ impl Request {
             Self::ProcessModules { .. } => "process-modules",
             Self::ProcessThreads { .. } => "process-threads",
             Self::ProcessConnections { .. } => "process-connections",
+            Self::ProcessFileIo { .. } => "process-file-io",
             Self::ProcessEvidence { .. } => "process-evidence",
             Self::Action { action } => action.label(),
         }
@@ -413,6 +475,7 @@ impl Request {
             Self::ProcessModules { pid, .. }
             | Self::ProcessThreads { pid, .. }
             | Self::ProcessConnections { pid, .. }
+            | Self::ProcessFileIo { pid, .. }
             | Self::ProcessEvidence { pid, .. } => valid_pid(*pid),
             Self::Action { action } => action.validate(),
         }
@@ -480,10 +543,14 @@ impl ActionRequest {
             Self::Kill { pid, .. }
             | Self::Suspend { pid, .. }
             | Self::Resume { pid, .. }
-            | Self::SetPriority { pid, .. }
-            | Self::SetAffinity { pid, .. } => valid_pid(*pid),
-            Self::SetAffinity { mask: 0, .. } => {
-                Err("an empty affinity mask would stop the process on every CPU".into())
+            | Self::SetPriority { pid, .. } => valid_pid(*pid),
+            // Checked before the pid so an empty mask can never reach the
+            // kernel: it would stop the process on every CPU.
+            Self::SetAffinity { pid, mask } => {
+                if *mask == 0 {
+                    return Err("an empty affinity mask would stop the process on every CPU".into());
+                }
+                valid_pid(*pid)
             }
             Self::Service { unit, .. } => {
                 if unit.is_empty() {
@@ -520,6 +587,9 @@ pub enum Response {
     Modules(Vec<WireModule>),
     Threads(WireThreads),
     Connections(Vec<WireConnection>),
+    /// Per-file I/O accounting of one exact process (`/proc/<pid>/io` is
+    /// owner-only, so another user's process needs the broker).
+    FileIo(Box<WireFileIo>),
     Evidence(Box<ProcessEvidence>),
     /// An action completed.
     Done,
@@ -594,7 +664,10 @@ pub enum WireThreadState {
     Dead,
     Idle,
     Parked,
-    Other,
+    /// A kernel state this schema does not name, carrying the raw `/proc`
+    /// character so the client can render the same evidence the direct
+    /// reader would, instead of collapsing every unknown state to one value.
+    Other(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,6 +688,12 @@ pub struct WireThread {
 
 /// One socket endpoint. Addresses are strings so the wire stays independent of
 /// the platform's socket types; the client parses them back.
+///
+/// The format is pinned: an IPv4 or IPv6 endpoint is exactly
+/// `std::net::SocketAddr::to_string()` (`127.0.0.1:8080`, `[::1]:8080`,
+/// `[fe80::1%2]:80`), a Unix endpoint is the socket path. A client that cannot
+/// parse one must report it as a diagnostic and drop only that row, never turn
+/// the whole answer into "no connections".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireConnection {
     /// `tcp`, `tcp6`, `udp`, `udp6`, `unix`.
@@ -737,7 +816,10 @@ pub fn encode_frame<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>
     if body.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame of {} bytes exceeds the {limit}-byte limit", body.len()),
+            format!(
+                "frame of {} bytes exceeds the {limit}-byte limit",
+                body.len()
+            ),
         ));
     }
     let mut frame = Vec::with_capacity(body.len() + 4);
@@ -834,9 +916,19 @@ mod tests {
     fn protected_image() -> ClientImage {
         ClientImage {
             path: "/usr/bin/taskman".into(),
+            device: 1,
+            inode: 2,
             owner_uid: 0,
             mode: 0o755,
         }
+    }
+
+    fn installed_clients() -> Vec<InstalledClient> {
+        vec![InstalledClient {
+            path: "/usr/bin/taskman".into(),
+            device: 1,
+            inode: 2,
+        }]
     }
 
     #[test]
@@ -884,14 +976,24 @@ mod tests {
     fn manifest_requires_at_least_one_authorized_uid() {
         let mut empty = manifest();
         empty.authorized_uids.clear();
-        assert!(empty.validate().expect_err("invalid").contains("authorized_uids"));
+        assert!(
+            empty
+                .validate()
+                .expect_err("invalid")
+                .contains("authorized_uids")
+        );
     }
 
     #[test]
     fn strict_manifest_requires_a_client_path() {
         let mut strict = manifest();
         strict.clients.clear();
-        assert!(strict.validate().expect_err("invalid").contains("clients is empty"));
+        assert!(
+            strict
+                .validate()
+                .expect_err("invalid")
+                .contains("clients is empty")
+        );
 
         strict.allow_user_writable_client = true;
         assert!(strict.validate().is_ok());
@@ -920,7 +1022,12 @@ mod tests {
     #[test]
     fn authorized_uid_with_protected_client_is_allowed() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&protected_image())),
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&protected_image())
+            ),
             PeerVerdict::Allowed
         );
     }
@@ -928,7 +1035,7 @@ mod tests {
     #[test]
     fn unauthorized_uid_is_refused_before_any_image_read() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1001), None),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(1001), None),
             PeerVerdict::Refused(Refusal::UnauthorizedUser)
         );
     }
@@ -936,7 +1043,7 @@ mod tests {
     #[test]
     fn root_is_always_allowed() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(0), None),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(0), None),
             PeerVerdict::Allowed
         );
     }
@@ -946,24 +1053,56 @@ mod tests {
         let mut writable = protected_image();
         writable.mode = 0o775;
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&writable)),
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&writable)
+            ),
             PeerVerdict::Refused(Refusal::UnprotectedClient)
         );
 
         let mut foreign = protected_image();
         foreign.owner_uid = 1000;
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&foreign)),
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&foreign)
+            ),
             PeerVerdict::Refused(Refusal::UnprotectedClient)
         );
     }
 
     #[test]
     fn unlisted_client_is_refused_even_when_protected() {
+        // A different executable, even one wearing an installed path.
         let mut other = protected_image();
         other.path = "/usr/bin/bash".into();
+        other.inode = 99;
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), Some(&other)),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(1000), Some(&other)),
+            PeerVerdict::Refused(Refusal::ClientNotListed)
+        );
+    }
+
+    #[test]
+    fn an_aliased_path_with_a_foreign_inode_is_refused() {
+        // `unshare -m` plus a bind mount is unprivileged: the peer's
+        // /proc/<pid>/exe then reads as an installed path while the task runs
+        // attacker code. The inode is what settles it.
+        let mut aliased = protected_image();
+        aliased.path = "/usr/bin/taskman".into();
+        aliased.device = 7;
+        aliased.inode = 8;
+        assert_eq!(
+            evaluate_peer(
+                &manifest(),
+                &installed_clients(),
+                &peer(1000),
+                Some(&aliased)
+            ),
             PeerVerdict::Refused(Refusal::ClientNotListed)
         );
     }
@@ -971,12 +1110,15 @@ mod tests {
     #[test]
     fn missing_client_image_is_refused_in_strict_mode_only() {
         assert_eq!(
-            evaluate_peer(&manifest(), &peer(1000), None),
+            evaluate_peer(&manifest(), &installed_clients(), &peer(1000), None),
             PeerVerdict::Refused(Refusal::MissingClientImage)
         );
         let mut dev = manifest();
         dev.allow_user_writable_client = true;
-        assert_eq!(evaluate_peer(&dev, &peer(1000), None), PeerVerdict::Allowed);
+        assert_eq!(
+            evaluate_peer(&dev, &installed_clients(), &peer(1000), None),
+            PeerVerdict::Allowed
+        );
     }
 
     #[test]
@@ -1043,7 +1185,11 @@ mod tests {
         assert_eq!(decoded, request);
 
         // A clean EOF between frames is not an error.
-        assert!(read_frame(&mut cursor, MAX_REQUEST_BYTES).expect("eof").is_none());
+        assert!(
+            read_frame(&mut cursor, MAX_REQUEST_BYTES)
+                .expect("eof")
+                .is_none()
+        );
 
         // A header that claims more than the limit is refused before allocating.
         let mut oversized = std::io::Cursor::new(u32::MAX.to_be_bytes().to_vec());
@@ -1058,12 +1204,15 @@ mod tests {
     fn encoding_refuses_a_body_over_the_limit() {
         let big = "x".repeat(MAX_REQUEST_BYTES);
         assert!(
-            encode_frame(&Request::Action {
-                action: ActionRequest::Service {
-                    unit: big,
-                    verb: ServiceVerb::Start
-                }
-            }, MAX_REQUEST_BYTES)
+            encode_frame(
+                &Request::Action {
+                    action: ActionRequest::Service {
+                        unit: big,
+                        verb: ServiceVerb::Start
+                    }
+                },
+                MAX_REQUEST_BYTES
+            )
             .is_err()
         );
     }
@@ -1102,6 +1251,21 @@ mod tests {
                     cycles: None,
                 }],
             }),
+            Response::FileIo(Box::new(WireFileIo {
+                files: vec![WireFileIoEntry {
+                    path: "/var/log/syslog".into(),
+                    read_bytes: Some(4096),
+                    write_bytes: None,
+                    read_ops: Some(2),
+                    write_ops: None,
+                    file_size: Some(8192),
+                    offset: Some(4096),
+                    access_known: true,
+                    is_read: true,
+                    is_write: false,
+                    open_handles: 1,
+                }],
+            })),
         ];
         for response in responses {
             let encoded = encode_frame(&response, MAX_RESPONSE_BYTES).expect("encode");
@@ -1109,6 +1273,32 @@ mod tests {
             let decoded: Response = decode_frame(body).expect("decode");
             assert_eq!(decoded, response);
         }
+    }
+
+    #[test]
+    fn requests_round_trip_with_their_identity_and_raw_state() {
+        for request in [
+            Request::ProcessConnections {
+                pid: 42,
+                start_ticks: 1234,
+            },
+            Request::ProcessFileIo {
+                pid: 42,
+                start_ticks: 1234,
+            },
+        ] {
+            let encoded = encode_frame(&request, MAX_REQUEST_BYTES).expect("encode");
+            let body = &encoded[4..];
+            let decoded: Request = decode_frame(body).expect("decode");
+            assert_eq!(decoded, request);
+        }
+
+        // An unnamed kernel state keeps its raw byte, so the brokered answer
+        // renders exactly what the direct reader would.
+        let state = WireThreadState::Other(b'P');
+        let encoded = encode_frame(&state, MAX_RESPONSE_BYTES).expect("encode");
+        let decoded: WireThreadState = decode_frame(&encoded[4..]).expect("decode");
+        assert_eq!(decoded, WireThreadState::Other(80));
     }
 
     #[test]

@@ -37,7 +37,9 @@ impl SensorSnapshot {
 
     /// Readings of one kind, lowest chip/label first.
     pub fn of_kind(&self, kind: SensorKind) -> impl Iterator<Item = &SensorReading> {
-        self.readings.iter().filter(move |reading| reading.kind == kind)
+        self.readings
+            .iter()
+            .filter(move |reading| reading.kind == kind)
     }
 
     /// The GPU NVML described for a PCI slot, matched on the normalized slot.
@@ -475,7 +477,13 @@ mod tests {
 
     #[test]
     fn sensor_stems_accept_inputs_limits_and_labels_only() {
-        for name in ["temp1_input", "fan2_input", "in0_max", "power1_crit", "temp3_label"] {
+        for name in [
+            "temp1_input",
+            "fan2_input",
+            "in0_max",
+            "power1_crit",
+            "temp3_label",
+        ] {
             assert!(sensor_stem(name).is_some(), "{name}");
         }
         for name in ["temp1_offset", "name", "uevent", "temp1_input_extra"] {
@@ -650,7 +658,8 @@ mod tests {
     #[test]
     fn pci_info_prefers_the_modern_bus_id() {
         let mut info = NvmlPciInfo::default();
-        info.bus_id_legacy[..16].copy_from_slice(b"0000:02:00.0\0\0\0");
+        // A 16-byte NUL-padded buffer: the literal is 12 bytes plus 4 NULs.
+        info.bus_id_legacy[..16].copy_from_slice(b"0000:02:00.0\0\0\0\0");
         info.bus_id[..16].copy_from_slice(b"00000000:01:00.0");
         assert_eq!(info.slot().as_deref(), Some("0000:01:00.0"));
     }
