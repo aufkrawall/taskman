@@ -27,13 +27,15 @@ mod x11_windows;
 use self::core_service::client::{self, ClientError};
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
+use crate::linux_core_bridge::{
+    client_error, connections_from_wire, module_from_wire, response_label, service_verb,
+    threads_from_wire,
+};
 use crate::linux_core_service::{
-    ActionRequest, MANIFEST_PATH, Request, Response, ServiceStatusInfo, ServiceVerb,
-    WireConnection, WireModule, WireThread, WireThreadState, WireThreads,
+    ActionRequest, MANIFEST_PATH, Request, Response, ServiceStatusInfo,
 };
 use crate::linux_telemetry;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -905,7 +907,7 @@ impl PlatformActions for LinuxActions {
         match client::request(&request) {
             // The broker runs as root, so its answer is the privileged one.
             Ok(Response::Done) => Ok(()),
-            Ok(other) => Err(unexpected_response("service control", &other)),
+            Ok(other) => Err(unexpected_response(request.label(), &other)),
             // No broker installed or answering: today's Polkit path, unchanged.
             Err(error) if error.may_fall_back() => polkit::direct_or_elevated(
                 direct,
@@ -916,7 +918,7 @@ impl PlatformActions for LinuxActions {
             ),
             // Root itself declined. A Polkit prompt would only ask the user to
             // repeat what the privileged path already refused.
-            Err(error) => Err(core_service_error("service control", &error)),
+            Err(error) => Err(client_error(request.label(), &error)),
         }
     }
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
@@ -1156,28 +1158,20 @@ impl PlatformActions for LinuxActions {
             }
             // `/proc/<pid>/maps` is readable only by the process' own user, so
             // another user's process is exactly the case the broker answers.
-            // The request carries the generation bracketed above, so the
-            // service re-checks the same process instead of a recycled pid.
             Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
-                match client::request(&Request::ProcessModules {
+                let request = Request::ProcessModules {
                     pid,
                     start_ticks: before,
-                }) {
-                    Ok(Response::Modules(wire)) => {
-                        // The service checked the generation itself; closing our
-                        // own bracket as well proves the answer still describes
-                        // the process this read asked about.
-                        ensure_process_generation(pid, before)?;
-                        Ok(wire.into_iter().map(process_module_from_wire).collect())
-                    }
-                    Ok(other) => Err(unexpected_response("process modules", &other)),
-                    // A broker that never answered leaves the direct reason in
-                    // place: it is the honest one for this token.
-                    Err(ClientError::Unavailable(_)) => Err(direct_error),
-                    // A refusal is a decision and names itself; it must never
-                    // read like the process had no modules.
-                    Err(error) => Err(core_service_error("process modules", &error)),
-                }
+                };
+                let modules = brokered_read(&request, direct_error, |response| match response {
+                    Response::Modules(wire) => Ok(wire.into_iter().map(module_from_wire).collect()),
+                    other => Err(other),
+                })?;
+                // The service re-checked the generation inside the request; our
+                // own bracket then proves the answer still describes the process
+                // this read asked about.
+                ensure_process_generation(pid, before)?;
+                Ok(modules)
             }
             Err(error) => Err(error),
         }
@@ -1195,18 +1189,16 @@ impl PlatformActions for LinuxActions {
                 Ok(threads)
             }
             Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
-                match client::request(&Request::ProcessThreads {
+                let request = Request::ProcessThreads {
                     pid,
                     start_ticks: before,
-                }) {
-                    Ok(Response::Threads(wire)) => {
-                        ensure_process_generation(pid, before)?;
-                        Ok(process_threads_from_wire(wire))
-                    }
-                    Ok(other) => Err(unexpected_response("process threads", &other)),
-                    Err(ClientError::Unavailable(_)) => Err(direct_error),
-                    Err(error) => Err(core_service_error("process threads", &error)),
-                }
+                };
+                let threads = brokered_read(&request, direct_error, |response| match response {
+                    Response::Threads(wire) => Ok(threads_from_wire(wire)),
+                    other => Err(other),
+                })?;
+                ensure_process_generation(pid, before)?;
+                Ok(threads)
             }
             Err(error) => Err(error),
         }
@@ -1220,18 +1212,28 @@ impl PlatformActions for LinuxActions {
                 Ok(connections)
             }
             Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
-                match client::request(&Request::ProcessConnections { pid }) {
-                    Ok(Response::Connections(wire)) => {
-                        // The connections request carries no creation identity,
-                        // so this bracket is what keeps a recycled pid from
-                        // inheriting another process' endpoints.
-                        ensure_process_generation(pid, before)?;
-                        Ok(connections_from_wire(wire))
-                    }
-                    Ok(other) => Err(unexpected_response("process connections", &other)),
-                    Err(ClientError::Unavailable(_)) => Err(direct_error),
-                    Err(error) => Err(core_service_error("process connections", &error)),
+                // The connection table carries no creation time, so the sampled
+                // generation travels with the request and is closed again below.
+                let request = Request::ProcessConnections {
+                    pid,
+                    start_ticks: before,
+                };
+                let mapping = brokered_read(&request, direct_error, |response| match response {
+                    Response::Connections(wire) => Ok(connections_from_wire(wire)),
+                    other => Err(other),
+                })?;
+                if !mapping.unparsable.is_empty() && broker_diagnostic_allowed() {
+                    // Dropping the row keeps the rest of the answer usable, but
+                    // a defect must not be invisible: name the endpoint.
+                    tracing::debug!(
+                        pid,
+                        dropped = mapping.unparsable.len(),
+                        first = mapping.unparsable.first().map(String::as_str),
+                        "core service answered endpoints this build cannot parse"
+                    );
                 }
+                ensure_process_generation(pid, before)?;
+                Ok(mapping.connections)
             }
             Err(error) => Err(error),
         }
@@ -1319,17 +1321,34 @@ fn brokered_action(
     };
     match client::request(&request) {
         Ok(Response::Done) => Some(Ok(())),
-        Ok(other) => Some(Err(unexpected_response("process action", &other))),
+        Ok(other) => Some(Err(unexpected_response(request.label(), &other))),
         // The broker never answered, so the caller's own path may still deliver
         // the operation the way it did before this service existed.
         Err(error) if error.may_fall_back() => None,
-        Err(error) => Some(Err(core_service_error("process action", &error))),
+        // The context is the verb that failed, not a generic label.
+        Err(error) => Some(Err(client_error(request.label(), &error))),
     }
 }
 
-/// A broker failure as a caller-visible error, keeping the service's reason.
-fn core_service_error(context: &'static str, error: &ClientError) -> tm_core::TmError {
-    tm_core::TmError::platform(context, error.to_string())
+/// Ask the broker for a per-process read the kernel refused.
+///
+/// A broker that never answered leaves the direct reason in place: it is the
+/// honest one for this token, and the broker's absence is not a measurement. A
+/// broker answer ends the decision — a refusal names itself instead of looking
+/// like an empty result.
+fn brokered_read<T>(
+    request: &Request,
+    direct_error: tm_core::TmError,
+    decode: impl FnOnce(Response) -> std::result::Result<T, Response>,
+) -> Result<T> {
+    match client::request(request) {
+        Ok(response) => match decode(response) {
+            Ok(value) => Ok(value),
+            Err(unexpected) => Err(unexpected_response(request.label(), &unexpected)),
+        },
+        Err(ClientError::Unavailable(_)) => Err(direct_error),
+        Err(error) => Err(client_error(request.label(), &error)),
+    }
 }
 
 fn unexpected_response(context: &'static str, response: &Response) -> tm_core::TmError {
@@ -1342,24 +1361,32 @@ fn unexpected_response(context: &'static str, response: &Response) -> tm_core::T
     )
 }
 
-fn response_label(response: &Response) -> &'static str {
-    match response {
-        Response::Status(_) => "status",
-        Response::Sensors(_) => "sensors",
-        Response::Modules(_) => "modules",
-        Response::Threads(_) => "threads",
-        Response::Connections(_) => "connections",
-        Response::Evidence(_) => "evidence",
-        Response::Done => "done",
-        Response::Error(_) => "error",
-    }
-}
+/// Whether a broker diagnostic may be logged now.
+///
+/// A per-process tab can ask several times per second and a defective answer
+/// repeats identically, so one line per window is enough to diagnose it without
+/// filling the log.
+fn broker_diagnostic_allowed() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const WINDOW_MS: u64 = 30_000;
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
 
-fn service_verb(action: ServiceAction) -> ServiceVerb {
-    match action {
-        ServiceAction::Start => ServiceVerb::Start,
-        ServiceAction::Stop => ServiceVerb::Stop,
-        ServiceAction::Restart => ServiceVerb::Restart,
+    let now = START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX - 1)) as u64
+        + 1;
+    let mut previous = LAST_MS.load(Ordering::Relaxed);
+    loop {
+        if previous != 0 && now.saturating_sub(previous) < WINDOW_MS {
+            return false;
+        }
+        match LAST_MS.compare_exchange_weak(previous, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => previous = actual,
+        }
     }
 }
 
@@ -1389,149 +1416,6 @@ fn core_service_state_from(
         // that is what this state offers.
         (true, None) => CoreServiceState::Stopped,
     }
-}
-
-fn process_module_from_wire(wire: WireModule) -> ProcessModule {
-    ProcessModule {
-        name: wire.name,
-        path: wire.path,
-        base_address: wire.base_address,
-        size_bytes: wire.size_bytes,
-    }
-}
-
-fn process_threads_from_wire(wire: WireThreads) -> ProcessThreads {
-    let base = wire.process_base_priority;
-    ProcessThreads {
-        process_base_priority: base,
-        threads: wire
-            .threads
-            .into_iter()
-            .map(|thread| process_thread_from_wire(thread, base))
-            .collect(),
-    }
-}
-
-fn process_thread_from_wire(wire: WireThread, process_base_priority: i32) -> ProcessThread {
-    ProcessThread {
-        tid: wire.tid,
-        // Procfs exposes no thread entry routine on either path.
-        start_address: None,
-        priority: wire.priority,
-        // The baseline is the thread's own nice value; when the service could
-        // not read one, the thread group's baseline stands in rather than a
-        // fabricated zero.
-        base_priority: wire.nice.unwrap_or(process_base_priority),
-        nice: wire.nice,
-        context_switches: wire.context_switches,
-        kernel_time_100ns: wire.kernel_time_100ns,
-        user_time_100ns: wire.user_time_100ns,
-        created_epoch_s: wire.created_epoch_s,
-        state: thread_state_from_wire(wire.state),
-        // Linux wait channels are names/addresses, not KWAIT_REASON ids.
-        wait_reason: None,
-        cycles: wire.cycles,
-    }
-}
-
-/// The same Linux state letters, mapped onto the model's vocabulary.
-///
-/// `Running` collapses onto `Runnable` because Linux' `R` covers both on-CPU and
-/// queued threads, exactly as the direct `/proc` reader maps it, so a row read
-/// through the broker renders like the same row read directly.
-fn thread_state_from_wire(state: WireThreadState) -> ThreadState {
-    match state {
-        WireThreadState::Running => ThreadState::Runnable,
-        WireThreadState::Sleeping => ThreadState::Sleeping,
-        WireThreadState::DiskSleep => ThreadState::Waiting,
-        WireThreadState::Stopped | WireThreadState::Tracing => ThreadState::Stopped,
-        WireThreadState::Zombie | WireThreadState::Dead => ThreadState::Terminated,
-        WireThreadState::Idle => ThreadState::Idle,
-        WireThreadState::Parked => ThreadState::Parked,
-        // The protocol keeps no raw state byte, so an unnamed state has no raw
-        // value to show; 0 is this variant's "unnamed", never a measured state.
-        WireThreadState::Other => ThreadState::Other(0),
-    }
-}
-
-fn connections_from_wire(wire: Vec<WireConnection>) -> Vec<ProcessConnection> {
-    wire.into_iter().filter_map(connection_from_wire).collect()
-}
-
-fn connection_from_wire(wire: WireConnection) -> Option<ProcessConnection> {
-    let protocol = match wire.protocol.as_str() {
-        "tcp" => ConnectionProtocol::Tcp,
-        "tcp6" => ConnectionProtocol::Tcp6,
-        "udp" => ConnectionProtocol::Udp,
-        "udp6" => ConnectionProtocol::Udp6,
-        // A Unix endpoint has no `SocketAddr`, which is what this model carries;
-        // the direct procfs reader lists the four IP tables only, so dropping
-        // these keeps both paths on the same vocabulary.
-        _ => return None,
-    };
-    let local = parse_socket_addr(&wire.local)?;
-    // Only TCP has a state; a datagram endpoint has none, exactly as the direct
-    // `/proc/net/udp*` walk leaves it unset.
-    let state = if matches!(protocol, ConnectionProtocol::Tcp | ConnectionProtocol::Tcp6) {
-        wire.state.as_deref().and_then(tcp_state_from_wire)
-    } else {
-        None
-    };
-    let remote = wire
-        .remote
-        .as_deref()
-        .and_then(parse_socket_addr)
-        .filter(|remote| named_remote(state, *remote));
-    Some(ProcessConnection {
-        protocol,
-        local,
-        remote,
-        state,
-    })
-}
-
-/// A peer the model can name: not a listener, not the all-zero placeholder the
-/// kernel writes into a socket that was never connected.
-fn named_remote(state: Option<TcpState>, remote: SocketAddr) -> bool {
-    state != Some(TcpState::Listen) && remote.port() != 0 && !remote.ip().is_unspecified()
-}
-
-/// Parse one endpoint the broker wrote as a string.
-///
-/// `SocketAddr`'s own grammar (`1.2.3.4:80`, `[::1]:80`) is tried first; an
-/// unbracketed IPv6 pair (`::1:80`) is accepted too, because a formatter that
-/// prints address and port separately produces exactly that.
-fn parse_socket_addr(text: &str) -> Option<SocketAddr> {
-    if let Ok(addr) = text.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    let (address, port) = text.rsplit_once(':')?;
-    let ip = address.parse::<std::net::IpAddr>().ok()?;
-    Some(SocketAddr::new(ip, port.parse().ok()?))
-}
-
-/// Map the broker's state name onto the model's vocabulary.
-///
-/// The wire spells enum variants in kebab-case, which is what `TcpState`'s own
-/// names become; an unknown name is not guessed at, because a row can show its
-/// endpoint without inventing a state for it.
-fn tcp_state_from_wire(name: &str) -> Option<TcpState> {
-    let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
-    Some(match normalized.as_str() {
-        "closed" => TcpState::Closed,
-        "listen" | "listening" => TcpState::Listen,
-        "syn-sent" => TcpState::SynSent,
-        "syn-received" | "syn-recv" => TcpState::SynReceived,
-        "established" => TcpState::Established,
-        "fin-wait-1" => TcpState::FinWait1,
-        "fin-wait-2" => TcpState::FinWait2,
-        "close-wait" => TcpState::CloseWait,
-        "closing" => TcpState::Closing,
-        "last-ack" => TcpState::LastAck,
-        "time-wait" => TcpState::TimeWait,
-        "delete-tcb" => TcpState::DeleteTcb,
-        _ => return None,
-    })
 }
 
 fn set_priority_direct(
@@ -2194,14 +2078,14 @@ mod tests {
     }
 
     #[test]
-    fn a_broker_refusal_keeps_its_own_reason_in_the_error() {
+    fn a_broker_refusal_names_the_operation_that_failed() {
         let refused = ClientError::Refused {
             code: crate::linux_core_service::Refusal::Rejected,
             detail: "creation identity changed".into(),
         };
         assert!(!refused.may_fall_back());
-        let message = core_service_error("terminate process", &refused).to_string();
-        assert!(message.contains("terminate process"), "{message}");
+        let message = client_error("kill", &refused).to_string();
+        assert!(message.contains("kill"), "{message}");
         assert!(message.contains("rejected"), "{message}");
         assert!(
             message.contains("creation identity changed"),
@@ -2210,7 +2094,7 @@ mod tests {
 
         let unavailable = ClientError::Unavailable("connect: No such file or directory".into());
         assert!(unavailable.may_fall_back());
-        let message = core_service_error("process modules", &unavailable).to_string();
+        let message = client_error("process-modules", &unavailable).to_string();
         assert!(message.contains("unavailable"), "{message}");
     }
 
@@ -2236,165 +2120,5 @@ mod tests {
             CoreServiceState::Unsupported,
             "every Linux build carries this client"
         );
-    }
-
-    #[test]
-    fn brokered_threads_keep_their_evidence_and_fill_a_missing_baseline() {
-        let threads = process_threads_from_wire(WireThreads {
-            process_base_priority: 5,
-            threads: vec![
-                WireThread {
-                    tid: 41,
-                    priority: 20,
-                    nice: Some(-5),
-                    context_switches: Some(9),
-                    kernel_time_100ns: 11,
-                    user_time_100ns: 12,
-                    created_epoch_s: Some(1_700_000_123),
-                    state: WireThreadState::Running,
-                    cycles: Some(13),
-                },
-                WireThread {
-                    tid: 42,
-                    priority: 25,
-                    nice: None,
-                    context_switches: None,
-                    kernel_time_100ns: 0,
-                    user_time_100ns: 0,
-                    created_epoch_s: None,
-                    state: WireThreadState::DiskSleep,
-                    cycles: None,
-                },
-            ],
-        });
-        assert_eq!(threads.process_base_priority, 5);
-        let first = &threads.threads[0];
-        assert_eq!(first.tid, 41);
-        assert_eq!(first.state, ThreadState::Runnable);
-        assert_eq!(first.base_priority, -5);
-        assert_eq!(first.nice, Some(-5));
-        assert_eq!(first.context_switches, Some(9));
-        assert_eq!(first.cycles, Some(13));
-        assert_eq!(first.created_epoch_s, Some(1_700_000_123));
-        let second = &threads.threads[1];
-        assert_eq!(
-            second.base_priority, 5,
-            "the thread group's baseline stands in for a missing nice value"
-        );
-        assert_eq!(second.nice, None);
-        assert_eq!(second.state, ThreadState::Waiting);
-        assert_eq!(
-            second.context_switches, None,
-            "an unavailable switch count must not become zero"
-        );
-        assert_eq!(second.cycles, None);
-    }
-
-    #[test]
-    fn linux_state_letters_survive_the_broker_round_trip() {
-        for (wire, expected) in [
-            // Linux 'R' covers both on-CPU and queued threads.
-            (WireThreadState::Running, ThreadState::Runnable),
-            (WireThreadState::Sleeping, ThreadState::Sleeping),
-            (WireThreadState::DiskSleep, ThreadState::Waiting),
-            (WireThreadState::Stopped, ThreadState::Stopped),
-            (WireThreadState::Tracing, ThreadState::Stopped),
-            (WireThreadState::Zombie, ThreadState::Terminated),
-            (WireThreadState::Dead, ThreadState::Terminated),
-            (WireThreadState::Idle, ThreadState::Idle),
-            (WireThreadState::Parked, ThreadState::Parked),
-        ] {
-            assert_eq!(thread_state_from_wire(wire), expected, "{wire:?}");
-        }
-    }
-
-    #[test]
-    fn brokered_connections_keep_only_what_the_model_can_name() {
-        let connections = connections_from_wire(vec![
-            WireConnection {
-                protocol: "tcp".into(),
-                local: "127.0.0.1:8080".into(),
-                remote: Some("10.0.0.2:443".into()),
-                state: Some("established".into()),
-            },
-            WireConnection {
-                protocol: "tcp".into(),
-                local: "0.0.0.0:22".into(),
-                // The kernel's all-zero placeholder is not a peer.
-                remote: Some("0.0.0.0:0".into()),
-                state: Some("listen".into()),
-            },
-            WireConnection {
-                protocol: "tcp6".into(),
-                local: "[::1]:9100".into(),
-                remote: None,
-                state: Some("time_wait".into()),
-            },
-            WireConnection {
-                protocol: "udp".into(),
-                local: "0.0.0.0:53".into(),
-                remote: None,
-                state: None,
-            },
-            // A Unix endpoint has no `SocketAddr` in this model.
-            WireConnection {
-                protocol: "unix".into(),
-                local: "/run/user/1000/bus".into(),
-                remote: None,
-                state: None,
-            },
-            // An address the row cannot name is dropped, not guessed at.
-            WireConnection {
-                protocol: "tcp".into(),
-                local: "not an address".into(),
-                remote: None,
-                state: Some("listen".into()),
-            },
-        ]);
-        assert_eq!(connections.len(), 4);
-        assert_eq!(connections[0].state, Some(TcpState::Established));
-        assert_eq!(
-            connections[0].remote,
-            Some("10.0.0.2:443".parse().expect("peer"))
-        );
-        assert_eq!(connections[1].remote, None, "a listener has no peer");
-        assert_eq!(connections[2].protocol, ConnectionProtocol::Tcp6);
-        assert_eq!(connections[2].state, Some(TcpState::TimeWait));
-        assert_eq!(connections[3].protocol, ConnectionProtocol::Udp);
-        assert_eq!(
-            connections[3].state, None,
-            "a datagram endpoint has no state"
-        );
-    }
-
-    #[test]
-    fn tcp_state_names_are_read_in_the_wire_spelling() {
-        assert_eq!(tcp_state_from_wire("Listen"), Some(TcpState::Listen));
-        assert_eq!(tcp_state_from_wire("syn_sent"), Some(TcpState::SynSent));
-        assert_eq!(tcp_state_from_wire("close-wait"), Some(TcpState::CloseWait));
-        assert_eq!(
-            tcp_state_from_wire("something-new"),
-            None,
-            "an unknown name must not be guessed at"
-        );
-        assert_eq!(tcp_state_from_wire(""), None);
-    }
-
-    #[test]
-    fn endpoints_are_parsed_in_every_address_form_the_wire_can_carry() {
-        assert_eq!(
-            parse_socket_addr("127.0.0.1:80"),
-            Some("127.0.0.1:80".parse().expect("ipv4 endpoint"))
-        );
-        assert_eq!(
-            parse_socket_addr("[::1]:80"),
-            Some("[::1]:80".parse().expect("bracketed endpoint"))
-        );
-        assert_eq!(
-            parse_socket_addr("::1:80"),
-            Some("[::1]:80".parse().expect("unbracketed endpoint"))
-        );
-        assert_eq!(parse_socket_addr("127.0.0.1"), None);
-        assert_eq!(parse_socket_addr(""), None);
     }
 }

@@ -8,6 +8,10 @@
 //!
 //! ## What an error means
 //!
+//! [`ClientError`] itself lives in [`crate::linux_core_bridge`], together with
+//! the refusal-to-error mapping, because those decisions are the same on every
+//! host and their tests run in the ordinary gate. This file only produces them.
+//!
 //! [`ClientError`] keeps three cases apart because the caller's next step
 //! depends on them:
 //!
@@ -51,9 +55,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::linux_core_service::{
-    CLIENT_DEADLINE_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Refusal, Request,
-    RequestEnvelope, Response, ResponseEnvelope, SOCKET_PATH, ServiceFailure, ServiceStatusInfo,
-    decode_frame, encode_frame, read_frame,
+    CLIENT_DEADLINE_MS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Request,
+    RequestEnvelope, Response, ResponseEnvelope, SOCKET_PATH, ServiceStatusInfo, decode_frame,
+    encode_frame, read_frame,
 };
 
 /// Hard ceiling for one request, connect included. Sampling must never park on
@@ -70,55 +74,9 @@ const UNAVAILABLE_COOLDOWN: Duration = Duration::from_secs(4);
 /// per-frame caller into a per-frame connect.
 const STATUS_TTL: Duration = Duration::from_secs(10);
 
-/// Why a request did not produce a response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientError {
-    /// No broker is reachable (not installed, not running, socket missing).
-    /// Callers may try their own token.
-    Unavailable(String),
-    /// The broker answered and refused. Callers must NOT fall back.
-    Refused { code: Refusal, detail: String },
-    /// The broker answered with a failure of a well-formed request.
-    Failed(String),
-}
-
-impl ClientError {
-    /// Whether a caller may still attempt the operation under its own token.
-    ///
-    /// Only a broker that never answered leaves the operation open: any answer,
-    /// even "I cannot do that", is evidence about this install that a second
-    /// privileged path must not paper over.
-    pub fn may_fall_back(&self) -> bool {
-        matches!(self, Self::Unavailable(_))
-    }
-
-    /// The broker's own wire code, when it answered with a refusal.
-    pub fn refusal(&self) -> Option<Refusal> {
-        match self {
-            Self::Refused { code, .. } => Some(*code),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unavailable(detail) => write!(formatter, "core service unavailable: {detail}"),
-            Self::Refused { code, detail } => write!(
-                formatter,
-                "core service refused the request ({}): {detail}",
-                code.as_str()
-            ),
-            Self::Failed(detail) => {
-                write!(
-                    formatter,
-                    "core service could not complete the request: {detail}"
-                )
-            }
-        }
-    }
-}
+/// The broker client's error type, defined once in the neutral bridge so its
+/// decisions and their tests are not Linux-only.
+pub use crate::linux_core_bridge::ClientError;
 
 /// The one connection, held across an exchange.
 struct Connection {
@@ -306,7 +264,11 @@ fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, 
         )));
     }
     match envelope.response {
-        Response::Error(failure) => Err(failure_to_error(failure)),
+        // The refusal-to-error split is a decision table, so it lives in the
+        // neutral bridge where the ordinary gate tests it.
+        Response::Error(failure) => Err(crate::linux_core_bridge::service_failure_to_client_error(
+            failure,
+        )),
         response => Ok(response),
     }
 }
@@ -436,119 +398,12 @@ fn transact(socket: &UnixStream, request: &Request, deadline: Instant) -> io::Re
     })
 }
 
-/// Map one broker refusal onto [`ClientError`].
-///
-/// The split is decided by one question: did the service make a decision about
-/// the caller or the target, or did it merely fail to carry the request out?
-///
-/// - `unsupported`, `busy` and `failed` mean nothing was decided: the operation
-///   is not implemented, no worker was free, or the action ran into its own OS
-///   error. They are reported as a failure with the service's own reason.
-/// - everything else is a decision — an unauthorized or unprotected client, a
-///   swapped protocol, a malformed request, an action the service rejects, a
-///   target whose creation identity no longer matches. Those are
-///   [`ClientError::Refused`], which a caller must never work around.
-fn failure_to_error(failure: ServiceFailure) -> ClientError {
-    let ServiceFailure { code, detail } = failure;
-    match code {
-        // The detail of a `failed` action already carries the OS error; naming
-        // the code again would only repeat "failed: failed".
-        Refusal::Failed => ClientError::Failed(detail),
-        Refusal::Unsupported | Refusal::Busy => {
-            ClientError::Failed(format!("{}: {detail}", code.as_str()))
-        }
-        code => ClientError::Refused { code, detail },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn failure(code: Refusal, detail: &str) -> ServiceFailure {
-        ServiceFailure {
-            code,
-            detail: detail.into(),
-        }
-    }
-
-    #[test]
-    fn only_a_lost_answer_leaves_the_operation_open() {
-        assert!(ClientError::Unavailable("no socket".into()).may_fall_back());
-        for code in [
-            Refusal::UnauthorizedUser,
-            Refusal::MissingClientImage,
-            Refusal::ClientNotListed,
-            Refusal::UnprotectedClient,
-            Refusal::ProtocolMismatch,
-            Refusal::MalformedRequest,
-            Refusal::Unsupported,
-            Refusal::NotFound,
-            Refusal::Rejected,
-            Refusal::Busy,
-            Refusal::Failed,
-        ] {
-            let error = failure_to_error(failure(code, "detail"));
-            assert!(
-                !error.may_fall_back(),
-                "{} must never fall back",
-                code.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn authorization_answers_are_decisions_about_the_caller() {
-        for code in [
-            Refusal::UnauthorizedUser,
-            Refusal::MissingClientImage,
-            Refusal::ClientNotListed,
-            Refusal::UnprotectedClient,
-            Refusal::ProtocolMismatch,
-            Refusal::MalformedRequest,
-        ] {
-            let error = failure_to_error(failure(code, "because"));
-            assert_eq!(error.refusal(), Some(code));
-            assert!(matches!(error, ClientError::Refused { .. }), "{code:?}");
-        }
-    }
-
-    #[test]
-    fn action_answers_stay_decisions_and_keep_their_reason() {
-        for code in [Refusal::Rejected, Refusal::NotFound] {
-            let error = failure_to_error(failure(code, "identity changed"));
-            assert_eq!(error.refusal(), Some(code));
-            let message = error.to_string();
-            assert!(message.contains(code.as_str()), "{message}");
-            assert!(message.contains("identity changed"), "{message}");
-        }
-    }
-
-    #[test]
-    fn a_broker_that_could_not_do_it_is_not_a_decision() {
-        let unsupported = failure_to_error(failure(Refusal::Unsupported, "no such operation"));
-        assert!(matches!(unsupported, ClientError::Failed(_)));
-        assert!(
-            unsupported.to_string().contains("unsupported operation"),
-            "{unsupported}"
-        );
-        assert!(
-            unsupported.to_string().contains("no such operation"),
-            "{unsupported}"
-        );
-
-        let busy = failure_to_error(failure(Refusal::Busy, "worker pool full"));
-        assert!(
-            busy.to_string().contains("busy: worker pool full"),
-            "{busy}"
-        );
-
-        // The action's own OS error is reported verbatim instead of being
-        // dressed up as a code.
-        let failed = failure_to_error(failure(Refusal::Failed, "EPERM: not permitted"));
-        assert_eq!(failed, ClientError::Failed("EPERM: not permitted".into()));
-        assert!(failed.to_string().contains("EPERM"), "{failed}");
-    }
+    // The refusal-to-error split, `may_fall_back` and the failure wording are
+    // covered by `crate::linux_core_bridge`'s tests, which run on every host.
 
     #[test]
     fn an_oversized_or_invalid_request_is_refused_before_anything_is_sent() {
