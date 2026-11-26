@@ -28,8 +28,8 @@ use self::core_service::client::{self, ClientError};
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
 use crate::linux_core_bridge::{
-    client_error, connections_from_wire, core_service_state, file_io_from_wire, module_from_wire,
-    response_label, service_verb, threads_from_wire,
+    StatusProbe, client_error, connections_from_wire, core_service_state, file_io_from_wire,
+    merge_file_io, module_from_wire, response_label, service_verb, threads_from_wire,
 };
 use crate::linux_core_service::{ActionRequest, MANIFEST_PATH, Request, Response};
 use crate::linux_telemetry;
@@ -1134,15 +1134,13 @@ impl PlatformActions for LinuxActions {
         // render path it is called from.
         let installed = manifest_installed();
         // A manifest-less machine has nothing to ask, so the probe is skipped
-        // entirely and the reason travels with the state.
-        let status = if installed {
+        // entirely; the manifest alone already decides the state.
+        let probe = if installed {
             client::status()
         } else {
-            Err(ClientError::Unavailable(
-                "the core service is not installed".into(),
-            ))
+            StatusProbe::Pending
         };
-        core_service_state(installed, status)
+        core_service_state(installed, probe)
     }
 
     fn open_file_location(&self, path: &str) -> Result<()> {
@@ -1275,17 +1273,16 @@ impl PlatformActions for LinuxActions {
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
         let before = process_start_for_read(pid, expected_start_epoch_s)?;
         let direct = process_io::list_process_file_io(pid, Some(before));
-        // There are two ways the direct walk is useless for another user's
-        // process: `/proc/<pid>/fd` is owner-only and comes back as an empty,
-        // incomplete snapshot, or another step fails outright with EPERM. Both
-        // are the case the broker exists for; a snapshot that saw handles is a
-        // real answer and never pays a round trip.
-        let escalate = match &direct {
-            Ok(snapshot) => !snapshot.accounting.handles_complete && snapshot.files.is_empty(),
+        // Only a REFUSED descriptor table is the broker's case. A partial walk —
+        // one uninspectable entry, or the budget running out — is a cutoff no
+        // other identity would improve on, so asking would cost a round trip per
+        // poll and could only replace counters we already have with unknown.
+        let refused = match &direct {
+            Ok(read) => read.coverage == process_io::HandleCoverage::Refused,
             Err(error) => polkit::is_permission_denied(error),
         };
-        if !escalate {
-            return direct;
+        if !refused {
+            return direct.map(|read| read.snapshot);
         }
         let request = Request::ProcessFileIo {
             pid,
@@ -1299,12 +1296,17 @@ impl PlatformActions for LinuxActions {
             Err(error) => return Err(client_error(request.label(), &error)),
         };
         let Some(snapshot) = brokered else {
-            return direct;
+            return direct.map(|read| read.snapshot);
         };
         // The request pins the sampled generation, and closing our own bracket
         // as well proves the answer still describes the process asked about.
         ensure_process_generation(pid, before)?;
-        Ok(snapshot)
+        // The wire carries files but not `/proc/<pid>/io` totals, so the numbers
+        // the direct read already had are kept instead of blanked.
+        Ok(match direct {
+            Ok(read) => merge_file_io(snapshot, &read.snapshot),
+            Err(_) => snapshot,
+        })
     }
 }
 
