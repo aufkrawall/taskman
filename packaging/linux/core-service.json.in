@@ -1,0 +1,10 @@
+{
+  "protocol": @PROTOCOL@,
+  "authorized_uids": [@UIDS@],
+  "clients": [@CLIENTS@],
+  "allow_user_writable_client": @ALLOW_USER_WRITABLE@,
+  "socket": "@SOCKET@",
+  "sensor_cache_ms": @SENSOR_CACHE_MS@,
+  "installed_unix_s": @INSTALLED_UNIX_S@,
+  "note": "@NOTE@"
+}
