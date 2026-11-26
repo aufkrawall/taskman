@@ -1704,9 +1704,9 @@ mod tests {
                             .expect("rendered frame");
                         assert_eq!((pw, ph), (w, h), "presented size must be the placed size");
                         let pixels = renderer.surface.as_ref().unwrap().pixels();
-                        let click_through = pixels
-                            .chunks_exact(4)
-                            .position(|p| p[3] == 0)
+                        let texels = (w as usize) * (h as usize);
+                        let click_through = (0..texels)
+                            .find(|i| pixels[i * 4 + 3] == 0)
                             .map(|i| (i % w as usize, i / w as usize));
                         assert_eq!(
                             click_through, None,
