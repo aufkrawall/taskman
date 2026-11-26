@@ -50,6 +50,15 @@ readonly PROTOCOL_VERSION=1
 readonly SOCKET_PATH=/run/taskman/core.sock
 readonly SENSOR_CACHE_MS=500
 
+# Largest uid a manifest can carry (u32). Checked here because a shorter read
+# of "4294967296" would authorize a different account entirely.
+readonly MAX_UID=4294967295
+
+# Every tool below is invoked by bare name while this script runs as root, and
+# both a sudo environment and pacman's scriptlet environment can carry a PATH an
+# unprivileged user prepared. Search the system set instead.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
 ROOT=
 SOURCE_DIR=
 TARGET_USER=
@@ -68,6 +77,9 @@ MODE_LABEL=install
 CAN_CHOWN=0
 RESOLVED_UID=
 RESOLVED_USER_NAME=
+# Set when the installed manifest is not one this installer wrote and has to be
+# replaced: the old file is kept as <manifest>.bak before the new one lands.
+MANIFEST_NEEDS_BACKUP=0
 
 # Every uid the manifest will authorize, in the order they were found: an
 # existing manifest's list first, then the user of this run.
@@ -383,25 +395,50 @@ add_client() {
   CLIENT_PATHS+=("$path")
 }
 
-# Read the uids an existing manifest authorizes. Returns 1 when the file exists
-# but holds no parsable authorized_uids list, which means it is not a manifest
-# this installer wrote and must not be silently extended.
+# Read the uids an existing manifest authorizes.
+#
+# Returns 0 when the file is absent (nothing to merge), 0 with the parsed uids
+# appended to AUTHORIZED_UIDS when it holds a readable list, and 1 when the file
+# exists but is not a manifest this installer may extend.
+#
+# The array body is read as text between the brackets rather than as a
+# single-line match, so a hand-formatted multi-line list is understood. Every
+# entry must be a plain decimal uid in 1..=4294967295: a truncated read of
+# "4294967296" would authorize a different account, and a value the service's
+# Vec<u32> rejects would leave an install that claims success and a broker that
+# refuses to start.
 read_manifest_uids() {
-  local file=$1 array numbers number
+  local file=$1 text rest body token
   local -a found=()
   if [ ! -f "$file" ]; then
     return 0
   fi
-  array=$(grep -oE '"authorized_uids"[[:space:]]*:[[:space:]]*\[[^]]*\]' -- "$file" || true)
-  if [ -z "$array" ]; then
-    return 1
-  fi
-  numbers=$(printf '%s\n' "$array" | grep -oE '[0-9]+' || true)
-  if [ -n "$numbers" ]; then
-    read -r -a found <<<"$numbers"
-  fi
-  for number in "${found[@]}"; do
-    add_uid "$number"
+  text=$(<"$file")
+  case $text in
+    *'"authorized_uids"'*) ;;
+    *) return 1 ;;
+  esac
+  rest=${text#*'"authorized_uids"'}
+  case $rest in
+    *'['*) ;;
+    *) return 1 ;;
+  esac
+  body=${rest#*'['}
+  case $body in
+    *']'*) ;;
+    *) return 1 ;;
+  esac
+  body=${body%%']'*}
+  body=${body//[$'\r\n\t']/ }
+  IFS=', ' read -r -a found <<<"$body"
+  for token in "${found[@]}"; do
+    case $token in
+      '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ "${#token}" -gt 10 ] || [ "$token" -gt "$MAX_UID" ] || [ "$token" -eq 0 ]; then
+      return 1
+    fi
+    add_uid "$token"
   done
   return 0
 }
@@ -442,15 +479,43 @@ render_manifest() {
   printf '%s\n' "$text" >"$out"
 }
 
+# The rendered manifest is the authorization policy, and the service refuses to
+# start on a file it cannot parse. Parsing it here turns "the broker silently
+# never comes up" into an install that fails in the terminal, and it also
+# catches a client path that would have broken the JSON string.
+validate_manifest_json() {
+  local file=$1
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "python3 not installed: the rendered manifest is not JSON-checked"
+    return 0
+  fi
+  if ! python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$file"; then
+    die "$file is not valid JSON: the manifest template or a client path is broken"
+  fi
+}
+
 # Write the manifest atomically. A partly written policy file would make the
 # broker refuse to start (it validates the manifest before listening), so the
 # final rename is what makes a crash mid-install harmless.
+#
+# This is the only place the manifest is written, and it runs after the
+# directory has been created and refused as a symlink: a root-owned write must
+# never follow a link an ordinary user could have planted.
 install_manifest() {
-  local dest=$ROOT$CONF_DIR/$MANIFEST_NAME staged
+  local dest=$ROOT$CONF_DIR/$MANIFEST_NAME staged stale_merge
   ensure_dir "$ROOT$CONF_DIR" 0755
+  if [ "$MANIFEST_NEEDS_BACKUP" -eq 1 ]; then
+    if [ "$CAN_CHOWN" -eq 1 ]; then
+      install -o 0 -g 0 -m 0600 -- "$dest" "$dest.bak"
+    else
+      install -m 0600 -- "$dest" "$dest.bak"
+    fi
+    log "kept the previous policy as $dest.bak"
+  fi
   staged=$(mktemp -- "$ROOT$CONF_DIR/.$MANIFEST_NAME.XXXXXX")
   TEMP_FILES+=("$staged")
   render_manifest "$staged"
+  validate_manifest_json "$staged"
   chmod 0644 -- "$staged"
   if [ "$CAN_CHOWN" -eq 1 ]; then
     chown 0:0 -- "$staged"
@@ -460,6 +525,14 @@ install_manifest() {
     rm -f -- "$dest"
   fi
   mv -f -- "$staged" "$dest"
+  # pacman keeps the packaged placeholder as .pacnew when the live file differs.
+  # This run just generated the policy that file was meant to be merged into, so
+  # leaving a second, unconfigured copy behind would only hide the real state.
+  stale_merge=$dest.pacnew
+  if [ -e "$stale_merge" ]; then
+    rm -f -- "$stale_merge"
+    log "removed the superseded placeholder $stale_merge"
+  fi
   log "manifest written: $dest"
 }
 
@@ -523,6 +596,24 @@ verify_protected() {
   fi
 }
 
+# Every file this script installs has to be next to it. Checking them up front
+# keeps a truncated payload (a hand-copied binary set, an archive that lost a
+# file) from failing halfway through an install, and it is what makes a payload
+# without the desktop/unit files a clear refusal instead of a stray install.
+validate_packaging_files() {
+  local name
+  for name in \
+    "$UNIT_NAME" \
+    "$MANIFEST_NAME.in" \
+    "$DESKTOP_ID.desktop" \
+    "$DESKTOP_ID.svg" \
+    "$DESKTOP_ID.metainfo.xml"; do
+    if [ ! -f "$SCRIPT_DIR/$name" ]; then
+      die "missing packaging file: $SCRIPT_DIR/$name (this payload is incomplete and cannot be installed)"
+    fi
+  done
+}
+
 stage_files() {
   ensure_dir "$ROOT$BIN_DIR" 0755
   ensure_dir "$ROOT$LIB_DIR" 0755
@@ -532,8 +623,12 @@ stage_files() {
   ensure_dir "$ROOT$ICON_DIR" 0755
   ensure_dir "$ROOT$METAINFO_DIR" 0755
 
-  install_owned "$GUI_SOURCE" "$ROOT$BIN_DIR/$GUI_BINARY" 0755
+  # The service image goes first and is verified before any user-visible path is
+  # touched: a failed install must not leave a new GUI talking to an old broker.
   install_owned "$SERVICE_SOURCE" "$ROOT$LIB_DIR/$SERVICE_BINARY" 0755
+  verify_protected "$ROOT$LIB_DIR/$SERVICE_BINARY" "the service image" 755
+
+  install_owned "$GUI_SOURCE" "$ROOT$BIN_DIR/$GUI_BINARY" 0755
   install_owned "$SCRIPT_PATH" "$ROOT$LIB_DIR/install-linux.sh" 0755
   install_owned "$TEMPLATE" "$ROOT$LIB_DIR/$MANIFEST_NAME.in" 0644
   install_owned "$UNIT_SOURCE" "$ROOT$UNIT_DIR/$UNIT_NAME" 0644
@@ -556,6 +651,8 @@ owned_files() {
     "$ROOT$ICON_DIR/$DESKTOP_ID.svg"
     "$ROOT$METAINFO_DIR/$DESKTOP_ID.metainfo.xml"
     "$ROOT$CONF_DIR/$MANIFEST_NAME"
+    "$ROOT$CONF_DIR/$MANIFEST_NAME.bak"
+    "$ROOT$CONF_DIR/$MANIFEST_NAME.pacnew"
   )
 }
 
@@ -598,6 +695,12 @@ enable_and_start() {
   if ! systemctl enable -- "$UNIT_NAME"; then
     warn "systemctl enable $UNIT_NAME failed"
   fi
+  # A unit that crash-looped before (bad manifest, missing image) keeps a
+  # "failed" start-limit state that swallows the next start, so a reinstall
+  # would look successful while the broker stayed down.
+  if ! systemctl reset-failed -- "$UNIT_NAME"; then
+    log "systemctl reset-failed $UNIT_NAME had no failed state to clear"
+  fi
   # `restart` starts a stopped unit too, and a reinstall must make the running
   # broker read the manifest this run just wrote.
   if ! systemctl restart -- "$UNIT_NAME"; then
@@ -618,17 +721,18 @@ report_service_state() {
   fi
 }
 
+# Decide the policy the manifest will carry. Read-only on purpose: it runs
+# before the first file is written, so a refusal here cannot leave anything
+# behind, and the backup of a foreign manifest is taken by install_manifest once
+# the manifest directory itself has been refused as a symlink.
 collect_manifest_policy() {
   local manifest=$ROOT$CONF_DIR/$MANIFEST_NAME previous
   AUTHORIZED_UIDS=()
   CLIENT_PATHS=()
+  MANIFEST_NEEDS_BACKUP=0
   if ! read_manifest_uids "$manifest"; then
-    warn "the existing $manifest is not a manifest this installer wrote; replacing it and keeping a copy as $manifest.bak"
-    if [ "$CAN_CHOWN" -eq 1 ]; then
-      install -o 0 -g 0 -m 0600 -- "$manifest" "$manifest.bak"
-    else
-      install -m 0600 -- "$manifest" "$manifest.bak"
-    fi
+    MANIFEST_NEEDS_BACKUP=1
+    warn "the existing $manifest is not a manifest this installer can extend (foreign or unreadable authorized_uids); it will be replaced and kept as $manifest.bak"
     AUTHORIZED_UIDS=()
   else
     previous=$(printf '%s ' "${AUTHORIZED_UIDS[@]}")
@@ -668,6 +772,7 @@ do_install() {
   resolve_self
   resolve_source_dir "${SOURCE_DIR:-}"
   validate_sources
+  validate_packaging_files
   validate_unit
   if [ -z "$ROOT" ]; then
     require_root
@@ -686,7 +791,6 @@ do_install() {
   fi
   log "installing $headline"
   stage_files
-  verify_protected "$ROOT$LIB_DIR/$SERVICE_BINARY" "the service image" 755
   install_manifest
   verify_protected "$ROOT$CONF_DIR/$MANIFEST_NAME" "the manifest" 644
 
@@ -701,8 +805,12 @@ do_install() {
   fi
 }
 
+# --post-install is the pacman scriptlet. It must never fail the transaction for
+# a documented manual step, so the "nobody to authorize" case is a loud warning
+# plus an enabled unit instead of a die: the broker cannot start without a uid,
+# but the operator's next command is a one-liner we print.
 do_post_install() {
-  local keep_existing=0
+  local keep_existing=0 unconfigured=0
   resolve_self
   if [ -n "$ROOT" ]; then
     die "--post-install runs on the installed system and does not take --root"
@@ -716,22 +824,37 @@ do_post_install() {
     resolve_user
   elif read_manifest_uids "$CONF_DIR/$MANIFEST_NAME" && [ "${#AUTHORIZED_UIDS[@]}" -gt 0 ]; then
     # A root login ran pacman: the package just replaced the manifest with its
-    # unconfigured placeholder, so silently regenerating it would turn a working
-    # broker into a dead one. Keep what is authorized and say how to change it.
+    # unconfigured placeholder, so regenerating it would turn a working broker
+    # into a dead one. Keep what is authorized and say how to change it.
     keep_existing=1
     warn "no invoking user to authorize; keeping the manifest's uid(s) ${AUTHORIZED_UIDS[*]} - run '$LIB_DIR/install-linux.sh --user <name>' to change them"
   else
-    die "cannot tell which user may use the broker: run '$LIB_DIR/install-linux.sh --user <name>'"
+    unconfigured=1
   fi
-  if [ "$keep_existing" -eq 0 ]; then
+  if [ "$unconfigured" -eq 1 ]; then
+    warn "no invoking user could be determined and $CONF_DIR/$MANIFEST_NAME authorizes nobody yet"
+    warn "the core service is enabled but will not start until you name its user:"
+    warn "  $LIB_DIR/install-linux.sh --user <name>"
+  elif [ "$keep_existing" -eq 0 ]; then
     collect_manifest_policy
     install_manifest
     verify_protected "$CONF_DIR/$MANIFEST_NAME" "the manifest" 644
   fi
   reload_units
-  enable_and_start
+  if [ "$unconfigured" -eq 1 ]; then
+    # Enabling only: starting a broker whose manifest lists no uid would burn
+    # the unit's start limit and report a failure the package did not cause.
+    if ! systemctl enable -- "$UNIT_NAME"; then
+      warn "systemctl enable $UNIT_NAME failed"
+    fi
+  else
+    enable_and_start
+  fi
   refresh_caches
-  report_service_state
+  if [ "$unconfigured" -eq 0 ]; then
+    report_service_state
+  fi
+  return 0
 }
 
 do_uninstall() {

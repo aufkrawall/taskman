@@ -11,6 +11,11 @@
 
 set -euo pipefail
 
+# Same reasoning as install-linux.sh: `readlink` and `bash` are resolved by name
+# while this runs as root, so search the system set instead of whatever PATH a
+# sudo or scriptlet environment carried.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
 self=$(readlink -f -- "${BASH_SOURCE[0]}")
 here=${self%/*}
 if [ -z "$here" ]; then
