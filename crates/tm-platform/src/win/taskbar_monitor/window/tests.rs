@@ -1242,7 +1242,7 @@ fn occlusion_result_rejects_unverified_band1_occluder_when_tray_missing_from_enu
 }
 
 #[test]
-fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
+fn core_geometry_change_remeasures_layout_and_refills_the_bar_after_pending_uia_wait() {
     let _zorder = z_order_test_lock();
     let _com = ComMtaGuard::enter();
     let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
@@ -1338,8 +1338,13 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
         taskbar_rect: grown_bar,
         ..env
     };
+    ctx.last_cross_mismatch = Some(std::time::Instant::now());
     ctx.refresh_taskbar_env(&config, &metrics, grown_env, true);
     assert!(!ctx.is_visible());
+    assert!(
+        ctx.last_cross_mismatch.is_none(),
+        "a taskbar geometry change must clear the refused-box rate limit"
+    );
 
     // Once UIA finishes scanning the grown taskbar and triggers `refresh(false)`,
     // `ctx` must remeasure and rerender for the new 48 px taskbar bounds rather
@@ -1373,7 +1378,7 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
 }
 
 #[test]
-fn fit_target_rect_hides_a_box_that_does_not_fill_the_bar() {
+fn fit_target_rect_refuses_a_box_that_does_not_fill_the_bar() {
     // Pure geometry: no window is needed, only a `WindowCtx` to hold the
     // diagnostic rate limit.
     let mut ctx = test_window_ctx(HWND::default(), false);
@@ -1381,35 +1386,59 @@ fn fit_target_rect_hides_a_box_that_does_not_fill_the_bar() {
 
     // A box that fills the bar's cross axis is placed unchanged, silently.
     let full = rect(-9_400, -10_000, -9_240, -9_952);
-    assert_eq!(ctx.fit_target_rect(full, bar), Some(full));
+    assert_eq!(ctx.fit_target_rect(full, bar), Ok(full));
     assert!(ctx.last_cross_mismatch.is_none());
 
     // The defect itself: a box a few pixels short leaves a strip of taskbar
-    // that takes the click, so it is hidden rather than presented short, and
-    // the dead band is diagnosed once per rate-limit window.
+    // that takes the click, so it is refused under its own hide reason, and the
+    // dead band is diagnosed once per rate-limit window.
     let short = rect(-9_400, -10_000, -9_240, -9_968);
-    assert_eq!(ctx.fit_target_rect(short, bar), None);
+    assert_eq!(
+        ctx.fit_target_rect(short, bar),
+        Err(HideReason::CrossAxisUnfilled)
+    );
     let first = ctx
         .last_cross_mismatch
         .expect("a box shorter than the bar must be diagnosed");
-    assert_eq!(ctx.fit_target_rect(short, bar), None);
+    assert_eq!(
+        ctx.fit_target_rect(short, bar),
+        Err(HideReason::CrossAxisUnfilled)
+    );
     assert_eq!(
         ctx.last_cross_mismatch,
         Some(first),
-        "the cross-axis diagnostic must be rate-limited"
+        "the refused-box diagnostic must be rate-limited"
     );
 
-    // A box taller than the bar, or one escaping it on the main axis, cannot be
-    // shown without leaving the bar: hide instead of clipping it.
-    let tall = rect(-9_400, -10_004, -9_240, -9_952);
-    assert_eq!(ctx.fit_target_rect(tall, bar), None);
-    let overlong = rect(-10_010, -10_000, -8_850, -9_952);
-    assert_eq!(ctx.fit_target_rect(overlong, bar), None);
+    // Revalidation traffic must not reset the limit: shell events arrive in
+    // bursts, so a reset there would turn the tripwire into a log storm.
+    ctx.request_layout_scan(LayoutUpdate::Invalidate, false);
+    assert_eq!(
+        ctx.last_cross_mismatch,
+        Some(first),
+        "revalidation must keep the rate limit"
+    );
 
-    // Vertical bar: the cross axis is the width, so a narrow box is hidden too.
+    // A box taller than the bar, or one escaping it on the main axis, is a
+    // placement failure rather than a sizing one.
+    let tall = rect(-9_400, -10_004, -9_240, -9_952);
+    assert_eq!(
+        ctx.fit_target_rect(tall, bar),
+        Err(HideReason::NoPlacementSlot)
+    );
+    let overlong = rect(-10_010, -10_000, -8_850, -9_952);
+    assert_eq!(
+        ctx.fit_target_rect(overlong, bar),
+        Err(HideReason::NoPlacementSlot)
+    );
+
+    // Vertical bar: the cross axis is the width, so a narrow box is refused too.
     let vertical = rect(-9_000, -10_000, -8_920, -9_000);
     let narrow = rect(-8_984, -9_900, -8_920, -9_800);
-    assert_eq!(ctx.fit_target_rect(narrow, vertical), None);
+    assert_eq!(
+        ctx.fit_target_rect(narrow, vertical),
+        Err(HideReason::CrossAxisUnfilled)
+    );
     let full_width = rect(-9_000, -9_900, -8_920, -9_800);
-    assert_eq!(ctx.fit_target_rect(full_width, vertical), Some(full_width));
+    assert_eq!(ctx.fit_target_rect(full_width, vertical), Ok(full_width));
 }

@@ -34,8 +34,10 @@ use windows::core::{PCWSTR, w};
 
 pub(super) const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 
-/// Clearance kept between the content and the box edge on each side. The box
-/// itself fills the taskbar's cross axis; only the content is budgeted.
+/// Clearance kept between the content and the box edge on each side, on top of
+/// the box itself filling the taskbar's cross axis. A bar too short for even the
+/// smallest font gives this clearance up (`MeasuredLayout::fit_rows_into_box`)
+/// rather than drawing past the box.
 const CONTENT_INSET_DIP: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -448,9 +450,6 @@ impl Renderer {
             return None;
         }
         let mut layout = self.measure_layout_fitting(display, bounds)?;
-        // A bar shorter than the smallest font cannot host the rows: shrink the
-        // row rhythm so they stay inside the box and `SetMaxHeight` clips the
-        // glyphs instead of drawing them past the window edge.
         layout.fit_rows_into_box();
         Some(layout)
     }
@@ -973,8 +972,10 @@ pub(super) struct MeasuredLayout {
 
 impl MeasuredLayout {
     /// Shrinks the row rhythm into the box when the content is taller than it,
-    /// so the rows stay centered inside the window on a bar too short for even
-    /// the smallest font.
+    /// so a bar too short for even the smallest font clips glyphs with
+    /// `SetMaxHeight` inside the window instead of drawing them past its edge.
+    /// This gives up `CONTENT_INSET_DIP` deliberately; the box itself never
+    /// exceeds the taskbar.
     fn fit_rows_into_box(&mut self) {
         if self.content_h <= self.dip_h || self.content_h <= 0.0 {
             return;
@@ -1462,11 +1463,11 @@ mod tests {
     /// Regression: the box used to be the content plus at most 4 DIP of padding
     /// per side, capped at `avail_dip_h()` = the bar minus another 4 DIP, and
     /// was then centered in the bar. So the bar always kept at least 2 DIP of
-    /// itself on each side of the widget — 2.5 px at 100 % scaling, 5 px at
-    /// 250 % — and more whenever the content was shorter than the bar, which is
-    /// why the dead band was noticed on a scaled display. The box must fill the
-    /// bar's cross axis exactly, in device pixels, at every scaling and bar
-    /// height.
+    /// itself on each side of the widget — 2 px at 100 % scaling, 2.5 px at
+    /// 125 %, 5 px at 250 % — and more whenever the content was shorter than the
+    /// bar, which is why the dead band was noticed on a scaled display. The box
+    /// must fill the bar's cross axis exactly, in device pixels, at every scaling
+    /// and bar height.
     #[test]
     fn widget_box_fills_taskbar_cross_axis_across_dpi_and_bar_heights() {
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -1490,11 +1491,12 @@ mod tests {
         for dpi in [96, 120, 144, 168, 192, 216, 240] {
             let scale = dpi as f32 / 96.0;
             let display = build_display(&cfg, &metrics, false, false, dpi, false);
-            for bar_h in [24, 30, 39, 40, 47, 48, 60, 63, 72, 75] {
+            for bar_h in [24, 30, 39, 40, 47, 48, 60, 63, 72, 75, 90, 120, 144] {
                 // A top bar and a bottom bar share the cross extent.
                 for bar in [rect(0, 1080 - bar_h, 1920, 1080), rect(0, 0, 1920, bar_h)] {
+                    let bounds = LayoutBounds::from_taskbar(bar, dpi);
                     let layout = renderer
-                        .measure_layout(&display, LayoutBounds::from_taskbar(bar, dpi))
+                        .measure_layout(&display, bounds)
                         .unwrap_or_else(|| panic!("no layout for a {bar_h}px bar at {dpi} DPI"));
                     assert_eq!(
                         layout.px_h, bar_h,
@@ -1521,13 +1523,17 @@ mod tests {
                         layout.content_h,
                         layout.dip_h
                     );
-                    // Two rows of the smallest font plus slack: above that
-                    // height the content keeps its clearance instead of
-                    // clipping against the box edge.
-                    if layout.dip_h >= 36.0 {
+                    // The step-down promises a fitting layout whenever even the
+                    // smallest font fits this bar, so test that property instead
+                    // of a hand-picked height band that skips most cases.
+                    let smallest_fits = renderer
+                        .measure_layout_at_size(&display, MIN_ADAPTIVE_FONT_PT, bounds)
+                        .is_some_and(|smallest| layout_fits_cross_axis(&smallest, bounds));
+                    if smallest_fits {
                         assert!(
-                            layout.content_h + CONTENT_INSET_DIP * 2.0 <= layout.dip_h,
-                            "content_h {} must keep its inset inside dip_h {} on a {bar_h}px bar at {dpi} DPI",
+                            layout_fits_cross_axis(&layout, bounds),
+                            "a {bar_h}px bar at {dpi} DPI that fits the smallest font must be \
+                             chosen to fit, got content_h {} against dip_h {}",
                             layout.content_h,
                             layout.dip_h
                         );
@@ -1560,7 +1566,7 @@ mod tests {
         for dpi in [96, 120, 144, 168, 192, 216, 240] {
             let scale = dpi as f32 / 96.0;
             let display = build_display(&cfg, &metrics, false, false, dpi, false);
-            for bar_w in [40, 48, 64, 80, 96] {
+            for bar_w in [40, 48, 64, 80, 96, 120, 144] {
                 let bar = rect(0, 0, bar_w, 1080);
                 let bounds = LayoutBounds::from_taskbar(bar, dpi);
                 assert!(
@@ -1590,17 +1596,25 @@ mod tests {
                     layout.content_h,
                     layout.dip_h
                 );
-                // Wide enough for the stacked columns: the content keeps its
-                // inset. A narrower bar clips instead of shrinking further.
-                if layout.dip_w >= 80.0 {
-                    assert!(
-                        layout.content_w + layout.pad_x * 2.0 + CONTENT_INSET_DIP * 2.0
-                            <= layout.dip_w,
-                        "content_w {} must keep its inset inside dip_w {} at {dpi} DPI",
-                        layout.content_w,
-                        layout.dip_w
-                    );
-                }
+                // The stacking rule, checked instead of sampled: a vertical bar
+                // stacks Network above CPU/RAM exactly when the side-by-side
+                // columns would not fit its width, and the unconstrained
+                // measurement is what makes that width testable.
+                let wide = renderer
+                    .measure_layout(
+                        &display,
+                        LayoutBounds {
+                            max_dip_w: f32::INFINITY,
+                            ..bounds
+                        },
+                    )
+                    .expect("unconstrained vertical layout");
+                assert!(!wide.stacked, "an unconstrained width must not stack");
+                assert_eq!(
+                    layout.stacked,
+                    wide.pad_x * 2.0 + wide.content_w > layout.dip_w - 2.0,
+                    "a {bar_w}px bar at {dpi} DPI must stack exactly when side-by-side does not fit"
+                );
             }
         }
         unsafe { CoUninitialize() };
@@ -1609,9 +1623,9 @@ mod tests {
     /// The defect as the user met it: measure the box, place it in the bar, and
     /// the presented rect must fill the bar's cross axis with no strip of
     /// taskbar left clickable on either side. The two halves can each be right
-    /// and still miss, so this composes them, and it asserts the one thing they
-    /// cannot show separately: every pixel of the presented bitmap has non-zero
-    /// alpha, so no row of the box is click-through.
+    /// and still miss, so this composes them, and at 100 % scaling it also scans
+    /// a real frame for a zero-alpha pixel — the arithmetic proves the window
+    /// rect, only the pixels prove the hit area.
     #[test]
     fn measured_then_placed_box_fills_the_bar_and_keeps_every_pixel_clickable() {
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -1632,7 +1646,7 @@ mod tests {
 
         for dpi in [96, 120, 144, 168, 192, 216, 240] {
             let display = build_display(&cfg, &metrics, false, false, dpi, false);
-            for cross in [24, 30, 40, 47, 48, 60, 72, 75] {
+            for cross in [24, 30, 40, 47, 48, 60, 72, 75, 90, 120, 144] {
                 for from_bottom in [true, false] {
                     let bar = if from_bottom {
                         rect(0, 1080 - cross, 1920, 1080)
@@ -1691,7 +1705,7 @@ mod tests {
         // The same composition on a left/right bar, whose cross axis is width.
         for dpi in [96, 120, 144, 168, 192] {
             let display = build_display(&cfg, &metrics, false, false, dpi, false);
-            for cross in [40, 48, 64, 80] {
+            for cross in [40, 48, 64, 80, 96, 120] {
                 for on_left in [true, false] {
                     let (left, right) = if on_left {
                         (0, cross)

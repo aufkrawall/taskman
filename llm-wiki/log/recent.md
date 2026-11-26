@@ -2,9 +2,9 @@
 
 - The taskbar widget's clickable box was the content plus at most 4 DIP of its own
   padding, capped at `avail_dip_h()` (the bar minus another 4 DIP) and centred in
-  the bar, so the bar always kept at least 2 DIP of itself per side — 2.5 px at
-  100 %, 5 px per side at 250 % — and more whenever the content was shorter than
-  the bar. Two workers fixed it in parallel worktrees and four reviewers read the
+  the bar, so the bar always kept at least 2 DIP of itself per side — 2 px at
+  100 %, 2.5 px at 125 %, 5 px at 250 % — and more whenever the content was
+  shorter than the bar. Two workers fixed it in parallel worktrees and four reviewers read the
   merged tree over two rounds. No behavioural P0 was found in the geometry, but
   round 2 caught a P0 the earlier rounds could not: the round-1 rename of
   `measure_and_render`'s parameter left two `48.0` call sites behind, i.e. a

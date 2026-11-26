@@ -1513,9 +1513,10 @@ rebase runbook.
   `clamp_into_taskbar` clamps and reports, `WindowCtx::fit_target_rect` hides
   instead of presenting one, a mismatch logs once per 30 s, and a bar shorter
   than the smallest font scales the row rhythm into the box rather than drawing
-  past it; across its own span the box also covers the bar's inner resize
-  border, which is accepted because a bar edge that swallows clicks is exactly
-  the defect), adapting to
+  past it, and since a vertical bar's width is pinned the same way, a bar too
+  narrow for the stacked columns clips them instead of hiding; across its own
+  span the box also covers the bar's inner resize border, which is accepted
+  because a bar edge that swallows clicks is exactly the defect), adapting to
   `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding via
   `SW_HIDE` if completely packed or occupancy is unknown. Shell window
   creation/destruction/replacement, taskbar root/child/control notifications,

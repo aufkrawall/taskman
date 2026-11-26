@@ -66,11 +66,13 @@ pub(super) enum HideReason {
     UiaUnavailable,
     NoRenderer,
     MeasureFailed,
-    /// The taskbar is full even for the compact layout, or the solved box does
-    /// not fill the bar's cross axis and would leave a strip of the bar taking
-    /// the widget's clicks. The second case also logs its own expected/actual
-    /// cross extent, which is what tells the two apart.
+    /// The taskbar is full even for the compact layout.
     NoPlacementSlot,
+    /// The solved box does not fill the bar's cross axis, so it would leave a
+    /// strip of the bar taking clicks that belong to the widget. Distinct from
+    /// `NoPlacementSlot` because that one sends an operator looking for a packed
+    /// bar, while this one is a sizing failure.
+    CrossAxisUnfilled,
     PresentFailed,
     RenderFailed,
 }
@@ -92,6 +94,7 @@ impl HideReason {
             Self::NoRenderer => "no_renderer",
             Self::MeasureFailed => "measure_failed",
             Self::NoPlacementSlot => "no_placement_slot",
+            Self::CrossAxisUnfilled => "cross_axis_unfilled",
             Self::PresentFailed => "present_failed",
             Self::RenderFailed => "render_failed",
         }
@@ -615,6 +618,7 @@ mod tests {
             (HideReason::NoRenderer, "no_renderer"),
             (HideReason::MeasureFailed, "measure_failed"),
             (HideReason::NoPlacementSlot, "no_placement_slot"),
+            (HideReason::CrossAxisUnfilled, "cross_axis_unfilled"),
             (HideReason::PresentFailed, "present_failed"),
             (HideReason::RenderFailed, "render_failed"),
         ];

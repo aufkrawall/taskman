@@ -266,25 +266,29 @@ impl WindowCtx {
     /// already refuses it, which makes this branch defence in depth: it can
     /// only fire if a caller hands this gate a footprint that did not come from
     /// the solver, and it is diagnosed once per 30 s so that it is not silent.
-    fn fit_target_rect(&mut self, rect: PixelRect, bar: PixelRect) -> Option<PixelRect> {
+    fn fit_target_rect(
+        &mut self,
+        rect: PixelRect,
+        bar: PixelRect,
+    ) -> Result<PixelRect, HideReason> {
         let (fitted, fills_cross) = clamp_into_taskbar(rect, bar);
         if fitted != rect {
             self.diagnose_refused_box(
                 fitted,
                 bar,
-                "taskbar monitor box would be cut to stay inside the taskbar; staying hidden",
+                "taskbar monitor box would be cut to stay inside the taskbar",
             );
-            return None;
+            return Err(HideReason::NoPlacementSlot);
         }
         if !fills_cross {
             self.diagnose_refused_box(
                 fitted,
                 bar,
-                "taskbar monitor box does not fill the taskbar cross axis; staying hidden",
+                "taskbar monitor box does not fill the taskbar cross axis",
             );
-            return None;
+            return Err(HideReason::CrossAxisUnfilled);
         }
-        Some(fitted)
+        Ok(fitted)
     }
 
     /// Rate-limited (once per 30 s) diagnosis for a box the gate refuses, so
@@ -501,13 +505,16 @@ impl WindowCtx {
                 right: x.saturating_add(w),
                 bottom: y.saturating_add(h),
             };
-            let Some(target_rect) = self.fit_target_rect(target_rect, env.taskbar_rect) else {
-                // Drop the cached footprint too: with unchanged content the fast
-                // path would otherwise re-solve the same refused box every
-                // refresh and never re-measure.
-                self.last_display = None;
-                self.hide(HideReason::NoPlacementSlot);
-                return;
+            let target_rect = match self.fit_target_rect(target_rect, env.taskbar_rect) {
+                Ok(fitted) => fitted,
+                Err(reason) => {
+                    // Drop the cached footprint too: with unchanged content the
+                    // fast path would otherwise re-solve the same refused box
+                    // every refresh and never re-measure.
+                    self.last_display = None;
+                    self.hide(reason);
+                    return;
+                }
             };
             self.last_anchor_slot = Some(placement.slot);
             self.last_compact = false;
@@ -617,13 +624,16 @@ impl WindowCtx {
             right: x.saturating_add(w),
             bottom: y.saturating_add(h),
         };
-        let Some(target_rect) = self.fit_target_rect(target_rect, env.taskbar_rect) else {
-            // Drop the cached footprint too: with unchanged content the fast
-            // path would otherwise re-solve the same refused box every refresh
-            // and never re-measure.
-            self.last_display = None;
-            self.hide(HideReason::NoPlacementSlot);
-            return;
+        let target_rect = match self.fit_target_rect(target_rect, env.taskbar_rect) {
+            Ok(fitted) => fitted,
+            Err(reason) => {
+                // Drop the cached footprint too: with unchanged content the fast
+                // path would otherwise re-solve the same refused box every
+                // refresh and never re-measure.
+                self.last_display = None;
+                self.hide(reason);
+                return;
+            }
         };
         self.last_anchor_slot = Some(placement.slot);
         self.last_compact = display.compact;
@@ -740,7 +750,7 @@ impl WindowCtx {
             right: x.saturating_add(self.last_size.0),
             bottom: y.saturating_add(self.last_size.1),
         };
-        if self.fit_target_rect(current, env.taskbar_rect).is_none() {
+        if self.fit_target_rect(current, env.taskbar_rect).is_err() {
             return;
         }
         let hwnd_raw = self.hwnd.0 as isize;

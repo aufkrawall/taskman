@@ -663,12 +663,22 @@ mod tests {
             Right,
         }
 
+        // Counted from the arrays themselves rather than re-encoded, so adding a
+        // geometry cannot silently leave the run counter out of step.
+        const EDGES: [Edge; 4] = [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right];
+        // A zero origin plus one with a non-zero y: the second also moves a
+        // vertical bar's top, which the first cannot.
+        const ORIGINS: [(i32, i32); 2] = [(0, 0), (-1920, 900)];
+        const DPIS: [u32; 7] = [96, 120, 144, 168, 192, 216, 240];
+        // 144 px is the real 250 % bar on a 4K display; 24 px the compact one.
+        const CROSS: [i32; 10] = [24, 30, 40, 48, 60, 72, 75, 90, 120, 144];
+
         let mut checked = 0;
-        for edge in [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right] {
+        for edge in EDGES {
             let horizontal = matches!(edge, Edge::Bottom | Edge::Top);
-            for (ox, oy) in [(0, 0), (-1920, 0)] {
-                for dpi in [96, 120, 144, 168, 192, 216, 240] {
-                    for cross in [24, 30, 40, 48, 60, 72, 75] {
+            for (ox, oy) in ORIGINS {
+                for dpi in DPIS {
+                    for cross in CROSS {
                         for tray_at_end in [true, false] {
                             let (bar, notify) = if horizontal {
                                 let (top, bottom) = if matches!(edge, Edge::Bottom) {
@@ -793,7 +803,70 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 4 * 2 * 7 * 7 * 2, "the whole matrix must run");
+        assert_eq!(
+            checked,
+            EDGES.len() * ORIGINS.len() * DPIS.len() * CROSS.len() * 2,
+            "the whole matrix must run"
+        );
+    }
+
+    /// The matrix runs 16:9-sized bars; a portrait monitor and an ultrawide are
+    /// the aspect ratios a real desktop adds, and neither changes the contract.
+    #[test]
+    fn placement_fills_portrait_and_ultrawide_bars() {
+        let cases = [
+            // 1080x1920 portrait, bar across the bottom and the top.
+            rect(0, 1920 - 48, 1080, 1920),
+            rect(0, 0, 1080, 48),
+            // 3440x1440 ultrawide, a 60 px bar across the top.
+            rect(0, 0, 3440, 60),
+            // Portrait monitor with the bar on the left edge: cross is width.
+            rect(0, 0, 48, 1920),
+        ];
+        for bar in cases {
+            let notify = if bar.is_horizontal() {
+                rect(bar.right - 220, bar.top, bar.right, bar.bottom)
+            } else {
+                rect(bar.left, bar.bottom - 220, bar.right, bar.bottom)
+            };
+            let (widget_w, widget_h) = if bar.is_horizontal() {
+                (150, bar.height())
+            } else {
+                (bar.width(), 150)
+            };
+            let uia = [notify];
+            let placed = solve_taskbar_placement(
+                bar,
+                Some(notify),
+                Some(&uia),
+                (widget_w, widget_h),
+                144,
+                None,
+                false,
+            )
+            .map(|p| rect(p.pos.0, p.pos.1, p.pos.0 + widget_w, p.pos.1 + widget_h))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a {}x{} bar must host the widget",
+                    bar.width(),
+                    bar.height()
+                )
+            });
+            assert!(bar.covers(placed), "{placed:?} must stay inside {bar:?}");
+            if bar.is_horizontal() {
+                assert_eq!(
+                    (placed.top, placed.bottom),
+                    (bar.top, bar.bottom),
+                    "{placed:?} must fill {bar:?} across its height"
+                );
+            } else {
+                assert_eq!(
+                    (placed.left, placed.right),
+                    (bar.left, bar.right),
+                    "{placed:?} must fill {bar:?} across its width"
+                );
+            }
+        }
     }
 
     #[test]
