@@ -2,8 +2,10 @@
 //!
 //! The entry is written under `$XDG_CONFIG_HOME/autostart` only when the user
 //! turns it on. Disabling removes a regular, user-owned desktop file bearing
-//! TaskMan's marker and refuses to touch any other file. Linux has no tray
-//! implementation here, so the entry deliberately starts a visible window.
+//! TaskMan's marker and refuses to touch any other file. The entry starts the
+//! GUI behind its tray icon, the same way the Windows registration does; a
+//! session where the icon cannot exist shows the window instead, so the entry
+//! never hides the app for good.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,6 +18,8 @@ use tm_core::error::{Result, TmError};
 const ENTRY_FILE_NAME: &str = "io.github.aufkrawall.Taskman.desktop";
 const OWNED_MARKER: &str = "X-Taskman-Autostart=1";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024;
+/// The switch the GUI reads to start hidden behind the tray icon.
+const MINIMIZED_TO_TRAY_ARG: &str = "--minimized-to-tray";
 
 pub fn supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
@@ -27,13 +31,31 @@ pub fn supported() -> bool {
     })
 }
 
+/// Enable or disable the per-user XDG autostart entry for a start behind the
+/// tray icon.
+///
+/// This is what the Settings toggle means, and it matches the Windows
+/// registration the same toggle writes: a login start lands on the icon instead
+/// of a window. It stays safe where the tray cannot exist — the GUI only hides
+/// itself once an icon really is there, and shows the window otherwise — so the
+/// entry does not have to ask what the session can do. [`set_enabled_for_start`]
+/// is the explicit form for a caller that wants to choose.
 pub fn set_enabled(enabled: bool) -> Result<()> {
+    set_enabled_for_start(enabled, true)
+}
+
+/// Enable or disable the per-user XDG autostart entry, starting hidden behind
+/// the tray icon when `start_minimized` asks for it.
+///
+/// The flag is only written for a caller that asks for it. `false` keeps the
+/// old visible start, which is what a desktop without any tray wants.
+pub fn set_enabled_for_start(enabled: bool, start_minimized: bool) -> Result<()> {
     let home = config_home()
         .ok_or_else(|| TmError::platform("autostart", "no absolute XDG config home"))?;
     if enabled {
         let executable = std::env::current_exe()
             .map_err(|error| TmError::platform("autostart executable", error.to_string()))?;
-        set_enabled_at(&home, &executable, true)
+        set_enabled_at(&home, &executable, true, start_minimized)
     } else {
         remove_owned_entry(&entry_path(&home))
     }
@@ -51,7 +73,12 @@ fn config_home() -> Option<PathBuf> {
         })
 }
 
-fn set_enabled_at(config_home: &Path, executable: &Path, enabled: bool) -> Result<()> {
+fn set_enabled_at(
+    config_home: &Path,
+    executable: &Path,
+    enabled: bool,
+    start_minimized: bool,
+) -> Result<()> {
     let path = entry_path(config_home);
     if !enabled {
         return remove_owned_entry(&path);
@@ -63,9 +90,13 @@ fn set_enabled_at(config_home: &Path, executable: &Path, enabled: bool) -> Resul
     fs::create_dir_all(parent)
         .map_err(|error| TmError::platform("create XDG autostart directory", error.to_string()))?;
     validate_autostart_directory(parent)?;
-    let contents = desktop_entry(executable)?;
+    let contents = desktop_entry(executable, start_minimized)?;
     write_owned_entry(&path, &contents)?;
-    tracing::info!(?path, "enabled self-owned XDG autostart entry");
+    tracing::info!(
+        ?path,
+        start_minimized,
+        "enabled self-owned XDG autostart entry"
+    );
     Ok(())
 }
 
@@ -99,7 +130,7 @@ fn entry_path(config_home: &Path) -> PathBuf {
     config_home.join("autostart").join(ENTRY_FILE_NAME)
 }
 
-fn desktop_entry(executable: &Path) -> Result<String> {
+fn desktop_entry(executable: &Path, start_minimized: bool) -> Result<String> {
     if !executable.is_absolute() {
         return Err(TmError::platform(
             "XDG autostart",
@@ -114,13 +145,20 @@ fn desktop_entry(executable: &Path) -> Result<String> {
     })?;
     let exec =
         quote_exec_arg(executable).map_err(|error| TmError::platform("XDG autostart", error))?;
+    // The flag is a separate argument, so it goes after the quoted executable
+    // and never inside the quotes.
+    let start_mode = if start_minimized {
+        format!(" {MINIMIZED_TO_TRAY_ARG}")
+    } else {
+        String::new()
+    };
     Ok(format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Version=1.0\n\
          Name=Taskman\n\
          Comment=Cross-platform task manager and system monitor\n\
-         Exec={exec}\n\
+         Exec={exec}{start_mode}\n\
          Icon=utilities-system-monitor\n\
          Terminal=false\n\
          Categories=System;Monitor;\n\
@@ -467,10 +505,10 @@ mod tests {
     }
 
     #[test]
-    fn autostart_entry_is_idempotent_and_never_requests_a_hidden_start() {
+    fn autostart_entry_is_idempotent_and_visible_unless_asked_to_hide() {
         let config = test_config("idempotent");
         let executable = Path::new("/opt/Task Man/taskman");
-        set_enabled_at(&config, executable, true).unwrap();
+        set_enabled_at(&config, executable, true, false).unwrap();
         let path = config.join("autostart").join(ENTRY_FILE_NAME);
         let first = fs::read_to_string(&path).unwrap();
         assert!(is_owned_entry(&first));
@@ -478,12 +516,47 @@ mod tests {
         assert!(!first.contains("--minimized-to-tray"));
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
 
-        set_enabled_at(&config, executable, true).unwrap();
+        set_enabled_at(&config, executable, true, false).unwrap();
         let second = fs::read_to_string(&path).unwrap();
         assert_eq!(first, second);
 
-        set_enabled_at(&config, executable, false).unwrap();
+        set_enabled_at(&config, executable, false, false).unwrap();
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(config);
+    }
+
+    /// A login start that asked for the tray has to carry the switch the GUI
+    /// reads; switching the request back rewrites the same entry (there is one
+    /// file, so the two modes must not stack up).
+    #[test]
+    fn autostart_entry_starts_in_the_tray_only_when_asked() {
+        let config = test_config("minimized");
+        let executable = Path::new("/opt/Task Man/taskman");
+        let path = config.join("autostart").join(ENTRY_FILE_NAME);
+
+        set_enabled_at(&config, executable, true, true).unwrap();
+        let hidden = fs::read_to_string(&path).unwrap();
+        assert!(is_owned_entry(&hidden));
+        assert!(
+            hidden.contains("Exec=\"/opt/Task Man/taskman\" --minimized-to-tray\n"),
+            "the flag is a separate argument after the quoted executable: {hidden}"
+        );
+        assert_eq!(
+            hidden.matches("--minimized-to-tray").count(),
+            1,
+            "the entry must not repeat the flag: {hidden}"
+        );
+
+        // Written twice with the same request: unchanged.
+        set_enabled_at(&config, executable, true, true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), hidden);
+
+        // The other mode replaces the entry rather than adding to it.
+        set_enabled_at(&config, executable, true, false).unwrap();
+        let visible = fs::read_to_string(&path).unwrap();
+        assert!(!visible.contains("--minimized-to-tray"));
+        assert!(visible.contains("Exec=\"/opt/Task Man/taskman\"\n"));
+
         let _ = fs::remove_dir_all(config);
     }
 
@@ -497,9 +570,9 @@ mod tests {
         fs::write(&path, original).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), false).is_err());
+        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), false, false).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true).is_err());
+        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true, false).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert_eq!(
             fs::metadata(&path).unwrap().mode() & 0o777,
@@ -525,7 +598,7 @@ mod tests {
         )
         .unwrap();
 
-        set_enabled_at(&config, Path::new("/opt/taskman"), true).unwrap();
+        set_enabled_at(&config, Path::new("/opt/taskman"), true, false).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(is_owned_entry(&text), "the entry becomes TaskMan's own");
@@ -544,8 +617,8 @@ mod tests {
         let path = dir.join(ENTRY_FILE_NAME);
         std::os::unix::fs::symlink(&target, &path).unwrap();
 
-        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true).is_err());
-        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), false).is_err());
+        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true, false).is_err());
+        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), false, false).is_err());
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "[Desktop Entry]\nName=Elsewhere\n"
@@ -561,7 +634,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
         let path = dir.join(ENTRY_FILE_NAME);
 
-        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true).is_err());
+        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true, false).is_err());
         assert!(!path.exists());
 
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
