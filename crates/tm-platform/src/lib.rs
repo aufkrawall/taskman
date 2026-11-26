@@ -27,6 +27,13 @@ mod fontconfig_text;
 /// Parsing and construction for a future protected Linux helper.
 #[cfg(any(target_os = "linux", test))]
 mod linux_action_support;
+/// Pure decision and mapping logic for the Linux core-service bridge: which
+/// failures may fall back to another token, how a broker answer becomes the
+/// existing model types, and what the capability state means. Compiled on
+/// every host so the normal gate actually runs its tests — the transport
+/// itself stays Linux-only.
+#[cfg(any(target_os = "linux", test))]
+mod linux_core_bridge;
 
 #[cfg(target_os = "windows")]
 pub mod win;

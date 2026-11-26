@@ -638,6 +638,12 @@ pub struct WireThread {
 
 /// One socket endpoint. Addresses are strings so the wire stays independent of
 /// the platform's socket types; the client parses them back.
+///
+/// The format is pinned: an IPv4 or IPv6 endpoint is exactly
+/// `std::net::SocketAddr::to_string()` (`127.0.0.1:8080`, `[::1]:8080`,
+/// `[fe80::1%2]:80`), a Unix endpoint is the socket path. A client that cannot
+/// parse one must report it as a diagnostic and drop only that row, never turn
+/// the whole answer into "no connections".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireConnection {
     /// `tcp`, `tcp6`, `udp`, `udp6`, `unix`.
