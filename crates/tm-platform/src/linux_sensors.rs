@@ -11,6 +11,7 @@
 //! (core product invariant).
 
 use serde::{Deserialize, Serialize};
+use tm_core::model::GpuInfo;
 
 /// One complete sensor poll.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -60,6 +61,11 @@ pub enum SensorKind {
     Voltage,
     Current,
     Power,
+    /// Cumulative energy counter (hwmon `energy*_input`, RAPL `energy_uj`), in
+    /// joules: the total counted so far, NOT the consumption of the sample
+    /// window. A wrapping counter publishes its range in
+    /// [`SensorReading::max`], so a consumer subtracts two samples modulo that
+    /// range instead of reading the value as a rate.
     Energy,
     Humidity,
     Intrusion,
@@ -260,7 +266,10 @@ pub fn scale_hwmon(kind: SensorKind, raw: i64) -> Option<f64> {
     }
     let plausible = match kind {
         SensorKind::Temperature => (-20.0..=200.0).contains(&scaled),
-        SensorKind::Fan => (0.0..=100_000.0).contains(&scaled),
+        // 0xffff is how a chip says "there is no tachometer", and the fastest
+        // server fans spin at about 25,000 RPM, so a higher answer is a
+        // sentinel rather than a measurement.
+        SensorKind::Fan => (0.0..=30_000.0).contains(&scaled),
         SensorKind::Voltage => (-5.0..=30.0).contains(&scaled),
         SensorKind::Current => (-200.0..=200.0).contains(&scaled),
         SensorKind::Power => (0.0..=10_000.0).contains(&scaled),
@@ -374,11 +383,141 @@ pub fn nvml_clock_mhz(raw: u32) -> Option<u32> {
     nvml_bounded(raw, 10_000)
 }
 
+/// Sort key of one powercap zone name: `0` is `(0, u32::MAX)`, `0:2` is
+/// `(0, 2)`.
+///
+/// The RAPL tree nests a package's own counter (`intel-rapl:0`) beside its
+/// constraints (`intel-rapl:0:2` is `dram`), and the suffixes share the package
+/// number. The pair keeps every zone of one package together, in the kernel's
+/// order, with the package's own counter — which has no second segment — after
+/// its constraints instead of tying with constraint 0. A name with a third
+/// segment or a non-numeric one is not a zone this model reads.
+pub fn powercap_zone_index(suffix: &str) -> Option<(u32, u32)> {
+    let mut segments = suffix.split(':');
+    let package: u32 = segments.next()?.parse().ok()?;
+    let constraint = match segments.next() {
+        Some(segment) => segment.parse().ok()?,
+        None => u32::MAX,
+    };
+    segments.next().is_none().then_some((package, constraint))
+}
+
 /// A small NVML counter, or `None` when it is outside the range the field can
 /// physically mean (a link width or generation saturated to `u32::MAX` is a
 /// driver sentinel, not a link).
 pub fn nvml_bounded(raw: u32, max: u32) -> Option<u32> {
     (raw <= max).then_some(raw)
+}
+
+/// Fill the adapter measurements sysfs does not publish from NVML readings.
+///
+/// The join key is [`normalize_pci_slot`], which folds NVML's eight-digit PCI
+/// domain onto the kernel's four, so a card in one domain can never borrow the
+/// readings of a card with the same bus in another. Sysfs wins per measured
+/// pair: a pair sysfs half-measured (a VRAM total with no used counter) is
+/// replaced whole, because NVML's pair is a measurement while sysfs's half is
+/// not. An adapter NVML does not describe keeps every field unavailable, and an
+/// adapter DRM did not enumerate is never created here.
+///
+/// `nvidia` is the adapter whose driver publishes no counter at all; any other
+/// adapter is consulted only when its utilization counter is missing.
+pub fn with_nvml(
+    mut gpu: GpuInfo,
+    slot: Option<&str>,
+    nvidia: bool,
+    nvml: &[GpuSensors],
+) -> GpuInfo {
+    // Nothing to join, or nothing this adapter is missing.
+    let needs_nvml = nvidia || !gpu.util_pct_available;
+    if nvml.is_empty() || !needs_nvml {
+        return gpu;
+    }
+    let Some(slot) = slot else {
+        return gpu;
+    };
+    let slot = normalize_pci_slot(slot);
+    let Some(readings) = nvml
+        .iter()
+        .find(|readings| readings.pci_slot.as_deref() == Some(slot.as_str()))
+    else {
+        return gpu;
+    };
+    if !gpu.util_pct_available
+        && let Some(pct) = readings.utilization_pct
+    {
+        gpu.util_pct = pct;
+        gpu.util_pct_available = true;
+    }
+    if !gpu.dedicated_mem_available
+        && let (Some(used), Some(total)) = (readings.memory_used_bytes, readings.memory_total_bytes)
+        && total > 0
+        && used <= total
+    {
+        gpu.mem_used_bytes = used;
+        gpu.mem_total_bytes = total;
+        gpu.dedicated_used_bytes = used;
+        gpu.dedicated_mem_available = true;
+    }
+    if gpu.temperature_c.is_none() {
+        gpu.temperature_c = readings.temperature_c;
+    }
+    gpu
+}
+
+/// Whether the brokered sensor fallback may ask the service for readings.
+///
+/// The fallback exists for the readings this token cannot take (an NVIDIA user
+/// outside the `video` group). Asking is paced by a background worker, and this
+/// gate is what keeps that worker from turning a decision into a poll: a
+/// transport failure is transient and retried, while a refusal is an answer
+/// about this client that does not change by asking again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerGate {
+    /// Ask the broker.
+    Ask,
+    /// The broker answered and refused (or answered something unusable).
+    /// Asking resumes only after the broker has been seen unreachable and then
+    /// reachable again, because a restarted or reinstalled service is a
+    /// different peer than the one that refused.
+    Refused {
+        /// Whether the liveness probe has reported the broker gone since the
+        /// refusal.
+        saw_unreachable: bool,
+    },
+}
+
+impl BrokerGate {
+    /// The gate a failed request leaves behind.
+    ///
+    /// `may_fall_back` is the client's own verdict: `true` only when the request
+    /// did not reach a broker at all. A refusal or an answered failure is final.
+    pub fn after_failure(may_fall_back: bool) -> Self {
+        if may_fall_back {
+            Self::Ask
+        } else {
+            Self::Refused {
+                saw_unreachable: false,
+            }
+        }
+    }
+
+    /// Fold one liveness probe into the gate.
+    pub fn observe(self, broker_available: bool) -> Self {
+        match self {
+            Self::Ask => Self::Ask,
+            Self::Refused {
+                saw_unreachable: true,
+            } if broker_available => Self::Ask,
+            Self::Refused { saw_unreachable } => Self::Refused {
+                saw_unreachable: saw_unreachable || !broker_available,
+            },
+        }
+    }
+
+    /// Whether a request may be sent now.
+    pub fn may_ask(self) -> bool {
+        matches!(self, Self::Ask)
+    }
 }
 
 /// Decode NVML's inline `busId` buffer into a normalized PCI slot.
@@ -459,8 +598,14 @@ pub const NVML_TEMPERATURE_MEMORY: u32 = 1;
 pub const NVML_CLOCK_GRAPHICS: u32 = 0;
 pub const NVML_CLOCK_MEM: u32 = 2;
 
-/// NVML return code for "not supported by this device/driver".
+/// NVML return code for success.
+pub const NVML_SUCCESS: i32 = 0;
+/// NVML return code for "not supported by this device/driver". An ordinary
+/// per-adapter answer: no fan, no PCI id, no memory-junction sensor.
 pub const NVML_ERROR_NOT_SUPPORTED: i32 = 3;
+/// NVML return code for "this token may not query the device". The one failure
+/// a root broker can supply readings for.
+pub const NVML_ERROR_NO_PERMISSION: i32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -520,6 +665,10 @@ mod tests {
         assert_eq!(scale_hwmon(SensorKind::Temperature, i64::MAX), None);
         assert_eq!(scale_hwmon(SensorKind::Temperature, -273_000), None);
         assert_eq!(scale_hwmon(SensorKind::Fan, -1), None);
+        // 0xffff is "this chip has no tachometer": 65,535 RPM is not a fan.
+        assert_eq!(scale_hwmon(SensorKind::Fan, 0xffff), None);
+        assert_eq!(scale_hwmon(SensorKind::Fan, 30_001), None);
+        assert_eq!(scale_hwmon(SensorKind::Fan, 25_000), Some(25_000.0));
         assert_eq!(scale_hwmon(SensorKind::Voltage, 1_000_000), None);
         assert_eq!(scale_hwmon(SensorKind::Power, -1_000_000), None);
         assert_eq!(scale_hwmon(SensorKind::Humidity, 250_000), None);
@@ -677,6 +826,212 @@ mod tests {
         assert!(snapshot.gpu_for_pci_slot("00000000:01:00.0").is_some());
         assert!(snapshot.gpu_for_pci_slot("0000:02:00.0").is_none());
         assert!(!snapshot.is_empty());
+    }
+
+    /// One NVML reading for `slot`, as the enumeration shapes it.
+    fn nvml_reading(slot: &str) -> GpuSensors {
+        GpuSensors {
+            index: 0,
+            pci_slot: Some(normalize_pci_slot(slot)),
+            utilization_pct: Some(37.0),
+            memory_total_bytes: Some(12 << 30),
+            memory_used_bytes: Some(3 << 30),
+            temperature_c: Some(63.0),
+            ..Default::default()
+        }
+    }
+
+    /// The row an adapter with sysfs counters gets from DRM: measured pairs are
+    /// available, the rest is not.
+    fn gpu_row() -> GpuInfo {
+        GpuInfo {
+            id: 0,
+            name: "NVIDIA GPU [10de:2684] (nvidia)".into(),
+            driver_version: "580.95.05".into(),
+            driver_date_epoch_s: None,
+            directx_version: String::new(),
+            pci_location: Some((3, 0, 1)),
+            util_pct_available: false,
+            util_pct: 0.0,
+            dedicated_mem_available: false,
+            shared_mem_available: false,
+            mem_used_bytes: 0,
+            mem_total_bytes: 0,
+            dedicated_used_bytes: 0,
+            shared_used_bytes: 0,
+            shared_total_bytes: 0,
+            hardware_reserved_bytes: 0,
+            temperature_c: None,
+            luid: None,
+            engines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nvml_fills_the_counters_the_nvidia_driver_does_not_publish() {
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:03:00.1")],
+        );
+        assert!(gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 37.0);
+        assert!(gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 3 << 30);
+        assert_eq!(gpu.mem_total_bytes, 12 << 30);
+        assert_eq!(gpu.dedicated_used_bytes, 3 << 30);
+        assert_eq!(gpu.temperature_c, Some(63.0));
+        // An adapter-wide utilization is not an engine instance.
+        assert!(gpu.engines.is_empty());
+    }
+
+    #[test]
+    fn sysfs_counters_win_over_nvml_where_the_driver_publishes_them() {
+        // nouveau answers `gpu_busy_percent`, so its own sample is shown even
+        // with NVML answering for the same card.
+        let mut gpu = gpu_row();
+        gpu.util_pct_available = true;
+        gpu.util_pct = 12.0;
+        gpu.dedicated_mem_available = true;
+        gpu.mem_used_bytes = 512 << 20;
+        gpu.mem_total_bytes = 8 << 30;
+        gpu.dedicated_used_bytes = 512 << 20;
+        gpu.temperature_c = Some(51.0);
+        let gpu = with_nvml(
+            gpu,
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:03:00.1")],
+        );
+        assert!(gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 12.0);
+        assert_eq!(gpu.mem_used_bytes, 512 << 20);
+        assert_eq!(gpu.mem_total_bytes, 8 << 30);
+        assert_eq!(gpu.temperature_c, Some(51.0));
+    }
+
+    #[test]
+    fn a_half_measured_vram_pair_is_replaced_whole() {
+        // gpu_from_card publishes a total it read without a used counter; the
+        // pair stays unavailable, and NVML's complete pair replaces both.
+        let mut gpu = gpu_row();
+        gpu.mem_total_bytes = 8 << 30;
+        let gpu = with_nvml(
+            gpu,
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:03:00.1")],
+        );
+        assert!(gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_total_bytes, 12 << 30);
+        assert_eq!(gpu.mem_used_bytes, 3 << 30);
+        assert_eq!(gpu.dedicated_used_bytes, 3 << 30);
+    }
+
+    #[test]
+    fn nvml_silence_leaves_the_measurements_unavailable() {
+        // NVML enumerated nothing this tick.
+        let gpu = with_nvml(gpu_row(), Some("0000:03:00.1"), true, &[]);
+        assert!(!gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 0.0);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 0);
+        assert_eq!(gpu.temperature_c, None);
+
+        // NVML answered, but only for another card: the join must not borrow
+        // that adapter's numbers.
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:02:00.0")],
+        );
+        assert!(!gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 0.0);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.temperature_c, None);
+    }
+
+    #[test]
+    fn a_card_in_another_pci_domain_does_not_join() {
+        // The same bus, device and function in segment 1 is a different card;
+        // folding the domain away would have the two share one adapter's
+        // readings.
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("00000001:03:00.1")],
+        );
+        assert!(!gpu.util_pct_available);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.temperature_c, None);
+        // The same reading joins the card that really sits in segment 1.
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0001:03:00.1"),
+            true,
+            &[nvml_reading("00000001:03:00.1")],
+        );
+        assert!(gpu.util_pct_available);
+    }
+
+    #[test]
+    fn nvml_memory_needs_a_total_to_be_a_measurement() {
+        let nvml = GpuSensors {
+            pci_slot: Some("0000:03:00.1".into()),
+            memory_used_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let gpu = with_nvml(gpu_row(), Some("0000:03:00.1"), true, &[nvml]);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 0);
+        assert_eq!(gpu.mem_total_bytes, 0);
+    }
+
+    #[test]
+    fn an_adapter_without_a_pci_slot_cannot_be_joined() {
+        let gpu = with_nvml(gpu_row(), None, true, &[nvml_reading("0000:03:00.1")]);
+        assert!(!gpu.util_pct_available);
+        assert!(!gpu.dedicated_mem_available);
+    }
+
+    #[test]
+    fn a_broker_refusal_stops_the_fallback_until_it_restarts() {
+        // Nothing answered: the next window asks again.
+        assert!(BrokerGate::after_failure(true).may_ask());
+        // The broker refused: stop, and stay stopped while it keeps answering
+        // probes, because the decision will not change by asking every window.
+        let mut gate = BrokerGate::after_failure(false);
+        assert!(!gate.may_ask());
+        gate = gate.observe(true);
+        assert!(!gate.may_ask());
+        // It went away, then came back: a different instance, ask once more.
+        gate = gate.observe(false);
+        assert!(!gate.may_ask());
+        gate = gate.observe(true);
+        assert!(gate.may_ask());
+        // A successful answer clears the stop.
+        assert!(BrokerGate::Ask.observe(false).may_ask());
+    }
+
+    #[test]
+    fn powercap_zones_include_the_package_constraints() {
+        assert_eq!(powercap_zone_index("0"), Some((0, u32::MAX)));
+        assert_eq!(powercap_zone_index("0:2"), Some((0, 2)));
+        assert_eq!(powercap_zone_index("1:0"), Some((1, 0)));
+        // Not a zone this model reads.
+        assert_eq!(powercap_zone_index("0:0:1"), None);
+        assert_eq!(powercap_zone_index("package-0"), None);
+        assert_eq!(powercap_zone_index(""), None);
+        assert_eq!(powercap_zone_index("0:"), None);
+        // A subzone stays in its package's group, and the package's own counter
+        // (no second segment) sorts last in it rather than tying with
+        // constraint 0.
+        let mut zones = [(1, u32::MAX), (0, 2), (0, u32::MAX), (0, 1)];
+        zones.sort();
+        assert_eq!(zones, [(0, 1), (0, 2), (0, u32::MAX), (1, u32::MAX)]);
     }
 
     #[test]
