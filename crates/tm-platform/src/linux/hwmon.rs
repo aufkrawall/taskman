@@ -301,8 +301,9 @@ fn energy_joules(raw: u64) -> Option<f64> {
 
 /// The `intel-rapl` zones of `/sys/class/powercap`, grouped by package.
 ///
-/// A package's own counter and its constraints share the package number, and
-/// the `(package, constraint)` pair keeps them together in the kernel's order.
+/// A package's own counter and its constraints share the package number, and the
+/// `(package, constraint)` pair keeps them together in the kernel's order: the
+/// package counter first, then its constraints by index.
 fn rapl_zones() -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(POWERCAP_ROOT)?.flatten() {
@@ -314,12 +315,15 @@ fn rapl_zones() -> std::io::Result<Vec<PathBuf>> {
         }
         out.push(entry.path());
     }
-    out.sort_by_key(|path| rapl_zone_index(path).unwrap_or((u32::MAX, u32::MAX)));
+    out.sort_by_key(|path| rapl_zone_index(path).unwrap_or((u32::MAX, None)));
     Ok(out)
 }
 
 /// The `(package, constraint)` pair of one powercap directory.
-fn rapl_zone_index(path: &Path) -> Option<(u32, u32)> {
+///
+/// The package's own counter has no constraint segment, so it carries `None` and
+/// sorts before its constraints.
+fn rapl_zone_index(path: &Path) -> Option<(u32, Option<u32>)> {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix(RAPL_PREFIX))

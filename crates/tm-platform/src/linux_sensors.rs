@@ -332,8 +332,13 @@ pub fn normalize_pci_slot(slot: &str) -> String {
     // A four-digit domain is the kernel's form; NVML publishes eight hex
     // digits. Both collapse to the low four digits, so the join works across
     // PCI domains up to 0xffff (more than Linux assigns).
+    //
+    // The domain is driver text, not necessarily ASCII: `nvml_text` only
+    // requires valid UTF-8, so `len() - 4` can land inside a multi-byte
+    // character. `get` answers `None` there and the whole domain is kept, which
+    // cannot join wrongly.
     let domain = if domain.len() > 4 {
-        &domain[domain.len() - 4..]
+        domain.get(domain.len() - 4..).unwrap_or(domain)
     } else {
         domain
     };
@@ -383,21 +388,22 @@ pub fn nvml_clock_mhz(raw: u32) -> Option<u32> {
     nvml_bounded(raw, 10_000)
 }
 
-/// Sort key of one powercap zone name: `0` is `(0, u32::MAX)`, `0:2` is
-/// `(0, 2)`.
+/// Sort key of one powercap zone name: `0` is `(0, None)`, `0:2` is
+/// `(0, Some(2))`.
 ///
 /// The RAPL tree nests a package's own counter (`intel-rapl:0`) beside its
 /// constraints (`intel-rapl:0:2` is `dram`), and the suffixes share the package
-/// number. The pair keeps every zone of one package together, in the kernel's
-/// order, with the package's own counter — which has no second segment — after
-/// its constraints instead of tying with constraint 0. A name with a third
-/// segment or a non-numeric one is not a zone this model reads.
-pub fn powercap_zone_index(suffix: &str) -> Option<(u32, u32)> {
+/// number. The pair keeps every zone of one package together in the kernel's
+/// order: the package's own counter comes first (`None` sorts before any
+/// constraint, and it cannot tie with constraint 0), then its constraints in
+/// index order. A name with a third segment or a non-numeric one is not a zone
+/// this model reads.
+pub fn powercap_zone_index(suffix: &str) -> Option<(u32, Option<u32>)> {
     let mut segments = suffix.split(':');
     let package: u32 = segments.next()?.parse().ok()?;
     let constraint = match segments.next() {
-        Some(segment) => segment.parse().ok()?,
-        None => u32::MAX,
+        Some(segment) => Some(segment.parse().ok()?),
+        None => None,
     };
     segments.next().is_none().then_some((package, constraint))
 }
@@ -484,32 +490,26 @@ pub enum BrokerGate {
         /// refusal.
         saw_unreachable: bool,
     },
+    /// The fallback cannot run in this process (its worker could not be
+    /// started). Asking stays off for the process's lifetime: there is nothing
+    /// left that could ask.
+    Disabled,
 }
 
 impl BrokerGate {
-    /// The gate a failed request leaves behind.
+    /// Fold one liveness observation into the gate.
     ///
-    /// `may_fall_back` is the client's own verdict: `true` only when the request
-    /// did not reach a broker at all. A refusal or an answered failure is final.
-    pub fn after_failure(may_fall_back: bool) -> Self {
-        if may_fall_back {
-            Self::Ask
-        } else {
-            Self::Refused {
-                saw_unreachable: false,
-            }
-        }
-    }
-
-    /// Fold one liveness probe into the gate.
-    pub fn observe(self, broker_available: bool) -> Self {
+    /// A broker that has been seen gone and then answers again is a different
+    /// peer — restarted, reinstalled, or started after the GUI — so a refusal
+    /// recorded before that no longer applies.
+    pub fn observe(self, liveness: BrokerLiveness) -> Self {
         match self {
-            Self::Ask => Self::Ask,
+            Self::Ask | Self::Disabled => self,
             Self::Refused {
                 saw_unreachable: true,
-            } if broker_available => Self::Ask,
+            } if liveness == BrokerLiveness::Reachable => Self::Ask,
             Self::Refused { saw_unreachable } => Self::Refused {
-                saw_unreachable: saw_unreachable || !broker_available,
+                saw_unreachable: saw_unreachable || liveness == BrokerLiveness::Unreachable,
             },
         }
     }
@@ -518,6 +518,55 @@ impl BrokerGate {
     pub fn may_ask(self) -> bool {
         matches!(self, Self::Ask)
     }
+
+    /// One window of the brokered fallback, as one pure step.
+    ///
+    /// `liveness` is this window's observation of the broker, and `last` is what
+    /// the previous window's request produced (`None` when it did not ask). The
+    /// result is the gate to carry into the next window and whether this window
+    /// should ask at all.
+    ///
+    /// A request that never reached a broker is transient, so the next window
+    /// asks again. A refusal latches: it is a decision about this client, and
+    /// repeating it every window would only spam the log until the broker is seen
+    /// gone and back (or the process restarts).
+    pub fn step(self, liveness: BrokerLiveness, last: Option<BrokerAttempt>) -> (Self, bool) {
+        // A fallback that cannot run keeps its state whatever the wire says.
+        if self == Self::Disabled {
+            return (Self::Disabled, false);
+        }
+        let gate = self.observe(liveness);
+        let gate = match last {
+            None | Some(BrokerAttempt::Answered | BrokerAttempt::Unreachable) => gate,
+            Some(BrokerAttempt::Refused) => Self::Refused {
+                saw_unreachable: false,
+            },
+        };
+        (gate, gate.may_ask())
+    }
+}
+
+/// Whether the broker answered a liveness observation.
+///
+/// What it answered does not matter: an answered probe, even a refusal, proves
+/// the service is there, while a probe that reached nobody proves it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerLiveness {
+    /// The broker answered.
+    Reachable,
+    /// No broker answered.
+    Unreachable,
+}
+
+/// What one window's request to the broker produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerAttempt {
+    /// The broker answered with readings.
+    Answered,
+    /// The broker answered and refused, or answered something unusable.
+    Refused,
+    /// The request never reached a broker.
+    Unreachable,
 }
 
 /// Decode NVML's inline `busId` buffer into a normalized PCI slot.
@@ -744,6 +793,17 @@ mod tests {
         assert_eq!(normalize_pci_slot("00000000:01:00.0"), "0000:01:00.0");
         assert_eq!(normalize_pci_slot("[0000:0A:00.0]"), "0000:0a:00.0");
         assert_eq!(normalize_pci_slot("00010000:01:00.0"), "0000:01:00.0");
+    }
+
+    #[test]
+    fn a_multi_byte_domain_is_kept_instead_of_panicking() {
+        // NVML text is only required to be UTF-8, so a driver string can put the
+        // low-four-digit cut inside a character. The whole domain is kept, which
+        // at worst fails to join; it must not panic or produce a broken string.
+        assert_eq!(normalize_pci_slot("0é000:01:00.0"), "0é000:01:00.0");
+        assert_eq!(normalize_pci_slot("éé:01:00.0"), "éé:01:00.0");
+        // A cut that lands on a character boundary still folds as before.
+        assert_eq!(normalize_pci_slot("é0000:01:00.0"), "0000:01:00.0");
     }
 
     #[test]
@@ -999,39 +1059,90 @@ mod tests {
 
     #[test]
     fn a_broker_refusal_stops_the_fallback_until_it_restarts() {
-        // Nothing answered: the next window asks again.
-        assert!(BrokerGate::after_failure(true).may_ask());
-        // The broker refused: stop, and stay stopped while it keeps answering
-        // probes, because the decision will not change by asking every window.
-        let mut gate = BrokerGate::after_failure(false);
-        assert!(!gate.may_ask());
-        gate = gate.observe(true);
-        assert!(!gate.may_ask());
-        // It went away, then came back: a different instance, ask once more.
-        gate = gate.observe(false);
-        assert!(!gate.may_ask());
-        gate = gate.observe(true);
-        assert!(gate.may_ask());
-        // A successful answer clears the stop.
-        assert!(BrokerGate::Ask.observe(false).may_ask());
+        // First window: nothing was attempted yet, so it asks.
+        let (gate, ask) = BrokerGate::Ask.step(BrokerLiveness::Unreachable, None);
+        assert!(ask, "a window that never asked must ask");
+        // The request reached nobody: transient, so the next window asks again.
+        let (gate, ask) = gate.step(
+            BrokerLiveness::Unreachable,
+            Some(BrokerAttempt::Unreachable),
+        );
+        assert!(ask);
+        let (gate, ask) = gate.step(
+            BrokerLiveness::Unreachable,
+            Some(BrokerAttempt::Unreachable),
+        );
+        assert!(ask);
+        assert_eq!(gate, BrokerGate::Ask);
+        // Readings arrived: nothing latches.
+        let (gate, ask) = gate.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Answered));
+        assert!(ask);
+        // The broker refused: the very next window must not ask, and ten more
+        // windows of a reachable broker must not reopen it.
+        let (gate, ask) = gate.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Refused));
+        assert!(!ask, "a refusal must latch before the next ask");
+        let mut latched = gate;
+        for _ in 0..10 {
+            let (next, ask) = latched.step(BrokerLiveness::Reachable, None);
+            assert!(!ask, "a refused policy does not change by asking again");
+            latched = next;
+        }
+        // It went away: still latched, but remembered.
+        let (latched, ask) = latched.step(BrokerLiveness::Unreachable, None);
+        assert!(!ask);
+        // It answered again: a different peer, so ask once more.
+        let (gate, ask) = latched.step(BrokerLiveness::Reachable, None);
+        assert!(ask, "a restarted broker reopens the fallback");
+        assert_eq!(gate, BrokerGate::Ask);
+    }
+
+    #[test]
+    fn an_unusable_answer_latches_without_being_retried() {
+        // The broker answered a sensor poll with another payload: not a
+        // transport failure, so the next window stays quiet.
+        let (gate, ask) =
+            BrokerGate::Ask.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Refused));
+        assert!(!ask);
+        assert_eq!(
+            gate,
+            BrokerGate::Refused {
+                saw_unreachable: false
+            }
+        );
+        // A window that did not ask keeps whatever it had.
+        let (gate, ask) = BrokerGate::Ask.step(BrokerLiveness::Reachable, None);
+        assert!(ask);
+        assert_eq!(gate, BrokerGate::Ask);
+    }
+
+    #[test]
+    fn a_fallback_that_could_not_start_never_asks() {
+        // The worker thread could not be spawned, so there is nothing left that
+        // could ask: no observation and no outcome reopens it.
+        let (gate, ask) = BrokerGate::Disabled.step(BrokerLiveness::Reachable, None);
+        assert!(!ask);
+        let (gate, ask) = gate.step(BrokerLiveness::Unreachable, None);
+        assert!(!ask);
+        let (gate, ask) = gate.step(BrokerLiveness::Reachable, Some(BrokerAttempt::Answered));
+        assert!(!ask);
+        assert_eq!(gate, BrokerGate::Disabled);
     }
 
     #[test]
     fn powercap_zones_include_the_package_constraints() {
-        assert_eq!(powercap_zone_index("0"), Some((0, u32::MAX)));
-        assert_eq!(powercap_zone_index("0:2"), Some((0, 2)));
-        assert_eq!(powercap_zone_index("1:0"), Some((1, 0)));
+        assert_eq!(powercap_zone_index("0"), Some((0, None)));
+        assert_eq!(powercap_zone_index("0:2"), Some((0, Some(2))));
+        assert_eq!(powercap_zone_index("1:0"), Some((1, Some(0))));
         // Not a zone this model reads.
         assert_eq!(powercap_zone_index("0:0:1"), None);
         assert_eq!(powercap_zone_index("package-0"), None);
         assert_eq!(powercap_zone_index(""), None);
         assert_eq!(powercap_zone_index("0:"), None);
-        // A subzone stays in its package's group, and the package's own counter
-        // (no second segment) sorts last in it rather than tying with
-        // constraint 0.
-        let mut zones = [(1, u32::MAX), (0, 2), (0, u32::MAX), (0, 1)];
+        // A package's own counter comes first, then its constraints in index
+        // order, and it cannot tie with constraint 0.
+        let mut zones: [(u32, Option<u32>); 4] = [(1, None), (0, Some(2)), (0, None), (0, Some(1))];
         zones.sort();
-        assert_eq!(zones, [(0, 1), (0, 2), (0, u32::MAX), (1, u32::MAX)]);
+        assert_eq!(zones, [(0, None), (0, Some(1)), (0, Some(2)), (1, None)]);
     }
 
     #[test]
