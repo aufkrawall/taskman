@@ -408,6 +408,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let expanded = app.processes_state.expanded.clone();
         let groups = app.processes_state.group_collapsed;
         let built = build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups);
+        // Warm every icon the new rows will ask for, once, before they are
+        // first painted: a row whose icon is still being resolved paints an
+        // empty cell, and the paint path may only ask for the rows it shows.
+        let keys = crate::app::icon_prefetch_keys(built.iter().map(|row| match row {
+            DisplayRow::Process(process) => process.icon_path.as_deref(),
+            DisplayRow::GroupHeader(..) => None,
+        }));
+        app.prefetch_icons(keys);
         let selectable = selectable_indices(&built, &expanded);
         cache = Some(Cache {
             key: key.clone(),

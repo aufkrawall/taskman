@@ -242,10 +242,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let cache_arc = app.shared.startup_cache.clone();
     let mut guard = tm_core::sync::lock(&cache_arc);
-    let Some((items, _)) = guard.as_mut() else {
+    let Some((items, fetched_at)) = guard.as_mut() else {
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
+    // Copied out before the row UI: the timestamp is the fetched list's only
+    // identity, and `IconPrefetch` uses it to recognise a rebuild.
+    let fetched_at = *fetched_at;
 
     let q = crate::search::Query::new(&app.search);
     let mut table = app.make_table("startup", columns());
@@ -258,6 +261,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let sort = app.startup_sort;
     let impact = |item: &StartupItem| derived.shown_impact(app, item);
     visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort, &impact));
+
+    // Warm the icons of the rows this rebuild just produced. The page
+    // re-derives `visible` from the fetched list every frame, so `IconPrefetch`
+    // — not the frame — decides when the cache is asked again: a new list or a
+    // new search.
+    if app.icons_prefetch.startup_due(fetched_at, &app.search) {
+        // Exactly the target the row paints through, in the table's own order;
+        // a row without one paints the platform's default application icon and
+        // has no key.
+        let mut paths: Vec<Option<&str>> = Vec::with_capacity(visible.len());
+        for &index in &visible {
+            let target = derived.targets.get(&items[index].id);
+            paths.push(target.map(|(path, _)| path.as_str()));
+        }
+        let keys = crate::app::icon_prefetch_keys(paths);
+        app.prefetch_icons(keys);
+    }
 
     // While a dialog is up it owns the keyboard: the page's nav, row keys and
     // menu key all stand down (`TaskManApp::modal_open`).

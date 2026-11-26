@@ -498,6 +498,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         URow::App { roll, .. } => &**roll,
     }));
 
+    // Warm the icons of the app rows this rebuild just produced. The page
+    // re-derives its rows from the live snapshot every frame, so `IconPrefetch`
+    // — not the frame — decides when the cache is asked again: a new sample or
+    // a new search.
+    if app.icons_prefetch.users_due(snap.timestamp_ms, &app.search) {
+        let keys = crate::app::icon_prefetch_keys(rows.iter().map(|row| match row {
+            URow::App { exe, .. } => exe.as_deref(),
+            URow::User(_) => None,
+        }));
+        app.prefetch_icons(keys);
+    }
+
     // While a dialog is up it owns the keyboard: the page's nav, row keys and
     // menu key all stand down (`TaskManApp::modal_open`).
     let dialog_open = app.modal_open();

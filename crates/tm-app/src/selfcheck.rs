@@ -684,6 +684,130 @@ pub fn run_code_samples() -> i32 {
     if ok { 0 } else { 1 }
 }
 
+/// Measure the icon resolution the pages depend on, without a GUI.
+///
+/// Icon resolution is the standing suspect behind the page slowdowns: a row
+/// whose icon is still pending paints an EMPTY icon cell, so a slow resolver
+/// is exactly what "the icons take forever to load" looks like, and on Linux
+/// one miss walks the whole theme chain. Nothing else in this program measures
+/// it — the pages report hit/miss counters only while a GUI paints — so this is
+/// the only way to answer "how expensive is one icon on this box" on a headless
+/// machine, which is how the fix is verified on a Plasma desktop.
+///
+/// It resolves the same keys the Processes and Details rows ask for
+/// ([`crate::icon_cache::row_icon_key`], so the rule cannot drift), once cold —
+/// the state a page is in when it first lists its rows — and once warm, because
+/// what a second page open costs is what the user actually repeats. The
+/// percentiles are taken over the cold lookups: a mean hides the few misses
+/// that dominate a page's first paint. One JSON line, exit 0 when it measured
+/// something.
+pub fn run_icons() -> i32 {
+    let mut collector = tm_platform::create_collector();
+    let Ok(snapshot) = collector.sample(Instant::now()) else {
+        tracing::error!("icon selfcheck: process snapshot failed");
+        eprintln!(
+            "{}",
+            serde_json::json!({"ok": false, "error": "process snapshot failed"})
+        );
+        return 1;
+    };
+    let keys = icon_keys(&snapshot);
+    if keys.is_empty() {
+        // Nothing to resolve is not a measurement, so it must not report as
+        // one: a summary of zeros here would read as "every icon is free".
+        tracing::error!("icon selfcheck: the snapshot carried no executable paths");
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "error": "no distinct executable paths in the snapshot",
+            })
+        );
+        return 1;
+    }
+
+    let actions = tm_platform::create_actions();
+    let mut per_key_us: Vec<u64> = Vec::with_capacity(keys.len());
+    let mut resolved = 0usize;
+    let cold = Instant::now();
+    for key in &keys {
+        let started = Instant::now();
+        let icon = actions.process_icon_rgba(key);
+        per_key_us.push(elapsed_us(started));
+        resolved += usize::from(icon.is_some());
+    }
+    let cold_ms = ms_rounded(cold.elapsed());
+    // The warm pass only measures time: the answers are the same ones, and
+    // whatever the platform remembers between two lookups (nothing on Linux, a
+    // shell image cache on Windows) is the difference the user feels on the
+    // second page visit.
+    let warm = Instant::now();
+    for key in &keys {
+        let _ = actions.process_icon_rgba(key);
+    }
+    let warm_ms = ms_rounded(warm.elapsed());
+
+    per_key_us.sort_unstable();
+    let summary = serde_json::json!({
+        "ok": true,
+        "keys": keys.len(),
+        "resolved": resolved,
+        "missing": keys.len().saturating_sub(resolved),
+        "cold_ms": cold_ms,
+        "warm_ms": warm_ms,
+        "p50_us": percentile(&per_key_us, 0.50),
+        "p95_us": percentile(&per_key_us, 0.95),
+        "max_us": percentile(&per_key_us, 1.0),
+    });
+    tracing::info!(
+        keys = keys.len(),
+        resolved,
+        cold_ms,
+        warm_ms,
+        "icon selfcheck measured"
+    );
+    println!("{summary}");
+    0
+}
+
+/// The distinct icon keys the pages would ask for, from one snapshot.
+///
+/// Deduplicated and capped by [`crate::app::icon_prefetch_keys`] — the same
+/// collector the pages use for their prefetch — so the check measures the work
+/// a rebuild actually hands over rather than one key per process row.
+fn icon_keys(snapshot: &tm_core::model::Snapshot) -> Vec<String> {
+    let keys: Vec<Option<String>> = snapshot
+        .processes
+        .iter()
+        .map(|process| crate::icon_cache::row_icon_key(process.exe_path.as_deref()))
+        .collect();
+    crate::app::icon_prefetch_keys(keys.iter().map(|key| key.as_deref()))
+}
+
+/// Nearest-rank percentile of `sorted` (ascending), or `None` when there is
+/// nothing to rank.
+///
+/// Nearest rank, not an interpolated one: the answer has to be a lookup this
+/// run really performed. An empty set has no percentile at all — `None`, never
+/// a zero that would read as "measured 0 µs".
+fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = ((p * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted.get(rank - 1).copied()
+}
+
+/// `since` in whole microseconds, saturating instead of wrapping.
+fn elapsed_us(since: Instant) -> u64 {
+    since.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+/// A duration in milliseconds, rounded to the hundredth the summary shows.
+fn ms_rounded(elapsed: Duration) -> f64 {
+    (elapsed.as_secs_f64() * 1000.0 * 100.0).round() / 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,5 +1234,58 @@ mod tests {
         assert_eq!(summary["waited_ms"], serde_json::json!(0));
         assert_eq!(summary["own_io_error"], serde_json::Value::Null);
         assert!(probe.waited.answer.is_err());
+    }
+
+    /// The icon check resolves the keys the PAGES would ask for: one per
+    /// distinct image, nothing for a row without one. Measuring one key per
+    /// process row would answer a question no page asks, because the rows are
+    /// deduplicated before they reach the cache.
+    #[test]
+    fn icon_keys_are_the_distinct_row_keys() {
+        let image = |pid: u32, name: &str, exe: Option<&str>| {
+            let mut process = tm_core::model::ProcessEntry::new(pid, name);
+            process.exe_path = exe.map(std::path::PathBuf::from);
+            process
+        };
+        let snapshot = tm_core::model::Snapshot {
+            processes: vec![
+                image(10, "browser.exe", Some(r"C:\apps\browser.exe")),
+                image(11, "browser.exe", Some(r"C:\apps\browser.exe")),
+                image(12, "cmd.exe", Some(r"C:\Windows\System32\cmd.exe")),
+                // No image at all: the row paints the platform's default icon
+                // and has no key to resolve.
+                image(13, "MemCompression", None),
+                // A bare kernel name is not a path, so it is no key either.
+                image(14, "Registry", Some("Registry")),
+            ],
+            ..Default::default()
+        };
+        let keys = icon_keys(&snapshot);
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert_eq!(keys[0], r"C:\apps\browser.exe");
+        assert_eq!(keys[1], r"C:\Windows\System32\cmd.exe");
+        // An empty snapshot asks for nothing rather than inventing a key.
+        assert!(icon_keys(&tm_core::model::Snapshot::default()).is_empty());
+    }
+
+    /// The percentiles are nearest rank over the lookups that really ran, and
+    /// an empty set answers `None` instead of a fabricated zero.
+    #[test]
+    fn percentiles_are_nearest_rank_and_empty_has_none() {
+        let mut samples = vec![7_u64, 1, 3, 9, 5];
+        samples.sort_unstable();
+        assert_eq!(percentile(&samples, 0.50), Some(5));
+        assert_eq!(percentile(&samples, 0.95), Some(9));
+        assert_eq!(percentile(&samples, 1.0), Some(9));
+
+        // A single sample is its own p50, p95 and max — the case a two-key
+        // snapshot produces.
+        assert_eq!(percentile(&[42], 0.50), Some(42));
+        assert_eq!(percentile(&[42], 0.95), Some(42));
+        assert_eq!(percentile(&[42], 1.0), Some(42));
+
+        assert_eq!(percentile(&[], 0.50), None);
+        assert_eq!(percentile(&[], 0.95), None);
+        assert_eq!(percentile(&[], 1.0), None);
     }
 }
