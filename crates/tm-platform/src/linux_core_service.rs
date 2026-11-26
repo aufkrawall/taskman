@@ -38,8 +38,12 @@ use serde::{Deserialize, Serialize};
 use crate::linux_sensors::SensorSnapshot;
 use tm_core::model::PriorityClass;
 
-/// Version of the request/response schema. Bumped whenever a field changes
-/// meaning or a required field is added; the manifest pins it as well.
+/// Version of the request/response schema. This is the FIRST released schema,
+/// so it stays 1 while the feature is still being assembled: the GUI and the
+/// service always ship from one release. Every wire-shape change AFTER this
+/// release — a new variant, a field whose meaning shifts, a removed field —
+/// must bump it, because a GUI and a service from different releases then fail
+/// at the handshake instead of misreading each other.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Root-owned runtime directory that systemd creates for the service.
@@ -244,14 +248,16 @@ pub fn manifest_protection_problem(owner_uid: Option<u32>, mode: Option<u32>) ->
         return Some("manifest mode could not be read".into());
     };
     let writable = mode & 0o022;
-    (writable != 0).then(|| {
-        format!("manifest must not be group- or world-writable (mode {mode:o})")
-    })
+    (writable != 0)
+        .then(|| format!("manifest must not be group- or world-writable (mode {mode:o})"))
 }
 
 /// Protection rule for the service binary: a user-writable image must never
 /// run as root.
-pub fn service_image_protection_problem(owner_uid: Option<u32>, mode: Option<u32>) -> Option<String> {
+pub fn service_image_protection_problem(
+    owner_uid: Option<u32>,
+    mode: Option<u32>,
+) -> Option<String> {
     manifest_protection_problem(owner_uid, mode)
         .map(|problem| problem.replace("manifest", "service image"))
 }
@@ -384,8 +390,13 @@ pub enum Request {
     /// Every thread of one exact process.
     ProcessThreads { pid: u32, start_ticks: i64 },
     /// Socket endpoints attributed to one process (`/proc/<pid>/fd` needs
-    /// CAP_SYS_PTRACE for another user's process).
-    ProcessConnections { pid: u32 },
+    /// CAP_SYS_PTRACE for another user's process). The creation identity is
+    /// required, like every other per-process request: the connection table
+    /// carries no creation time, so the identity must be pinned before the
+    /// read or a recycled pid would hand back another process's sockets.
+    ProcessConnections { pid: u32, start_ticks: i64 },
+    /// Files one exact process has open, with its per-file I/O totals.
+    ProcessFileIo { pid: u32, start_ticks: i64 },
     /// Container/hardening evidence the kernel withholds from other users.
     ProcessEvidence { pid: u32, start_ticks: i64 },
     /// One privileged mutation.
@@ -401,6 +412,7 @@ impl Request {
             Self::ProcessModules { .. } => "process-modules",
             Self::ProcessThreads { .. } => "process-threads",
             Self::ProcessConnections { .. } => "process-connections",
+            Self::ProcessFileIo { .. } => "process-file-io",
             Self::ProcessEvidence { .. } => "process-evidence",
             Self::Action { action } => action.label(),
         }
@@ -413,6 +425,7 @@ impl Request {
             Self::ProcessModules { pid, .. }
             | Self::ProcessThreads { pid, .. }
             | Self::ProcessConnections { pid, .. }
+            | Self::ProcessFileIo { pid, .. }
             | Self::ProcessEvidence { pid, .. } => valid_pid(*pid),
             Self::Action { action } => action.validate(),
         }
@@ -480,10 +493,14 @@ impl ActionRequest {
             Self::Kill { pid, .. }
             | Self::Suspend { pid, .. }
             | Self::Resume { pid, .. }
-            | Self::SetPriority { pid, .. }
-            | Self::SetAffinity { pid, .. } => valid_pid(*pid),
-            Self::SetAffinity { mask: 0, .. } => {
-                Err("an empty affinity mask would stop the process on every CPU".into())
+            | Self::SetPriority { pid, .. } => valid_pid(*pid),
+            // Checked before the pid so an empty mask can never reach the
+            // kernel: it would stop the process on every CPU.
+            Self::SetAffinity { pid, mask } => {
+                if *mask == 0 {
+                    return Err("an empty affinity mask would stop the process on every CPU".into());
+                }
+                valid_pid(*pid)
             }
             Self::Service { unit, .. } => {
                 if unit.is_empty() {
@@ -520,6 +537,9 @@ pub enum Response {
     Modules(Vec<WireModule>),
     Threads(WireThreads),
     Connections(Vec<WireConnection>),
+    /// Per-file I/O accounting of one exact process (`/proc/<pid>/io` is
+    /// owner-only, so another user's process needs the broker).
+    FileIo(Box<WireFileIo>),
     Evidence(Box<ProcessEvidence>),
     /// An action completed.
     Done,
@@ -594,7 +614,10 @@ pub enum WireThreadState {
     Dead,
     Idle,
     Parked,
-    Other,
+    /// A kernel state this schema does not name, carrying the raw `/proc`
+    /// character so the client can render the same evidence the direct
+    /// reader would, instead of collapsing every unknown state to one value.
+    Other(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,6 +638,12 @@ pub struct WireThread {
 
 /// One socket endpoint. Addresses are strings so the wire stays independent of
 /// the platform's socket types; the client parses them back.
+///
+/// The format is pinned: an IPv4 or IPv6 endpoint is exactly
+/// `std::net::SocketAddr::to_string()` (`127.0.0.1:8080`, `[::1]:8080`,
+/// `[fe80::1%2]:80`), a Unix endpoint is the socket path. A client that cannot
+/// parse one must report it as a diagnostic and drop only that row, never turn
+/// the whole answer into "no connections".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireConnection {
     /// `tcp`, `tcp6`, `udp`, `udp6`, `unix`.
@@ -737,7 +766,10 @@ pub fn encode_frame<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>
     if body.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame of {} bytes exceeds the {limit}-byte limit", body.len()),
+            format!(
+                "frame of {} bytes exceeds the {limit}-byte limit",
+                body.len()
+            ),
         ));
     }
     let mut frame = Vec::with_capacity(body.len() + 4);
@@ -884,14 +916,24 @@ mod tests {
     fn manifest_requires_at_least_one_authorized_uid() {
         let mut empty = manifest();
         empty.authorized_uids.clear();
-        assert!(empty.validate().expect_err("invalid").contains("authorized_uids"));
+        assert!(
+            empty
+                .validate()
+                .expect_err("invalid")
+                .contains("authorized_uids")
+        );
     }
 
     #[test]
     fn strict_manifest_requires_a_client_path() {
         let mut strict = manifest();
         strict.clients.clear();
-        assert!(strict.validate().expect_err("invalid").contains("clients is empty"));
+        assert!(
+            strict
+                .validate()
+                .expect_err("invalid")
+                .contains("clients is empty")
+        );
 
         strict.allow_user_writable_client = true;
         assert!(strict.validate().is_ok());
@@ -1043,7 +1085,11 @@ mod tests {
         assert_eq!(decoded, request);
 
         // A clean EOF between frames is not an error.
-        assert!(read_frame(&mut cursor, MAX_REQUEST_BYTES).expect("eof").is_none());
+        assert!(
+            read_frame(&mut cursor, MAX_REQUEST_BYTES)
+                .expect("eof")
+                .is_none()
+        );
 
         // A header that claims more than the limit is refused before allocating.
         let mut oversized = std::io::Cursor::new(u32::MAX.to_be_bytes().to_vec());
@@ -1058,12 +1104,15 @@ mod tests {
     fn encoding_refuses_a_body_over_the_limit() {
         let big = "x".repeat(MAX_REQUEST_BYTES);
         assert!(
-            encode_frame(&Request::Action {
-                action: ActionRequest::Service {
-                    unit: big,
-                    verb: ServiceVerb::Start
-                }
-            }, MAX_REQUEST_BYTES)
+            encode_frame(
+                &Request::Action {
+                    action: ActionRequest::Service {
+                        unit: big,
+                        verb: ServiceVerb::Start
+                    }
+                },
+                MAX_REQUEST_BYTES
+            )
             .is_err()
         );
     }
@@ -1102,6 +1151,21 @@ mod tests {
                     cycles: None,
                 }],
             }),
+            Response::FileIo(Box::new(WireFileIo {
+                files: vec![WireFileIoEntry {
+                    path: "/var/log/syslog".into(),
+                    read_bytes: Some(4096),
+                    write_bytes: None,
+                    read_ops: Some(2),
+                    write_ops: None,
+                    file_size: Some(8192),
+                    offset: Some(4096),
+                    access_known: true,
+                    is_read: true,
+                    is_write: false,
+                    open_handles: 1,
+                }],
+            })),
         ];
         for response in responses {
             let encoded = encode_frame(&response, MAX_RESPONSE_BYTES).expect("encode");
@@ -1109,6 +1173,32 @@ mod tests {
             let decoded: Response = decode_frame(body).expect("decode");
             assert_eq!(decoded, response);
         }
+    }
+
+    #[test]
+    fn requests_round_trip_with_their_identity_and_raw_state() {
+        for request in [
+            Request::ProcessConnections {
+                pid: 42,
+                start_ticks: 1234,
+            },
+            Request::ProcessFileIo {
+                pid: 42,
+                start_ticks: 1234,
+            },
+        ] {
+            let encoded = encode_frame(&request, MAX_REQUEST_BYTES).expect("encode");
+            let body = &encoded[4..];
+            let decoded: Request = decode_frame(body).expect("decode");
+            assert_eq!(decoded, request);
+        }
+
+        // An unnamed kernel state keeps its raw byte, so the brokered answer
+        // renders exactly what the direct reader would.
+        let state = WireThreadState::Other(b'P');
+        let encoded = encode_frame(&state, MAX_RESPONSE_BYTES).expect("encode");
+        let decoded: WireThreadState = decode_frame(&encoded[4..]).expect("decode");
+        assert_eq!(decoded, WireThreadState::Other(80));
     }
 
     #[test]
