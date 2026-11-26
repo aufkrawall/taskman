@@ -15,7 +15,10 @@
 //! * thermal zone: `chip` is the zone `type` (`x86_pkg_temp`, `acpitz`, ...) and
 //!   `label` the zone name (`thermal_zone0`), which is what identifies the row.
 //! * RAPL: `chip` is `intel-rapl`, `label` the zone `name` (`package-0`, `core`,
-//!   `dram`) and `device` the zone directory (`intel-rapl:0`).
+//!   `core`, `dram` — a label that repeats across packages) and `device` the
+//!   zone directory (`intel-rapl:0`, `intel-rapl:0:2`), which is what makes a
+//!   package and its constraints distinguishable. `value` is a cumulative
+//!   counter and `max` the range it wraps at, not a rate.
 //!
 //! Every walk is bounded. sysfs is kernel-owned, but the core service runs this
 //! as root: a malformed or hostile tree must not be able to grow the reading
@@ -23,13 +26,15 @@
 
 use crate::linux_sensors::{
     SensorKind, SensorReading, attribute_order, hwmon_device_label, kind_of_stem, parse_alarm,
-    scale_hwmon, sensor_stem, split_attribute, unit_of_kind,
+    powercap_zone_index, scale_hwmon, sensor_stem, split_attribute, unit_of_kind,
 };
 use std::path::{Path, PathBuf};
 
 const HWMON_ROOT: &str = "/sys/class/hwmon";
 const THERMAL_ROOT: &str = "/sys/class/thermal";
 const POWERCAP_ROOT: &str = "/sys/class/powercap";
+/// The RAPL provider's directory prefix inside the powercap class.
+const RAPL_PREFIX: &str = "intel-rapl:";
 /// No board has more chips than this, and the cap keeps a hostile class
 /// directory from growing the walk.
 const MAX_CHIPS: usize = 64;
@@ -228,10 +233,14 @@ impl Collector {
 
     /// `/sys/class/powercap/intel-rapl:*`: cumulative energy counters.
     ///
-    /// The counters are root-only on current kernels, so an unelevated sampler
-    /// records the denial and reports them absent instead of 0 J.
+    /// The tree nests a package's own counter beside its constraints
+    /// (`intel-rapl:0:2` is `dram`), and a zone's `name` repeats across
+    /// packages, so the zone directory travels in `device`. Each zone also
+    /// publishes the range its counter wraps at, which becomes the reading's
+    /// `max`. The counters are root-only on current kernels, so an unelevated
+    /// sampler records the denial and reports them absent instead of 0 J.
     fn powercap(&mut self) {
-        let zones = match class_entries(POWERCAP_ROOT, "intel-rapl:") {
+        let zones = match rapl_zones() {
             Ok(zones) => zones,
             Err(error) => {
                 self.note(Path::new(POWERCAP_ROOT), error);
@@ -250,10 +259,7 @@ impl Collector {
                     continue;
                 }
             };
-            let energy = i64::try_from(raw)
-                .ok()
-                .and_then(|raw| scale_hwmon(SensorKind::Energy, raw));
-            let Some(value) = energy else {
+            let Some(value) = energy_joules(raw) else {
                 self.note(&path, "no plausible value");
                 continue;
             };
@@ -274,12 +280,50 @@ impl Collector {
                 kind: SensorKind::Energy,
                 value,
                 unit: unit_of_kind(SensorKind::Energy),
-                max: None,
+                // Without the range a consumer cannot tell a wrap from a
+                // counter that jumped backwards.
+                max: read_number::<u64>(&zone.join("max_energy_range_uj"))
+                    .ok()
+                    .and_then(energy_joules),
                 crit: None,
                 alarm: None,
             });
         }
     }
+}
+
+/// One RAPL microjoule counter in joules.
+fn energy_joules(raw: u64) -> Option<f64> {
+    i64::try_from(raw)
+        .ok()
+        .and_then(|raw| scale_hwmon(SensorKind::Energy, raw))
+}
+
+/// The `intel-rapl` zones of `/sys/class/powercap`, grouped by package.
+///
+/// A package's own counter and its constraints share the package number, and
+/// the `(package, constraint)` pair keeps them together in the kernel's order.
+fn rapl_zones() -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(POWERCAP_ROOT)?.flatten() {
+        if out.len() >= MAX_CHIPS {
+            break;
+        }
+        if rapl_zone_index(&entry.path()).is_none() {
+            continue;
+        }
+        out.push(entry.path());
+    }
+    out.sort_by_key(|path| rapl_zone_index(path).unwrap_or((u32::MAX, u32::MAX)));
+    Ok(out)
+}
+
+/// The `(package, constraint)` pair of one powercap directory.
+fn rapl_zone_index(path: &Path) -> Option<(u32, u32)> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(RAPL_PREFIX))
+        .and_then(powercap_zone_index)
 }
 
 /// The bounded `prefix` + digits entries of one sysfs class directory, in
