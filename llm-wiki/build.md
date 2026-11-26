@@ -193,6 +193,26 @@ git config --local lfs.allowincompletepush true
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
 
+### Python build tests (`tools/tests/test_*.py`)
+
+Every file loads the driver by path and executes it without registering it in
+`sys.modules`:
+
+```python
+spec = importlib.util.spec_from_file_location("taskman_build", root / "build.py")
+build = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build)
+```
+
+That keeps `build.py` importable with no package and no side effects, but it
+also makes the module invisible to `sys.modules` while it executes. Python
+3.14 reads `sys.modules[cls.__module__]` inside `@dataclass`, so a dataclass at
+module level raises `AttributeError: 'NoneType' object has no attribute
+'__dict__'` there and takes every test file down with it — Arch ships 3.14, and
+that is how it was found. Use a `NamedTuple` or a plain class for the small
+value types in `build.py`; `ArchPackageHost` is a `NamedTuple` for that reason,
+not for style.
+
 ### Live-kernel tests (`--live-tests`)
 
 `python build.py --live-tests` runs the `#[ignore]`d tests in `tm-platform`

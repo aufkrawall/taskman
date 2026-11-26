@@ -144,8 +144,11 @@ NVML access lives in `linux/sensors.rs`.
   Arch package on every run: a native `makepkg` on an Arch host, or the first
   Arch WSL distro that has one on Windows (`TASKMAN_ARCH_WSL_DISTRO` names a
   distro instead of searching for it). A host with neither is a skip, not a
-  failure. The musl artifact stays headless: it carries the two binaries
-  and the README, no desktop entry and no unit.
+  failure. Verify a built package without installing it: `pacman -Qip`/`-Qlp`
+  on the file for its metadata and payload, then extract it and run
+  `taskman --selfcheck`, which is the cheapest proof that the packaged binary
+  links and samples a live system. The musl artifact stays headless: it
+  carries the two binaries and the README, no desktop entry and no unit.
 - A Windows host without `cross`/`zig` can only produce that headless
   fallback, so `packaging/linux/build-artifact.sh` builds the GUI-capable
   glibc tarball natively on any Linux host (desktop, WSL2, CI container) with
