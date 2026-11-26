@@ -9,6 +9,12 @@ pub mod actions;
 /// Linux host-fact parsing and telemetry-demand selection, shared by the
 /// Linux backend. Platform-neutral on purpose so its tests run on every host.
 pub mod linux_telemetry;
+/// Linux core-service wire protocol, protected manifest and peer policy.
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_core_service;
+/// Linux sensor reading types and their `/sys` + NVML conversions.
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_sensors;
 /// Freedesktop icon-theme lookup, shared by the Unix backends. Platform-
 /// neutral on purpose so its tests run on every host.
 pub mod xdg_icons;

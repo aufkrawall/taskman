@@ -3,6 +3,7 @@
 
 pub mod activation;
 mod autostart;
+pub mod core_service;
 mod cpu_stat;
 mod desktop_session;
 mod diskstats;
@@ -16,6 +17,7 @@ mod process_io;
 mod process_modules;
 mod process_threads;
 mod process_tree;
+mod sensors;
 pub(crate) mod services;
 mod sessions;
 mod shell;
