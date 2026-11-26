@@ -22,11 +22,12 @@
 //! dev box and CI.
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Maximum edge of a decoded icon; larger PNGs are box-downsampled so the
 /// GUI-side texture cache stays small (64×64×4 ≈ 16 KiB per icon).
@@ -83,6 +84,31 @@ fn read_text_capped(path: &Path) -> Option<String> {
 const THEME_DIR_CACHE_CAP: usize = 64;
 const FILE_CACHE_CAP: usize = 1024;
 const DECODE_CACHE_CAP: usize = 128;
+
+/// Bounds for the cache of directory contents.
+///
+/// This one holds the working set of a whole chain walk — a theme tree is tens
+/// of size dirs, each with a few context dirs, times the handful of themes in the
+/// chain — so it is sized to keep a full walk resident. Evicting part of it would
+/// re-read exactly the directories the next lookup asks about, and re-reading
+/// them is the cost this cache exists to remove.
+const LISTING_CACHE_CAP: usize = 1024;
+/// Icon names established as absent. Same order as the file cache: the misses
+/// are the names the GUI keeps retrying, and an entry is a `String` and a stamp.
+const MISS_CACHE_CAP: usize = 1024;
+
+/// How long a directory listing stays authoritative, measured from the
+/// `read_dir` that produced it.
+///
+/// A listing cannot live for the process lifetime: an icon or a whole theme
+/// installed while TaskMan runs would then never appear, and the icon worker
+/// resolves names for hours. A bounded interval keeps a warm lookup free of
+/// filesystem calls while an install still shows up within a minute.
+const LISTING_TTL: Duration = Duration::from_secs(60);
+/// How long a miss stays authoritative — the window the GUI's own
+/// `FAILURE_RETRY_TTL` keeps a failed key out of its queue for, so a name that is
+/// absent now is asked again at the same pace as before instead of never.
+const MISS_RETRY_TTL: Duration = Duration::from_secs(30);
 
 /// Theme that stands in for "the desktop's configured theme" when nothing
 /// names one: `/usr/share/icons/default/index.theme` is the spec's designated
@@ -448,40 +474,180 @@ impl<K: Eq + Hash + Clone, V> Bounded<K, V> {
     }
 }
 
-/// Lazily filled answers: a theme's parsed layout, an icon name's file and a
-/// PNG's decoded pixels.
+/// What one directory holds, as it was when it was read.
 ///
-/// Only successes are stored. A miss must stay retryable: the GUI keeps a
-/// failed key out of the queue for `FAILURE_RETRY_TTL` and then asks again, so
-/// an icon, theme file or temporarily unreadable directory that shows up later
-/// still resolves. Caching the negative for the process lifetime would turn
-/// that bounded retry into "never again", and a directory read can fail for
-/// reasons that have nothing to do with the icon existing (EACCES, EMFILE, an
-/// I/O error on a network home).
+/// The walk used to answer every question with `Path::is_file()`: one icon name
+/// that no theme ships cost ~12,300 `stat`/`open` calls and ~1,400 `read_dir`s
+/// against a stock Arch theme tree, and a name that only resolves late in the
+/// chain cost thousands of probes too. A directory's entries answer all of those
+/// as hash lookups, and a directory is read once.
+struct DirListing {
+    /// Entry names that are files — the only thing an icon probe can hit. An
+    /// icon name is a `String`, so an entry whose name is not UTF-8 can never be
+    /// asked for and is not kept.
+    files: HashSet<String>,
+    /// Subdirectory paths, sorted by [`sorted`]: one icon name can exist in more
+    /// than one context of one size dir, and a filesystem-defined `read_dir`
+    /// order must not decide which file wins.
+    subdirs: Vec<PathBuf>,
+    /// The directory exists but could not be read — `EACCES`, `EMFILE`, an I/O
+    /// error on a network home. The empty sets above are then not an answer but
+    /// the absence of one: a miss that consulted this listing must stay
+    /// retryable (see [`Resolution`]), while the empty listing itself is still
+    /// worth caching so one unreadable directory is not re-read per icon.
+    unreadable: bool,
+    /// When this listing was read, for [`LISTING_TTL`].
+    read_at: Instant,
+}
+
+impl DirListing {
+    /// Read `dir` once: its file names, and its subdirectories sorted.
+    ///
+    /// A directory that cannot be read yields an empty listing that is cached
+    /// like any other. Absent and unreadable are kept apart: absence is a normal
+    /// answer (most of the chain does not exist), while a read that *failed* says
+    /// nothing about what is in there and must not settle a miss.
+    fn read(dir: &Path) -> Self {
+        let mut files: HashSet<String> = HashSet::new();
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        let mut unreadable = false;
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    // The entry's own type costs no `stat`; only a symlink needs
+                    // the follow-up, because a theme may ship a context dir as
+                    // one, and every probe this replaces was an `is_file()`,
+                    // which follows the link.
+                    let is_dir = if file_type.is_symlink() {
+                        entry.path().is_dir()
+                    } else {
+                        file_type.is_dir()
+                    };
+                    if is_dir {
+                        subdirs.push(entry.path());
+                        continue;
+                    }
+                    // A symlink to a file is a file; a broken one is neither.
+                    if file_type.is_symlink() && !entry.path().is_file() {
+                        continue;
+                    }
+                    if let Some(name) = entry.file_name().to_str() {
+                        files.insert(name.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                unreadable = error.kind() != std::io::ErrorKind::NotFound;
+            }
+        }
+        Self {
+            files,
+            subdirs: sorted(subdirs),
+            unreadable,
+            read_at: Instant::now(),
+        }
+    }
+
+    /// Whether the directory holds nothing at all — as opposed to could not be
+    /// read, which also has no entries but stays retryable.
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.subdirs.is_empty() && !self.unreadable
+    }
+}
+
+/// Lazily filled answers: a theme's parsed layout, a directory's contents, an
+/// icon name's file, a PNG's decoded pixels — and the names the chain does not
+/// hold.
+///
+/// A miss used to be recomputed every time, because keeping it for the process
+/// lifetime would have turned the GUI's bounded retry (`FAILURE_RETRY_TTL`) into
+/// "never again": an icon, theme file or temporarily unreadable directory that
+/// shows up later still has to resolve. It is now remembered for that same window
+/// and walked again after it, and a walk that could not read what it needed —
+/// `EACCES`, `EMFILE`, an I/O error on a network home, a theme whose declared
+/// tree is not installed yet — is not remembered at all, so a transient failure
+/// still retries immediately. Directory listings expire for the same reason.
 struct Caches {
     /// `<icon dir>/<theme>` → its candidate size dirs, best first.
     theme_dirs: Bounded<PathBuf, Arc<Vec<SizeDir>>>,
+    /// Directory → what it holds. Every `is_file()` probe of the walk is answered
+    /// from here; unlike the rest of these caches an entry ages out, after
+    /// [`LISTING_TTL`].
+    listings: Bounded<PathBuf, Arc<DirListing>>,
     /// Icon name → resolved file.
     files: Bounded<String, PathBuf>,
+    /// Icon name → when it was established that no theme holds it, for
+    /// [`MISS_RETRY_TTL`].
+    misses: Bounded<String, Instant>,
     /// Resolved file → decoded RGBA.
     decoded: Bounded<PathBuf, (u32, u32, Vec<u8>)>,
+    /// `read_dir` calls this cache has made. The tests pin that a warm lookup and
+    /// a remembered miss perform none, and the ignored
+    /// `bench_host_theme_icon_lookup` reports it for the host's real theme tree;
+    /// production only ever increments it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fs_probes: usize,
+    /// Resolutions that had to consult the filesystem instead of the caches
+    /// above. Read by the tests — a remembered miss must not reach the filesystem
+    /// again — and by the same benchmark.
+    #[cfg_attr(not(test), allow(dead_code))]
+    walks: usize,
+    /// Test-only clock: added to every age computed here, so a test can cross a
+    /// TTL without sleeping. Always [`Duration::ZERO`] in production, which has
+    /// no way to set it.
+    clock_skew: Duration,
 }
 
 impl Default for Caches {
     fn default() -> Self {
         Self {
             theme_dirs: Bounded::new(THEME_DIR_CACHE_CAP),
+            listings: Bounded::new(LISTING_CACHE_CAP),
             files: Bounded::new(FILE_CACHE_CAP),
+            misses: Bounded::new(MISS_CACHE_CAP),
             decoded: Bounded::new(DECODE_CACHE_CAP),
+            fs_probes: 0,
+            walks: 0,
+            clock_skew: Duration::ZERO,
         }
     }
 }
 
+impl Caches {
+    /// How old the answer stored at `at` is, from this cache's point of view.
+    ///
+    /// The test-only skew is added here rather than baked into the stored stamps:
+    /// a test then moves the cache past a TTL without sleeping, and no `Instant`
+    /// arithmetic (which underflows on a freshly booted host) is involved.
+    fn age(&self, at: Instant) -> Duration {
+        at.elapsed() + self.clock_skew
+    }
+}
+
+/// What one uncached walk concluded.
+enum Resolution {
+    /// The icon's file.
+    Found(PathBuf),
+    /// No theme in the chain holds the name and every directory that could hold
+    /// it was consulted: worth remembering for [`MISS_RETRY_TTL`].
+    Absent,
+    /// Nothing was found, but the walk cannot claim the name is absent: a
+    /// directory could not be read, a theme declares a layout that is not
+    /// installed yet, or the name never reached a directory at all (it is not a
+    /// themed icon name, or it is an absolute path used as-is). Remembering any of
+    /// those would cancel the caller's retry instead of bounding it.
+    Unsettled,
+}
+
 /// Resolver with a lazily built desktop-file index (exe basename → icon
 /// name), so repeated lookups do not rescan `applications/`, plus bounded
-/// caches for the rest of a lookup's static answers: a theme's parsed layout,
-/// an icon name's file, and a decoded PNG (one `Icon=` value is shared by many
-/// executables — every Electron helper, every launcher entry).
+/// caches for the rest of a lookup's answers: a theme's parsed layout, a
+/// directory's contents, an icon name's file, a decoded PNG (one `Icon=` value
+/// is shared by many executables — every Electron helper, every launcher entry)
+/// and the names the chain does not hold.
 pub struct IconResolver {
     lookup: IconLookup,
     /// exe basename (lowercase) → `Icon=` value, highest-precedence desktop
@@ -567,96 +733,207 @@ impl IconResolver {
     /// the pixmaps dirs. PNG files only.
     ///
     /// The answer is cached by name, so the walk runs once per distinct name
-    /// rather than once per executable that uses it. A miss is not cached: the
-    /// GUI retries a failed lookup on its own bounded schedule.
+    /// rather than once per executable that uses it. A miss is remembered for
+    /// [`MISS_RETRY_TTL`] — the window the GUI keeps a failed key out of its
+    /// queue for — and walked again after it, so an icon installed later still
+    /// resolves; a walk that could not read what it needed is not remembered at
+    /// all (see [`Resolution`]).
     pub fn find_icon_file(&self, name: &str) -> Option<PathBuf> {
         if name.is_empty() {
             return None;
         }
-        let cached = tm_core::sync::lock(&self.caches).files.get(name).cloned();
-        if let Some(cached) = cached {
-            return Some(cached);
+        {
+            let caches = tm_core::sync::lock(&self.caches);
+            if let Some(cached) = caches.files.get(name) {
+                return Some(cached.clone());
+            }
+            // A remembered miss is one hash lookup: the GUI asks again every
+            // `FAILURE_RETRY_TTL`, and the walk behind this answer cost thousands
+            // of probes.
+            if let Some(missed_at) = caches.misses.get(name)
+                && caches.age(*missed_at) < MISS_RETRY_TTL
+            {
+                return None;
+            }
         }
-        let file = self.resolve_icon_file(name)?;
-        tm_core::sync::lock(&self.caches)
-            .files
-            .insert(name.to_string(), file.clone());
-        Some(file)
+        match self.resolve_icon_file(name) {
+            Resolution::Found(file) => {
+                tm_core::sync::lock(&self.caches)
+                    .files
+                    .insert(name.to_string(), file.clone());
+                Some(file)
+            }
+            Resolution::Absent => {
+                let missed_at = Instant::now();
+                tm_core::sync::lock(&self.caches)
+                    .misses
+                    .insert(name.to_string(), missed_at);
+                None
+            }
+            Resolution::Unsettled => None,
+        }
     }
 
     /// Uncached [`Self::find_icon_file`]: the walk over the theme chain, then
-    /// the pixmaps dirs.
-    fn resolve_icon_file(&self, name: &str) -> Option<PathBuf> {
+    /// the pixmaps dirs, reporting whether its answer is the filesystem's final
+    /// word.
+    fn resolve_icon_file(&self, name: &str) -> Resolution {
+        {
+            let mut caches = tm_core::sync::lock(&self.caches);
+            caches.walks += 1;
+        }
         // Per the spec an icon name that is an absolute path is used directly.
         if Path::new(name).is_absolute() {
             let p = PathBuf::from(name);
-            return p.is_file().then_some(p);
+            // One `is_file()`, not a walk: retrying it is free, so there is
+            // nothing to remember either way.
+            return if p.is_file() {
+                Resolution::Found(p)
+            } else {
+                Resolution::Unsettled
+            };
         }
         // A themed icon name is one path component. `Icon=` and `Inherits=`
         // reach `Path::join` below, where a relative `..` or a separator would
         // resolve outside the icon dirs the spec says to search.
         if !is_themed_icon_name(name) {
-            return None;
+            return Resolution::Unsettled;
         }
         let file_names = icon_file_names(name);
         let icon_dirs = self.lookup.icon_dirs();
+        let mut settled = true;
         for theme in &self.themes {
             for dir in &icon_dirs {
-                if let Some(f) = self.find_in_theme(dir, theme, &file_names) {
-                    return Some(f);
+                if let Some(f) = self.find_in_theme(dir, theme, &file_names, &mut settled) {
+                    return Resolution::Found(f);
                 }
             }
         }
         // Legacy pixmaps dirs hold plain files: `<pixmaps>/<name>.png`.
-        self.lookup.pixmaps.iter().find_map(|px| {
-            file_names
+        for px in &self.lookup.pixmaps {
+            let listing = self.listing(px);
+            if listing.unreadable {
+                settled = false;
+                continue;
+            }
+            if let Some(file_name) = file_names
                 .iter()
-                .map(|file_name| px.join(file_name))
-                .find(|f| f.is_file())
-        })
+                .find(|file_name| listing.files.contains(file_name.as_str()))
+            {
+                return Resolution::Found(px.join(file_name));
+            }
+        }
+        if settled {
+            Resolution::Absent
+        } else {
+            Resolution::Unsettled
+        }
     }
 
     /// Find `<icon_dir>/<theme>/<size>/<context>/<file_name>`, choosing the size
     /// closest to [`TARGET_SIZE`]. Uses the theme's `index.theme` directory list
     /// when present; otherwise walks the two-level `<size>/<context>` layout.
+    ///
+    /// Every question the walk asks — does this size dir hold the name, which
+    /// context of it does, does the theme dir exist — is answered from
+    /// [`Self::listing`], so one `read_dir` per directory replaces one probe per
+    /// candidate file and a warm walk performs no filesystem calls at all.
+    /// `settled` records whether it could read everything it needed: a walk that
+    /// could not must not make a miss authoritative (see [`Resolution`]).
     fn find_in_theme(
         &self,
         icon_dir: &Path,
         theme: &str,
         file_names: &[String],
+        settled: &mut bool,
     ) -> Option<PathBuf> {
         let theme_dir = icon_dir.join(theme);
-        if !theme_dir.is_dir() {
+        // Most of the chain is absent — no `$HOME/.local/share/icons`, no Breeze
+        // on GNOME — and a directory holding nothing answers no icon without a
+        // layout parse. A theme dir that failed to be read is not empty in this
+        // sense; [`Self::size_dirs`] reports that.
+        if self.listing(&theme_dir).is_empty() {
             return None;
         }
-        for dir in self.size_dirs(&theme_dir).iter() {
-            // Listed once per size dir, not once per candidate extension.
-            let mut contexts: Option<Vec<PathBuf>> = None;
+        for dir in self.size_dirs(&theme_dir, settled).iter() {
+            let listing = self.listing(&dir.path);
+            if listing.unreadable {
+                // Cached, so the walk does not retry the read for every icon;
+                // reported, so a miss that took this listing is not remembered.
+                *settled = false;
+                continue;
+            }
             for file_name in file_names {
                 // The icon may sit directly in the size dir (Breeze's
                 // `apps/48/` layout) or one context level deeper (the
                 // standard `48x48/apps/` layout).
-                let direct = dir.path.join(file_name);
-                if direct.is_file() {
-                    return Some(direct);
+                if listing.files.contains(file_name.as_str()) {
+                    return Some(dir.path.join(file_name));
                 }
                 // Sorted like every other directory walk here: one icon name
                 // can exist in more than one context of the same size dir, and
                 // a filesystem-defined order must not decide which file wins.
-                let contexts = contexts.get_or_insert_with(|| sorted_dir_paths(&dir.path));
-                if let Some(f) = first_in_contexts(contexts, file_name) {
-                    return Some(f);
+                for context in &listing.subdirs {
+                    let context_listing = self.listing(context);
+                    if context_listing.unreadable {
+                        // A context whose listing failed is probed directly: the
+                        // walk has no names for it, and `is_file` can still answer
+                        // where `read_dir` could not.
+                        *settled = false;
+                        if let Some(f) = first_in_contexts(std::slice::from_ref(context), file_name)
+                        {
+                            return Some(f);
+                        }
+                    } else if context_listing.files.contains(file_name.as_str()) {
+                        return Some(context.join(file_name));
+                    }
                 }
             }
         }
         None
     }
 
+    /// `dir`'s listing, read at most once per [`LISTING_TTL`].
+    ///
+    /// Re-reading a directory is what a lookup costs now, so it is done once and
+    /// shared: the same size dir answers every icon name under it. A listing is
+    /// not kept for the process lifetime — an icon or theme installed while
+    /// TaskMan runs has to appear — so it ages out and is read again on next use.
+    fn listing(&self, dir: &Path) -> Arc<DirListing> {
+        let fresh = {
+            let caches = tm_core::sync::lock(&self.caches);
+            match caches.listings.get(dir) {
+                Some(cached) if caches.age(cached.read_at) < LISTING_TTL => Some(cached.clone()),
+                _ => None,
+            }
+        };
+        if let Some(fresh) = fresh {
+            return fresh;
+        }
+        self.listing_now(dir)
+    }
+
+    /// [`Self::listing`] without consulting the cache first.
+    fn listing_now(&self, dir: &Path) -> Arc<DirListing> {
+        // Read outside the guard: a `read_dir` is filesystem work, and the lock
+        // covers the map, not the I/O.
+        let listing = Arc::new(DirListing::read(dir));
+        let mut caches = tm_core::sync::lock(&self.caches);
+        caches.fs_probes += 1;
+        caches.listings.insert(dir.to_path_buf(), listing.clone());
+        listing
+    }
+
     /// Candidate size dirs of `theme_dir`, best first, parsed once per theme
     /// dir: a theme's layout is static for the process, while it used to be
     /// re-read from `index.theme` — and its `<size>` dirs re-listed — for every
     /// theme of every icon dir, on every lookup.
-    fn size_dirs(&self, theme_dir: &Path) -> Arc<Vec<SizeDir>> {
+    ///
+    /// Declared-but-absent directories are dropped here (see
+    /// [`retain_reachable`]). `settled` is cleared when that leaves a declared
+    /// layout with nothing installed, or when the theme dir itself cannot be
+    /// read.
+    fn size_dirs(&self, theme_dir: &Path, settled: &mut bool) -> Arc<Vec<SizeDir>> {
         let cached = {
             let caches = tm_core::sync::lock(&self.caches);
             caches.theme_dirs.get(theme_dir).cloned()
@@ -664,9 +941,36 @@ impl IconResolver {
         if let Some(cached) = cached {
             return cached;
         }
+        // Read fresh rather than through [`LISTING_TTL`]: this readdir decides
+        // which declared directories are installed at all, it happens once per
+        // theme layout (the result is cached below), and a listing up to a minute
+        // old would hide the tree of a theme that was installed while the app
+        // runs — with the miss that layout produced looking final.
+        let listing = self.listing_now(theme_dir);
+        if listing.unreadable {
+            // Not "this theme has no icons": the layout is unknown, so the miss
+            // this walk reports has to stay immediately retryable.
+            *settled = false;
+            return Arc::new(Vec::new());
+        }
+        if listing.is_empty() {
+            return Arc::new(Vec::new());
+        }
         // Parsed outside the guard: reading `index.theme` is filesystem work,
         // and the lock is meant to cover the map, not the I/O.
-        let dirs = Arc::new(size_dirs_of_theme(theme_dir));
+        let mut dirs = size_dirs_of_theme(theme_dir);
+        let declared = dirs.len();
+        retain_reachable(theme_dir, &mut dirs, &listing);
+        // A theme that declares directories of which not one is installed is an
+        // installation (or a repair) in progress: its `index.theme` landed before
+        // the tree. That layout is not settled, so the miss it produced is not
+        // remembered. A theme that is only *partly* absent is the normal state —
+        // hicolor declares ~700 directories on a stock Arch system and ships
+        // ~28 — and is pruned silently.
+        if dirs.is_empty() && declared > 0 {
+            *settled = false;
+        }
+        let dirs = Arc::new(dirs);
         // An empty layout is not a success: it is what a failed `read_dir`, a
         // half-written `index.theme` or a `Directories=` list that has not been
         // filled in yet all look like, and those clear. Keeping it would make
@@ -734,9 +1038,13 @@ fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 ///
 /// A name that exists in several contexts of one size dir — `apps` and
 /// `mimetypes` both ship generic ones — is decided by this order alone, so the
-/// caller passes [`sorted_dir_paths`] and the winner never depends on the
+/// caller passes the sorted subdirectories and the winner never depends on the
 /// filesystem's `read_dir` order. The scan is separate from that walk so a test
-/// can hand it a fixed order.
+/// can hand it a fixed order. It is also the only place a candidate file is now
+/// probed directly: [`IconResolver::find_in_theme`] answers from the size dir's
+/// [`DirListing`] and reaches this scan only for a context whose own listing
+/// could not be read, where `is_file` may still answer — and where the miss has
+/// to stay retryable instead of looking like an empty directory.
 fn first_in_contexts(contexts: &[PathBuf], file_name: &str) -> Option<PathBuf> {
     contexts
         .iter()
@@ -1053,11 +1361,15 @@ fn theme_inherits(icon_dirs: &[PathBuf], theme: &str) -> Vec<String> {
 /// (`default` → `Adwaita` → `AdwaitaLegacy` → `hicolor` on a stock GNOME box,
 /// `Breeze-Dark` → `Breeze` → `hicolor` on Plasma), and stopping after one
 /// level made those themes' icons invisible. `visited` also makes a malformed
-/// `Inherits` cycle terminate.
+/// `Inherits` cycle terminate, and it is what keeps each theme in the chain
+/// exactly once at its first position: a diamond (`a` inherits `b` and `c`, both
+/// inheriting `d`) names `d` twice, and every entry here is walked against every
+/// icon dir — a repeat is a whole second pass over the same directories for an
+/// answer the first pass already gave.
 fn theme_chain(icon_dirs: &[PathBuf], current: Option<&str>) -> Vec<String> {
     let start = current.unwrap_or(DEFAULT_THEME).to_string();
     let mut chain: Vec<String> = Vec::new();
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = HashSet::new();
     let mut stack = vec![start];
     while let Some(theme) = stack.pop() {
         // A theme name is one path component, and this one is also joined onto
@@ -1173,6 +1485,29 @@ fn size_dirs_of_theme(theme_dir: &Path) -> Vec<SizeDir> {
             .then_with(|| a.path.cmp(&b.path))
     });
     dirs
+}
+
+/// Drop the declared directories that `listing` of `theme_dir` says are not
+/// installed.
+///
+/// A theme's `index.theme` lists every directory the theme *would* ship: on a
+/// stock Arch system hicolor declares ~700 of them and installs ~28, so the
+/// unpruned list walked 672 directories that cannot hold a file — the bulk of the
+/// ~12,300 probes one absent icon name used to cost. A declared directory is
+/// reached only through its first path component, so that component is the one
+/// thing worth confirming, and the theme dir's own listing answers it for all of
+/// them at once. Order and ranking are untouched: this only removes entries that
+/// cannot produce a file, after `is_theme_subdirectory` has ruled out the
+/// absolute and climbing ones.
+fn retain_reachable(theme_dir: &Path, dirs: &mut Vec<SizeDir>, listing: &DirListing) {
+    let existing: HashSet<PathBuf> = listing.subdirs.iter().cloned().collect();
+    dirs.retain(|dir| {
+        dir.path
+            .strip_prefix(theme_dir)
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .is_some_and(|first| existing.contains(&theme_dir.join(first.as_os_str())))
+    });
 }
 
 /// One directory declared by a theme's `index.theme`.
@@ -2990,5 +3325,287 @@ mod tests {
         let sb = Sandbox::new("mixed-case");
         let r = IconResolver::new(sb.lookup());
         assert_eq!(r.icon_name_for("/usr/bin/MyApp").as_deref(), Some("MyApp"));
+    }
+
+    /// A listing as the cache holds it after a failed `read_dir`: no names, no
+    /// subdirectories, and the flag that keeps a miss which took it from being
+    /// remembered. No portable test can make a real directory unreadable —
+    /// `chmod` does not exist on the Windows dev box — and what is pinned here is
+    /// the cache's reaction, not the kernel's.
+    fn cached_listing(files: &[&str], unreadable: bool) -> Arc<DirListing> {
+        Arc::new(DirListing {
+            files: files.iter().map(|name| name.to_string()).collect(),
+            subdirs: Vec::new(),
+            unreadable,
+            read_at: Instant::now(),
+        })
+    }
+
+    /// The point of the listing cache: a walk over a tree it has already read
+    /// performs no filesystem calls. Measured against a real theme tree (Adwaita
+    /// + AdwaitaLegacy + hicolor + default), one icon name no theme ships used to
+    /// cost ~12,300 `is_file()` probes and ~1,400 `read_dir`s — on the icon
+    /// worker, for every distinct executable, and again on every retry.
+    #[test]
+    fn a_warm_lookup_performs_no_filesystem_probes() {
+        let sb = Sandbox::new("warm-lookup");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=32x32\n\n[32x32]\nSize=32\n",
+        );
+        // One context level below the size dir, which is the walk that used to
+        // cost a `read_dir` plus a probe per candidate name.
+        write_png(
+            &sb.root.join("share/icons/custom/32x32/apps/warm.png"),
+            32,
+            32,
+            [1, 2, 3, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let first = r.find_icon_file("warm").expect("icon");
+        assert!(first.ends_with("32x32/apps/warm.png"), "{first:?}");
+        // The cold miss walks the rest of the chain, so every directory a later
+        // walk can ask about has been listed.
+        assert_eq!(r.find_icon_file("absent-one"), None);
+        let probes = tm_core::sync::lock(&r.caches).fs_probes;
+        let walks = tm_core::sync::lock(&r.caches).walks;
+        assert!(probes > 0 && walks > 0, "{probes} probes, {walks} walks");
+
+        // A name the tree does not hold: the walk runs — the miss of another
+        // name is not the answer — and every directory it asks is already
+        // listed, so it costs no `read_dir` and no `stat`.
+        assert_eq!(r.find_icon_file("absent-two"), None);
+        assert_eq!(
+            tm_core::sync::lock(&r.caches).walks,
+            walks + 1,
+            "the walk runs"
+        );
+        assert_eq!(
+            tm_core::sync::lock(&r.caches).fs_probes,
+            probes,
+            "and it reads nothing"
+        );
+    }
+
+    /// A miss is remembered for `MISS_RETRY_TTL` — the same window the GUI keeps
+    /// a failed key out of its queue for — and walked again once it has passed,
+    /// so an icon that appears later still resolves instead of the retry being
+    /// cancelled. The clock is moved through the cache's test-only skew; nothing
+    /// sleeps.
+    #[test]
+    fn a_missed_name_is_remembered_for_the_retry_window_and_walked_again_after() {
+        let sb = Sandbox::new("miss-window");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=32x32/apps\n\n[32x32/apps]\nSize=32\n",
+        );
+        // An installed directory, so the layout is settled and the miss below is
+        // the filesystem's final word for the window.
+        write_png(
+            &sb.root.join("share/icons/custom/32x32/apps/other.png"),
+            32,
+            32,
+            [2, 2, 2, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        assert_eq!(r.find_icon_file("ghost"), None);
+        let probes = tm_core::sync::lock(&r.caches).fs_probes;
+        let walks = tm_core::sync::lock(&r.caches).walks;
+        assert!(probes > 0 && walks > 0, "{probes} probes, {walks} walks");
+
+        // Inside the window: one hash lookup. The GUI retries a failed key every
+        // `FAILURE_RETRY_TTL`, and each of those retries used to walk the whole
+        // chain again.
+        assert_eq!(r.find_icon_file("ghost"), None);
+        assert_eq!(tm_core::sync::lock(&r.caches).fs_probes, probes);
+        assert_eq!(tm_core::sync::lock(&r.caches).walks, walks);
+
+        // Past it the walk runs again — and is answered by the listings it
+        // already holds, so it still reads nothing.
+        {
+            let mut caches = tm_core::sync::lock(&r.caches);
+            caches.clock_skew = MISS_RETRY_TTL + Duration::from_secs(1);
+        }
+        assert_eq!(r.find_icon_file("ghost"), None);
+        assert_eq!(
+            tm_core::sync::lock(&r.caches).walks,
+            walks + 1,
+            "the walk has to run again once the window has passed"
+        );
+        assert_eq!(tm_core::sync::lock(&r.caches).fs_probes, probes);
+
+        // An icon installed while the app runs resolves: past both windows the
+        // listings are re-read as well, which is why a listing is a cache with a
+        // TTL and not a snapshot for the life of the process.
+        write_png(
+            &sb.root.join("share/icons/custom/32x32/apps/ghost.png"),
+            32,
+            32,
+            [3, 4, 5, 255],
+        );
+        {
+            let mut caches = tm_core::sync::lock(&r.caches);
+            caches.clock_skew = LISTING_TTL + Duration::from_secs(1);
+        }
+        let found = r.find_icon_file("ghost").expect("installed icon resolves");
+        assert!(found.ends_with("32x32/apps/ghost.png"), "{found:?}");
+    }
+
+    /// A theme's `index.theme` lists every directory it would ship. hicolor on a
+    /// stock Arch system declares ~700 and installs ~28, so the unpruned list
+    /// walked 672 directories that cannot hold a file — most of the ~12,300
+    /// probes one absent icon name cost.
+    #[test]
+    fn declared_but_absent_size_dirs_are_pruned_from_the_candidates() {
+        let sb = Sandbox::new("prune-declared");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=32x32/apps,48x48/apps,vendor/16x16\n\n\
+             [32x32/apps]\nSize=32\n\n[48x48/apps]\nSize=48\n\n[vendor/16x16]\nSize=16\n",
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/32x32/apps/real.png"),
+            32,
+            32,
+            [5, 5, 5, 255],
+        );
+        let theme_dir = sb.root.join("share/icons/custom");
+        let r = IconResolver::new(sb.lookup());
+        let mut settled = true;
+        let dirs = r.size_dirs(&theme_dir, &mut settled);
+        assert_eq!(
+            dirs.iter().map(|dir| dir.path.clone()).collect::<Vec<_>>(),
+            [theme_dir.join("32x32/apps")],
+            "only the installed directory can hold a file"
+        );
+        assert_eq!(dirs[0].pixel_size, 32);
+        assert!(
+            settled,
+            "a theme that ships some of its directories is settled"
+        );
+        // Ranking and resolution are untouched: the installed directory still
+        // supplies the icon.
+        let file = r.find_icon_file("real").expect("icon in the installed dir");
+        assert!(file.ends_with("32x32/apps/real.png"), "{file:?}");
+    }
+
+    /// Every theme appears in the chain once, at its first position. A diamond —
+    /// `top` inherits `left` and `right`, both inheriting `shared` — names
+    /// `shared` twice for a plain depth-first walk, and every chain entry is
+    /// walked against every icon dir, so a repeat is a whole second pass over the
+    /// same directories for an answer the first one already gave.
+    #[test]
+    fn a_theme_chain_lists_each_theme_once() {
+        let sb = Sandbox::new("chain-dedupe");
+        write_desktop(
+            &sb.root.join("share/icons/top/index.theme"),
+            "[Icon Theme]\nName=Top\nInherits=left,right\n",
+        );
+        write_desktop(
+            &sb.root.join("share/icons/left/index.theme"),
+            "[Icon Theme]\nName=Left\nInherits=shared\n",
+        );
+        write_desktop(
+            &sb.root.join("share/icons/right/index.theme"),
+            "[Icon Theme]\nName=Right\nInherits=shared\n",
+        );
+        write_desktop(
+            &sb.root.join("share/icons/shared/index.theme"),
+            "[Icon Theme]\nName=Shared\n",
+        );
+        let icon_dirs = sb.lookup().icon_dirs();
+        let themes = theme_chain(&icon_dirs, Some("top"));
+        let chain: Vec<&str> = themes.iter().map(String::as_str).collect();
+        assert_eq!(chain, ["top", "left", "shared", "right", "hicolor"]);
+    }
+
+    /// A directory that could not be read is cached — one `EACCES` or `EMFILE`
+    /// must not cost a `read_dir` per lookup — but it must never make a miss
+    /// authoritative: the walk did not see what was in there, so the GUI's retry
+    /// has to reach the filesystem again instead of being answered from the memo.
+    #[test]
+    fn an_unreadable_listing_does_not_remember_the_miss() {
+        let sb = Sandbox::new("unreadable-listing");
+        write_desktop(
+            &sb.root.join("share/icons/custom/index.theme"),
+            "[Icon Theme]\nName=Custom\nDirectories=32x32/apps\n\n[32x32/apps]\nSize=32\n",
+        );
+        write_png(
+            &sb.root.join("share/icons/custom/32x32/apps/other.png"),
+            32,
+            32,
+            [6, 6, 6, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let size_dir = sb.root.join("share/icons/custom/32x32/apps");
+        tm_core::sync::lock(&r.caches)
+            .listings
+            .insert(size_dir.clone(), cached_listing(&[], true));
+        assert_eq!(r.find_icon_file("ghost"), None);
+        let walks = tm_core::sync::lock(&r.caches).walks;
+        assert!(walks > 0);
+
+        // Not remembered: the next attempt walks again instead of answering from
+        // the memo.
+        assert_eq!(r.find_icon_file("ghost"), None);
+        assert_eq!(
+            tm_core::sync::lock(&r.caches).walks,
+            walks + 1,
+            "an unreadable directory never settles a miss"
+        );
+
+        // And once the directory can be read, with the icon in it, the retry finds
+        // it immediately — no window to wait out.
+        write_png(&size_dir.join("ghost.png"), 32, 32, [7, 7, 7, 255]);
+        tm_core::sync::lock(&r.caches)
+            .listings
+            .insert(size_dir, cached_listing(&["ghost.png"], false));
+        let found = r.find_icon_file("ghost").expect("the retry resolves it");
+        assert!(found.ends_with("32x32/apps/ghost.png"), "{found:?}");
+    }
+
+    /// The host's own theme tree, resolved twice: the numbers this file's lookup
+    /// path is judged by. Ignored, because it depends on whatever themes the
+    /// machine has and on a real `$XDG_DATA_DIRS`; the headless Linux run is
+    /// `cargo test -p tm-platform -- --ignored --nocapture bench_host_theme_icon_lookup`.
+    #[test]
+    #[ignore]
+    fn bench_host_theme_icon_lookup() {
+        let resolver = IconResolver::shared();
+        // Names a desktop theme ships …
+        let mut names: Vec<String> = resolver.desktop_index.values().cloned().collect();
+        names.sort();
+        names.dedup();
+        names.truncate(20);
+        names.extend(DEFAULT_APP_ICON_NAMES.iter().map(|name| name.to_string()));
+        // … and names no theme ships, which are the expensive case: every theme
+        // of the chain, every size dir of it, and nothing at the end.
+        names.extend((0..20).map(|i| format!("taskman-bench-missing-{i}")));
+        println!("{} names, theme chain {:?}", names.len(), resolver.themes);
+        for pass in 1..=2 {
+            let (probes, walks) = {
+                let caches = tm_core::sync::lock(&resolver.caches);
+                (caches.fs_probes, caches.walks)
+            };
+            let mut found = 0usize;
+            let start = Instant::now();
+            for name in &names {
+                if resolver.find_icon_file(name).is_some() {
+                    found += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            let (probes_after, walks_after) = {
+                let caches = tm_core::sync::lock(&resolver.caches);
+                (caches.fs_probes, caches.walks)
+            };
+            println!(
+                "pass {pass}: {found}/{} resolved, {} directory reads, {} walks, {:.1} ms",
+                names.len(),
+                probes_after - probes,
+                walks_after - walks,
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
     }
 }
