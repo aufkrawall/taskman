@@ -7,7 +7,9 @@
   format), `options.rs` (CLI), `install.rs` (plan/orchestration), `win.rs`
   (Win32 plumbing), `ui.rs` (eframe wizard).
 - `crates/tm-ui/` — the shared theme (see `repo-map.md`).
-- `build.py` `package_setup()` — artifact production.
+- `build.py` `package_setup()` — artifact production. A Linux/macOS host builds the
+  same installer by cross-compiling the Windows target (`build.md` § Windows
+  x86_64 from a Linux/macOS host); the host's `taskman-payload` embeds it.
 - Contract it reuses: `tm-platform/src/win/core_service.rs`
   (`--core-service=install|uninstall` elevated helper; see `core-service.md`).
 

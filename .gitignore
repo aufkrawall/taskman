@@ -24,3 +24,7 @@ tool-paths.env
 debug-tool-manifest.json
 debug-tool-warnings.txt
 debug-tool-availability.md
+
+# Project-local Windows cross toolchain (tools/setup-windows-cross.py): a
+# private rustup, cargo-xwin and the Microsoft CRT/SDK cache
+/.cross

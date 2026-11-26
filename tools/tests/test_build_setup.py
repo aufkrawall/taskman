@@ -2,6 +2,7 @@
 
 import importlib.util
 from pathlib import Path
+import platform
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,11 @@ spec.loader.exec_module(build)
 
 
 class PackageSetupTests(unittest.TestCase):
+    # The payload tool runs on the build host, whatever the installer targets.
+    payload_name = (
+        "taskman-payload.exe" if platform.system() == "Windows" else "taskman-payload"
+    )
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -26,7 +32,7 @@ class PackageSetupTests(unittest.TestCase):
             self.gui,
             self.service,
             self.out_dir / "taskman-setup.exe",
-            self.out_dir / "taskman-payload.exe",
+            self.out_dir / self.payload_name,
         ):
             path.write_bytes(b"MZ")
         self.dest = self.dist / "taskman-v1.2.3-windows-x86_64-setup.exe"
@@ -90,7 +96,7 @@ class PackageSetupTests(unittest.TestCase):
         self.assertEqual(self.leftovers(), [])
 
     def test_missing_payload_tool_removes_stale_setup(self):
-        (self.out_dir / "taskman-payload.exe").unlink()
+        (self.out_dir / self.payload_name).unlink()
         self.dist.mkdir()
         self.dest.write_bytes(b"previous build")
         with self.fake_tool():

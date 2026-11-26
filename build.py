@@ -8,7 +8,10 @@ Default behavior (`python build.py`): build the host and Linux x86_64 release
 Windows builds also produce the self-contained setup installer
 (`dist/taskman-v<version>-windows-<arch>-setup.exe`): a single 100%-Rust
 `taskman-setup.exe` with the application payload embedded and SHA-256
-verified at install time.
+verified at install time. A Linux or macOS host produces the same Windows
+x86_64 zip and installer by cross-compiling `x86_64-pc-windows-msvc` with
+`cargo-xwin`; a host without that toolchain logs a skip (fatal with
+`--require-all-targets`), `--host-only` and `--no-windows` leave it out.
 
 Linux builds produce a self-contained install tarball: `bin/taskman`,
 `bin/taskman-service` and the `packaging/linux` tree (installer, systemd unit,
@@ -46,6 +49,11 @@ DIST = ROOT / "dist"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 LINUX_ARM64_TARGET = "aarch64-unknown-linux-gnu"
 WINDOWS_ARM64_TARGET = "aarch64-pc-windows-msvc"
+# The Windows x86_64 release a non-Windows host cross-builds (see
+# `build_windows_cross`). MSVC, not gnu: the installer's security properties
+# (delay-loaded DLLs, hybrid CRT, requireAdministrator manifest) and the
+# hardening flags are MSVC-linker features that a mingw build cannot carry.
+WINDOWS_X64_TARGET = "x86_64-pc-windows-msvc"
 # Self-contained fallback: no cross compiler, Docker or zig, only the official
 # rustup std component plus the bundled rust-lld linker.
 LINUX_MUSL_TARGET = "x86_64-unknown-linux-musl"
@@ -254,6 +262,7 @@ def find_zig() -> Path | None:
 # separately when their standard library is installed. The ARM64 entries
 # mirror the release artifacts built by --all-targets.
 CROSS_CHECK_TARGETS = [
+    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "aarch64-pc-windows-msvc",
@@ -303,11 +312,49 @@ def host_target() -> str:
     return f"{arch}-unknown-linux-gnu"
 
 
+def find_rustc() -> str | None:
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        exe = "rustc.exe" if platform.system() == "Windows" else "rustc"
+        fallback = Path.home() / ".cargo" / "bin" / exe
+        rustc = str(fallback) if fallback.is_file() else None
+    return rustc
+
+
+def sysroot_rust_targets() -> set[str]:
+    """Targets whose std sits in the active sysroot, for a toolchain without rustup.
+
+    A distribution's own `rust` package (Arch ships one) has no rustup to list
+    from, but `rustc` finds a target's std at `<sysroot>/lib/rustlib/<target>/lib`
+    all the same, so that is what decides whether a cross target can build.
+    """
+    rustc = find_rustc()
+    if rustc is None:
+        return set()
+    try:
+        proc = subprocess.run(
+            [rustc, "--print", "sysroot"], capture_output=True, text=True, cwd=ROOT
+        )
+    except OSError:
+        return set()
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return set()
+    rustlib = Path(proc.stdout.strip()) / "lib" / "rustlib"
+    try:
+        return {
+            lib.parent.name
+            for lib in rustlib.glob("*/lib")
+            if any(lib.glob("libstd-*.rlib"))
+        }
+    except OSError:
+        return set()
+
+
 def installed_rust_targets() -> set[str]:
-    """Targets whose std is installed, or an empty set without rustup."""
+    """Targets whose std is installed (rustup's list, else the sysroot's)."""
     rustup = shutil.which("rustup")
     if rustup is None:
-        return set()
+        return sysroot_rust_targets()
     proc = subprocess.run(
         [rustup, "target", "list", "--installed"],
         capture_output=True,
@@ -458,6 +505,182 @@ def build_linux_musl(profile: str) -> tuple[Path | None, bool]:
         "headless/--selfcheck only; install cross or cargo-zigbuild for a "
         "GUI-capable glibc artifact"
     )
+    return exe, True
+
+
+def ensure_rust_target(target: str) -> bool:
+    """Make sure a target's std is installed, through rustup when there is one."""
+    if target in installed_rust_targets():
+        return True
+    rustup = shutil.which("rustup")
+    if rustup is None:
+        return False
+    log(f"installing {target} standard library via rustup (one-time)")
+    return run([rustup, "target", "add", target]) and target in installed_rust_targets()
+
+
+# The private toolchain `tools/setup-windows-cross.py` installs: its own rustup
+# (the official toolchain matching the host `rustc`, plus the Windows std),
+# cargo-xwin and the Microsoft CRT/SDK cache, all below the checkout so the
+# system partition is untouched. Its layout is defined by that script.
+CROSS_DIR = ROOT / ".cross"
+CROSS_SETUP = "tools/setup-windows-cross.py"
+# The private toolchain is a different compiler build from a distribution's
+# `rustc`, so it gets its own target directory instead of invalidating the host
+# build's artifacts (build scripts, proc macros) on every alternation.
+CROSS_TARGET_DIR = ROOT / "target" / "windows-cross"
+
+
+class WindowsCross(NamedTuple):
+    """A usable Windows cross toolchain: the cargo-xwin to run and its environment.
+
+    `target_dir` is where cargo writes `<target>/<profile>`; `env` is merged
+    under the per-call environment (private rustup/cargo homes, SDK cache).
+    """
+
+    xwin: str
+    env: dict[str, str]
+    target_dir: Path
+    label: str
+
+
+def xwin_cache_dir() -> Path:
+    """Where an ambient `cargo-xwin` keeps the Microsoft CRT and Windows SDK."""
+    configured = os.environ.get("XWIN_CACHE_DIR", "").strip()
+    if configured:
+        return Path(configured)
+    if platform.system() == "Darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "cargo-xwin"
+
+
+def xwin_sdk_cached(cache_dir: Path) -> bool:
+    """True when `cargo-xwin` already holds the x86_64 CRT and SDK in `cache_dir`.
+
+    `cargo-xwin` downloads them from Microsoft on first use. That download is
+    large and carries Microsoft's license terms, so the driver never starts it
+    on its own: it is a one-time step the user takes, and until then the
+    Windows build is a logged skip. The `DONE` marker is the one `cargo-xwin`
+    itself writes after a complete download; its first line lists the
+    architectures present.
+    """
+    try:
+        lines = (cache_dir / "xwin" / "DONE").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return bool(lines) and "x86_64" in lines[0].split()
+
+
+def private_windows_cross() -> WindowsCross | None:
+    """The `.cross` toolchain, when `tools/setup-windows-cross.py` has completed."""
+    cargo_home = CROSS_DIR / "cargo-home"
+    rustup_home = CROSS_DIR / "rustup"
+    xwin = cargo_home / "bin" / "cargo-xwin"
+    if not xwin.is_file() or not xwin_sdk_cached(CROSS_DIR / "xwin"):
+        return None
+    toolchain = next(
+        (
+            lib.parents[3].name
+            for lib in sorted(
+                (rustup_home / "toolchains").glob(f"*/lib/rustlib/{WINDOWS_X64_TARGET}/lib")
+            )
+            if any(lib.glob("libstd-*.rlib"))
+        ),
+        None,
+    )
+    if toolchain is None:
+        return None
+    path = os.environ.get("PATH", "")
+    env = {
+        "RUSTUP_HOME": str(rustup_home),
+        "CARGO_HOME": str(cargo_home),
+        "RUSTUP_TOOLCHAIN": toolchain,
+        "XWIN_CACHE_DIR": str(CROSS_DIR / "xwin"),
+        "PATH": f"{cargo_home / 'bin'}{os.pathsep}{path}" if path else str(cargo_home / "bin"),
+    }
+    return WindowsCross(str(xwin), env, CROSS_TARGET_DIR, f"private toolchain {CROSS_DIR}")
+
+
+def ambient_windows_cross() -> tuple[WindowsCross | None, str]:
+    """A `cargo-xwin` the host already has (PATH, `~/.cargo/bin`), or why not."""
+    xwin = find_cargo_tool("cargo-xwin")
+    if xwin is None:
+        return None, "cargo-xwin is not installed"
+    if not ensure_rust_target(WINDOWS_X64_TARGET):
+        return None, f"the {WINDOWS_X64_TARGET} standard library is not installed"
+    if not xwin_sdk_cached(xwin_cache_dir()):
+        return None, "the Microsoft CRT/Windows SDK is not cached"
+    return WindowsCross(xwin, {}, ROOT / "target", "cargo-xwin on this host"), ""
+
+
+def windows_cross_toolchain() -> tuple[WindowsCross | None, str | None]:
+    """Resolve the Windows cross toolchain: ``(toolchain, None)`` or ``(None, why not)``.
+
+    Everything checked here is a tool or component the driver cannot supply
+    itself, so a missing one is a reason to skip with instructions rather than
+    a build failure: that is how a missing Arch `makepkg` is treated on
+    Windows. The private `.cross` toolchain wins over an ambient one because
+    it is complete by construction.
+    """
+    private = private_windows_cross()
+    if private is not None:
+        return private, None
+    ambient, why = ambient_windows_cross()
+    if ambient is not None:
+        return ambient, None
+    return None, (
+        f"{why}. Run `python {CROSS_SETUP} --accept-microsoft-license` once: it "
+        f"installs a private toolchain into {CROSS_DIR} (nothing outside the "
+        "checkout) and downloads the Microsoft CRT/SDK under Microsoft's license "
+        "terms, which the driver never does by itself"
+    )
+
+
+def build_windows_cross(profile: str) -> tuple[Path | None, bool]:
+    """Cross-build the Windows x86_64 GUI, service and setup (non-Windows host).
+
+    Returns ``(taskman.exe, attempted)``; ``attempted`` is False when the host
+    lacks the toolchain, so the caller can tell a skip from a failed build.
+    `cargo-xwin` supplies the MSVC CRT and Windows SDK import libraries and
+    links with lld-link, which understands the same hardening and installer
+    arguments (`/CETCOMPAT`, `/DELAYLOAD`, `/MANIFESTUAC`) the MSVC linker gets
+    on a Windows host, so the result is the artifact a Windows host builds and
+    not a degraded stand-in.
+    """
+    toolchain, reason = windows_cross_toolchain()
+    if toolchain is None:
+        log(f"windows x86_64 cross build unavailable: {reason} - skipping")
+        return None, False
+    log(f"building windows x86_64 with {toolchain.label}")
+    # The binary found above is run directly: a `~/.cargo/bin` that is not on
+    # PATH would hide it from `cargo xwin`'s subcommand lookup. It expects the
+    # subcommand name as its first argument, exactly as cargo passes it.
+    command = [
+        toolchain.xwin,
+        "xwin",
+        "build",
+        "--profile",
+        profile,
+        "--target",
+        WINDOWS_X64_TARGET,
+        "--workspace",
+    ]
+    # Only x86_64 is built, so only x86_64 may be fetched or demanded: the
+    # default also wants aarch64, which would start a second SDK download.
+    env = {**toolchain.env, "XWIN_ARCH": "x86_64"}
+    if toolchain.target_dir != ROOT / "target":
+        env["CARGO_TARGET_DIR"] = str(toolchain.target_dir)
+    if profile != "dev":
+        env.update(release_rustflags(True) or {})
+    if not run(command, env=env):
+        return None, True
+    out_dir = toolchain.target_dir / WINDOWS_X64_TARGET / ("debug" if profile == "dev" else profile)
+    exe = out_dir / "taskman.exe"
+    if not exe.exists():
+        log(f"windows x86_64 binary missing after build: {exe}")
+        return None, True
     return exe, True
 
 
@@ -960,11 +1183,11 @@ def package_tar(name: str, files: list[tuple[Path, str]]) -> Path:
 def package_setup(
     profile: str, gui_exe: Path, service_exe: Path, label: str, version: str
 ) -> Path | None:
-    """Build one self-contained setup installer (Windows only).
+    """Build one self-contained setup installer (Windows target).
 
     `taskman-setup.exe` (linked for gui_exe's target) gets the payload archive
     appended by the HOST `taskman-payload` tool, so an x64 host can package an
-    ARM64 installer. Archive writer and reader live in one Rust crate
+    ARM64 installer, and a Linux host the Windows one. Archive writer and reader live in one Rust crate
     (`crates/tm-installer`), so the format cannot drift between the two.
 
     The artifact is embedded into a temporary file under `target/`, verified
@@ -974,6 +1197,9 @@ def package_setup(
     stale one that looks like the output of this run, behind.
     """
     dest = DIST / f"taskman-v{version}-{label}-setup.exe"
+    # The payload tool and the staging file belong to the HOST build directory,
+    # not to `gui_exe`'s: a cross-built installer (Linux host, Windows target)
+    # is embedded by the tool the host can run.
     out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
     staged = out_dir / f"{dest.name}.partial"
 
@@ -989,7 +1215,9 @@ def package_setup(
     if not setup_exe.exists():
         discard(f"setup binary missing after build: {setup_exe}")
         return None
-    payload_tool = out_dir / "taskman-payload.exe"
+    payload_tool = out_dir / (
+        "taskman-payload.exe" if platform.system() == "Windows" else "taskman-payload"
+    )
     if not payload_tool.exists():
         discard(f"payload tool missing after build: {payload_tool}")
         return None
@@ -1209,7 +1437,9 @@ def live_tests() -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--debug", action="store_true", help="build the dev profile instead of release")
-    ap.add_argument("--host-only", action="store_true", help="skip the linux cross build")
+    ap.add_argument(
+        "--host-only", action="store_true", help="skip the linux and windows cross builds"
+    )
     ap.add_argument("--linux-only", action="store_true", help="skip the host build")
     ap.add_argument(
         "--all-targets",
@@ -1223,6 +1453,11 @@ def main() -> int:
         "--no-arch-package",
         action="store_true",
         help="skip the pacman package (its build compiles the Linux binaries again)",
+    )
+    ap.add_argument(
+        "--no-windows",
+        action="store_true",
+        help="skip the Windows x86_64 cross build a non-Windows host otherwise makes",
     )
     ap.add_argument(
         "--require-all-targets",
@@ -1346,6 +1581,45 @@ def main() -> int:
                     failures += 1
                 else:
                     log(f"setup installer ready: {setup}")
+
+    # Windows x86_64 from a non-Windows host. It is a cross build like the
+    # Linux one, so `--host-only` leaves it out, and like the Linux one a host
+    # without the toolchain skips it unless `--require-all-targets` is given.
+    windows_cross_requested = (
+        platform.system() != "Windows"
+        and not args.host_only
+        and not args.linux_only
+        and not args.no_windows
+    )
+    if windows_cross_requested:
+        exe, attempted = build_windows_cross(profile)
+        if exe is None:
+            if attempted:
+                failures += 1
+            elif args.require_all_targets:
+                log("windows build required (--require-all-targets) but no toolchain")
+                failures += 1
+        else:
+            log(f"windows x86_64 binary ready: {exe}")
+            service_exe = exe.with_name("taskman-service.exe")
+            if not service_exe.exists():
+                log(f"core service binary missing after build: {service_exe}")
+                failures += 1
+            else:
+                artifacts.append(
+                    (
+                        f"taskman-v{version}-windows-x86_64",
+                        [(exe, "taskman.exe"), (service_exe, "taskman-service.exe")],
+                    )
+                )
+                if not args.no_package:
+                    setup = package_setup(
+                        profile, exe, service_exe, "windows-x86_64", version
+                    )
+                    if setup is None:
+                        failures += 1
+                    else:
+                        log(f"setup installer ready: {setup}")
 
     linux_x86_64_flavor: str | None = None
     if linux_requested:

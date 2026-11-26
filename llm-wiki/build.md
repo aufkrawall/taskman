@@ -68,6 +68,61 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    anywhere is a logged skip, never a failed build, and `--no-arch-package`
    skips it on purpose.
 
+### Windows x86_64 from a Linux/macOS host
+
+A non-Windows host also produces `taskman-v<version>-windows-x86_64.zip` and
+`...-windows-x86_64-setup.exe` (`build_windows_cross()`, then the same
+`package_setup()` a Windows host uses). Route: `cargo xwin build --target
+x86_64-pc-windows-msvc --workspace`, i.e. `cargo-xwin` supplies the Microsoft
+CRT/Windows SDK import libraries and links with `lld-link`. **MSVC, not
+`x86_64-pc-windows-gnu`, on purpose:** the hardening flags (`-Ccontrol-flow-guard`,
+`/CETCOMPAT`) and the installer's security properties (`/DELAYLOAD` +
+`delayimp.lib`, the hybrid CRT, `/MANIFESTUAC requireAdministrator`; see
+`installer.md`) are MSVC-linker features, so a mingw build would ship a
+weaker installer. `app.res` is a committed compiled resource, so no resource
+compiler is needed. There is no code signing on either host.
+
+Toolchain resolution (`windows_cross_toolchain()`): the **private toolchain
+in `<checkout>/.cross`** first, then an ambient `cargo-xwin` (PATH or
+`~/.cargo/bin`, std via `ensure_rust_target`, SDK cache in `$XWIN_CACHE_DIR` or
+`~/.cache/cargo-xwin`). A missing piece is a logged skip naming the fix, like a
+missing `makepkg`, and fatal only under `--require-all-targets`. The driver never
+installs a toolchain or downloads the Microsoft CRT/SDK (about 1 GB, Microsoft's
+license terms); the build's own crate downloads go to `.cross/cargo-home`.
+
+**One-time setup: `python tools/setup-windows-cross.py
+--accept-microsoft-license`.** It installs, below `.cross/` (gitignored; the
+system partition, `~/.cargo` and `~/.rustup` are untouched): a private rustup
+with the official toolchain whose version equals the host `rustc` plus the
+`x86_64-pc-windows-msvc` std, `cargo-xwin`, and the x86_64 CRT/SDK cache
+(`.cross/xwin/xwin/DONE` marks completion). About 1.6 GB. Why a private rustup
+and not the distribution's `rust` plus the official `rust-std` tarball: a
+distribution compiler stamps its own version string
+(`rustc 1.100.0 (...) (Arch Linux rust 1:1.100.0-1)`) into crate metadata, so
+the official std is rejected as "compiled by an incompatible version of rustc"
+(tried 2026-11-26; forcing the version string did not make it load), and
+`/usr/lib/rustlib` is root-owned anyway. The private route uses the official
+compiler for the Windows artifacts, with its own cargo target directory
+(`target/windows-cross`) so the two compilers never invalidate each other's
+host build scripts and proc macros. `XWIN_ARCH=x86_64` is pinned: the default
+also demands aarch64 and would re-download the manifest every run.
+
+Verified 2026-11-26 on Arch (no rustup, system rust 1.100.0): cold build about
+3 min; all three binaries are PE32+ x86-64 with CFG guard flags and
+CETCOMPAT; `taskman-setup.exe` has a `requireAdministrator` manifest, the
+icon resources, the eight DLLs of `DELAY_LOADED` as delay imports and no
+`vcruntime140.dll` import (hybrid CRT), and `taskman-payload verify` passes on
+the finished installer. Not run: the installer itself under wine (wine aborts
+inside the agent sandbox) and `tests/import_table.rs`, which needs Windows.
+
+The payload tool and the staging file always come from the HOST build
+directory (`target/release/taskman-payload`, runnable on the build machine); only
+`taskman-setup.exe` and the two app binaries come from the cross target
+directory (`target/windows-cross/x86_64-pc-windows-msvc/<profile>/` with the
+private toolchain). `--host-only`, `--linux-only` and
+`--no-windows` leave the step out; `--all-targets` does not add Windows ARM64
+on a non-Windows host. Regression: `python tools/tests/test_build_windows.py`.
+
 `cross_check()` type-checks every non-host target with `--all-targets` on
 purpose: without it, `#[cfg(test)]` code behind `cfg(target_os = "linux")`
 is compiled by nothing on this host, and a broken Linux test would only
@@ -95,7 +150,7 @@ that refused to start, and two Linux-only test fixtures, all survived the
 Windows-only gate.
 
 Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
-`--no-package`, `--require-all-targets`, `--check`, `--audit`,
+`--no-package`, `--no-windows`, `--require-all-targets`, `--check`, `--audit`,
 `--live-tests`.
 
 `--all-targets` adds two cross-built artifacts:
