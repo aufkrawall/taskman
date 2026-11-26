@@ -81,7 +81,12 @@ const FAILED: u8 = 2;
 /// How often the tray thread checks that the session bus and its watcher are
 /// still there while it waits for the UI. A bus or a panel that goes away takes
 /// the icon with it, and a window hidden behind a lost icon has to come back.
-const BUS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// Five seconds, not half a minute: a restarted panel leaves the icon missing
+/// until this tick notices, and while the window is hidden there is nothing
+/// else to click. The check is one `GetNameOwner` round trip on the session
+/// bus, so a short interval costs nothing.
+const BUS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One `IconPixmap` entry: width, height, then ARGB32 network-order bytes.
 type IconPixmap = (i32, i32, Vec<u8>);
@@ -250,6 +255,13 @@ fn tray_thread_main(shared: Arc<Shared>, wake: Receiver<Wake>) {
         }
         if connection.is_closed() {
             tracing::warn!("tray icon lost its session bus connection");
+            // The icon died with the bus, and a hidden window has no other way
+            // back: the loop is about to end, so ask the UI for a frame now.
+            // Without this, an invisible window only runs `logic` when someone
+            // requests a repaint, and nobody will: `rescue_window_hidden_without_tray`
+            // would never observe the failure.
+            shared.state.store(FAILED, Ordering::Release);
+            crate::signal_tray(crate::TRAY_ACTION_OPEN);
             break;
         }
         let current = watcher_owner(&connection);

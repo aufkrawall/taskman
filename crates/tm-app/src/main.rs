@@ -1537,9 +1537,12 @@ impl eframe::App for NativeApp {
                         ctx.request_repaint_after(std::time::Duration::from_millis(25));
                     }
                     InitialHideAction::Show => {
-                        tracing::warn!(
-                            "tray icon unavailable for a start-minimized launch; showing the window"
-                        );
+                        // The reason was logged where the decision was made
+                        // (no tray icon, or a display server that cannot hide);
+                        // repeating it here as "no icon" would be wrong on
+                        // Wayland, where the icon exists and only the hide does
+                        // not.
+                        tracing::info!("start-minimized is unavailable here; showing the window");
                         self.hidden_to_tray = false;
                         // The window has never been shown, so it has nothing to
                         // show: take the gate before asking for it.
