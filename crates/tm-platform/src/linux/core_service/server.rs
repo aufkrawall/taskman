@@ -24,6 +24,10 @@
 //! executable and its metadata. The `start_ticks` bracket around that open
 //! closes pid reuse in both directions. The resolved path survives in logs only.
 //!
+//! That snapshot would make a package upgrade look like an impostor, so a
+//! `ClientNotListed` mismatch re-resolves the manifest's clients (once per
+//! window, logged, same rules) instead of requiring a service restart.
+//!
 //! ## Refusals
 //!
 //! A refusal is written before the request is read, so the socket is half-closed
@@ -50,7 +54,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::actions::{ConnectionProtocol, ServiceAction, TcpState, ThreadState};
@@ -101,11 +105,20 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 /// its frame sees EPIPE/ECONNRESET on a half-closed socket — which the GUI
 /// classifies as an unavailable broker and retries under its own token. Reading
 /// (and discarding) the rest of that frame keeps the refusal an answer.
+///
+/// This is ONE absolute deadline for the whole drain, not a timeout per read:
+/// the drain runs on the accept thread, every local uid can reach it with an
+/// `UnauthorizedUser` refusal, and a peer that trickles one byte per read must
+/// not be able to park the root broker's control plane.
 const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Reads one refusal drain may perform. 64 × 4 KiB covers `MAX_REQUEST_BYTES`
-/// with room to spare, and bounds a peer that trickles one byte at a time.
-const MAX_DRAIN_READS: u32 = 64;
+/// How often an identity mismatch may trigger a client-list re-resolve.
+///
+/// Trust is a startup snapshot, so a package upgrade would leave the running
+/// broker trusting the old inode and refusing the new GUI until a restart. One
+/// re-resolve per window is enough to survive an upgrade without letting a peer
+/// turn every mismatch into a `/proc` walk.
+const CLIENT_REFRESH_WINDOW_MS: u64 = 30_000;
 
 /// Back-off after `accept` failed because this process ran out of descriptors
 /// or memory. Waiting for a client to close is the only fix; it is not a broken
@@ -158,10 +171,14 @@ const BROKER_WARNING_WINDOW_MS: u64 = 5_000;
 /// the broker; the accept loop reports and keeps serving.
 ///
 /// `dev` (the `--dev` argv entry, which the packaged unit never passes)
-/// disables the install-root and service-image checks and logs a warning. It
-/// still requires the root-owned manifest, because the authorized uids have to
-/// come from somewhere the user cannot write. Passing `--dev` means being root
-/// already, so it cannot widen anyone's privileges.
+/// disables the install-root and service-image checks and logs a warning, and it
+/// skips manifest client resolution the same way a manifest with
+/// `allow_user_writable_client` does — otherwise the escape hatch could not start
+/// on the build tree it exists for. Both still require the root-owned manifest,
+/// because the authorized uids have to come from somewhere the user cannot write,
+/// and neither grants anything a normal start would: an unresolved client list is
+/// only satisfiable by uid 0 or by that explicit manifest exemption. Passing
+/// `--dev` means being root already, so it cannot widen anyone's privileges.
 pub fn run_service(dev: bool) -> Result<(), String> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
@@ -179,13 +196,34 @@ pub fn run_service(dev: bool) -> Result<(), String> {
     }
 
     let manifest = load_manifest()?;
-    let installed = resolve_installed_clients(&manifest)?;
+    // Dev mode and the manifest's own escape hatch must be able to start on a
+    // machine where no client resolves (a build tree, a portable copy), but they
+    // still get no grant a normal start would give: an empty list can only be
+    // satisfied by uid 0 or by `allow_user_writable_client`.
+    let clients_resolved = !(dev || manifest.allow_user_writable_client);
+    let installed = if clients_resolved {
+        resolve_installed_clients(&manifest)?
+    } else {
+        let reason = if dev {
+            "dev mode"
+        } else {
+            "allow_user_writable_client"
+        };
+        tracing::warn!(
+            reason,
+            "skipping manifest client resolution: only uid 0 and clients this manifest \
+             explicitly exempts can be authorized"
+        );
+        Vec::new()
+    };
     let (service_image, install_verified) = verify_service_image(dev)?;
     let listener = prepare_listener()?;
 
     let state = Arc::new(ServiceState {
         manifest,
-        installed,
+        installed: RwLock::new(installed),
+        clients_resolved,
+        client_refresh_ms: AtomicU64::new(0),
         started: Instant::now(),
         started_unix_s: unix_now_s(),
         install_verified,
@@ -218,7 +256,7 @@ pub fn run_service(dev: bool) -> Result<(), String> {
         socket = SOCKET_PATH,
         protocol = PROTOCOL_VERSION,
         authorized_uids = state.manifest.authorized_uids.len(),
-        installed_clients = state.installed.len(),
+        installed_clients = tm_core::sync::read(&state.installed).len(),
         image = %state.service_image,
         install_verified,
         "linux core service listening"
@@ -338,8 +376,15 @@ pub fn selfcheck() -> Result<String, String> {
 struct ServiceState {
     manifest: Manifest,
     /// The protected clients resolved from the manifest in THIS process's mount
-    /// namespace at startup. Peer trust is decided on their `(st_dev, st_ino)`.
-    installed: Vec<InstalledClient>,
+    /// namespace. Peer trust is decided on their `(st_dev, st_ino)`, so an
+    /// upgrade replaces this list instead of restarting the broker.
+    installed: RwLock<Vec<InstalledClient>>,
+    /// Whether `installed` was actually resolved. Dev mode and
+    /// `allow_user_writable_client` skip resolution on purpose, and the upgrade
+    /// refresh must not quietly re-introduce it there.
+    clients_resolved: bool,
+    /// Monotonic ms of the last client-list re-resolve attempt.
+    client_refresh_ms: AtomicU64,
     started: Instant,
     started_unix_s: u64,
     /// Only ever true when the full install verification ran and passed; dev
@@ -431,6 +476,47 @@ impl ServiceState {
             in_flight: &self.units_in_flight,
             unit: unit.to_string(),
         })
+    }
+
+    /// Re-resolve the manifest's clients after an identity mismatch.
+    ///
+    /// Trust is a startup snapshot, so a package upgrade would otherwise leave
+    /// this process refusing the newly installed GUI until someone restarts the
+    /// unit. Re-applying the same rule (root-owned, not group/world writable,
+    /// inside a protected directory chain) is exactly what that restart would
+    /// do, and the window keeps a peer from turning every mismatch into a
+    /// `/proc` walk. Returns whether the recorded identity actually changed.
+    fn refresh_installed_clients(&self) -> bool {
+        if !self.clients_resolved {
+            return false;
+        }
+        if !claim_log_window(
+            &self.client_refresh_ms,
+            monotonic_ms(),
+            CLIENT_REFRESH_WINDOW_MS,
+        ) {
+            return false;
+        }
+        let clients = match resolve_installed_clients(&self.manifest) {
+            Ok(clients) => clients,
+            Err(problem) => {
+                tracing::warn!(
+                    %problem,
+                    "client identity mismatch, and the manifest's clients could not be re-resolved"
+                );
+                return false;
+            }
+        };
+        let changed = *tm_core::sync::read(&self.installed) != clients;
+        if changed {
+            tracing::warn!(
+                clients = clients.len(),
+                "installed client identity changed since startup: the manifest's clients were \
+                 re-resolved"
+            );
+            *tm_core::sync::write(&self.installed) = clients;
+        }
+        changed
     }
 
     fn status(&self) -> ServiceStatusInfo {
@@ -657,19 +743,38 @@ pub fn protected_directory_chain(directory: &Path) -> Option<String> {
 /// install where nothing resolves could never authorize anyone.
 fn resolve_installed_clients(manifest: &Manifest) -> Result<Vec<InstalledClient>, String> {
     let mut installed = Vec::new();
-    for entry in &manifest.clients {
+    // Explicit files first. A named client must never be dropped in favour of
+    // whatever a directory entry happens to contain, or it would later be
+    // refused as `ClientNotListed` with nothing in the log to explain it.
+    for entry in manifest
+        .clients
+        .iter()
+        .filter(|entry| !entry.ends_with('/'))
+    {
         if installed.len() >= MAX_INSTALLED_CLIENTS {
-            break;
+            tracing::warn!(
+                client = %entry,
+                limit = MAX_INSTALLED_CLIENTS,
+                "manifest client list is truncated: this listed client is NOT trusted"
+            );
+            continue;
         }
-        match entry.strip_suffix('/') {
-            Some(directory) => {
-                resolve_client_directory(entry, Path::new(directory), &mut installed)?;
-            }
-            None => {
-                if let Some(client) = resolve_client_file(entry, Path::new(entry))? {
-                    installed.push(client);
-                }
-            }
+        if let Some(client) = resolve_client_file(entry, Path::new(entry))? {
+            installed.push(client);
+        }
+    }
+    for entry in manifest.clients.iter().filter(|entry| entry.ends_with('/')) {
+        if installed.len() >= MAX_INSTALLED_CLIENTS {
+            tracing::warn!(
+                client = %entry,
+                limit = MAX_INSTALLED_CLIENTS,
+                "manifest client list is truncated: this client directory is not trusted"
+            );
+            continue;
+        }
+        // `filter` above guarantees the suffix, so this cannot loop on a `None`.
+        if let Some(directory) = entry.strip_suffix('/') {
+            resolve_client_directory(entry, Path::new(directory), &mut installed)?;
         }
     }
     if installed.is_empty() {
@@ -706,6 +811,12 @@ fn resolve_client_file(entry: &str, path: &Path) -> Result<Option<InstalledClien
         Some(metadata.mode() & 0o7777),
     ) {
         return Err(problem);
+    }
+    // The same chain rule the manifest, the service image and the log directory
+    // get: a writable parent lets its owner replace the file the identity was
+    // recorded from, which would make the recorded inode a lie.
+    if let Some(problem) = protected_directory_chain(path) {
+        return Err(format!("manifest client {entry}: {problem}"));
     }
     Ok(Some(InstalledClient {
         path: entry.to_string(),
@@ -777,6 +888,10 @@ fn resolve_client_directory(
             // A directory entry lists a tree, not one file: an unprotected file
             // in it is simply not a client, and refusing the whole service for
             // one stray helper would be worse than not trusting it.
+            tracing::warn!(client = %path.display(), %problem, "manifest client is not trusted");
+            continue;
+        }
+        if let Some(problem) = protected_directory_chain(&path) {
             tracing::warn!(client = %path.display(), %problem, "manifest client is not trusted");
             continue;
         }
@@ -1024,11 +1139,13 @@ extern "C" fn on_stop_signal(_signal: libc::c_int) {
 
 /// Install the stop handlers and return the wake pipe's read end.
 ///
-/// `sigaction` with explicit zero flags: NO `SA_RESTART`, so a stop interrupts a
-/// blocking syscall instead of resuming it, and the handler writes to the
-/// self-pipe the accept loop waits on. Both mechanisms are deliberate — the pipe
-/// is what actually wakes `poll`, and the missing `SA_RESTART` keeps a worker
-/// parked in a socket read from silently outliving the stop.
+/// The handler writes to the self-pipe, and that write is what actually wakes
+/// the accept loop's `poll`; the atomic flag is what the loop then reads.
+///
+/// `sigaction` with explicit zero flags means NO `SA_RESTART`, so a blocking
+/// syscall in the accept thread returns `EINTR` instead of being resumed. That
+/// does NOT bound a worker: `read_frame` retries `Interrupted`, so a worker's
+/// socket read is bounded by `REQUEST_TIMEOUT`, not by the signal.
 fn install_stop_signal() -> Result<RawFd, String> {
     let mut descriptors: [libc::c_int; 2] = [0; 2];
     // SAFETY: `descriptors` is the two-element array `pipe2` requires.
@@ -1217,9 +1334,24 @@ fn enqueue(
             return Ok(());
         }
     };
-    if let PeerVerdict::Refused(refusal) =
-        evaluate_peer(&state.manifest, &state.installed, &peer, image.as_ref())
-    {
+    // The lock is released before the refusal path runs: a refresh takes the
+    // write side and must not deadlock behind this read.
+    let verdict = {
+        let installed = tm_core::sync::read(&state.installed);
+        evaluate_peer(&state.manifest, &installed, &peer, image.as_ref())
+    };
+    // An identity mismatch is what a package upgrade looks like from here: the
+    // installed GUI now has a new inode while this process still trusts the old
+    // one. Re-resolve once per window and let a match through, exactly as a
+    // restart would; anything else stays the same refusal.
+    let verdict = match verdict {
+        PeerVerdict::Refused(Refusal::ClientNotListed) if state.refresh_installed_clients() => {
+            let installed = tm_core::sync::read(&state.installed);
+            evaluate_peer(&state.manifest, &installed, &peer, image.as_ref())
+        }
+        other => other,
+    };
+    if let PeerVerdict::Refused(refusal) = verdict {
         let detail = auth_refusal_detail(refusal, &peer, image.as_ref());
         refuse(state, stream, refusal, detail);
         return Ok(());
@@ -1374,20 +1506,23 @@ fn refuse(state: &ServiceState, stream: UnixStream, code: Refusal, detail: Strin
 /// client can classify as a decision.
 fn finish_refusal(stream: &mut UnixStream) {
     let _ = stream.shutdown(Shutdown::Write);
-    if stream
-        .set_read_timeout(Some(REFUSAL_DRAIN_TIMEOUT))
-        .is_err()
-    {
-        return;
-    }
+    // ONE absolute deadline for the whole drain. A per-read timeout would let a
+    // peer that trickles one byte per read hold this — and this runs on the
+    // accept thread, for any local uid, so that would park the control plane.
+    let deadline = Instant::now() + REFUSAL_DRAIN_TIMEOUT;
     let mut discarded = 0usize;
-    let mut reads = 0u32;
     let mut buffer = [0u8; 4096];
-    // Two bounds: the byte budget, and the number of reads. `Interrupted` must
-    // not be able to spin this loop, and a peer that keeps trickling bytes must
-    // not be able to hold the connection either.
-    while discarded < MAX_REQUEST_BYTES && reads < MAX_DRAIN_READS {
-        reads += 1;
+    while discarded < MAX_REQUEST_BYTES {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            break;
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => discarded = discarded.saturating_add(read),
@@ -1708,6 +1843,17 @@ fn run_action(state: &ServiceState, peer_pid: u32, action: ActionRequest) -> Res
             // systemctl option or reach outside `*.service`.
             if let Err(problem) = crate::linux_action_support::validate_service_unit(&unit) {
                 return Response::error(Refusal::Rejected, problem);
+            }
+            // systemd accepts an escaped backslash, so `foo\x2dbar.service` and
+            // `foo-bar.service` name ONE unit. The in-flight claim is keyed by
+            // the string as sent, so admitting both would let two mutations of
+            // the same unit run at once. A name needing an escape is refused
+            // rather than normalized: no packaged unit has one.
+            if unit.contains('\\') {
+                return Response::error(
+                    Refusal::Rejected,
+                    "systemd escape sequences in a unit name are not accepted",
+                );
             }
             if unit == SERVICE_UNIT {
                 return Response::error(
@@ -2796,6 +2942,22 @@ Max realtime timeout      unlimited            unlimited            us        \n
         uid == 0
     }
 
+    /// Skip a test this run cannot express, and SAY so.
+    ///
+    /// Most containers run the suite as root, where a foreign-owned file or
+    /// directory cannot be created — exactly the coverage these tests exist for.
+    /// A silent return would report a green suite with none of it, so the skip
+    /// is announced and stays visible in the log.
+    fn skip_when_root(test: &str) -> bool {
+        if !running_as_root() {
+            return false;
+        }
+        eprintln!(
+            "note: {test} skipped, this run is root so a foreign-owned file cannot be created"
+        );
+        true
+    }
+
     fn metadata_of(path: &Path) -> std::fs::Metadata {
         std::fs::symlink_metadata(path).expect("test metadata")
     }
@@ -2804,7 +2966,7 @@ Max realtime timeout      unlimited            unlimited            us        \n
 
     #[test]
     fn a_socket_directory_the_service_does_not_own_is_refused() {
-        if running_as_root() {
+        if skip_when_root("a_socket_directory_the_service_does_not_own_is_refused") {
             return;
         }
         let directory = TestDirectory::new("socket-dir");
@@ -2816,7 +2978,7 @@ Max realtime timeout      unlimited            unlimited            us        \n
 
     #[test]
     fn a_missing_socket_directory_is_created_with_the_pinned_mode() {
-        if running_as_root() {
+        if skip_when_root("a_missing_socket_directory_is_created_with_the_pinned_mode") {
             return;
         }
         let parent = TestDirectory::new("socket-create");
@@ -2842,7 +3004,7 @@ Max realtime timeout      unlimited            unlimited            us        \n
         assert!(error.contains("not a socket"), "{error}");
         assert!(regular.exists(), "the refusal must not unlink anything");
 
-        if running_as_root() {
+        if skip_when_root("stale_socket_removal_only_accepts_a_socket_that_root_owns") {
             return;
         }
         let socket_path = directory.path().join("bound.sock");
@@ -2859,7 +3021,7 @@ Max realtime timeout      unlimited            unlimited            us        \n
         let missing = directory.path().join("absent");
         assert!(protected_directory_chain(&missing).is_some());
         // The directory it created is a real directory, but not root-owned.
-        if !running_as_root() {
+        if !skip_when_root("socket_directory_chain_rules_reject_a_missing_directory") {
             assert!(protected_directory_chain(directory.path()).is_some());
         }
     }
@@ -2907,11 +3069,55 @@ Max realtime timeout      unlimited            unlimited            us        \n
         assert_eq!(received.len(), 8);
     }
 
+    /// The drain budget is ONE deadline, not one timeout per read.
+    ///
+    /// A peer that trickles bytes would otherwise buy itself a fresh timeout for
+    /// every byte, and this runs on the accept thread: an unprivileged client
+    /// must not be able to park the broker's control plane.
+    #[test]
+    fn a_trickling_client_cannot_stretch_the_refusal_drain() {
+        let (mut server, mut client) = UnixStream::pair().expect("socket pair");
+        // The producer really does sleep: a trickling peer is the condition
+        // under test, not a raced handshake.
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..16 {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        finish_refusal(&mut server);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "the drain must be bounded by one deadline, took {elapsed:?}"
+        );
+        trickle.join().expect("trickle thread");
+    }
+
+    /// The P0's executable pin, exercised against a real kernel: the identity
+    /// the broker records for a peer must be the file object the kernel reports
+    /// for that task, not a path it read somewhere.
+    #[test]
+    fn the_resolved_image_identity_is_the_kernel_executable_object() {
+        let image = resolve_peer_image(std::process::id()).expect("own executable image");
+        // `/proc/self/exe` and `/proc/<our pid>/exe` are the same magic link.
+        let metadata = std::fs::metadata("/proc/self/exe").expect("own executable metadata");
+        assert_eq!(image.device, metadata.dev());
+        assert_eq!(image.inode, metadata.ino());
+        assert_eq!(image.owner_uid, metadata.uid());
+        assert_eq!(image.mode, metadata.mode() & 0o7777);
+        // The path is a diagnostic only, but it must still name the image.
+        assert!(!image.path.is_empty(), "{image:?}");
+    }
+
     // ---------------------------------------------------- installed clients
 
     #[test]
     fn a_user_owned_client_file_refuses_the_broker() {
-        if running_as_root() {
+        if skip_when_root("a_user_owned_client_file_refuses_the_broker") {
             return;
         }
         let directory = TestDirectory::new("installed-client");
@@ -2925,7 +3131,7 @@ Max realtime timeout      unlimited            unlimited            us        \n
 
     #[test]
     fn a_client_directory_the_user_owns_refuses_the_broker() {
-        if running_as_root() {
+        if skip_when_root("a_client_directory_the_user_owns_refuses_the_broker") {
             return;
         }
         let directory = TestDirectory::new("client-directory");
