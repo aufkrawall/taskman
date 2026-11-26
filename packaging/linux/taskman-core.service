@@ -30,6 +30,11 @@ Group=root
 # the socket's parent never depends on the installer's tail end running.
 RuntimeDirectory=taskman
 RuntimeDirectoryMode=0755
+# The broker keeps a file log, and ProtectSystem=strict below makes /var/log
+# read-only for it. systemd creates and owns /var/log/taskman for the unit, so
+# the logger writes instead of silently degrading to nothing.
+LogsDirectory=taskman
+LogsDirectoryMode=0755
 
 # --- Hardening --------------------------------------------------------------
 # The broker's entire job is acting on other users' processes and reading what
