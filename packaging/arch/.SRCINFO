@@ -1,0 +1,14 @@
+pkgbase = taskman
+	pkgdesc = Cross-platform task manager and system monitor
+	pkgver = 0.1.34
+	pkgrel = 1
+	url = https://github.com/aufkrawall/taskman
+	arch = x86_64
+	license = MIT
+	makedepends = rust
+	depends = glibc
+	options = !lto
+	options = !debug
+	install = taskman.install
+
+pkgname = taskman
