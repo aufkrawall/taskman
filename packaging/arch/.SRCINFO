@@ -5,10 +5,12 @@ pkgbase = taskman
 	url = https://github.com/aufkrawall/taskman
 	arch = x86_64
 	license = MIT
-	makedepends = rust
 	depends = glibc
+	makedepends = rust
+	backup = etc/taskman/core-service.json
 	options = !lto
 	options = !debug
+	options = !strip
 	install = taskman.install
 
 pkgname = taskman

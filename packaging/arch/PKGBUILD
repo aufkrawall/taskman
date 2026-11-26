@@ -22,10 +22,17 @@ depends=('glibc')
 # The `rust` package ships cargo; there is no separate `cargo` package in the
 # official repositories.
 makedepends=('rust')
-# `!lto`: the workspace release profile already decides LTO, and makepkg's
-# LTO flags are C/C++ buildflags. `!debug`: release packaging must not grow a
-# debuginfo tree (the profile strips to the symbol table on purpose).
-options=('!lto' '!debug')
+# The manifest is the authorization policy: the package ships an unconfigured
+# placeholder and `taskman.install` fills it in for the installing user, so
+# pacman must keep the live file and hand the placeholder over as `.pacnew`
+# instead of overwriting a working list of authorized uids on every upgrade.
+backup=('etc/taskman/core-service.json')
+# `!lto`: the workspace release profile already decides LTO, and makepkg's LTO
+# flags are C/C++ buildflags. `!debug`: release packaging must not grow a
+# debuginfo tree. `!strip`: the profile deliberately keeps the symbol table
+# (`strip = "debuginfo"`) because crash records must name functions; makepkg's
+# strip would take it away again.
+options=('!lto' '!debug' '!strip')
 install=taskman.install
 source=()
 sha256sums=()
