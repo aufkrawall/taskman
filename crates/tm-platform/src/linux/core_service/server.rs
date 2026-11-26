@@ -1687,8 +1687,9 @@ fn connections_response(pid: u32, start_ticks: i64) -> Response {
 /// presented as one coherent answer.
 fn file_io_response(pid: u32, start_ticks: i64) -> Response {
     match process_io::list_process_file_io(pid, Some(start_ticks)) {
-        Ok(snapshot) => Response::FileIo(Box::new(WireFileIo {
-            files: snapshot
+        Ok(read) => Response::FileIo(Box::new(WireFileIo {
+            files: read
+                .snapshot
                 .files
                 .into_iter()
                 .map(|file| WireFileIoEntry {
@@ -1775,7 +1776,7 @@ fn run_action(state: &ServiceState, peer_pid: u32, action: ActionRequest) -> Res
             if let Some(refusal) = mutation_target_refusal(pid, peer_pid) {
                 return refusal;
             }
-            match process_tree::kill_process(pid, Some(start_ticks), tree) {
+            match process_tree::kill_process_with_delivery(pid, Some(start_ticks), tree).0 {
                 Ok(()) => Response::Done,
                 Err(error) => error_response(error),
             }

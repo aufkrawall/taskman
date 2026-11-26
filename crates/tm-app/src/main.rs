@@ -1295,7 +1295,7 @@ impl NativeApp {
             Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => Some(LinuxDisplay::X11),
             _ => None,
         };
-        let display = from_handle.unwrap_or_else(|| {
+        let backend = from_handle.unwrap_or_else(|| {
             let wayland =
                 std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
             if wayland {
@@ -1305,11 +1305,11 @@ impl NativeApp {
             }
         });
         tracing::info!(
-            ?display,
+            backend = ?backend,
             from_display_handle = from_handle.is_some(),
             "resolved the Linux display backend"
         );
-        self.linux_display = Some(display);
+        self.linux_display = Some(backend);
     }
 
     #[cfg(target_os = "linux")]

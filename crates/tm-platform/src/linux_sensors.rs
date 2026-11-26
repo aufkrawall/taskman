@@ -677,7 +677,8 @@ mod tests {
     fn attribute_names_split_into_stem_and_attribute() {
         assert_eq!(split_attribute("temp1_input"), Some(("temp1", "input")));
         assert_eq!(split_attribute("temp1_crit"), Some(("temp1", "crit")));
-        assert_eq!(split_attribute("no_underscore"), None);
+        // No underscore at all: there is nothing to split into a stem here.
+        assert_eq!(split_attribute("nounderscore"), None);
         assert_eq!(split_attribute("_input"), None);
         assert_eq!(split_attribute("temp1_"), None);
     }
@@ -1077,12 +1078,12 @@ mod tests {
         assert!(ask, "a window that never asked must ask");
         // The request reached nobody: transient, so the next window asks again.
         let (gate, ask) = gate.step(
-            BrokerLiveness::Unreachable,
+            Some(BrokerLiveness::Unreachable),
             Some(BrokerAttempt::Unreachable),
         );
         assert!(ask);
         let (gate, ask) = gate.step(
-            BrokerLiveness::Unreachable,
+            Some(BrokerLiveness::Unreachable),
             Some(BrokerAttempt::Unreachable),
         );
         assert!(ask);

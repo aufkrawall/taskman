@@ -546,7 +546,7 @@ impl ActionRequest {
             | Self::SetPriority { pid, .. } => valid_pid(*pid),
             // Checked before the pid so an empty mask can never reach the
             // kernel: it would stop the process on every CPU.
-            Self::SetAffinity { pid, mask } => {
+            Self::SetAffinity { pid, mask, .. } => {
                 if *mask == 0 {
                     return Err("an empty affinity mask would stop the process on every CPU".into());
                 }

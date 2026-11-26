@@ -458,7 +458,7 @@ fn connection_from_wire(wire: WireConnection) -> RowMapping {
         // A Unix endpoint has no `SocketAddr`, which is what this model carries.
         _ => return RowMapping::NotExpressible,
     };
-    let Ok(local) = parse_socket_addr(&wire.local) else {
+    let Some(local) = parse_socket_addr(&wire.local) else {
         return RowMapping::Unparsable(wire.local);
     };
     // Only TCP has a state; a datagram endpoint has none, exactly as the direct
@@ -472,7 +472,7 @@ fn connection_from_wire(wire: WireConnection) -> RowMapping {
         Some(text) => {
             // A peer the row cannot name is an unparsable address, and the
             // direct reader drops that row rather than listing half of it.
-            let Ok(remote) = parse_socket_addr(text) else {
+            let Some(remote) = parse_socket_addr(text) else {
                 return RowMapping::Unparsable(text.to_string());
             };
             named_remote(state, remote).then_some(remote)
@@ -818,7 +818,7 @@ mod tests {
         // A `systemctl restart` outlives the read deadline by design, so the
         // two must never be conflated: giving up on a running action is what
         // turns it into a retryable "unavailable".
-        assert!(ACTION_DEADLINE_MS > CLIENT_DEADLINE_MS);
+        const { assert!(ACTION_DEADLINE_MS > CLIENT_DEADLINE_MS) };
         for request in every_action() {
             assert_eq!(
                 request_deadline(&request),

@@ -156,7 +156,7 @@ pub(crate) fn event_is_click(event_id: &str) -> bool {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn argb32_network_order(rgba: &[u8]) -> Vec<u8> {
     let mut argb = Vec::with_capacity(rgba.len() & !3);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         argb.extend_from_slice(&[pixel[3], pixel[0], pixel[1], pixel[2]]);
     }
     argb

@@ -172,6 +172,8 @@ mod linux_service {
 
     use tm_platform::linux::core_service::server;
 
+    use crate::linux_args;
+
     /// Where the service writes its daily log. Root-owned on every mainstream
     /// distribution, so the directory below it can be created and verified.
     const SERVICE_LOG_DIRECTORY: &str = "/var/log/taskman";
