@@ -37,7 +37,9 @@ impl SensorSnapshot {
 
     /// Readings of one kind, lowest chip/label first.
     pub fn of_kind(&self, kind: SensorKind) -> impl Iterator<Item = &SensorReading> {
-        self.readings.iter().filter(move |reading| reading.kind == kind)
+        self.readings
+            .iter()
+            .filter(move |reading| reading.kind == kind)
     }
 
     /// The GPU NVML described for a PCI slot, matched on the normalized slot.
@@ -291,7 +293,10 @@ pub fn normalize_pci_slot(slot: &str) -> String {
 /// The buffer is NUL-terminated ASCII like `00000000:01:00.0`. Anything else
 /// (empty, unterminated, non-ASCII) yields `None` rather than a wrong join.
 pub fn nvml_bus_id_to_pci_slot(buffer: &[u8]) -> Option<String> {
-    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
     let text = std::str::from_utf8(&buffer[..end]).ok()?;
     let text = text.trim();
     if text.is_empty() || !text.is_ascii() {
@@ -387,7 +392,13 @@ mod tests {
 
     #[test]
     fn sensor_stems_accept_inputs_limits_and_labels_only() {
-        for name in ["temp1_input", "fan2_input", "in0_max", "power1_crit", "temp3_label"] {
+        for name in [
+            "temp1_input",
+            "fan2_input",
+            "in0_max",
+            "power1_crit",
+            "temp3_label",
+        ] {
             assert!(sensor_stem(name).is_some(), "{name}");
         }
         for name in ["temp1_offset", "name", "uevent", "temp1_input_extra"] {
