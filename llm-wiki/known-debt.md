@@ -681,13 +681,15 @@ remain follow-up rather than being simulated in headless tests:
   directory-listing cache (a warm lookup performs no filesystem calls at all),
   the declared-but-uninstalled size directories are pruned once per theme
   (hicolor declares ~700 and installs ~28), and a miss is remembered for
-  `MISS_RETRY_TTL` (30 s, the GUI's own retry window). Remaining limits: an icon
-  added *inside an existing directory* can take up to `LISTING_TTL` (60 s) to
-  appear; a theme that declares directories of which none are installed is
-  treated as an install in progress and never settles a miss; and a walk that
-  consulted a directory it could not read (`EACCES`, `EMFILE`, a network home)
-  is never remembered. Symbolic SVGs that rely on a host stylesheet render with
-  their own fallback colours.
+  `MISS_RETRY_TTL` (30 s, the GUI's own retry window). The pruned layout carries
+  the same `LISTING_TTL` as the listing it is derived from — a prune is an
+  observation, so a layout kept for the process would hide a size directory a
+  package installs later until restart. Remaining limits: an icon added *inside
+  an existing directory*, or a whole size directory added by a later install, can
+  take up to `LISTING_TTL` (60 s) to appear; and a walk that consulted a
+  directory it could not read (`EACCES`, `EMFILE`, a network home) is never
+  remembered. Symbolic SVGs that rely on a host stylesheet render with their own
+  fallback colours.
 - **Icon theme resolution is a process-lifetime snapshot.** The theme chain and
   the desktop-file index are resolved once per process (the texture half of the
   same rule is § 2026-11-22 above), so switching the desktop icon theme keeps the

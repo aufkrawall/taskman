@@ -45,6 +45,11 @@ const FAILURE_CACHE_CAP: usize = 512;
 /// `drain_results` runs once for every visible row.
 const UPLOAD_BUDGET: usize = 32;
 /// Base retry window for icons whose extraction failed (e.g. file locked).
+///
+/// The platform resolver remembers a name miss for its own `MISS_RETRY_TTL`
+/// (`tm-platform/src/xdg_icons.rs`), which is deliberately the same 30 s: a retry
+/// that comes sooner is answered from that memo, so raising this alone would buy
+/// nothing and lowering it would only add lookups. Change both together.
 const FAILURE_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Ceiling of the per-key failure ladder (see [`Failure::next`]). A flat 30 s
 /// retry asked the platform for every icon-less row over and over for the life

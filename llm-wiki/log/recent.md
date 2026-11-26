@@ -33,6 +33,17 @@
 - Rejected: caching a name miss for the process lifetime (it cancels the "an icon or
   theme installed later must appear" recovery), and re-reading XSettings or walking
   `index.theme` per lookup to soften the process-lifetime theme snapshot.
+- Two review rounds on the three branches found two things worth remembering.
+  1. The pruned size-dir layout cannot be a process-lifetime cache: the prune is an
+  observation, so a layout computed while a package was absent would hide the size
+  dir that package installs until restart, and the miss it produced would keep being
+  remembered. It now carries the same `LISTING_TTL` as the listing it is derived
+  from, and an *empty* layout is cached under that bound instead of being recomputed
+  per lookup (the exemption it replaced cost two `read_dir`s and an `index.theme`
+  parse per walk for any theme whose tree was half-installed).
+  2. `prefetch` and `lookup` must not share one in-flight ceiling: a page's rebuild
+  could fill the queue with speculative keys and leave a visible row refused, then
+  queued behind them. Speculative work has its own, smaller ceiling.
 
 ## 2026-11-26 - Linux bare-metal audit (KDE Plasma Wayland, NVIDIA, Arch)
 
