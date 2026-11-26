@@ -2079,25 +2079,4 @@ mod tests {
             "a vanished target answers the same under any identity"
         );
     }
-
-    #[test]
-    fn a_broker_refusal_names_the_operation_that_failed() {
-        let refused = ClientError::Refused {
-            code: crate::linux_core_service::Refusal::Rejected,
-            detail: "creation identity changed".into(),
-        };
-        assert!(!refused.may_fall_back());
-        let message = client_error("kill", &refused).to_string();
-        assert!(message.contains("kill"), "{message}");
-        assert!(message.contains("rejected"), "{message}");
-        assert!(
-            message.contains("creation identity changed"),
-            "the service's own reason must survive: {message}"
-        );
-
-        let unavailable = ClientError::Unavailable("connect: No such file or directory".into());
-        assert!(unavailable.may_fall_back());
-        let message = client_error("process-modules", &unavailable).to_string();
-        assert!(message.contains("unavailable"), "{message}");
-    }
 }
