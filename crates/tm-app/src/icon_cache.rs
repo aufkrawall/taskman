@@ -62,6 +62,16 @@ const FAILURE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30
 /// waves. The queue is a `String` per key, so even the raised cap is a few
 /// hundred KiB.
 const IN_FLIGHT_CAP: usize = 1024;
+/// The part of [`IN_FLIGHT_CAP`] a speculative [`IconCache::prefetch`] may
+/// spend.
+///
+/// A prefetch is a guess about rows that are not on screen yet; an [`IconCache::lookup`]
+/// is a row the user is looking at. Sharing one ceiling let a 300-key rebuild fill
+/// the queue, refuse the visible row that was not in the set, and then make it
+/// wait behind a thousand warmed keys — the rows would paint nothing, in the
+/// commit whose whole point is that they stop doing that. A quarter leaves the
+/// paint path headroom even when a page warms everything it has.
+const PREFETCH_CAP: usize = IN_FLIGHT_CAP / 4;
 /// Backoff between failed icon-worker spawn attempts. Every visible row asks
 /// for its icon on every frame, so an unconditional retry meant a `spawn`
 /// syscall, a channel allocation and a `tracing::warn!` per row per frame while
@@ -183,7 +193,8 @@ struct Decoded {
 pub struct IconStats {
     /// Textures currently resident.
     pub ready: usize,
-    /// Keys waiting out their failure window.
+    /// Keys holding a failure record: inside their retry window, or carrying the
+    /// backoff ladder past it.
     pub failed: usize,
     /// Keys requested but not answered yet.
     pub queued: usize,
@@ -211,7 +222,7 @@ pub struct IconCache {
     /// Cumulative prefetch requests enqueued, for [`IconCache::stats`].
     prefetched: Arc<std::sync::atomic::AtomicU64>,
     /// `(egui pass number, textures uploaded in that pass)`. The budget is
-    /// per frame, not per row: `drain_results` runs once for every visible
+    /// per pass, not per row: `drain_results` runs once for every visible
     /// row, so a per-call counter let one cold frame upload everything.
     budget: Arc<Mutex<(u64, usize)>>,
 }
@@ -283,6 +294,15 @@ impl IconCache {
     /// map lookups and nothing else. Nothing is uploaded and the per-pass
     /// [`UPLOAD_BUDGET`] is untouched: the answers wait in the result queue for
     /// the next [`IconCache::icon_or_default`] of that key.
+    ///
+    /// A key is normalized through [`icon_lookup_key`] first, so this cannot
+    /// queue an image the paint path would never ask for: on Windows a bare name
+    /// such as `cmd.exe` is no icon source at all (`usable_icon_path`), and
+    /// handing it to the shell would resolve it against the current directory
+    /// and cache a folder's icon under a key no row can ever paint.
+    ///
+    /// Called from a page's row-model rebuild, which happens after construction;
+    /// the first paint still owns the startup spawn the module doc pins.
     pub fn prefetch(
         &self,
         actions: &Arc<dyn tm_platform::actions::PlatformActions>,
@@ -293,22 +313,26 @@ impl IconCache {
         {
             let mut inner = sync::lock(&self.inner);
             for key in keys {
-                if inner.tex.contains_key(&key)
-                    || inner.queued.contains(&key)
-                    || inner.failed.get(&key).is_some_and(Failure::waiting)
+                let Some(key) = icon_lookup_key(&key) else {
+                    continue;
+                };
+                if inner.tex.contains_key(key)
+                    || inner.queued.contains(key)
+                    || inner.failed.get(key).is_some_and(Failure::waiting)
                 {
                     continue;
                 }
-                // The same ceiling `lookup` uses: the hand-off queue is bounded,
-                // and a prefetch that filled it would starve the rows that are
-                // on screen right now.
+                // Its own ceiling, well below the one `lookup` uses: a prefetch
+                // is speculative and must never fill the hand-off queue, or a row
+                // that appears after the rebuild (a new process, another page)
+                // would be refused and then wait behind every warmed key.
                 if self.in_flight.load(std::sync::atomic::Ordering::Relaxed) + requested.len()
-                    >= IN_FLIGHT_CAP
+                    >= PREFETCH_CAP
                 {
                     break;
                 }
-                inner.queued.insert(key.clone());
-                requested.push(key);
+                inner.queued.insert(key.to_string());
+                requested.push(key.to_string());
             }
         }
         // Handed over outside the cache lock: `send_request` takes the channel
@@ -437,7 +461,7 @@ impl IconCache {
         }
     }
 
-    /// Upload finished extractions into textures, respecting the per-frame
+    /// Upload finished extractions into textures, respecting the per-pass
     /// budget; requests a repaint whenever anything was uploaded (and again
     /// when a backlog remains) so fresh icons appear without waiting for an
     /// unrelated frame.
@@ -954,6 +978,7 @@ mod tests {
     #[test]
     fn eviction_is_lru_not_random() {
         let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
         let cache = IconCache::default();
         let texture = ctx.load_texture(
             "test",
@@ -971,15 +996,21 @@ mod tests {
                     },
                 );
             }
+            // The clock starts above the seeded ticks, the way a session that has
+            // already used the cache would find it.
             inner.next_use = CACHE_CAP as u64;
-            // /apps/0 was the oldest entry; ask for it so it becomes the most
-            // recently used one.
-            let touched_at = inner.next_use;
-            if let Some(touched) = inner.tex.get_mut("/apps/0") {
-                touched.last_used = touched_at;
-            }
-            inner.next_use += 1;
         }
+        // /apps/0 is the oldest entry; painting it makes it the most recently
+        // used one. This goes through the hit path on purpose: a `lookup` that
+        // stopped bumping `last_used` has to fail this test, because in
+        // production that is the difference between evicting a row that is on
+        // screen and evicting one that is not.
+        assert!(
+            cache
+                .icon_or_default(&ctx, &actions, Some("/apps/0"))
+                .is_some(),
+            "a seeded texture is a hit"
+        );
         // One freshly answered icon pushes the map over the high-water mark,
         // and that evicts one batch down to the low-water mark.
         publish(&cache, "/apps/fresh", Some((1, 1, vec![255, 0, 0, 255])));
@@ -997,6 +1028,85 @@ mod tests {
             );
         }
         assert!(inner.tex.contains_key(&format!("/apps/{}", evicted + 1)));
+    }
+
+    /// A failure is not forever: once a key's window lapses the next lookup asks
+    /// the platform again, and an icon that appears in the meantime paints. The
+    /// ladder's whole point is that this still happens — just less often.
+    #[test]
+    fn a_lapsed_failure_is_retried_and_a_late_icon_paints() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        let path = "/apps/late";
+        publish(&cache, path, None);
+        cache.drain_results(&ctx);
+        assert!(matches!(
+            cache.lookup(&ctx, &actions, path),
+            Lookup::Missing
+        ));
+
+        // Age the record past its window without sleeping: the retry is due, and
+        // the record the ladder needs must still be there to escalate.
+        {
+            let mut inner = sync::lock(&cache.inner);
+            let failure = inner.failed.get_mut(path).expect("a failure record");
+            failure.at = std::time::Instant::now()
+                .checked_sub(failure.window + std::time::Duration::from_millis(1))
+                .expect("a window this short is representable");
+        }
+        assert!(
+            matches!(cache.lookup(&ctx, &actions, path), Lookup::Pending),
+            "a lapsed failure is asked for again"
+        );
+        {
+            let inner = sync::lock(&cache.inner);
+            assert!(inner.queued.contains(path), "the request is queued");
+        }
+        assert_eq!(cache.stats().in_flight, 1);
+
+        publish(&cache, path, Some((1, 1, vec![255, 0, 0, 255])));
+        cache.drain_results(&ctx);
+        assert!(
+            cache.icon_or_default(&ctx, &actions, Some(path)).is_some(),
+            "an icon that shows up after the retry paints"
+        );
+        assert_eq!(
+            sync::lock(&cache.inner).failed.get(path).map(|f| f.window),
+            None,
+            "and the ladder is forgotten"
+        );
+    }
+
+    /// The record outlives the retry it schedules, by exactly one more window:
+    /// dropping it when the retry lapses would restart the ladder for exactly the
+    /// keys that are still failing, and keeping it longer would grow the map.
+    #[test]
+    fn a_failure_record_is_kept_for_one_window_past_its_retry() {
+        use std::time::Duration;
+        let window = Duration::from_secs(30);
+        let fresh = Failure {
+            at: std::time::Instant::now(),
+            window,
+        };
+        assert!(!fresh.forgettable(), "a fresh failure stays");
+        assert!(fresh.waiting(), "and it waits");
+        assert!(
+            !Failure {
+                at: std::time::Instant::now() - window,
+                window,
+            }
+            .forgettable(),
+            "a due retry keeps its ladder"
+        );
+        assert!(
+            Failure {
+                at: std::time::Instant::now() - window * 2,
+                window,
+            }
+            .forgettable(),
+            "two lapsed windows are enough"
+        );
     }
 
     /// A key that keeps failing waits longer every time, and a success forgets
