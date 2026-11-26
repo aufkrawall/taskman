@@ -388,6 +388,8 @@ pub enum Request {
     /// Socket endpoints attributed to one process (`/proc/<pid>/fd` needs
     /// CAP_SYS_PTRACE for another user's process).
     ProcessConnections { pid: u32 },
+    /// Files one exact process has open, with its per-file I/O totals.
+    ProcessFileIo { pid: u32, start_ticks: i64 },
     /// Container/hardening evidence the kernel withholds from other users.
     ProcessEvidence { pid: u32, start_ticks: i64 },
     /// One privileged mutation.
@@ -403,6 +405,7 @@ impl Request {
             Self::ProcessModules { .. } => "process-modules",
             Self::ProcessThreads { .. } => "process-threads",
             Self::ProcessConnections { .. } => "process-connections",
+            Self::ProcessFileIo { .. } => "process-file-io",
             Self::ProcessEvidence { .. } => "process-evidence",
             Self::Action { action } => action.label(),
         }
@@ -415,6 +418,7 @@ impl Request {
             Self::ProcessModules { pid, .. }
             | Self::ProcessThreads { pid, .. }
             | Self::ProcessConnections { pid, .. }
+            | Self::ProcessFileIo { pid, .. }
             | Self::ProcessEvidence { pid, .. } => valid_pid(*pid),
             Self::Action { action } => action.validate(),
         }
@@ -482,10 +486,14 @@ impl ActionRequest {
             Self::Kill { pid, .. }
             | Self::Suspend { pid, .. }
             | Self::Resume { pid, .. }
-            | Self::SetPriority { pid, .. }
-            | Self::SetAffinity { pid, .. } => valid_pid(*pid),
-            Self::SetAffinity { mask: 0, .. } => {
-                Err("an empty affinity mask would stop the process on every CPU".into())
+            | Self::SetPriority { pid, .. } => valid_pid(*pid),
+            // Checked before the pid so an empty mask can never reach the
+            // kernel: it would stop the process on every CPU.
+            Self::SetAffinity { pid, mask } => {
+                if *mask == 0 {
+                    return Err("an empty affinity mask would stop the process on every CPU".into());
+                }
+                valid_pid(*pid)
             }
             Self::Service { unit, .. } => {
                 if unit.is_empty() {
@@ -522,6 +530,9 @@ pub enum Response {
     Modules(Vec<WireModule>),
     Threads(WireThreads),
     Connections(Vec<WireConnection>),
+    /// Per-file I/O accounting of one exact process (`/proc/<pid>/io` is
+    /// owner-only, so another user's process needs the broker).
+    FileIo(Box<WireFileIo>),
     Evidence(Box<ProcessEvidence>),
     /// An action completed.
     Done,
@@ -1124,6 +1135,21 @@ mod tests {
                     cycles: None,
                 }],
             }),
+            Response::FileIo(Box::new(WireFileIo {
+                files: vec![WireFileIoEntry {
+                    path: "/var/log/syslog".into(),
+                    read_bytes: Some(4096),
+                    write_bytes: None,
+                    read_ops: Some(2),
+                    write_ops: None,
+                    file_size: Some(8192),
+                    offset: Some(4096),
+                    access_known: true,
+                    is_read: true,
+                    is_write: false,
+                    open_handles: 1,
+                }],
+            })),
         ];
         for response in responses {
             let encoded = encode_frame(&response, MAX_RESPONSE_BYTES).expect("encode");
