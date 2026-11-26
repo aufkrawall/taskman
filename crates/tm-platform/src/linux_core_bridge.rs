@@ -11,12 +11,13 @@
 //! Linux-only; nothing here may touch a socket, `/proc`, or any platform API.
 
 use crate::actions::{
-    ConnectionProtocol, CoreServiceState, ProcessConnection, ProcessModule, ProcessThread,
+    ConnectionProtocol, CoreServiceState, FileIoAccounting, FileIoAccountingState,
+    ProcessConnection, ProcessFileIo, ProcessFileIoSnapshot, ProcessModule, ProcessThread,
     ProcessThreads, ServiceAction, TcpState, ThreadState,
 };
 use crate::linux_core_service::{
-    Refusal, Response, ServiceFailure, ServiceStatusInfo, ServiceVerb, WireConnection, WireModule,
-    WireThread, WireThreadState, WireThreads,
+    Refusal, Response, ServiceFailure, ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo,
+    WireFileIoEntry, WireModule, WireThread, WireThreadState, WireThreads,
 };
 use std::net::{IpAddr, SocketAddr};
 use tm_core::error::TmError;
@@ -144,6 +145,56 @@ pub(crate) fn service_verb(action: ServiceAction) -> ServiceVerb {
         ServiceAction::Start => ServiceVerb::Start,
         ServiceAction::Stop => ServiceVerb::Stop,
         ServiceAction::Restart => ServiceVerb::Restart,
+    }
+}
+
+/// Files one process has open, mapped from the broker's answer.
+///
+/// `/proc/<pid>/fd` and `/proc/<pid>/io` are owner-only, so another user's
+/// process needs the broker for the rows themselves. The accounting block is
+/// decided by what the answer does NOT carry, and every field errs toward
+/// "unknown":
+///
+/// - `state` stays [`FileIoAccountingState::Unavailable`]: Linux has no
+///   per-file trace, so these rows are not the measured request accounting that
+///   state describes.
+/// - `counter_read_bytes`/`counter_write_bytes` stay `None`: the protocol
+///   reports files, not the process-wide totals, and summing the rows would
+///   silently drop every byte that went to a pipe, a socket or a device.
+/// - `handles_complete` stays `false`: the wire has no completeness flag, so the
+///   weaker fact is stated — the enumeration's coverage is not part of the
+///   answer — instead of claiming a complete handle table.
+pub(crate) fn file_io_from_wire(wire: WireFileIo) -> ProcessFileIoSnapshot {
+    ProcessFileIoSnapshot {
+        files: wire
+            .files
+            .into_iter()
+            .map(file_io_entry_from_wire)
+            .collect(),
+        accounting: FileIoAccounting {
+            state: FileIoAccountingState::Unavailable,
+            counter_read_bytes: None,
+            counter_write_bytes: None,
+            handles_complete: false,
+            // Every other counter belongs to a trace that does not exist here.
+            ..FileIoAccounting::default()
+        },
+    }
+}
+
+fn file_io_entry_from_wire(wire: WireFileIoEntry) -> ProcessFileIo {
+    ProcessFileIo {
+        path: wire.path,
+        read_bytes: wire.read_bytes,
+        write_bytes: wire.write_bytes,
+        read_ops: wire.read_ops,
+        write_ops: wire.write_ops,
+        file_size: wire.file_size,
+        offset: wire.offset,
+        access_known: wire.access_known,
+        is_read: wire.is_read,
+        is_write: wire.is_write,
+        open_handles: wire.open_handles,
     }
 }
 
@@ -677,6 +728,58 @@ mod tests {
         assert_eq!(module.path, "/usr/lib/libc.so.6");
         assert_eq!(module.base_address, 0x7f00_0000);
         assert_eq!(module.size_bytes, 0x2000);
+    }
+
+    #[test]
+    fn brokered_file_io_claims_only_what_the_answer_carries() {
+        let snapshot = file_io_from_wire(WireFileIo {
+            files: vec![
+                WireFileIoEntry {
+                    path: "/var/log/syslog".into(),
+                    read_bytes: Some(4096),
+                    write_bytes: None,
+                    read_ops: Some(2),
+                    write_ops: None,
+                    file_size: Some(8192),
+                    offset: Some(4096),
+                    access_known: true,
+                    is_read: true,
+                    is_write: false,
+                    open_handles: 1,
+                },
+                WireFileIoEntry {
+                    path: "/tmp/scratch".into(),
+                    read_bytes: None,
+                    write_bytes: Some(512),
+                    read_ops: None,
+                    write_ops: None,
+                    file_size: None,
+                    offset: None,
+                    access_known: false,
+                    is_read: false,
+                    is_write: true,
+                    open_handles: 2,
+                },
+            ],
+        });
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.files[0].path, "/var/log/syslog");
+        assert_eq!(snapshot.files[0].read_bytes, Some(4096));
+        assert_eq!(
+            snapshot.files[1].read_bytes, None,
+            "an unmeasured counter must stay unknown, never zero"
+        );
+        assert_eq!(snapshot.files[1].write_bytes, Some(512));
+        assert_eq!(snapshot.files[1].open_handles, 2);
+        // The wire carries files, not a trace and not process totals.
+        assert_eq!(
+            snapshot.accounting.state,
+            FileIoAccountingState::Unavailable
+        );
+        assert_eq!(snapshot.accounting.counter_read_bytes, None);
+        assert_eq!(snapshot.accounting.counter_write_bytes, None);
+        assert!(!snapshot.accounting.handles_complete);
+        assert_eq!(snapshot.accounting.events_lost, None);
     }
 
     fn wire_thread(tid: u32, state: WireThreadState) -> crate::linux_core_service::WireThread {

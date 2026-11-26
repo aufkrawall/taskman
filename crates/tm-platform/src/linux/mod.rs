@@ -28,8 +28,8 @@ use self::core_service::client::{self, ClientError};
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
 use crate::linux_core_bridge::{
-    client_error, connections_from_wire, core_service_state, module_from_wire, response_label,
-    service_verb, threads_from_wire,
+    client_error, connections_from_wire, core_service_state, file_io_from_wire, module_from_wire,
+    response_label, service_verb, threads_from_wire,
 };
 use crate::linux_core_service::{ActionRequest, MANIFEST_PATH, Request, Response};
 use crate::linux_telemetry;
@@ -847,9 +847,8 @@ impl PlatformActions for LinuxActions {
         // for other users' processes through the broker when it is installed.
         // They stay independent of the broker's presence on purpose: a missing
         // service must neither blank a tab nor disable an action the direct
-        // path still delivers, and no flag here promises something only a
-        // future protocol revision can carry (per-file I/O accounting, module
-        // unloading, a whole-machine network view).
+        // path still delivers, and no flag here promises something no path can
+        // carry (module unloading, a whole-machine network view).
         Capabilities {
             services_list: services::available(),
             services_control: services::available(),
@@ -1274,12 +1273,38 @@ impl PlatformActions for LinuxActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
-        // Per-file I/O has no broker arm yet: the wire protocol declares
-        // `WireFileIo` but neither a request nor a response variant carries it,
-        // so this walk stays on the GUI token and another user's process keeps
-        // reporting `handles_complete = false` instead of a fabricated empty
-        // list. Closing that needs a protocol revision, not a client change.
-        process_io::list_process_file_io(pid, expected_start_epoch_s)
+        let before = process_start_for_read(pid, expected_start_epoch_s)?;
+        let direct = process_io::list_process_file_io(pid, Some(before));
+        // There are two ways the direct walk is useless for another user's
+        // process: `/proc/<pid>/fd` is owner-only and comes back as an empty,
+        // incomplete snapshot, or another step fails outright with EPERM. Both
+        // are the case the broker exists for; a snapshot that saw handles is a
+        // real answer and never pays a round trip.
+        let escalate = match &direct {
+            Ok(snapshot) => !snapshot.accounting.handles_complete && snapshot.files.is_empty(),
+            Err(error) => polkit::is_permission_denied(error),
+        };
+        if !escalate {
+            return direct;
+        }
+        let request = Request::ProcessFileIo {
+            pid,
+            start_ticks: before,
+        };
+        let brokered = match client::request(&request) {
+            Ok(Response::FileIo(wire)) => Some(file_io_from_wire(*wire)),
+            Ok(other) => return Err(unexpected_response(request.label(), &other)),
+            // No broker: the local answer, or its error, is the honest one.
+            Err(error) if error.may_fall_back() => None,
+            Err(error) => return Err(client_error(request.label(), &error)),
+        };
+        let Some(snapshot) = brokered else {
+            return direct;
+        };
+        // The request pins the sampled generation, and closing our own bracket
+        // as well proves the answer still describes the process asked about.
+        ensure_process_generation(pid, before)?;
+        Ok(snapshot)
     }
 }
 
