@@ -697,6 +697,7 @@ impl Renderer {
             dip_w,
             dip_h,
             dpi_scale,
+            font_size_pt,
             pad_x,
             row_h,
             row_gap,
@@ -940,6 +941,11 @@ pub(super) struct MeasuredLayout {
     pub(super) px_h: i32,
     pub(super) dip_w: f32,
     pub(super) dip_h: f32,
+    /// The size this layout was measured at, which the adaptive step-down can
+    /// lower below the configured one. Read by the layout tests, which have to
+    /// compare two measurements at the same size.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) font_size_pt: f32,
     pub(super) dpi_scale: f32,
     pub(super) pad_x: f32,
     pub(super) row_h: f32,
@@ -1598,22 +1604,31 @@ mod tests {
                 );
                 // The stacking rule, checked instead of sampled: a vertical bar
                 // stacks Network above CPU/RAM exactly when the side-by-side
-                // columns would not fit its width, and the unconstrained
-                // measurement is what makes that width testable.
+                // columns would not fit its width. The reference measure keeps
+                // `max_dip_w` infinite, which only disables stacking, and takes
+                // the size this layout ended up at, because the adaptive
+                // step-down would otherwise measure the two at different fonts.
                 let wide = renderer
-                    .measure_layout(
+                    .measure_layout_at_size(
                         &display,
+                        layout.font_size_pt,
                         LayoutBounds {
                             max_dip_w: f32::INFINITY,
                             ..bounds
                         },
                     )
                     .expect("unconstrained vertical layout");
-                assert!(!wide.stacked, "an unconstrained width must not stack");
+                assert!(
+                    !wide.stacked,
+                    "an unconstrained width must not stack at {} pt",
+                    layout.font_size_pt
+                );
                 assert_eq!(
                     layout.stacked,
                     wide.pad_x * 2.0 + wide.content_w > layout.dip_w - 2.0,
-                    "a {bar_w}px bar at {dpi} DPI must stack exactly when side-by-side does not fit"
+                    "a {bar_w}px bar at {dpi} DPI must stack exactly when side-by-side does not \
+                     fit at {} pt",
+                    layout.font_size_pt
                 );
             }
         }
