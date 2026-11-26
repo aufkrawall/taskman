@@ -105,7 +105,9 @@ NVML access lives in `linux/sensors.rs`.
   - `/usr/lib/systemd/system/taskman-core.service`
   - `/etc/taskman/core-service.json` (root:root 0644)
   - `/usr/share/applications/io.github.aufkrawall.Taskman.desktop`
-  - `/usr/share/icons/hicolor/<size>/apps/io.github.aufkrawall.Taskman.png`
+  - `/usr/share/icons/hicolor/scalable/apps/io.github.aufkrawall.Taskman.svg`
+    (one scalable icon: both KDE and GNOME's icon themes load SVG, and it
+    needs no raster size table; `*.png` stays gitignored in this repository)
   - `/usr/share/metainfo/io.github.aufkrawall.Taskman.metainfo.xml`
   - `/run/taskman` via the unit's `RuntimeDirectory=`
 - Arch package: `packaging/arch/PKGBUILD` + `taskman.install`. `package()`
