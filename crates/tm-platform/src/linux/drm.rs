@@ -4,7 +4,15 @@
 //! driver-specific: when those files are absent, the fields stay unavailable
 //! and `engines` stays empty. No engine is synthesized from a missing usage
 //! counter.
+//!
+//! The proprietary NVIDIA driver publishes neither `gpu_busy_percent` nor
+//! `mem_info_vram_used`, so those adapters get their measurements from NVML
+//! (`sensors::nvml_gpus`) joined on the normalized PCI slot. Sysfs wins
+//! wherever it has a value, and an adapter NVML says nothing about keeps its
+//! fields unavailable — no row is invented for a card DRM did not enumerate.
 
+use super::sensors;
+use crate::linux_sensors::GpuSensors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -97,6 +105,13 @@ fn card_cache() -> &'static Mutex<Option<CardCache>> {
 /// adapters are still listed — as Windows lists the adapters it enumerated —
 /// while their measurements stay unavailable.
 pub fn gpus(measure: bool) -> Vec<GpuInfo> {
+    // NVML is read before the identity cache lock: a brokered query can block
+    // for its own deadline, and no other adapter caller should wait for that.
+    let nvml = if measure {
+        sensors::nvml_gpus()
+    } else {
+        Vec::new()
+    };
     let mut guard = tm_core::sync::lock(card_cache());
     let stale = guard
         .as_ref()
@@ -115,7 +130,7 @@ pub fn gpus(measure: bool) -> Vec<GpuInfo> {
         .cards
         .iter()
         .enumerate()
-        .map(|(id, card)| gpu_for(id, card, measure, cache))
+        .map(|(id, card)| gpu_for(id, card, measure, cache, &nvml))
         .collect()
 }
 
@@ -140,13 +155,77 @@ fn scan_cards() -> Option<CardCache> {
 }
 
 /// One adapter row: cached identity plus, when measured, this tick's counters.
-fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> GpuInfo {
+fn gpu_for(
+    id: usize,
+    card: &CardIdentity,
+    measure: bool,
+    cache: &CardCache,
+    nvml: &[GpuSensors],
+) -> GpuInfo {
     let facts = if measure {
         read_live(card)
     } else {
         card.facts.clone()
     };
-    gpu_from_card(id, facts, &cache.nvidia_names)
+    let slot = facts.pci_slot.clone();
+    let nvidia = is_nvidia_card(&facts);
+    let gpu = gpu_from_card(id, facts, &cache.nvidia_names);
+    with_nvml(gpu, slot.as_deref(), nvidia, nvml)
+}
+
+/// Whether sysfs publishes no utilization or VRAM counter for this adapter, so
+/// NVML is its only measurement source.
+///
+/// The proprietary driver reports neither; nouveau reports `gpu_busy_percent`.
+fn is_nvidia_card(facts: &CardFacts) -> bool {
+    facts.driver.as_deref() == Some("nvidia") || facts.vendor_id == Some(0x10de)
+}
+
+/// Fill the measurements sysfs does not publish from NVML.
+///
+/// Each field is filled only when sysfs had nothing for it, so a driver that
+/// publishes a real counter keeps it. The join key is
+/// `crate::linux_sensors::normalize_pci_slot`, which folds NVML's eight-digit PCI
+/// domain onto the kernel's four; the module's own `normalize_pci_slot` keeps
+/// the domain because it keys `/proc/driver/nvidia` names. An adapter NVML does
+/// not describe keeps every field unavailable.
+fn with_nvml(mut gpu: GpuInfo, slot: Option<&str>, nvidia: bool, nvml: &[GpuSensors]) -> GpuInfo {
+    // Nothing to join, or nothing this adapter is missing: a driver that
+    // answers both counters needs NVML for nothing.
+    let needs_nvml = nvidia || !gpu.util_pct_available;
+    if nvml.is_empty() || !needs_nvml {
+        return gpu;
+    }
+    let Some(slot) = slot else {
+        return gpu;
+    };
+    let slot = crate::linux_sensors::normalize_pci_slot(slot);
+    let Some(readings) = nvml
+        .iter()
+        .find(|readings| readings.pci_slot.as_deref() == Some(slot.as_str()))
+    else {
+        return gpu;
+    };
+    if !gpu.util_pct_available
+        && let Some(pct) = readings.utilization_pct
+    {
+        gpu.util_pct = pct;
+        gpu.util_pct_available = true;
+    }
+    if !gpu.dedicated_mem_available
+        && let (Some(used), Some(total)) = (readings.memory_used_bytes, readings.memory_total_bytes)
+        && total > 0
+        && used <= total
+    {
+        gpu.mem_used_bytes = used;
+        gpu.mem_total_bytes = total;
+        gpu.dedicated_used_bytes = used;
+        gpu.dedicated_mem_available = true;
+    }
+    if gpu.temperature_c.is_none() {
+        gpu.temperature_c = readings.temperature_c;
+    }
+    gpu
 }
 
 /// The cards sysfs lists, lowest name order. `None` when the directory cannot be
@@ -577,5 +656,116 @@ Bus Location    : 0000:01:00.0
         assert_eq!(temperature_millidegrees_to_c(51_250), Some(51.25));
         assert_eq!(temperature_millidegrees_to_c(-5_000), None);
         assert_eq!(temperature_millidegrees_to_c(i64::MAX), None);
+    }
+
+    /// One NVML reading for `slot`, as the enumeration shapes it.
+    fn nvml_reading(slot: &str) -> GpuSensors {
+        GpuSensors {
+            index: 0,
+            pci_slot: Some(crate::linux_sensors::normalize_pci_slot(slot)),
+            utilization_pct: Some(37.0),
+            memory_total_bytes: Some(12 << 30),
+            memory_used_bytes: Some(3 << 30),
+            temperature_c: Some(63.0),
+            ..Default::default()
+        }
+    }
+
+    /// The row the sampler publishes for `facts`, joined against `nvml`.
+    fn row(facts: CardFacts, nvml: &[GpuSensors]) -> GpuInfo {
+        let slot = facts.pci_slot.clone();
+        let nvidia = is_nvidia_card(&facts);
+        let gpu = gpu_from_card(0, facts, &HashMap::new());
+        with_nvml(gpu, slot.as_deref(), nvidia, nvml)
+    }
+
+    /// An NVIDIA card whose sysfs counters say nothing, as the proprietary
+    /// driver leaves them.
+    fn silent_nvidia() -> CardFacts {
+        CardFacts {
+            driver: Some("nvidia".into()),
+            vendor_id: Some(0x10de),
+            device_id: Some(0x2684),
+            busy_pct: None,
+            vram_used: None,
+            vram_total: None,
+            temperature_c: None,
+            ..fact()
+        }
+    }
+
+    #[test]
+    fn nvml_fills_the_counters_the_nvidia_driver_does_not_publish() {
+        let gpu = row(silent_nvidia(), &[nvml_reading("0000:03:00.1")]);
+        assert!(gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 37.0);
+        assert!(gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 3 << 30);
+        assert_eq!(gpu.mem_total_bytes, 12 << 30);
+        assert_eq!(gpu.dedicated_used_bytes, 3 << 30);
+        assert_eq!(gpu.temperature_c, Some(63.0));
+        // An adapter-wide utilization is not an engine instance.
+        assert!(gpu.engines.is_empty());
+    }
+
+    #[test]
+    fn sysfs_counters_win_over_nvml_where_the_driver_publishes_them() {
+        // nouveau publishes `gpu_busy_percent`, so its own sample is shown even
+        // with NVML answering for the same card.
+        let facts = CardFacts {
+            driver: Some("nouveau".into()),
+            vendor_id: Some(0x10de),
+            busy_pct: Some(12.0),
+            ..fact()
+        };
+        let gpu = row(facts, &[nvml_reading("0000:03:00.1")]);
+        assert!(gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 12.0);
+        assert_eq!(gpu.mem_used_bytes, 512 << 20);
+        assert_eq!(gpu.mem_total_bytes, 8 << 30);
+        assert_eq!(gpu.temperature_c, Some(51.0));
+    }
+
+    #[test]
+    fn nvml_silence_leaves_the_measurements_unavailable() {
+        // NVML enumerated nothing this tick.
+        let gpu = row(silent_nvidia(), &[]);
+        assert!(!gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 0.0);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 0);
+        assert_eq!(gpu.temperature_c, None);
+
+        // NVML answered, but only for another card: the join must not borrow
+        // that adapter's numbers.
+        let gpu = row(silent_nvidia(), &[nvml_reading("0000:02:00.0")]);
+        assert!(!gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 0.0);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.temperature_c, None);
+    }
+
+    #[test]
+    fn nvml_memory_needs_a_total_to_be_a_measurement() {
+        let nvml = GpuSensors {
+            pci_slot: Some("0000:03:00.1".into()),
+            memory_used_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let gpu = row(silent_nvidia(), &[nvml]);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 0);
+        assert_eq!(gpu.mem_total_bytes, 0);
+    }
+
+    #[test]
+    fn an_adapter_without_a_pci_slot_cannot_be_joined() {
+        let facts = CardFacts {
+            pci_slot: None,
+            ..silent_nvidia()
+        };
+        let gpu = row(facts, &[nvml_reading("0000:03:00.1")]);
+        assert!(!gpu.util_pct_available);
+        assert!(!gpu.dedicated_mem_available);
     }
 }
