@@ -323,6 +323,12 @@ validate_unit() {
   fi
 }
 
+# Whether systemd is the running init system. Split from require_systemd so the
+# package scriptlet can skip instead of failing inside a chroot or container.
+systemd_is_running() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
 require_systemd() {
   if ! command -v systemctl >/dev/null 2>&1; then
     die "systemctl is not installed: $UNIT_NAME is a systemd unit, nothing was changed"
@@ -503,6 +509,20 @@ validate_manifest_json() {
   fi
 }
 
+# Drop pacman's copy of the packaged placeholder. `/etc/taskman/core-service.json`
+# is in the package's `backup=()`, so an upgrade never touches the live file and
+# instead writes the placeholder beside it as `.pacnew`. This scriptlet is the
+# merge, and the placeholder carries no policy this system should adopt: it is
+# superseded both when the policy was regenerated and when the installed policy
+# was deliberately kept.
+remove_superseded_placeholder() {
+  local stale=$1
+  if [ -e "$stale" ]; then
+    rm -f -- "$stale"
+    log "removed the superseded placeholder $stale"
+  fi
+}
+
 # Write the manifest atomically. A partly written policy file would make the
 # broker refuse to start (it validates the manifest before listening), so the
 # final rename is what makes a crash mid-install harmless.
@@ -511,7 +531,7 @@ validate_manifest_json() {
 # directory has been created and refused as a symlink: a root-owned write must
 # never follow a link an ordinary user could have planted.
 install_manifest() {
-  local dest=$ROOT$CONF_DIR/$MANIFEST_NAME staged stale_merge
+  local dest=$ROOT$CONF_DIR/$MANIFEST_NAME staged
   ensure_dir "$ROOT$CONF_DIR" 0755
   if [ "$MANIFEST_NEEDS_BACKUP" -eq 1 ]; then
     if [ "$CAN_CHOWN" -eq 1 ]; then
@@ -537,11 +557,7 @@ install_manifest() {
   # pacman keeps the packaged placeholder as .pacnew when the live file differs.
   # This run just generated the policy that file was meant to be merged into, so
   # leaving a second, unconfigured copy behind would only hide the real state.
-  stale_merge=$dest.pacnew
-  if [ -e "$stale_merge" ]; then
-    rm -f -- "$stale_merge"
-    log "removed the superseded placeholder $stale_merge"
-  fi
+  remove_superseded_placeholder "$dest.pacnew"
   log "manifest written: $dest"
 }
 
@@ -815,9 +831,9 @@ do_install() {
 }
 
 # --post-install is the pacman scriptlet. It must never fail the transaction for
-# a documented manual step, so the "nobody to authorize" case is a loud warning
-# plus an enabled unit instead of a die: the broker cannot start without a uid,
-# but the operator's next command is a one-liner we print.
+# a documented manual step, so two cases are a loud warning plus a return 0
+# instead of a die: a chroot/pacstrap where systemd is not the init system, and
+# an install nobody can be authorized for. Neither leaves a unit that start-loops.
 do_post_install() {
   local keep_existing=0 unconfigured=0
   resolve_self
@@ -825,20 +841,28 @@ do_post_install() {
     die "--post-install runs on the installed system and does not take --root"
   fi
   require_root
-  require_systemd
   if [ ! -f "$LIB_DIR/$SERVICE_BINARY" ] || [ ! -f "$UNIT_DIR/$UNIT_NAME" ]; then
     die "$UNIT_DIR/$UNIT_NAME or $LIB_DIR/$SERVICE_BINARY is missing: the package payload is incomplete"
+  fi
+  if ! systemd_is_running; then
+    # pacstrap, arch-chroot and container builds run scriptlets without systemd;
+    # there is nothing to reload, enable or start, and the booted system re-runs
+    # this scriptlet when the unit is first needed.
+    warn "systemd is not running here (/run/systemd/system is missing): skipping the unit setup"
+    warn "from the booted system, run: $LIB_DIR/install-linux.sh --post-install"
+    return 0
   fi
   if [ -n "${TARGET_USER:-}" ]; then
     resolve_user
   elif [ -n "${SUDO_USER:-}" ] && can_resolve_user; then
     resolve_user
   elif read_manifest_uids "$CONF_DIR/$MANIFEST_NAME" && [ "${#AUTHORIZED_UIDS[@]}" -gt 0 ]; then
-    # A root login ran pacman: the package just replaced the manifest with its
-    # unconfigured placeholder, so regenerating it would turn a working broker
-    # into a dead one. Keep what is authorized and say how to change it.
+    # A root login ran pacman. The live manifest still holds the policy (it is in
+    # backup=), so regenerating it would only rewrite the same uids; keep it and
+    # drop the placeholder pacman left beside it.
     keep_existing=1
     warn "no invoking user to authorize; keeping the manifest's uid(s) ${AUTHORIZED_UIDS[*]} - run '$LIB_DIR/install-linux.sh --user <name>' to change them"
+    remove_superseded_placeholder "$CONF_DIR/$MANIFEST_NAME.pacnew"
   else
     unconfigured=1
   fi
@@ -846,22 +870,21 @@ do_post_install() {
     if [ -n "${SUDO_USER:-}" ]; then
       warn "SUDO_USER names $SUDO_USER, which is not an account on this system"
     fi
+    remove_superseded_placeholder "$CONF_DIR/$MANIFEST_NAME.pacnew"
     warn "no invoking user could be determined and $CONF_DIR/$MANIFEST_NAME authorizes nobody yet"
-    warn "the core service is enabled but will not start until you name its user:"
+    warn "the core service is installed but NOT enabled: a unit whose manifest lists no uid fails on every start"
+    warn "authorize a user (this also enables and starts the unit):"
     warn "  $LIB_DIR/install-linux.sh --user <name>"
+    warn "or do it by hand afterwards:"
+    warn "  systemctl enable $UNIT_NAME"
+    warn "  systemctl start $UNIT_NAME"
   elif [ "$keep_existing" -eq 0 ]; then
     collect_manifest_policy
     install_manifest
     verify_protected "$CONF_DIR/$MANIFEST_NAME" "the manifest" 644
   fi
   reload_units
-  if [ "$unconfigured" -eq 1 ]; then
-    # Enabling only: starting a broker whose manifest lists no uid would burn
-    # the unit's start limit and report a failure the package did not cause.
-    if ! systemctl enable -- "$UNIT_NAME"; then
-      warn "systemctl enable $UNIT_NAME failed"
-    fi
-  else
+  if [ "$unconfigured" -eq 0 ]; then
     enable_and_start
   fi
   refresh_caches
