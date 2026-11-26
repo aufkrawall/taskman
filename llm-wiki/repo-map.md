@@ -527,8 +527,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   metadata never merges different visible executables. Common app/game
   launchers keep their helper UI but launched titles become peer App rows.
   Background/Windows groups are flat lists where a process's own application
-  collapses into an expandable `Name (N)` row and busy absorbed external tasks
-  (≥ 1 % CPU, different image, windowless) are promoted into Background.
+  collapses into an expandable `Name (N)` row. App helpers stay in their app's
+  nested tree regardless of CPU load (no promotion into Background).
   `joins_family` lets the same image join unconditionally; different images
   require same-publisher + helper-like evidence while windowless, idle and away
   from a system/launch boundary. Repeat runs of one image under one
