@@ -964,18 +964,26 @@ impl PlatformActions for LinuxActions {
         tree: bool,
     ) -> Result<()> {
         validate_mutation_target(pid)?;
-        let direct = process_tree::kill_process(pid, expected_start_epoch_s, tree);
+        let (direct, delivered) =
+            process_tree::kill_process_with_delivery(pid, expected_start_epoch_s, tree);
         // The broker is the only path that can signal another user's process,
         // and it re-reads the creation ticks itself. The tree case is included:
         // the service walks the descendants as root, which a portable,
         // user-writable GUI image can never do safely.
-        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
-            ActionRequest::Kill {
-                pid,
-                start_ticks,
-                tree,
-            }
-        }) {
+        //
+        // A walk that already signalled something is NOT retried: it exits part
+        // way through (`Ok` for one descendant, EPERM for the next), and asking
+        // the service to signal the whole tree again would deliver a second
+        // SIGTERM to the part that is left standing.
+        if !delivered
+            && let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+                ActionRequest::Kill {
+                    pid,
+                    start_ticks,
+                    tree,
+                }
+            })
+        {
             return result;
         }
         match (expected_start_epoch_s, tree) {
@@ -1311,6 +1319,12 @@ fn may_escalate(direct: &Result<()>, start_ticks: Option<i64>) -> bool {
 /// change the outcome, or no broker is installed and answering. `Some(result)`
 /// is final — the service either did it or gave its reason, and a reason must
 /// never degrade into a second privileged attempt.
+///
+/// The caller decides whether a *partial* attempt may be retried: suspend,
+/// resume, priority and affinity write absolute values, so re-applying one
+/// cannot be observed twice, while a kill is gated on
+/// [`process_tree::kill_process_with_delivery`] reporting that nothing was
+/// delivered.
 fn brokered_action(
     direct: &Result<()>,
     start_ticks: Option<i64>,
