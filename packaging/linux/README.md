@@ -61,8 +61,10 @@ exist and are executable, every packaging file it installs is next to it,
 `ExecStart=` in the unit matches the binary path it installs, and the account
 named by `--user`/`SUDO_USER` exists. It never writes a service image or a
 manifest that a non-root user could modify. `--post-install` (the pacman
-scriptlet) never fails a transaction: when it cannot determine who to authorize
-it warns, enables the unit and exits 0.
+scriptlet) never fails a transaction: it returns 0 without touching the unit
+when systemd is not the running init system (pacstrap, `arch-chroot`, container
+builds) or when it cannot determine who to authorize, and in the latter case it
+prints the command that authorizes a user, enables and starts the unit.
 
 ## How the service is authorized
 
@@ -85,17 +87,21 @@ it warns, enables the unit and exits 0.
 - `socket` — `/run/taskman/core.sock`, and `sensor_cache_ms` — 500, the minimum
   age of the cached sensor snapshot a burst of GUI requests shares.
 
-The uid list is **replaced instead of extended** in exactly three cases, and the
+The uid list is **replaced instead of extended** in exactly two cases, and the
 installer says so each time:
 
 1. the installed file is not a manifest this installer wrote (no
    `authorized_uids` key, an unparsable one, or an entry outside the uid range
    above) — the old file is kept as `core-service.json.bak`;
-2. a package upgrade replaced the live file with the packaged placeholder —
-   pacman keeps the generated file (it is in `backup=`) and the scriptlet merges
-   from it, removing the superseded `core-service.json.pacnew` so no
-   unconfigured copy is left behind;
-3. `--uninstall` removed the policy, so the next install starts from scratch.
+2. `--uninstall` removed the policy, so the next install starts from scratch.
+
+A package upgrade is not one of them. `/etc/taskman/core-service.json` is in the
+package's `backup=()`, so pacman leaves the live file alone and writes the
+packaged placeholder beside it as `core-service.json.pacnew`; `--post-install`
+then merges from the live file and deletes that placeholder, so nothing is
+rewritten and no unconfigured copy is left behind. The same deletion happens
+when the scriptlet decides the installed policy must stand because no invoking
+user could be determined.
 
 `--dev` is the one exception: it sets `allow_user_writable_client` and records
 the image the developer actually built. A package never ships it.
@@ -143,15 +149,20 @@ makepkg -si
 `/usr/lib/taskman/install-linux.sh --post-install` (systemd reload, enable and
 start, desktop/icon cache refresh, manifest written for the user who ran
 pacman), and `pre_remove` stops and disables the unit before pacman deletes the
-files. The scriptlet cannot fail a transaction: with no invoking user to
-authorize it warns, enables the unit and exits 0, naming
-`/usr/lib/taskman/install-linux.sh --user <name>` as the one command left.
+files. The scriptlet cannot fail a transaction. In a chroot, `pacstrap` or
+container install, where systemd is not the running init system, it says so and
+returns without touching the unit. With no invoking user to authorize it warns,
+leaves the unit **disabled** (a unit whose manifest lists no uid would fail on
+every start), and prints
+`/usr/lib/taskman/install-linux.sh --user <name>` plus the `systemctl enable` /
+`systemctl start` pair for doing it by hand.
 
-`/etc/taskman/core-service.json` is listed in `backup=`, so an upgrade hands the
-packaged placeholder over as `.pacnew` instead of overwriting the authorized uids
-of a working install; `--post-install` merges from the live file and removes the
-superseded `.pacnew`. `options` carries `!strip` because the release profile
-deliberately keeps the symbol table for crash records.
+`/etc/taskman/core-service.json` is listed in `backup=`, so pacman leaves a
+working policy alone and writes the packaged placeholder beside it as `.pacnew`;
+`--post-install` merges from the live file and deletes that placeholder, also
+when it decided the installed policy should stand. `options` carries `!strip`
+because the release profile deliberately keeps the symbol table for crash
+records.
 
 `python build.py --arch-package` runs that `makepkg` for you and copies the
 result into `dist/`; it skips with a note when `makepkg` is not installed
