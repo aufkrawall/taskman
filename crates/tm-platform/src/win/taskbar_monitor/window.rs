@@ -48,7 +48,7 @@ pub(super) struct WindowCtx {
     pub(super) last_size: (i32, i32),
     pub(super) last_pos: Option<(i32, i32)>,
     pub(super) last_present_error: Option<Instant>,
-    /// Last cross-axis mismatch warning (see `fit_target_rect`).
+    /// Last refused-box diagnostic (see `diagnose_refused_box`).
     pub(super) last_cross_mismatch: Option<Instant>,
     pub(super) last_anchor_slot: Option<AnchorSlot>,
     pub(super) last_compact: bool,
@@ -103,9 +103,6 @@ impl WindowCtx {
             self.last_display = None;
             self.last_anchor_slot = None;
             self.last_compact = false;
-            // A discarded layout is a new chance to diagnose a real mismatch
-            // instead of inheriting the previous one's 30 s window.
-            self.last_cross_mismatch = None;
         }
         if arm_settle && !self.hwnd.0.is_null() {
             unsafe {
@@ -272,31 +269,47 @@ impl WindowCtx {
     fn fit_target_rect(&mut self, rect: PixelRect, bar: PixelRect) -> Option<PixelRect> {
         let (fitted, fills_cross) = clamp_into_taskbar(rect, bar);
         if fitted != rect {
+            self.diagnose_refused_box(
+                fitted,
+                bar,
+                "taskbar monitor box would be cut to stay inside the taskbar; staying hidden",
+            );
             return None;
         }
         if !fills_cross {
-            let (expected, actual) = if bar.is_horizontal() {
-                (bar.height(), fitted.height())
-            } else {
-                (bar.width(), fitted.width())
-            };
-            if self
-                .last_cross_mismatch
-                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
-            {
-                tracing::warn!(
-                    expected,
-                    actual,
-                    left = fitted.left,
-                    top = fitted.top,
-                    ?bar,
-                    "taskbar monitor box does not fill the taskbar cross axis; staying hidden"
-                );
-                self.last_cross_mismatch = Some(Instant::now());
-            }
+            self.diagnose_refused_box(
+                fitted,
+                bar,
+                "taskbar monitor box does not fill the taskbar cross axis; staying hidden",
+            );
             return None;
         }
         Some(fitted)
+    }
+
+    /// Rate-limited (once per 30 s) diagnosis for a box the gate refuses, so
+    /// neither refusal reason is silent.
+    fn diagnose_refused_box(&mut self, rect: PixelRect, bar: PixelRect, reason: &str) {
+        if self
+            .last_cross_mismatch
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(30))
+        {
+            return;
+        }
+        let (expected, actual) = if bar.is_horizontal() {
+            (bar.height(), rect.height())
+        } else {
+            (bar.width(), rect.width())
+        };
+        tracing::warn!(
+            expected,
+            actual,
+            left = rect.left,
+            top = rect.top,
+            ?bar,
+            "{reason}"
+        );
+        self.last_cross_mismatch = Some(Instant::now());
     }
 
     #[cfg(test)]
@@ -350,8 +363,10 @@ impl WindowCtx {
             self.last_display = None;
             self.last_anchor_slot = None;
             self.last_compact = false;
-            // A discarded layout is a new chance to diagnose a real mismatch
-            // instead of inheriting the previous one's 30 s window.
+            // A new bar geometry or DPI is a new chance to diagnose a real
+            // mismatch instead of inheriting the previous one's 30 s window.
+            // Ordinary revalidation traffic deliberately does not reset it, so
+            // a shell event burst cannot turn the tripwire into a log storm.
             self.last_cross_mismatch = None;
         } else if notify_geom_changed {
             self.last_env_geom = Some(geom);

@@ -68,7 +68,10 @@ impl LayoutBounds {
         Self {
             horizontal: true,
             max_dip_w: f32::INFINITY,
-            max_dip_h: cross_px as f32,
+            // Unread on a horizontal bar (`avail_h` uses `cross_px / scale`),
+            // and left infinite so a future reader cannot mistake this pixel
+            // count for a DIP extent at any scaling but 96 DPI.
+            max_dip_h: f32::INFINITY,
             cross_px,
         }
     }
@@ -1315,10 +1318,10 @@ mod tests {
         let normal = build_display(&cfg, &metrics, false, false, 96, false);
         let compact = build_display(&cfg, &metrics, false, false, 96, true);
         let (nw, _nh, _) = renderer
-            .measure_and_render(&normal, 48.0, None)
+            .measure_and_render(&normal, 48, None)
             .expect("normal render");
         let (cw, ch, _) = renderer
-            .measure_and_render(&compact, 48.0, None)
+            .measure_and_render(&compact, 48, None)
             .expect("compact render");
         assert!(
             cw < nw,

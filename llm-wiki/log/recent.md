@@ -4,9 +4,14 @@
   padding, capped at `avail_dip_h()` (the bar minus another 4 DIP) and centred in
   the bar, so the bar always kept at least 2 DIP of itself per side — 2.5 px at
   100 %, 5 px per side at 250 % — and more whenever the content was shorter than
-  the bar. Two workers fixed it in parallel worktrees and two reviewers read the
-  merged tree; **no P0**, and the durable rule now lives in `current.md`
-  § Windows taskbar monitor.
+  the bar. Two workers fixed it in parallel worktrees and four reviewers read the
+  merged tree over two rounds. No behavioural P0 was found in the geometry, but
+  round 2 caught a P0 the earlier rounds could not: the round-1 rename of
+  `measure_and_render`'s parameter left two `48.0` call sites behind, i.e. a
+  compile error. Nothing in this record was compiled at the time of writing; the
+  gate ran after the final merge, and a "reviewed clean" claim before a compile is
+  exactly how that class of defect survives.
+- The durable rule lives in `current.md` § Windows taskbar monitor.
 - Root cause worth remembering: `LayoutBounds` carried DIP sizes only, so the
   box's pixel extent and its DIP extent were rounded independently and neither was
   the bar. `cross_px` (device pixels, taken straight from `taskbar_rect`) is the
