@@ -103,6 +103,9 @@ impl WindowCtx {
             self.last_display = None;
             self.last_anchor_slot = None;
             self.last_compact = false;
+            // A discarded layout is a new chance to diagnose a real mismatch
+            // instead of inheriting the previous one's 30 s window.
+            self.last_cross_mismatch = None;
         }
         if arm_settle && !self.hwnd.0.is_null() {
             unsafe {
@@ -254,12 +257,13 @@ impl WindowCtx {
     /// Belt and braces for the placement contract: the box handed to
     /// `SetWindowPos`, `UpdateLayeredWindow` and the occlusion check is clamped
     /// into the taskbar here as well, so no code path can place or present the
-    /// widget outside the bar. `None` means the box would have to be cut down
-    /// to fit and must be hidden instead of clipped.
+    /// widget outside the bar. `None` means the box may not be shown.
     ///
-    /// A box that stays inside but does not fill the bar's cross axis is
-    /// diagnosed once per 30 s rather than silently accepted: that dead band is
-    /// exactly where clicks reach the taskbar instead of the widget.
+    /// The cross axis must be filled, not merely respected. The box this gate
+    /// replaced was a few pixels short, and that dead band is exactly where a
+    /// click reached the taskbar instead of the widget, so a box that would
+    /// have to be cut down and a box that leaves such a band are both hidden
+    /// and diagnosed once per 30 s rather than presented short.
     fn fit_target_rect(&mut self, rect: PixelRect, bar: PixelRect) -> Option<PixelRect> {
         let (fitted, fills_cross) = clamp_into_taskbar(rect, bar);
         if fitted != rect {
@@ -278,10 +282,11 @@ impl WindowCtx {
                 tracing::warn!(
                     expected,
                     actual,
-                    "taskbar monitor box does not fill the taskbar cross axis"
+                    "taskbar monitor box does not fill the taskbar cross axis; staying hidden"
                 );
                 self.last_cross_mismatch = Some(Instant::now());
             }
+            return None;
         }
         Some(fitted)
     }
@@ -337,6 +342,9 @@ impl WindowCtx {
             self.last_display = None;
             self.last_anchor_slot = None;
             self.last_compact = false;
+            // A discarded layout is a new chance to diagnose a real mismatch
+            // instead of inheriting the previous one's 30 s window.
+            self.last_cross_mismatch = None;
         } else if notify_geom_changed {
             self.last_env_geom = Some(geom);
             self.request_layout_scan(LayoutUpdate::Recheck, true);

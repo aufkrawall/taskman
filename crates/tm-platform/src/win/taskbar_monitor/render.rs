@@ -64,14 +64,16 @@ impl LayoutBounds {
         }
     }
 
-    /// A horizontal taskbar `max_dip_h` DIP tall at 96 DPI.
+    /// A horizontal taskbar `cross_px` device pixels tall at 96 DPI. Named in
+    /// pixels because that is what the box is measured in: a DIP-named
+    /// constructor is what let the box and the bar disagree in the first place.
     #[cfg(test)]
-    pub(super) fn horizontal(max_dip_h: f32) -> Self {
+    pub(super) fn horizontal_px(cross_px: i32) -> Self {
         Self {
             horizontal: true,
             max_dip_w: f32::INFINITY,
-            max_dip_h,
-            cross_px: max_dip_h.round().max(0.0) as i32,
+            max_dip_h: cross_px as f32,
+            cross_px,
         }
     }
 }
@@ -641,7 +643,7 @@ impl Renderer {
 
         let two_rows = has_net || (has_cpu && has_ram);
         let mut row_gap = if two_rows { 1.0 } else { 0.0 };
-        if !stacked && two_rows && row_h * 2.0 + row_gap + 4.0 > avail_h {
+        if !stacked && two_rows && row_h * 2.0 + row_gap + CONTENT_INSET_DIP * 2.0 > avail_h {
             row_gap = 0.0;
         }
         let section_gap = if stacked {
@@ -672,7 +674,7 @@ impl Renderer {
         let len_w_dip = (pad_x * 2.0 + content_w).ceil();
         // A vertical bar's length follows the content, capped to the bar so the
         // widget never runs past the taskbar's end.
-        let len_cap_dip = (bounds.max_dip_h - CONTENT_INSET_DIP).max(1.0);
+        let len_cap_dip = (bounds.max_dip_h - CONTENT_INSET_DIP * 2.0).max(1.0);
         let len_h_dip = (content_h + CONTENT_INSET_DIP * 2.0).min(len_cap_dip);
         let len_w_px = (len_w_dip * dpi_scale).round().max(1.0) as i32;
         let len_h_px = (len_h_dip * dpi_scale).round().max(1.0) as i32;
@@ -917,10 +919,10 @@ impl Renderer {
     pub(super) fn measure_and_render(
         &mut self,
         display: &RenderedDisplay,
-        max_taskbar_dip_h: f32,
+        cross_px: i32,
         hwnd: Option<isize>,
     ) -> Option<(i32, i32, HDC)> {
-        self.measure_and_render_in(display, LayoutBounds::horizontal(max_taskbar_dip_h), hwnd)
+        self.measure_and_render_in(display, LayoutBounds::horizontal_px(cross_px), hwnd)
     }
 
     #[cfg(test)]
@@ -1173,7 +1175,7 @@ mod tests {
         };
         let display = build_display(&cfg, &metrics, false, false, 96, false);
         let (w, h, _hdc) = renderer
-            .measure_and_render(&display, 48.0, None)
+            .measure_and_render(&display, 48, None)
             .expect("rendered surface");
         assert!(w > 40 && h > 20, "unexpected widget size {w}x{h}");
 
@@ -1206,7 +1208,7 @@ mod tests {
 
         let hi_dpi = build_display(&cfg, &metrics, false, false, 144, false);
         let (hw, hh, _hdc2) = renderer
-            .measure_and_render(&hi_dpi, 48.0, None)
+            .measure_and_render(&hi_dpi, 48, None)
             .expect("hi-dpi rendered surface");
         // At 144 DPI the widget widens with the DIP content, but its height is
         // pinned to the 48px taskbar cross extent it was measured against.
@@ -1258,7 +1260,7 @@ mod tests {
         let (w1, h1, _) = renderer
             .measure_and_render(
                 &build_display(&cfg, &low_metrics, false, false, 96, false),
-                48.0,
+                48,
                 None,
             )
             .expect("low load render");
@@ -1267,7 +1269,7 @@ mod tests {
         let (w2, h2, _) = renderer
             .measure_and_render(
                 &build_display(&cfg, &high_metrics, false, false, 96, false),
-                48.0,
+                48,
                 None,
             )
             .expect("high load render");
@@ -1435,15 +1437,16 @@ mod tests {
         };
         let display = build_display(&cfg, &metrics, false, false, 96, false);
 
-        // Previously panicked when max_dip_h in (16.0, 26.0) made max_h < 22.0 in clamp(22.0, max_h).
-        let tiny_bounds = LayoutBounds::horizontal(20.0);
+        // Previously panicked when the cross extent landed in (16, 26) px and the
+        // old clamp's minimum exceeded its maximum.
+        let tiny_bounds = LayoutBounds::horizontal_px(20);
         let (tw, th, _) = renderer
             .measure_and_render_in(&display, tiny_bounds, None)
             .expect("tiny horizontal taskbar must not panic");
         assert!(tw > 0 && th <= 20, "tiny bar height {th} must stay <= 20px");
 
         // Windows 10 small taskbar (~30 DIPs): larger configured font steps down to fit cleanly.
-        let small_bounds = LayoutBounds::horizontal(30.0);
+        let small_bounds = LayoutBounds::horizontal_px(30);
         let small_layout = renderer
             .measure_layout(&display, small_bounds)
             .expect("small taskbar layout");
@@ -1457,11 +1460,14 @@ mod tests {
         unsafe { CoUninitialize() };
     }
 
-    /// Regression: the box used to be the content plus up to 4 DIP of padding
-    /// per side and was then centered in the bar, so a 48px bar at 96 DPI got a
-    /// 32px widget with an 8px dead band above and below it where clicks landed
-    /// on the taskbar instead of the widget. The box must fill the bar's cross
-    /// axis exactly, in device pixels, at every scaling and bar height.
+    /// Regression: the box used to be the content plus at most 4 DIP of padding
+    /// per side, capped at `avail_dip_h()` = the bar minus another 4 DIP, and
+    /// was then centered in the bar. So the bar always kept at least 2 DIP of
+    /// itself on each side of the widget — 2.5 px at 100 % scaling, 5 px at
+    /// 250 % — and more whenever the content was shorter than the bar, which is
+    /// why the dead band was noticed on a scaled display. The box must fill the
+    /// bar's cross axis exactly, in device pixels, at every scaling and bar
+    /// height.
     #[test]
     fn widget_box_fills_taskbar_cross_axis_across_dpi_and_bar_heights() {
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -1595,6 +1601,129 @@ mod tests {
                         layout.content_w,
                         layout.dip_w
                     );
+                }
+            }
+        }
+        unsafe { CoUninitialize() };
+    }
+
+    /// The defect as the user met it: measure the box, place it in the bar, and
+    /// the presented rect must fill the bar's cross axis with no strip of
+    /// taskbar left clickable on either side. The two halves can each be right
+    /// and still miss, so this composes them, and it asserts the one thing they
+    /// cannot show separately: every pixel of the presented bitmap has non-zero
+    /// alpha, so no row of the box is click-through.
+    #[test]
+    fn measured_then_placed_box_fills_the_bar_and_keeps_every_pixel_clickable() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let mut renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        let cfg = Config {
+            enabled: true,
+            show_cpu: true,
+            show_ram: true,
+            show_network: true,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(23.0),
+            ram_pct: Some(48.0),
+            net_sent_bps: Some(12_300.0),
+            net_recv_bps: Some(456_700.0),
+        };
+
+        for dpi in [96, 120, 144, 168, 192, 216, 240] {
+            let display = build_display(&cfg, &metrics, false, false, dpi, false);
+            for cross in [24, 30, 40, 47, 48, 60, 72, 75] {
+                for from_bottom in [true, false] {
+                    let bar = if from_bottom {
+                        rect(0, 1080 - cross, 1920, 1080)
+                    } else {
+                        rect(0, 0, 1920, cross)
+                    };
+                    let notify = rect(bar.right - 220, bar.top, bar.right, bar.bottom);
+                    let uia = [notify];
+                    let layout = renderer
+                        .measure_layout(&display, LayoutBounds::from_taskbar(bar, dpi))
+                        .unwrap_or_else(|| panic!("no layout for a {cross}px bar at {dpi} DPI"));
+                    let (w, h) = (layout.px_w, layout.px_h);
+                    let placement = solve_taskbar_placement(
+                        bar,
+                        Some(notify),
+                        Some(&uia),
+                        (w, h),
+                        dpi,
+                        None,
+                        false,
+                    )
+                    .unwrap_or_else(|| panic!("no placement for a {cross}px bar at {dpi} DPI"));
+                    let (x, y) = placement.pos;
+                    let widget = rect(x, y, x + w, y + h);
+                    assert_eq!(
+                        widget.top, bar.top,
+                        "a {cross}px bar at {dpi} DPI must be filled from its top edge, not centred"
+                    );
+                    assert_eq!(
+                        widget.bottom, bar.bottom,
+                        "a {cross}px bar at {dpi} DPI must be filled to its bottom edge"
+                    );
+                    assert!(bar.covers(widget), "{widget:?} must stay inside {bar:?}");
+
+                    if dpi == 96 {
+                        // One real frame per bar height at 100 %: the alpha scan
+                        // is what proves the hit area, not the arithmetic.
+                        let (pw, ph, _) = renderer
+                            .render_layout(&display, layout, None)
+                            .expect("rendered frame");
+                        assert_eq!((pw, ph), (w, h), "presented size must be the placed size");
+                        let pixels = renderer.surface.as_ref().unwrap().pixels();
+                        let click_through = pixels
+                            .chunks_exact(4)
+                            .position(|p| p[3] == 0)
+                            .map(|i| (i % w as usize, i / w as usize));
+                        assert_eq!(
+                            click_through, None,
+                            "pixel {click_through:?} of the {w}x{h} box would be click-through"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The same composition on a left/right bar, whose cross axis is width.
+        for dpi in [96, 120, 144, 168, 192] {
+            let display = build_display(&cfg, &metrics, false, false, dpi, false);
+            for cross in [40, 48, 64, 80] {
+                for on_left in [true, false] {
+                    let (left, right) = if on_left {
+                        (0, cross)
+                    } else {
+                        (1920 - cross, 1920)
+                    };
+                    let bar = rect(left, 0, right, 1080);
+                    let notify = rect(left, 880, right, 1080);
+                    let uia = [rect(left, 0, right, 420), rect(left, 830, right, 880)];
+                    let layout = renderer
+                        .measure_layout(&display, LayoutBounds::from_taskbar(bar, dpi))
+                        .unwrap_or_else(|| panic!("no layout for a {cross}px bar at {dpi} DPI"));
+                    let (w, h) = (layout.px_w, layout.px_h);
+                    let placement = solve_taskbar_placement(
+                        bar,
+                        Some(notify),
+                        Some(&uia),
+                        (w, h),
+                        dpi,
+                        None,
+                        false,
+                    )
+                    .unwrap_or_else(|| panic!("no placement for a {cross}px bar at {dpi} DPI"));
+                    let (x, y) = placement.pos;
+                    let widget = rect(x, y, x + w, y + h);
+                    assert_eq!(
+                        (widget.left, widget.right),
+                        (bar.left, bar.right),
+                        "a {cross}px bar at {dpi} DPI must be filled across its width"
+                    );
+                    assert!(bar.covers(widget), "{widget:?} must stay inside {bar:?}");
                 }
             }
         }

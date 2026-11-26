@@ -1358,7 +1358,7 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
 }
 
 #[test]
-fn fit_target_rect_keeps_the_box_inside_the_bar_and_diagnoses_a_short_cross_axis() {
+fn fit_target_rect_hides_a_box_that_does_not_fill_the_bar() {
     // Pure geometry: no window is needed, only a `WindowCtx` to hold the
     // diagnostic rate limit.
     let mut ctx = test_window_ctx(HWND::default(), false);
@@ -1369,14 +1369,15 @@ fn fit_target_rect_keeps_the_box_inside_the_bar_and_diagnoses_a_short_cross_axis
     assert_eq!(ctx.fit_target_rect(full, bar), Some(full));
     assert!(ctx.last_cross_mismatch.is_none());
 
-    // A shorter box keeps its size (it is still wanted), but the dead band is
-    // diagnosed once per rate-limit window instead of passing unnoticed.
+    // The defect itself: a box a few pixels short leaves a strip of taskbar
+    // that takes the click, so it is hidden rather than presented short, and
+    // the dead band is diagnosed once per rate-limit window.
     let short = rect(-9_400, -10_000, -9_240, -9_968);
-    assert_eq!(ctx.fit_target_rect(short, bar), Some(short));
+    assert_eq!(ctx.fit_target_rect(short, bar), None);
     let first = ctx
         .last_cross_mismatch
         .expect("a box shorter than the bar must be diagnosed");
-    assert_eq!(ctx.fit_target_rect(short, bar), Some(short));
+    assert_eq!(ctx.fit_target_rect(short, bar), None);
     assert_eq!(
         ctx.last_cross_mismatch,
         Some(first),
@@ -1390,10 +1391,10 @@ fn fit_target_rect_keeps_the_box_inside_the_bar_and_diagnoses_a_short_cross_axis
     let overlong = rect(-10_010, -10_000, -8_850, -9_952);
     assert_eq!(ctx.fit_target_rect(overlong, bar), None);
 
-    // Vertical bar: the cross axis is the width.
+    // Vertical bar: the cross axis is the width, so a narrow box is hidden too.
     let vertical = rect(-9_000, -10_000, -8_920, -9_000);
     let narrow = rect(-8_984, -9_900, -8_920, -9_800);
-    assert_eq!(ctx.fit_target_rect(narrow, vertical), Some(narrow));
+    assert_eq!(ctx.fit_target_rect(narrow, vertical), None);
     let full_width = rect(-9_000, -9_900, -8_920, -9_800);
     assert_eq!(ctx.fit_target_rect(full_width, vertical), Some(full_width));
 }

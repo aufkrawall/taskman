@@ -1502,7 +1502,18 @@ rebase runbook.
   outer-edge-anchored `AlternateGap` (e.g. centered Win11 left space),
   adapting to stacked vertical layout when a vertical bar's cross-axis width is
   narrower than side-by-side columns (stepping down font size down to `6.5` pt if
-  needed on short/narrow bars, rejecting cross-axis overflow), adapting to
+  needed on short/narrow bars; the box itself fills the bar's cross axis
+  exactly — `px_h` on a bottom/top bar, `px_w` on a left/right one, taken as an
+  integer from `taskbar_rect` and never round-tripped through DIPs, with
+  `dip = px / scale` so the Direct2D box, the window and the `1/255`-alpha hit
+  area are one box at any scaling — because a box even a few pixels short leaves
+  a strip of the bar that takes the click; the solver refuses a non-filling box,
+  `clamp_into_taskbar` clamps and reports, `WindowCtx::fit_target_rect` hides
+  instead of presenting one, a mismatch logs once per 30 s, and a bar shorter
+  than the smallest font scales the row rhythm into the box rather than drawing
+  past it; across its own span the box also covers the bar's inner resize
+  border, which is accepted because a bar edge that swallows clicks is exactly
+  the defect), adapting to
   `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding via
   `SW_HIDE` if completely packed or occupancy is unknown. Shell window
   creation/destruction/replacement, taskbar root/child/control notifications,

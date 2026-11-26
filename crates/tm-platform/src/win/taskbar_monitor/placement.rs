@@ -152,17 +152,19 @@ pub(super) fn solve_taskbar_placement(
         }
     };
     let (bar_start, bar_end) = project(taskbar_rect);
-    // The widget is placed at the bar's cross start whenever it fills the bar's
-    // cross axis, which is the normal case: equality is not a tolerance here.
     let (cross_start, cross_avail, widget_len, widget_cross) = if horizontal {
         (taskbar_rect.top, taskbar_rect.height(), w, h)
     } else {
         (taskbar_rect.left, taskbar_rect.width(), h, w)
     };
-    if widget_cross > cross_avail {
+    // The box fills the bar's cross axis exactly, so it starts at the bar's
+    // cross edge. Anything else is the reported defect and is refused rather
+    // than centred: a shorter box leaves a strip of the bar taking clicks that
+    // belong to the widget, and a taller one covers the bar's own edge.
+    if widget_cross != cross_avail {
         return None;
     }
-    let cross_pos = cross_start + (cross_avail - widget_cross) / 2;
+    let cross_pos = cross_start;
     let bar_len = bar_end - bar_start;
     let req_len = if prefer_keep_compact {
         widget_len + hysteresis
@@ -349,7 +351,7 @@ mod tests {
             taskbar,
             Some(notify),
             Some(&[notify]),
-            (160, 36),
+            (160, 48),
             96,
             None,
             false,
@@ -357,7 +359,7 @@ mod tests {
         .unwrap()
         .pos;
         assert!(monitor.covers(taskbar));
-        assert_eq!(pos, (1700 - 160 - 6, 1032 + (48 - 36) / 2));
+        assert_eq!(pos, (1700 - 160 - 6, 1032));
     }
 
     #[test]
@@ -371,7 +373,7 @@ mod tests {
             taskbar,
             Some(notify),
             Some(&uia),
-            (150, 36),
+            (150, 48),
             96,
             None,
             false,
@@ -396,7 +398,7 @@ mod tests {
             taskbar,
             Some(notify),
             Some(&packed_right),
-            (150, 36),
+            (150, 48),
             96,
             Some(AnchorSlot::TrayAdjacent),
             false,
@@ -417,7 +419,7 @@ mod tests {
             taskbar,
             Some(notify),
             Some(&barely_open_right),
-            (150, 36),
+            (150, 48),
             96,
             Some(alt.slot),
             false,
@@ -432,7 +434,7 @@ mod tests {
             taskbar,
             Some(notify),
             Some(&wide_open_right),
-            (150, 36),
+            (150, 48),
             96,
             Some(stayed.slot),
             false,
@@ -464,7 +466,7 @@ mod tests {
                 taskbar,
                 Some(notify),
                 Some(&tight),
-                (150, 36),
+                (150, 48),
                 96,
                 None,
                 false,
@@ -475,14 +477,14 @@ mod tests {
             taskbar,
             Some(notify),
             Some(&tight),
-            (118, 36),
+            (118, 48),
             96,
             None,
             false,
         )
         .expect("compact width should fit");
         assert_eq!(compact_res.slot, AnchorSlot::TrayAdjacent);
-        assert_eq!(compact_res.pos, (1700 - 118 - 6, 1032 + (48 - 36) / 2));
+        assert_eq!(compact_res.pos, (1700 - 118 - 6, 1032));
 
         // At 152px usable (>= 150 but < 150+16), prefer_keep_compact keeps compact active.
         let borderline = chunk_items(0, 1536);
@@ -491,7 +493,7 @@ mod tests {
                 taskbar,
                 Some(notify),
                 Some(&borderline),
-                (150, 36),
+                (150, 48),
                 96,
                 Some(AnchorSlot::TrayAdjacent),
                 true,
@@ -506,7 +508,7 @@ mod tests {
                 taskbar,
                 Some(notify),
                 Some(&completely_full),
-                (118, 36),
+                (118, 48),
                 96,
                 None,
                 false,
@@ -521,7 +523,7 @@ mod tests {
                     taskbar,
                     Some(notify),
                     empty_uia,
-                    (150, 36),
+                    (150, 48),
                     96,
                     None,
                     false,
@@ -545,13 +547,13 @@ mod tests {
             neg_bar,
             Some(neg_notify),
             Some(&uia_with_container),
-            (150, 36),
+            (150, 48),
             96,
             None,
             false,
         )
         .expect("bogus >=60% container rect must be ignored");
-        assert_eq!(neg_res.pos, (-220 - 150 - 6, 1032 + (48 - 36) / 2));
+        assert_eq!(neg_res.pos, (-220 - 150 - 6, 1032));
 
         // RTL taskbar: tray on the left edge [0..220], apps on [900..1920].
         let rtl_bar = rect(0, 1032, 1920, 1080);
@@ -561,7 +563,7 @@ mod tests {
             rtl_bar,
             Some(rtl_notify),
             Some(&rtl_uia),
-            (150, 36),
+            (150, 48),
             96,
             None,
             false,
@@ -578,7 +580,7 @@ mod tests {
             vert_bar,
             Some(vert_notify),
             Some(&vert_uia),
-            (72, 38),
+            (80, 38),
             96,
             None,
             false,
