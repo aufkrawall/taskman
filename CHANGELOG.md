@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A busy build no longer splits across two Processes sections.** A windowless helper of an app that used at least 1 % CPU and ran a different executable was lifted out of the app into Background processes, together with its own children but not its parent — so a `cargo.exe` started from an editor's terminal stayed in the editor's tree while its busy `rustc.exe` children appeared under Background, and rows jumped between the two sections whenever a compiler crossed the threshold. The rule predates the nested app trees and was there to keep busy tools visible; an expanded app row now shows its whole subtree with the same parent links as the Details tree, and the app row's totals already include the tool's load, so the helpers stay where they belong. Background "Name (N)" family rows still keep a busy different-image helper out of the collapsed group.
+
 ## 0.1.34 - 2026-11-26
 
 ### New
