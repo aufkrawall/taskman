@@ -7,10 +7,29 @@
 //! ## Shape
 //!
 //! The calling thread is the accept thread: it owns the listening socket,
-//! resolves each connection's kernel credentials, and hands the connection to
-//! one of two bounded workers through a 16-slot queue. A full queue is answered
-//! with `Refusal::Busy` instead of blocking accept, and one request per
-//! connection keeps a stalled client from pinning a worker forever.
+//! resolves each connection's kernel credentials, authorizes the peer, and only
+//! then hands the connection to one of two bounded workers through a 16-slot
+//! queue. Authorization before queueing matters: an authorized peer could
+//! otherwise hold both worker slots by connecting and never sending. A full
+//! queue is answered with `Refusal::Busy` instead of blocking accept, and one
+//! request per connection keeps a stalled client from pinning a worker forever.
+//!
+//! ## Peer identity
+//!
+//! A path is not an identity. `unshare -m` plus a bind mount is unprivileged and
+//! makes any executable appear at an installed path, so the broker never
+//! compares paths: at startup it resolves every manifest client in ITS OWN mount
+//! namespace and records the `(st_dev, st_ino)` of the protected file, and per
+//! connection it opens `/proc/<pid>/exe` so the KERNEL resolves the peer's
+//! executable and its metadata. The `start_ticks` bracket around that open
+//! closes pid reuse in both directions. The resolved path survives in logs only.
+//!
+//! ## Refusals
+//!
+//! A refusal is written before the request is read, so the socket is half-closed
+//! and drained afterwards: a client that is mid-frame must receive an answer,
+//! not the EPIPE/ECONNRESET that the GUI is allowed to retry under its own
+//! token.
 //!
 //! SIGTERM/SIGINT set an atomic flag and write one byte to a self-pipe; the
 //! accept loop waits in `poll` on the listener and on that pipe, so a stop is
@@ -20,24 +39,27 @@
 //! Nothing on a request path may panic, and nothing the kernel does not publish
 //! is invented: an unreadable field stays `None`, never a fabricated zero.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::actions::{ConnectionProtocol, ServiceAction, TcpState, ThreadState};
 use crate::linux_core_service::{
-    ActionRequest, ClientImage, INSTALL_ROOT, MANIFEST_PATH, MAX_MANIFEST_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESPONSE_BYTES, Manifest, NamespaceId, PROTOCOL_VERSION, PeerCredentials, PeerVerdict,
-    ProcessEvidence, Refusal, Request, RequestEnvelope, ResourceLimit, Response, ResponseEnvelope,
-    SERVICE_UNIT, SOCKET_DIR, SOCKET_PATH, ServiceStatusInfo, ServiceVerb, WireConnection,
+    ACTION_DEADLINE_MS, ActionRequest, ClientImage, INSTALL_ROOT, InstalledClient, MANIFEST_PATH,
+    MAX_MANIFEST_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Manifest, NamespaceId,
+    PROTOCOL_VERSION, PeerCredentials, PeerVerdict, ProcessEvidence, Refusal, Request,
+    RequestEnvelope, ResourceLimit, Response, ResponseEnvelope, SERVICE_UNIT, SOCKET_DIR,
+    SOCKET_PATH, ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo, WireFileIoEntry,
     WireModule, WireThread, WireThreadState, WireThreads, decode_frame, encode_frame,
     evaluate_peer, is_inside_install_root, manifest_protection_problem, read_frame,
     service_image_protection_problem,
@@ -47,9 +69,9 @@ use tm_core::error::TmError;
 use tm_core::model::PriorityClass;
 
 use super::super::{
-    ensure_process_generation, process_connections, process_modules, process_start_for_read,
-    process_threads, process_tree, send_signal_checked, sensors, services, set_affinity_direct,
-    set_priority_direct,
+    ensure_process_generation, process_connections, process_io, process_modules,
+    process_start_for_read, process_threads, process_tree, send_signal_checked, sensors, services,
+    set_affinity_direct, set_priority_direct,
 };
 
 /// Version this build reports; the workspace version, so a status answer names
@@ -73,9 +95,34 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// an empty socket buffer.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// How long a refusal drains what the client may still be writing.
+///
+/// A refusal is written before the request is read, so a client in the middle of
+/// its frame sees EPIPE/ECONNRESET on a half-closed socket — which the GUI
+/// classifies as an unavailable broker and retries under its own token. Reading
+/// (and discarding) the rest of that frame keeps the refusal an answer.
+const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Reads one refusal drain may perform. 64 × 4 KiB covers `MAX_REQUEST_BYTES`
+/// with room to spare, and bounds a peer that trickles one byte at a time.
+const MAX_DRAIN_READS: u32 = 64;
+
+/// Back-off after `accept` failed because this process ran out of descriptors
+/// or memory. Waiting for a client to close is the only fix; it is not a broken
+/// listener, so it must not count toward [`MAX_CONSECUTIVE_ACCEPT_FAILURES`].
+const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(20);
+
+/// How long the self-check waits for its one probe connection.
+const SOCKET_PROBE_TIMEOUT_MS: i32 = 1_000;
+
 /// A listener that cannot accept this many times in a row is broken (not busy:
 /// a full queue does not fail `accept`), so the failure stops being invisible.
 const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 16;
+
+/// Bound on the clients resolved from the manifest at startup. An install lists
+/// one to a handful; a directory entry could list more, and a request path must
+/// never be able to grow this.
+const MAX_INSTALLED_CLIENTS: usize = 32;
 
 /// The socket is world-connectable on purpose: authorization is per peer
 /// (kernel credentials plus a protected client image), not per file.
@@ -102,10 +149,6 @@ const MAX_OPEN_FDS: u32 = 1_000_000;
 const REFUSAL_LOG_WINDOW_MS: u64 = 5_000;
 const BROKER_WARNING_WINDOW_MS: u64 = 5_000;
 
-/// Development escape hatch. Only ever an explicit argv entry: the packaged
-/// unit's `ExecStart` never passes it, and it cannot be set from the manifest.
-const DEV_ARGUMENT: &str = "--dev";
-
 // ------------------------------------------------------------ public surface
 
 /// Run the broker until the process is asked to stop.
@@ -114,12 +157,12 @@ const DEV_ARGUMENT: &str = "--dev";
 /// install, socket that cannot be bound). A per-connection error never stops
 /// the broker; the accept loop reports and keeps serving.
 ///
-/// `--dev` on the command line disables the install-path and client-image
-/// protection checks and logs a warning. It exists so a developer can run the
-/// broker out of a build tree; the packaged unit never passes it, and passing
-/// it requires root anyway, so it cannot widen anyone's privileges.
-pub fn run_service() -> Result<(), String> {
-    let dev = std::env::args().any(|argument| argument == DEV_ARGUMENT);
+/// `dev` (the `--dev` argv entry, which the packaged unit never passes)
+/// disables the install-root and service-image checks and logs a warning. It
+/// still requires the root-owned manifest, because the authorized uids have to
+/// come from somewhere the user cannot write. Passing `--dev` means being root
+/// already, so it cannot widen anyone's privileges.
+pub fn run_service(dev: bool) -> Result<(), String> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     if uid != 0 {
@@ -129,22 +172,28 @@ pub fn run_service() -> Result<(), String> {
     }
     if dev {
         tracing::warn!(
-            "running the Linux core service in dev mode: the install-root and client-image \
-             protection checks are disabled"
+            manifest = MANIFEST_PATH,
+            "running the Linux core service in dev mode: the install-root and service-image \
+             checks are disabled; the root-owned manifest is still required"
         );
     }
 
     let manifest = load_manifest()?;
+    let installed = resolve_installed_clients(&manifest)?;
     let (service_image, install_verified) = verify_service_image(dev)?;
     let listener = prepare_listener()?;
 
     let state = Arc::new(ServiceState {
         manifest,
+        installed,
         started: Instant::now(),
         started_unix_s: unix_now_s(),
         install_verified,
         service_image,
-        sensors: Mutex::new(SensorCache::default()),
+        sensor_poll: Mutex::new(SensorCache::default()),
+        sensor_sample_unix_ms: AtomicI64::new(0),
+        sensor_available: AtomicBool::new(false),
+        units_in_flight: Mutex::new(HashSet::new()),
         requests_served: AtomicU64::new(0),
         refusals: AtomicU64::new(0),
     });
@@ -169,6 +218,7 @@ pub fn run_service() -> Result<(), String> {
         socket = SOCKET_PATH,
         protocol = PROTOCOL_VERSION,
         authorized_uids = state.manifest.authorized_uids.len(),
+        installed_clients = state.installed.len(),
         image = %state.service_image,
         install_verified,
         "linux core service listening"
@@ -283,17 +333,27 @@ pub fn selfcheck() -> Result<String, String> {
 
 // -------------------------------------------------------------------- state
 
-/// Everything the workers share. Immutable after startup except the cache and
-/// the counters, both behind their own lock/atomics.
+/// Everything the workers share. Immutable after startup except the published
+/// sensor state, the in-flight units and the counters.
 struct ServiceState {
     manifest: Manifest,
+    /// The protected clients resolved from the manifest in THIS process's mount
+    /// namespace at startup. Peer trust is decided on their `(st_dev, st_ino)`.
+    installed: Vec<InstalledClient>,
     started: Instant,
     started_unix_s: u64,
     /// Only ever true when the full install verification ran and passed; dev
     /// mode reports `false` rather than claiming a check it skipped.
     install_verified: bool,
     service_image: String,
-    sensors: Mutex<SensorCache>,
+    /// Serializes sensor polls only. A `Status` answer never takes it.
+    sensor_poll: Mutex<SensorCache>,
+    /// Published after every poll so `Status` cannot block behind sysfs + NVML.
+    sensor_sample_unix_ms: AtomicI64,
+    sensor_available: AtomicBool,
+    /// Unit names with a verb in flight, so one unit's action can never be
+    /// started twice by two clients.
+    units_in_flight: Mutex<HashSet<String>>,
     requests_served: AtomicU64,
     refusals: AtomicU64,
 }
@@ -303,6 +363,18 @@ struct ServiceState {
 #[derive(Default)]
 struct SensorCache {
     last: Option<(Instant, SensorSnapshot)>,
+}
+
+/// One unit's in-flight claim; dropping it releases the unit.
+struct UnitFlight<'a> {
+    in_flight: &'a Mutex<HashSet<String>>,
+    unit: String,
+}
+
+impl Drop for UnitFlight<'_> {
+    fn drop(&mut self) {
+        tm_core::sync::lock(self.in_flight).remove(&self.unit);
+    }
 }
 
 impl ServiceState {
@@ -316,12 +388,13 @@ impl ServiceState {
 
     /// Serve the cached snapshot unless it is older than the manifest's window.
     ///
-    /// The poll runs while the lock is held on purpose: a queued request then
+    /// The poll runs while the poll lock is held on purpose: a queued request
     /// waits for the poll in flight instead of starting a second one, which is
-    /// exactly the "a burst is not a burst of polling" contract.
+    /// exactly the "a burst is not a burst of polling" contract. `Status` does
+    /// not take this lock, so it never waits behind a slow `/sys` walk.
     fn sensor_snapshot(&self) -> SensorSnapshot {
         let window = Duration::from_millis(self.manifest.sensor_cache_ms);
-        let mut cache = tm_core::sync::lock(&self.sensors);
+        let mut cache = tm_core::sync::lock(&self.sensor_poll);
         if let Some((taken, snapshot)) = cache.last.as_ref()
             && taken.elapsed() < window
         {
@@ -329,16 +402,35 @@ impl ServiceState {
         }
         let snapshot = sensors::snapshot();
         cache.last = Some((Instant::now(), snapshot.clone()));
+        drop(cache);
+        // Publish outside the lock: this is the only state `Status` reads.
+        self.sensor_sample_unix_ms
+            .store(snapshot.taken_at_unix_ms, Ordering::Relaxed);
+        self.sensor_available
+            .store(!snapshot.is_empty(), Ordering::Relaxed);
         snapshot
     }
 
-    /// Last poll's availability and timestamp, without polling anything: a
-    /// status request must never be the reason sysfs is read.
+    /// Last poll's availability and timestamp, read without any lock: a status
+    /// request must never be the reason sysfs is read, nor wait for it.
     fn last_sensor_poll(&self) -> (bool, i64) {
-        match tm_core::sync::lock(&self.sensors).last.as_ref() {
-            Some((_, snapshot)) => (!snapshot.is_empty(), snapshot.taken_at_unix_ms),
-            None => (false, 0),
+        (
+            self.sensor_available.load(Ordering::Relaxed),
+            self.sensor_sample_unix_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Claim one unit for one verb, or `None` when a verb is already running.
+    fn begin_unit_flight(&self, unit: &str) -> Option<UnitFlight<'_>> {
+        let mut in_flight = tm_core::sync::lock(&self.units_in_flight);
+        if !in_flight.insert(unit.to_string()) {
+            return None;
         }
+        drop(in_flight);
+        Some(UnitFlight {
+            in_flight: &self.units_in_flight,
+            unit: unit.to_string(),
+        })
     }
 
     fn status(&self) -> ServiceStatusInfo {
@@ -520,6 +612,183 @@ fn protected_directory_problem(
     (writable != 0).then(|| format!("{label} must not be group- or world-writable (mode {mode:o})"))
 }
 
+/// `None` when `directory` and every ancestor is a real directory that root
+/// owns and nobody but root can write.
+///
+/// Shared with the service binary, which writes its logs into one of these
+/// trees: a writable ancestor lets an ordinary user replace whatever the
+/// service later opens there, and no per-file check can detect that.
+pub fn protected_directory_chain(directory: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Some(format!("{} must not be a symlink", directory.display()));
+            }
+            if !metadata.is_dir() {
+                return Some(format!("{} is not a directory", directory.display()));
+            }
+            if let Some(problem) = protected_directory_problem(
+                &directory.display().to_string(),
+                Some(metadata.uid()),
+                Some(metadata.mode() & 0o7777),
+            ) {
+                return Some(problem);
+            }
+        }
+        Err(error) => {
+            return Some(format!(
+                "{} could not be inspected: {error}",
+                directory.display()
+            ));
+        }
+    }
+    protected_directory_chain_problem(directory)
+}
+
+/// Resolve every manifest client ONCE, in this process's mount namespace.
+///
+/// This is the whole point of the identity model: the recorded `(st_dev,
+/// st_ino)` is the protected installed file as root sees it, so a peer that
+/// arranges for another executable to appear at an installed path (a private
+/// mount namespace plus a bind mount is unprivileged) reports a different
+/// inode and is not trusted. A missing entry is skipped with a warning — an
+/// install may list a client that a package does not ship today — but a
+/// present entry the service cannot prove safe is a broken install, and an
+/// install where nothing resolves could never authorize anyone.
+fn resolve_installed_clients(manifest: &Manifest) -> Result<Vec<InstalledClient>, String> {
+    let mut installed = Vec::new();
+    for entry in &manifest.clients {
+        if installed.len() >= MAX_INSTALLED_CLIENTS {
+            break;
+        }
+        match entry.strip_suffix('/') {
+            Some(directory) => {
+                resolve_client_directory(entry, Path::new(directory), &mut installed)?;
+            }
+            None => {
+                if let Some(client) = resolve_client_file(entry, Path::new(entry))? {
+                    installed.push(client);
+                }
+            }
+        }
+    }
+    if installed.is_empty() {
+        return Err(format!(
+            "no manifest client resolved to a protected installed executable (clients: {})",
+            manifest.clients.join(", ")
+        ));
+    }
+    Ok(installed)
+}
+
+/// One listed client path. `Ok(None)` means the entry is simply not installed.
+fn resolve_client_file(entry: &str, path: &Path) -> Result<Option<InstalledClient>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            tracing::warn!(client = entry, "manifest client is not installed; skipped");
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "manifest client {entry} could not be inspected: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "manifest client {entry} must be a regular file, not a symlink or a special file"
+        ));
+    }
+    if let Some(problem) = protected_directory_problem(
+        &format!("manifest client {entry}"),
+        Some(metadata.uid()),
+        Some(metadata.mode() & 0o7777),
+    ) {
+        return Err(problem);
+    }
+    Ok(Some(InstalledClient {
+        path: entry.to_string(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
+}
+
+/// A directory entry in `clients` (`/usr/lib/taskman/`) trusts every protected
+/// executable installed directly inside it. The trust is still the identity
+/// recorded here, not the path a peer reports.
+fn resolve_client_directory(
+    entry: &str,
+    directory: &Path,
+    installed: &mut Vec<InstalledClient>,
+) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            tracing::warn!(
+                client = entry,
+                "manifest client directory is not installed; skipped"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "manifest client directory {entry} could not be inspected: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "manifest client directory {entry} must be a real directory"
+        ));
+    }
+    // A writable directory would let its owner plant a file the service then
+    // trusts, which is the one thing an installed directory must prevent.
+    if let Some(problem) = protected_directory_problem(
+        &format!("manifest client directory {entry}"),
+        Some(metadata.uid()),
+        Some(metadata.mode() & 0o7777),
+    ) {
+        return Err(problem);
+    }
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("manifest client directory {entry} could not be read: {error}"))?;
+    for file in entries.flatten() {
+        if installed.len() >= MAX_INSTALLED_CLIENTS {
+            tracing::warn!(
+                client = entry,
+                limit = MAX_INSTALLED_CLIENTS,
+                "manifest client directory lists more files than the broker tracks"
+            );
+            break;
+        }
+        let path = file.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        if let Some(problem) = protected_directory_problem(
+            &format!("manifest client {}", path.display()),
+            Some(metadata.uid()),
+            Some(metadata.mode() & 0o7777),
+        ) {
+            // A directory entry lists a tree, not one file: an unprotected file
+            // in it is simply not a client, and refusing the whole service for
+            // one stray helper would be worse than not trusting it.
+            tracing::warn!(client = %path.display(), %problem, "manifest client is not trusted");
+            continue;
+        }
+        installed.push(InstalledClient {
+            path: path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+    }
+    Ok(())
+}
+
 /// Verify the running image, i.e. that this process is the protected binary.
 ///
 /// The check runs after `exec`, so it proves the image and every directory above
@@ -678,27 +947,60 @@ fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
     })
 }
 
-/// Resolve the peer's executable the way the policy expects it: the kernel's
-/// own `/proc/<pid>/exe`, then that file's owner and mode.
+/// Resolve the peer's executable as a kernel object, not as a path string.
 ///
-/// The ` (deleted)` suffix is deliberately NOT stripped: a replaced binary no
-/// longer resolves, and the honest answer is "no client image" rather than
-/// checking the manifest against whichever file now has that path.
-fn resolve_client_image(pid: u32) -> Option<ClientImage> {
+/// `open("/proc/<pid>/exe")` makes the KERNEL resolve the task's own executable,
+/// so a private mount namespace cannot substitute anything: the returned
+/// `(st_dev, st_ino)` is the file that task actually runs. The path is kept for
+/// logging only.
+///
+/// The creation identity (`start_ticks`) is read before the open and again
+/// after it. Without that bracket an authorized user could exit and let pid
+/// reuse hand the connection's pid to the installed GUI, or the reverse: a
+/// grant earned by one process generation must never authorize another.
+fn resolve_peer_image(pid: u32) -> Result<ClientImage, Refusal> {
     if pid == 0 {
-        return None;
+        return Err(Refusal::MissingClientImage);
     }
-    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let path = link.to_string_lossy().into_owned();
-    let metadata = std::fs::metadata(&path).ok()?;
+    let before = super::super::read_proc_start_ticks(pid).map_err(|_| Refusal::NotFound)?;
+    // No `O_NOFOLLOW`: `/proc/<pid>/exe` is a magic link whose target IS the
+    // executable, and refusing to follow it would refuse every peer.
+    let executable = open_proc_executable(pid).map_err(|_| Refusal::MissingClientImage)?;
+    let metadata = executable
+        .metadata()
+        .map_err(|_| Refusal::MissingClientImage)?;
     if !metadata.is_file() {
-        return None;
+        return Err(Refusal::MissingClientImage);
     }
-    Some(ClientImage {
+    let path = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|target| target.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let after = super::super::read_proc_start_ticks(pid).map_err(|_| Refusal::NotFound)?;
+    if before != after {
+        return Err(Refusal::NotFound);
+    }
+    Ok(ClientImage {
         path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
         owner_uid: metadata.uid(),
         mode: metadata.mode() & 0o7777,
     })
+}
+
+/// Open the executable the kernel reports for `pid`, close-on-exec.
+fn open_proc_executable(pid: u32) -> io::Result<std::fs::File> {
+    let path = CString::new(format!("/proc/{pid}/exe"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid contains a NUL byte"))?;
+    // SAFETY: `path` is a valid NUL-terminated string and `open` only reads the
+    // flags; it returns a fresh descriptor that nothing else owns.
+    let descriptor = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is fresh and unowned, so taking ownership here
+    // releases it exactly once.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
 }
 
 // ------------------------------------------------------------------ signals
@@ -722,9 +1024,11 @@ extern "C" fn on_stop_signal(_signal: libc::c_int) {
 
 /// Install the stop handlers and return the wake pipe's read end.
 ///
-/// `signal(2)` is enough even though its handlers may run with `SA_RESTART`:
-/// the stop path never depends on an interrupted syscall, because the handler
-/// writes to the self-pipe the accept loop is waiting on.
+/// `sigaction` with explicit zero flags: NO `SA_RESTART`, so a stop interrupts a
+/// blocking syscall instead of resuming it, and the handler writes to the
+/// self-pipe the accept loop waits on. Both mechanisms are deliberate — the pipe
+/// is what actually wakes `poll`, and the missing `SA_RESTART` keeps a worker
+/// parked in a socket read from silently outliving the stop.
 fn install_stop_signal() -> Result<RawFd, String> {
     let mut descriptors: [libc::c_int; 2] = [0; 2];
     // SAFETY: `descriptors` is the two-element array `pipe2` requires.
@@ -735,12 +1039,25 @@ fn install_stop_signal() -> Result<RawFd, String> {
         ));
     }
     WAKE_WRITE_FD.store(descriptors[1], Ordering::Release);
-    let handler: extern "C" fn(libc::c_int) = on_stop_signal;
+    // SAFETY: `sigaction` is plain old data; an all-zero value is the empty
+    // handler table, which the two fields below fill in.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // Casting a function item through `*const ()` keeps the address rustc's
+    // `function_casts_as_integer` lint objects to a single, explicit step.
+    action.sa_sigaction = on_stop_signal as *const () as libc::sighandler_t;
+    action.sa_flags = 0;
+    // SAFETY: `sa_mask` is the all-zero set, i.e. valid storage for the empty
+    // set `sigemptyset` writes.
+    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+        return Err(format!(
+            "could not initialize the signal set: {}",
+            io::Error::last_os_error()
+        ));
+    }
     for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: the handler has the signature `signal` requires and only
-        // touches atomics plus the async-signal-safe `write`.
-        let previous = unsafe { libc::signal(signal, handler as libc::sighandler_t) };
-        if previous == libc::SIG_ERR {
+        // SAFETY: `action` is a fully initialized handler table and a null old
+        // table is allowed.
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
             return Err(format!(
                 "could not install the signal handler: {}",
                 io::Error::last_os_error()
@@ -810,6 +1127,15 @@ fn accept_loop(
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if is_resource_exhaustion(&error) => {
+                // Out of descriptors or memory: the listener is fine, `accept`
+                // will work again once a client closes. Back-pressure, not a
+                // fault, and definitely not a reason to stop the root broker.
+                if broker_warning_allowed() {
+                    tracing::warn!(%error, "accept is out of resources; waiting for one to free up");
+                }
+                wait_for_stop(wake_fd, ACCEPT_RESOURCE_BACKOFF);
+            }
             Err(error) => {
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
@@ -827,7 +1153,37 @@ fn accept_loop(
     Ok(())
 }
 
-/// Resolve kernel credentials and queue the connection, or answer `Busy`.
+/// Descriptor or memory pressure, not a broken listener.
+fn is_resource_exhaustion(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+/// Wait up to `duration`, but return immediately when a stop wakes the pipe.
+///
+/// A plain sleep here would make a stop wait for the whole back-off; polling the
+/// wake pipe keeps the shutdown event-driven.
+fn wait_for_stop(wake_fd: RawFd, duration: Duration) {
+    let mut polled = [libc::pollfd {
+        fd: wake_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let timeout = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: the array and its length match, and `wake_fd` stays owned by the
+    // caller for the whole loop.
+    unsafe { libc::poll(polled.as_mut_ptr(), 1, timeout) };
+}
+
+/// Authenticate the peer, then queue the connection.
+///
+/// Authorization happens HERE, before the connection owns a worker slot: an
+/// authorized peer could otherwise hold both workers for the request deadline
+/// by connecting and never sending anything, repeatedly. Refusals go out on the
+/// short write budget and are drained, so a refused client sees an answer
+/// rather than a vanished broker.
 fn enqueue(
     stream: UnixStream,
     state: &ServiceState,
@@ -849,20 +1205,38 @@ fn enqueue(
     {
         tracing::warn!(%error, "could not mark an accepted connection close-on-exec");
     }
+    // uid 0 needs no grant, so an image it cannot be resolved for (a task that
+    // just exec'd away, a kernel thread) must not lock the superuser out; for
+    // everyone else an unresolvable image is the refusal itself.
+    let image = match resolve_peer_image(peer.pid) {
+        Ok(image) => Some(image),
+        Err(_) if peer.uid == 0 => None,
+        Err(refusal) => {
+            let detail = auth_refusal_detail(refusal, &peer, None);
+            refuse(state, stream, refusal, detail);
+            return Ok(());
+        }
+    };
+    if let PeerVerdict::Refused(refusal) =
+        evaluate_peer(&state.manifest, &state.installed, &peer, image.as_ref())
+    {
+        let detail = auth_refusal_detail(refusal, &peer, image.as_ref());
+        refuse(state, stream, refusal, detail);
+        return Ok(());
+    }
     match work_tx.try_send(ClientWork { stream, peer }) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(work)) => {
             // Back-pressure, not a fault: answer instead of blocking accept, so
             // one slow client cannot stop the socket from being drained.
-            let mut stream = work.stream;
             if broker_warning_allowed() {
                 tracing::warn!("the broker's request queue is full; answering busy");
             }
-            let _ = stream.set_write_timeout(Some(BUSY_TIMEOUT));
-            send_response(
+            refuse(
                 state,
-                &mut stream,
-                Response::error(Refusal::Busy, "the broker's request queue is full"),
+                work.stream,
+                Refusal::Busy,
+                "the broker's request queue is full".to_string(),
             );
             Ok(())
         }
@@ -886,22 +1260,18 @@ fn run_worker(receiver: &Mutex<Receiver<ClientWork>>, state: &ServiceState) {
 
 // ------------------------------------------------------------- one connection
 
-/// Authenticate one peer, serve exactly one request, and drop the connection.
+/// Serve exactly one already-authorized request and drop the connection.
+///
+/// Peer resolution and the authorization decision happened in [`enqueue`], so a
+/// worker only ever carries traffic that has already been granted.
 fn handle_client(work: ClientWork, state: &ServiceState) {
     let ClientWork { mut stream, peer } = work;
-    // Bounded before the first write, so the refusal path cannot park a worker
-    // on a client that never drains its socket.
+    // Bounded before the first write (a refusal path writes before it reads) so
+    // no client that never drains its socket can park a worker.
     if let Err(error) = stream.set_write_timeout(Some(REQUEST_TIMEOUT)) {
         if broker_warning_allowed() {
             tracing::warn!(%error, "could not set a broker write deadline");
         }
-        return;
-    }
-    let image = resolve_client_image(peer.pid);
-    if let PeerVerdict::Refused(code) = evaluate_peer(&state.manifest, &peer, image.as_ref()) {
-        let detail = auth_refusal_detail(code, &peer, image.as_ref());
-        log_refusal(code, &detail);
-        send_response(state, &mut stream, Response::error(code, detail));
         return;
     }
     if let Err(error) = stream.set_read_timeout(Some(REQUEST_TIMEOUT)) {
@@ -921,12 +1291,7 @@ fn handle_client(work: ClientWork, state: &ServiceState) {
                 // The frame was refused before allocating, and the client is
                 // still there to receive the reason.
                 let detail = format!("request frame refused: {error}");
-                log_refusal(Refusal::MalformedRequest, &detail);
-                send_response(
-                    state,
-                    &mut stream,
-                    Response::error(Refusal::MalformedRequest, detail),
-                );
+                send_refusal(state, &mut stream, Refusal::MalformedRequest, detail);
             } else if broker_warning_allowed() {
                 tracing::warn!(%error, peer_uid = peer.uid, "could not read a broker request");
             }
@@ -938,12 +1303,7 @@ fn handle_client(work: ClientWork, state: &ServiceState) {
         Ok(envelope) => envelope,
         Err(error) => {
             let detail = format!("request body is not a request: {error}");
-            log_refusal(Refusal::MalformedRequest, &detail);
-            send_response(
-                state,
-                &mut stream,
-                Response::error(Refusal::MalformedRequest, detail),
-            );
+            send_refusal(state, &mut stream, Refusal::MalformedRequest, detail);
             return;
         }
     };
@@ -954,25 +1314,16 @@ fn handle_client(work: ClientWork, state: &ServiceState) {
             "this broker speaks protocol {PROTOCOL_VERSION}, the client sent {}",
             envelope.protocol
         );
-        log_refusal(Refusal::ProtocolMismatch, &detail);
-        send_response(
-            state,
-            &mut stream,
-            Response::error(Refusal::ProtocolMismatch, detail),
-        );
+        send_refusal(state, &mut stream, Refusal::ProtocolMismatch, detail);
         return;
     }
     if let Err(problem) = envelope.request.validate() {
-        log_refusal(Refusal::MalformedRequest, &problem);
-        send_response(
-            state,
-            &mut stream,
-            Response::error(Refusal::MalformedRequest, problem),
-        );
+        send_refusal(state, &mut stream, Refusal::MalformedRequest, problem);
         return;
     }
 
     let label = envelope.request.label();
+    let is_action = matches!(&envelope.request, Request::Action { .. });
     state.count_request();
     let response = dispatch(state, peer.pid, envelope.request);
     tracing::debug!(
@@ -980,7 +1331,70 @@ fn handle_client(work: ClientWork, state: &ServiceState) {
         request = label,
         "broker request served"
     );
+    // An action can legitimately run for `ACTION_DEADLINE_MS` (a `systemctl
+    // restart` waits on systemd's job), so its answer gets that budget instead
+    // of the read deadline: a client that is still waiting must not be cut off
+    // by a write timeout, and it must not see a half-written frame either.
+    let write_budget = if is_action {
+        Duration::from_millis(ACTION_DEADLINE_MS)
+    } else {
+        REQUEST_TIMEOUT
+    };
+    if let Err(error) = stream.set_write_timeout(Some(write_budget)) {
+        if broker_warning_allowed() {
+            tracing::warn!(%error, "could not set a broker write deadline");
+        }
+        return;
+    }
     send_response(state, &mut stream, response);
+}
+
+/// Answer one refusal, count it, and make sure the client sees an answer.
+fn send_refusal(state: &ServiceState, stream: &mut UnixStream, code: Refusal, detail: String) {
+    log_refusal(code, &detail);
+    send_response(state, stream, Response::error(code, detail));
+    finish_refusal(stream);
+}
+
+/// Answer a connection this process refuses to serve and close it.
+fn refuse(state: &ServiceState, stream: UnixStream, code: Refusal, detail: String) {
+    let mut stream = stream;
+    // The refusal is written before any request is read, so it must not be
+    // allowed to park the accept thread on a client that never drains.
+    let _ = stream.set_write_timeout(Some(BUSY_TIMEOUT));
+    send_refusal(state, &mut stream, code, detail);
+}
+
+/// Half-close after a refusal and discard what the client is still writing.
+///
+/// A refusal is written before the request is read. Closing straight away makes
+/// a client that is mid-frame see EPIPE/ECONNRESET, which is transport
+/// failure — the one class the GUI is allowed to retry elsewhere. Reading the
+/// remainder (bounded, with a deadline) turns the refusal into an answer the
+/// client can classify as a decision.
+fn finish_refusal(stream: &mut UnixStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    if stream
+        .set_read_timeout(Some(REFUSAL_DRAIN_TIMEOUT))
+        .is_err()
+    {
+        return;
+    }
+    let mut discarded = 0usize;
+    let mut reads = 0u32;
+    let mut buffer = [0u8; 4096];
+    // Two bounds: the byte budget, and the number of reads. `Interrupted` must
+    // not be able to spin this loop, and a peer that keeps trickling bytes must
+    // not be able to hold the connection either.
+    while discarded < MAX_REQUEST_BYTES && reads < MAX_DRAIN_READS {
+        reads += 1;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => discarded = discarded.saturating_add(read),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// Encode and write exactly one response, replacing an oversize payload with a
@@ -1016,6 +1430,8 @@ fn auth_refusal_detail(
 ) -> String {
     let mut detail = format!("{}: uid {} pid {}", code.as_str(), peer.uid, peer.pid);
     if let Some(image) = image {
+        // Diagnostic only. Trust was decided on (st_dev, st_ino); a path can be
+        // anything the peer's namespace makes it look like.
         detail.push_str(" image ");
         detail.push_str(&image.path);
     }
@@ -1030,12 +1446,13 @@ fn dispatch(state: &ServiceState, peer_pid: u32, request: Request) -> Response {
         Request::Sensors => Response::Sensors(Box::new(state.sensor_snapshot())),
         Request::ProcessModules { pid, start_ticks } => modules_response(pid, start_ticks),
         Request::ProcessThreads { pid, start_ticks } => threads_response(pid, start_ticks),
-        Request::ProcessConnections { pid } => connections_response(pid),
+        Request::ProcessConnections { pid, start_ticks } => connections_response(pid, start_ticks),
+        Request::ProcessFileIo { pid, start_ticks } => file_io_response(pid, start_ticks),
         Request::ProcessEvidence { pid, start_ticks } => match collect_evidence(pid, start_ticks) {
             Ok(evidence) => Response::Evidence(Box::new(evidence)),
             Err(error) => error_response(error),
         },
-        Request::Action { action } => run_action(peer_pid, action),
+        Request::Action { action } => run_action(state, peer_pid, action),
     }
 }
 
@@ -1100,10 +1517,11 @@ fn threads_response(pid: u32, start_ticks: i64) -> Response {
     })
 }
 
-fn connections_response(pid: u32) -> Response {
-    // The wire carries no creation identity for this read, so the broker takes
-    // its own bracket around the walk.
-    let before = match process_start_for_read(pid, None) {
+fn connections_response(pid: u32, start_ticks: i64) -> Response {
+    // `/proc/<pid>/fd` and the network tables are several reads, so the sampled
+    // generation is proven before the walk and again after it: a recycled pid
+    // must not answer with another process's endpoints.
+    let before = match process_start_for_read(pid, Some(start_ticks)) {
         Ok(before) => before,
         Err(error) => return error_response(error),
     };
@@ -1127,6 +1545,36 @@ fn connections_response(pid: u32) -> Response {
     )
 }
 
+/// Per-file I/O of one exact process.
+///
+/// The reader brackets the two procfs walks with the same creation identity, so
+/// a partially old handle list and a partially new counter read can never be
+/// presented as one coherent answer.
+fn file_io_response(pid: u32, start_ticks: i64) -> Response {
+    match process_io::list_process_file_io(pid, Some(start_ticks)) {
+        Ok(snapshot) => Response::FileIo(Box::new(WireFileIo {
+            files: snapshot
+                .files
+                .into_iter()
+                .map(|file| WireFileIoEntry {
+                    path: file.path,
+                    read_bytes: file.read_bytes,
+                    write_bytes: file.write_bytes,
+                    read_ops: file.read_ops,
+                    write_ops: file.write_ops,
+                    file_size: file.file_size,
+                    offset: file.offset,
+                    access_known: file.access_known,
+                    is_read: file.is_read,
+                    is_write: file.is_write,
+                    open_handles: file.open_handles,
+                })
+                .collect(),
+        })),
+        Err(error) => error_response(error),
+    }
+}
+
 fn wire_thread_state(state: ThreadState) -> WireThreadState {
     match state {
         // Linux `TASK_RUNNING` covers on-CPU and runnable-in-queue alike, which
@@ -1138,14 +1586,16 @@ fn wire_thread_state(state: ThreadState) -> WireThreadState {
         ThreadState::Terminated => WireThreadState::Zombie,
         ThreadState::Idle => WireThreadState::Idle,
         ThreadState::Parked => WireThreadState::Parked,
-        // Windows-only scheduler states have no procfs meaning, and an unmapped
-        // kernel byte lands here too.
+        // The raw `/proc` character is carried, not collapsed: the direct reader
+        // shows the same evidence, and the client can render the byte it names.
+        ThreadState::Other(raw) => WireThreadState::Other(u8::try_from(raw).unwrap_or(u8::MAX)),
+        // Windows-only scheduler states have no procfs meaning; they cannot be
+        // produced by this backend and carry no byte to report.
         ThreadState::Initialized
         | ThreadState::Ready
         | ThreadState::Standby
         | ThreadState::Transition
-        | ThreadState::DeferredReady
-        | ThreadState::Other(_) => WireThreadState::Other,
+        | ThreadState::DeferredReady => WireThreadState::Other(u8::MAX),
     }
 }
 
@@ -1180,7 +1630,7 @@ fn tcp_state_name(state: TcpState) -> String {
 
 // ------------------------------------------------------------------- actions
 
-fn run_action(peer_pid: u32, action: ActionRequest) -> Response {
+fn run_action(state: &ServiceState, peer_pid: u32, action: ActionRequest) -> Response {
     match action {
         ActionRequest::Kill {
             pid,
@@ -1265,6 +1715,15 @@ fn run_action(peer_pid: u32, action: ActionRequest) -> Response {
                     "the broker does not control its own unit",
                 );
             }
+            // One verb per unit at a time. A second request for the same unit
+            // answers `Busy` without starting anything, so a client that gave up
+            // on a slow verb and retried cannot mutate the unit twice.
+            let Some(_flight) = state.begin_unit_flight(&unit) else {
+                return Response::error(
+                    Refusal::Busy,
+                    format!("a verb for {unit} is already in flight"),
+                );
+            };
             let action = match verb {
                 ServiceVerb::Start => ServiceAction::Start,
                 ServiceVerb::Stop => ServiceAction::Stop,
@@ -1862,34 +2321,117 @@ fn socket_directory_problem(path: &Path) -> Option<String> {
     }
 }
 
-/// Open and immediately close one local connection.
+/// Open and immediately close one local connection, with a real deadline.
 ///
-/// The connect itself can park on a full backlog, so it runs on a helper thread
-/// with a deadline; the broker answers a connection that closes without a
-/// request by dropping it, and the helper cannot outlive the process.
+/// `UnixStream::connect` blocks indefinitely on a full backlog, so the self-check
+/// does the connect itself: a non-blocking socket plus `poll` means the probe
+/// costs one descriptor for at most [`SOCKET_PROBE_TIMEOUT_MS`] and leaves
+/// nothing behind (a helper thread could not be cancelled and would outlive the
+/// report).
 fn probe_connection(path: &Path) -> &'static str {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let target: PathBuf = path.to_path_buf();
-    let spawned = std::thread::Builder::new()
-        .name("tm-selfcheck-connect".into())
-        .spawn(move || {
-            let _ = sender.send(UnixStream::connect(&target).is_ok());
-        });
-    if spawned.is_err() {
+    let Ok((address, length)) = unix_socket_address(path) else {
+        return "unavailable";
+    };
+    // SAFETY: the family/type/protocol combination is valid, and the returned
+    // descriptor is owned here from the next line on.
+    let descriptor = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
         return "unavailable";
     }
-    match receiver.recv_timeout(Duration::from_millis(1_000)) {
-        Ok(true) => "connected",
-        Ok(false) => "refused",
-        Err(_) => "timeout",
-    }
+    // SAFETY: `address` is a fully initialized `sockaddr_un` of `length` bytes.
+    let connected = unsafe {
+        libc::connect(
+            descriptor,
+            (&raw const address).cast::<libc::sockaddr>(),
+            length,
+        )
+    };
+    let outcome = if connected == 0 {
+        "connected"
+    } else {
+        let error = io::Error::last_os_error();
+        // The listener exists and the handshake is in flight; wait for it.
+        // Anything else (a full backlog answers EAGAIN here) did not connect.
+        match error.raw_os_error() {
+            Some(libc::EINPROGRESS) => wait_for_connect(descriptor),
+            _ => "refused",
+        }
+    };
+    // SAFETY: the descriptor was created here and is closed exactly once.
+    unsafe { libc::close(descriptor) };
+    outcome
 }
+
+/// Wait for a pending non-blocking connect, then read its outcome.
+fn wait_for_connect(descriptor: RawFd) -> &'static str {
+    let mut polled = [libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLOUT,
+        revents: 0,
+    }];
+    // SAFETY: the array and its length match, and the descriptor is owned by
+    // the caller for the duration of the call.
+    let ready = unsafe { libc::poll(polled.as_mut_ptr(), 1, SOCKET_PROBE_TIMEOUT_MS) };
+    if ready <= 0 {
+        return if ready == 0 { "timeout" } else { "unavailable" };
+    }
+    let mut pending: libc::c_int = 0;
+    let mut pending_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the option value and its length describe `pending`.
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut pending).cast::<libc::c_void>(),
+            &mut pending_length,
+        )
+    };
+    if result != 0 {
+        return "unavailable";
+    }
+    if pending == 0 { "connected" } else { "refused" }
+}
+
+/// The kernel's `sockaddr_un` for one path.
+///
+/// `UnixStream::connect` builds this internally; the self-check needs the raw
+/// form because it connects on a non-blocking socket.
+fn unix_socket_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: `sockaddr_un` is plain old data and a zeroed value is the empty
+    // address, which the family and the path below fill in.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path does not fit in a sockaddr_un",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    // The trailing zero from `zeroed` terminates the path, and the kernel reads
+    // `sun_path` as a C string, so the full struct size is a valid length.
+    let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    Ok((address, length))
+}
+
+// ----------------------------------------------------------------------- tests
 
 // ----------------------------------------------------------------------- tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A realistic `/proc/<pid>/status` for a root service process.
     const STATUS_TEXT: &str = "\
@@ -2093,12 +2635,13 @@ Max realtime timeout      unlimited            unlimited            us        \n
         );
         assert_eq!(
             wire_thread_state(ThreadState::Other(u32::from(b'?'))),
-            WireThreadState::Other
+            WireThreadState::Other(b'?')
         );
-        // Windows-only scheduler states must not be invented as Linux ones.
+        // Windows-only scheduler states must not be invented as Linux ones, and
+        // they carry no `/proc` byte to report.
         assert_eq!(
             wire_thread_state(ThreadState::Ready),
-            WireThreadState::Other
+            WireThreadState::Other(u8::MAX)
         );
     }
 
@@ -2197,8 +2740,13 @@ Max realtime timeout      unlimited            unlimited            us        \n
         assert!(evidence.uid.is_some());
         assert!(evidence.threads.is_some_and(|threads| threads >= 1));
         assert!(!evidence.limits.is_empty());
-        assert!(!evidence.namespaces.is_empty());
         assert!(evidence.open_fds.is_some());
+        // `/proc/<pid>/ns` can be hidden even for the caller's own process on a
+        // hardened host, so the list may be empty; every entry that did parse
+        // must still name a namespace kind.
+        for namespace in &evidence.namespaces {
+            assert!(!namespace.kind.is_empty(), "{namespace:?}");
+        }
     }
 
     /// A mismatched creation identity must never produce evidence.
@@ -2211,5 +2759,190 @@ Max realtime timeout      unlimited            unlimited            us        \n
             matches!(error, TmError::ProcessNotFound { .. }),
             "unexpected error: {error:?}"
         );
+    }
+
+    // ------------------------------------------------------------- tempdirs
+
+    /// A unique directory under the system temp dir, removed on drop.
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir()
+                .join(format!("tm-broker-{label}-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Root-owned expectations cannot be produced by an unprivileged test run.
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        uid == 0
+    }
+
+    fn metadata_of(path: &Path) -> std::fs::Metadata {
+        std::fs::symlink_metadata(path).expect("test metadata")
+    }
+
+    // ---------------------------------------------------------------- socket
+
+    #[test]
+    fn a_socket_directory_the_service_does_not_own_is_refused() {
+        if running_as_root() {
+            return;
+        }
+        let directory = TestDirectory::new("socket-dir");
+        let error = verify_socket_directory(directory.path(), &metadata_of(directory.path()))
+            .expect_err("a foreign directory must not be trusted");
+        assert!(error.contains("owned by root"), "{error}");
+        assert!(socket_directory_problem(directory.path()).is_some());
+    }
+
+    #[test]
+    fn a_missing_socket_directory_is_created_with_the_pinned_mode() {
+        if running_as_root() {
+            return;
+        }
+        let parent = TestDirectory::new("socket-create");
+        let directory = parent.path().join("taskman");
+        // Creation itself succeeds; the owner rule then refuses the result,
+        // because an unprivileged test run cannot create a root-owned directory.
+        let error = prepare_socket_directory(&directory).expect_err("owner check");
+        assert!(error.contains("owned by root"), "{error}");
+        let metadata = metadata_of(&directory);
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, SOCKET_DIRECTORY_MODE);
+    }
+
+    #[test]
+    fn stale_socket_removal_only_accepts_a_socket_that_root_owns() {
+        let directory = TestDirectory::new("stale-socket");
+        let missing = directory.path().join("missing.sock");
+        assert!(remove_stale_socket(&missing).is_ok());
+
+        let regular = directory.path().join("regular.sock");
+        std::fs::write(&regular, b"not a socket").expect("regular file");
+        let error = remove_stale_socket(&regular).expect_err("a regular file must survive");
+        assert!(error.contains("not a socket"), "{error}");
+        assert!(regular.exists(), "the refusal must not unlink anything");
+
+        if running_as_root() {
+            return;
+        }
+        let socket_path = directory.path().join("bound.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        drop(listener);
+        let error = remove_stale_socket(&socket_path).expect_err("a foreign socket must survive");
+        assert!(error.contains("owned by uid"), "{error}");
+        assert!(socket_path.exists());
+    }
+
+    #[test]
+    fn socket_directory_chain_rules_reject_a_missing_directory() {
+        let directory = TestDirectory::new("chain");
+        let missing = directory.path().join("absent");
+        assert!(protected_directory_chain(&missing).is_some());
+        // The directory it created is a real directory, but not root-owned.
+        if !running_as_root() {
+            assert!(protected_directory_chain(directory.path()).is_some());
+        }
+    }
+
+    // ----------------------------------------------------------------- peers
+
+    #[test]
+    fn peer_credentials_describe_the_process_on_the_other_end() {
+        let (server, _client) = UnixStream::pair().expect("socket pair");
+        let credentials = peer_credentials(&server).expect("peer credentials");
+        // Both ends belong to this process, so the kernel reports this process.
+        assert_eq!(credentials.pid, std::process::id());
+        // SAFETY: getuid/getgid have no preconditions and cannot fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!(credentials.uid, uid);
+        assert_eq!(credentials.gid, gid);
+    }
+
+    /// A refused client must receive an answer and a clean close, not a reset
+    /// while it is still writing — a reset is what makes the GUI retry the
+    /// operation under its own token.
+    #[test]
+    fn a_refusal_drains_what_the_client_is_still_writing() {
+        let (mut server, mut client) = UnixStream::pair().expect("socket pair");
+        let pending = b"GET / HTTP/1.1\r\n\r\n";
+        client.write_all(pending).expect("client write");
+        server.write_all(&[0u8; 8]).expect("server write");
+        let started = Instant::now();
+        finish_refusal(&mut server);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the drain must be bounded"
+        );
+
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 64];
+        loop {
+            match client.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => received.extend_from_slice(&buffer[..read]),
+                Err(error) => panic!("a refused client must not see {error}"),
+            }
+        }
+        // The response is intact and the write half is closed after it.
+        assert_eq!(received.len(), 8);
+    }
+
+    // ---------------------------------------------------- installed clients
+
+    #[test]
+    fn a_user_owned_client_file_refuses_the_broker() {
+        if running_as_root() {
+            return;
+        }
+        let directory = TestDirectory::new("installed-client");
+        let client = directory.path().join("taskman");
+        std::fs::write(&client, b"#!/bin/sh\n").expect("client file");
+        let mut manifest = Manifest::default();
+        manifest.clients = vec![client.to_string_lossy().into_owned()];
+        let error = resolve_installed_clients(&manifest).expect_err("a foreign client");
+        assert!(error.contains("owned by root"), "{error}");
+    }
+
+    #[test]
+    fn a_client_directory_the_user_owns_refuses_the_broker() {
+        if running_as_root() {
+            return;
+        }
+        let directory = TestDirectory::new("client-directory");
+        let mut manifest = Manifest::default();
+        manifest.clients = vec![format!("{}/", directory.path().to_string_lossy())];
+        let error = resolve_installed_clients(&manifest).expect_err("a foreign directory");
+        assert!(error.contains("owned by root"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_client_is_skipped_and_an_empty_install_is_refused() {
+        let mut manifest = Manifest::default();
+        manifest.clients = vec![
+            "/nonexistent/taskman-client".into(),
+            "/nonexistent/taskman-helper/".into(),
+        ];
+        let error = resolve_installed_clients(&manifest).expect_err("nothing resolved");
+        assert!(error.contains("no manifest client resolved"), "{error}");
     }
 }

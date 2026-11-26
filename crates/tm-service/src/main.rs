@@ -167,8 +167,10 @@ mod service {
 
 #[cfg(target_os = "linux")]
 mod linux_service {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+
+    use tm_platform::linux::core_service::server;
 
     /// Where the service writes its daily log. Root-owned on every mainstream
     /// distribution, so the directory below it can be created and verified.
@@ -193,16 +195,17 @@ Commands:
   --help           print this help
 
 Development:
-  --run --dev      run the broker with the install-path and client-image
-                   protection checks disabled. The packaged unit never passes
-                   it, and it still requires root.
+  --run --dev      run the broker with the install-root and service-image
+                   checks disabled. The packaged unit never passes it, and it
+                   still needs root plus the root-owned manifest, because the
+                   authorized uids cannot come from anywhere a user can write.
 
 The environment is not read: every path comes from the build or the manifest.";
 
     pub fn main() {
         let arguments = std::env::args().skip(1).collect::<Vec<_>>();
         match linux_args::plan(&arguments) {
-            linux_args::Plan::Run => run_broker(),
+            linux_args::Plan::Run { dev } => run_broker(dev),
             linux_args::Plan::Selfcheck => selfcheck(),
             linux_args::Plan::Version => println!(
                 "taskman-service {} (linux core service, protocol {})",
@@ -227,7 +230,7 @@ The environment is not read: every path comes from the build or the manifest.";
         )
     }
 
-    fn run_broker() {
+    fn run_broker(dev: bool) {
         // File logging is best effort and never gates the broker: a log
         // directory that cannot be proven root-owned disables the appender
         // only, because an unusable directory must not take the privileged
@@ -250,7 +253,7 @@ The environment is not read: every path comes from the build or the manifest.";
             std::process::abort();
         }));
 
-        let result = tm_platform::linux::core_service::server::run_service();
+        let result = server::run_service(dev);
         if let Err(error) = &result {
             tracing::error!(%error, "linux core service stopped with an error");
             eprintln!("taskman-service: {error}");
@@ -277,35 +280,41 @@ The environment is not read: every path comes from the build or the manifest.";
 
     /// The log directory, or `None` when it cannot be proven safe.
     ///
-    /// `/var/log` itself is root-owned, so creating the service directory is
-    /// safe; the result is verified exactly like a directory that already
-    /// existed.
+    /// The broker's own rule decides this: the directory AND every ancestor must
+    /// be a real, root-owned directory that nobody but root can write. A
+    /// writable parent would let an ordinary user swap whatever the appender
+    /// opens later, which no per-file check could detect.
     fn prepare_log_directory() -> Option<PathBuf> {
         let directory = Path::new(SERVICE_LOG_DIRECTORY);
         match std::fs::symlink_metadata(directory) {
-            Ok(metadata) => protected_log_directory(directory, &metadata),
+            Ok(_) => protected_log_directory(directory),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // `/var/log` is root-owned on every mainstream distribution, but
+                // it is proven rather than assumed: nothing may be created inside
+                // a tree the service cannot trust.
+                if let Some(problem) = server::protected_directory_chain(directory.parent()?) {
+                    tracing::warn!(
+                        %problem,
+                        "service log directory parent cannot be proven safe; file logging disabled"
+                    );
+                    return None;
+                }
                 if std::fs::create_dir(directory).is_err() {
                     return None;
                 }
                 let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755));
-                let metadata = std::fs::symlink_metadata(directory).ok()?;
-                protected_log_directory(directory, &metadata)
+                protected_log_directory(directory)
             }
             Err(_) => None,
         }
     }
 
-    fn protected_log_directory(directory: &Path, metadata: &std::fs::Metadata) -> Option<PathBuf> {
-        let safe = !metadata.file_type().is_symlink()
-            && metadata.is_dir()
-            && metadata.uid() == 0
-            && metadata.mode() & 0o022 == 0;
-        if !safe {
+    fn protected_log_directory(directory: &Path) -> Option<PathBuf> {
+        if let Some(problem) = server::protected_directory_chain(directory) {
             tracing::warn!(
                 directory = %directory.display(),
-                "service log directory cannot be proven root-owned and unwritable; file logging \
-                 disabled"
+                %problem,
+                "service log directory cannot be proven safe; file logging disabled"
             );
             return None;
         }
@@ -329,8 +338,11 @@ mod linux_args {
     /// What one command line asks the service to do.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Plan {
-        /// Run the broker in the foreground.
-        Run,
+        /// Run the broker in the foreground; `dev` is the explicit `--dev`
+        /// escape hatch, which the packaged unit never passes.
+        Run {
+            dev: bool,
+        },
         /// Validate the installation and print one JSON report.
         Selfcheck,
         Version,
@@ -347,7 +359,7 @@ mod linux_args {
         match arguments {
             [] => Plan::Usage("no arguments given".into()),
             [single] => match single.as_str() {
-                RUN_ARGUMENT => Plan::Run,
+                RUN_ARGUMENT => Plan::Run { dev: false },
                 SELFCHECK_ARGUMENT => Plan::Selfcheck,
                 VERSION_ARGUMENT => Plan::Version,
                 HELP_ARGUMENT => Plan::Help,
@@ -356,7 +368,7 @@ mod linux_args {
             [first, second]
                 if first.as_str() == RUN_ARGUMENT && second.as_str() == DEV_ARGUMENT =>
             {
-                Plan::Run
+                Plan::Run { dev: true }
             }
             _ => Plan::Usage(
                 "only --run, --run --dev, --selfcheck, --version and --help are accepted".into(),
@@ -374,8 +386,8 @@ mod linux_args {
 
         #[test]
         fn the_unit_command_line_runs_the_broker() {
-            assert_eq!(plan(&args(&["--run"])), Plan::Run);
-            assert_eq!(plan(&args(&["--run", "--dev"])), Plan::Run);
+            assert_eq!(plan(&args(&["--run"])), Plan::Run { dev: false });
+            assert_eq!(plan(&args(&["--run", "--dev"])), Plan::Run { dev: true });
         }
 
         #[test]
