@@ -453,6 +453,21 @@ trip (start minimized → second launch restores → close to tray → restore).
 winit side's transition rule has a unit test; the event-loop and present paths
 need a compositor and have no automated test.
 
+### 19. `egui_software`: span-exact triangle fill, libm-free rounding, per-triangle white texel
+
+Profiled with callgrind on a scripted scroll (`TASKMAN_SCROLL_PROBE`, Processes
+page): `triangle_impl` alone was ~30 % of the instructions, `roundf` ~13 % and
+bilinear sampling ~13 %.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui_software/src/raster.rs` | `row_span` solves each row's covered pixels from the three integer edge functions (one division per edge); all three paths fill only that span. | The per-pixel inside test over the bounding box rejected half of every rect's two triangles and re-tested the same pixels for every triangle of a rounded shape's fan. Same integers, same fill rule, so the covered pixels are identical (`row_span_covers_exactly_the_pixels_the_per_pixel_test_accepts`). |
+| `crates/egui_software/src/raster.rs`, `texture.rs` | `round_to_u8` / `floor_exact` replace `round().clamp(0,255)` and `floor()` in blending and bilinear sampling. | Baseline x86-64 has no `roundss`, so each was a libm call per channel. Both are bit-exact (tests sweep the half-integer neighbourhoods and the non-finite values). |
+| `crates/egui_software/src/lib.rs` | `paint_mesh` treats a triangle whose three UVs are `WHITE_UV` as untextured even when the mesh is not all-white. | One textured vertex (a prepared disc, an image) in a batch sent every flat fill and feathered edge of that batch through a bilinear fetch of the white texel. This is the same rule the mesh-level check already applied. |
+
+**Coverage:** the unit tests above, plus the existing renderer parity and
+watertightness tests. Measured at 1650×1080: 8.8 → 7.0 ms paint per scrolling frame.
+
 ## Rebase runbook
 
 ```

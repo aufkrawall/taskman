@@ -236,6 +236,12 @@ pub struct IconCache {
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// Cumulative prefetch requests enqueued, for [`IconCache::stats`].
     prefetched: Arc<std::sync::atomic::AtomicU64>,
+    /// The context the workers wake when they publish an answer
+    /// ([`IconCache::set_repaint_context`]). Without it a finished icon waited
+    /// for whatever repaint came next — on an idle window the next telemetry
+    /// tick, up to a second later — so a page's icons appeared well after its
+    /// rows although the lookups had long finished.
+    repaint: Arc<std::sync::OnceLock<egui::Context>>,
     /// `(egui pass number, textures uploaded in that pass)`. The budget is
     /// per pass, not per row: `drain_results` runs once for every visible
     /// row, so a per-call counter let one cold frame upload everything.
@@ -243,6 +249,33 @@ pub struct IconCache {
 }
 
 impl IconCache {
+    /// Let the workers wake `ctx` when they publish an answer, so an icon is
+    /// painted on the frame after its lookup finishes instead of on the next
+    /// unrelated repaint. Set once, by the app, before the first request.
+    pub fn set_repaint_context(&self, ctx: &egui::Context) {
+        let _ = self.repaint.set(ctx.clone());
+    }
+
+    /// Queue the platform's default application icon, so the first row
+    /// without an icon of its own does not wait for it.
+    pub fn warm_default_icon(&self, actions: &Arc<dyn tm_platform::actions::PlatformActions>) {
+        self.ensure_worker(actions);
+        {
+            let mut inner = sync::lock(&self.inner);
+            if inner.tex.contains_key(DEFAULT_APP_ICON_KEY)
+                || inner.queued.contains(DEFAULT_APP_ICON_KEY)
+                || inner
+                    .failed
+                    .get(DEFAULT_APP_ICON_KEY)
+                    .is_some_and(Failure::waiting)
+            {
+                return;
+            }
+            inner.queued.insert(DEFAULT_APP_ICON_KEY.to_string());
+        }
+        self.send_request(DEFAULT_APP_ICON_KEY);
+    }
+
     /// The texture to paint for a row whose executable is `path`.
     ///
     /// This is the only icon entry point the pages use, and it never lets the
@@ -464,6 +497,7 @@ impl IconCache {
         let rx = Arc::new(Mutex::new(rx));
         let results = self.results.clone();
         let has_results = self.has_results.clone();
+        let repaint = self.repaint.clone();
         *sync::lock(&self.tx) = Some(Arc::new(tx));
         let mut started = 0usize;
         for index in 0..ICON_WORKERS {
@@ -471,9 +505,10 @@ impl IconCache {
             let actions = actions.clone();
             let results = results.clone();
             let has_results = has_results.clone();
+            let repaint = repaint.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("tm-icons-{index}"))
-                .spawn(move || icon_worker(rx, actions, results, has_results));
+                .spawn(move || icon_worker(rx, actions, results, has_results, repaint));
             if spawned.is_ok() {
                 started += 1;
             }
@@ -688,6 +723,7 @@ fn icon_worker(
     actions: Arc<dyn tm_platform::actions::PlatformActions>,
     results: Arc<Mutex<Vec<Decoded>>>,
     has_results: Arc<std::sync::atomic::AtomicBool>,
+    repaint: Arc<std::sync::OnceLock<egui::Context>>,
 ) {
     loop {
         // The guard covers the wait, not the extraction: it is dropped at the end
@@ -705,7 +741,14 @@ fn icon_worker(
             actions.process_icon_rgba(&path)
         };
         sync::lock(&results).push(Decoded { path, icon });
-        has_results.store(true, std::sync::atomic::Ordering::Relaxed);
+        // One wake-up per batch: the flag is only false once the UI has taken
+        // the queue, so the answers that land before that frame runs ride the
+        // repaint the first of them asked for.
+        if !has_results.swap(true, std::sync::atomic::Ordering::Relaxed)
+            && let Some(ctx) = repaint.get()
+        {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -876,6 +919,54 @@ mod tests {
             sync::lock(&cache.inner)
                 .tex
                 .contains_key(DEFAULT_APP_ICON_KEY)
+        );
+    }
+
+    /// Regression: a finished lookup must wake the UI by itself. The worker used
+    /// to publish its answer and wait for whatever frame came next, so on an
+    /// idle window a page's icons appeared on the next telemetry tick, up to a
+    /// second after their rows, although every lookup had long finished. Here no
+    /// frame runs between the request and the wake-up, so only the worker can
+    /// have asked for it — and the frame it asks for paints the icon.
+    #[test]
+    fn a_finished_lookup_requests_the_repaint_that_paints_it() {
+        let ctx = egui::Context::default();
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = woken.clone();
+        ctx.set_request_repaint_callback(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        cache.set_repaint_context(&ctx);
+        cache.warm_default_icon(&actions);
+        cache.prefetch(&actions, ["/usr/bin/app".to_string()]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while cache.stats().in_flight > 0
+            && sync::lock(&cache.results).len() < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        while !woken.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the worker published an answer without waking the UI"
+        );
+        assert!(
+            pump(&cache, &ctx, &actions, Some("/usr/bin/app")).is_some(),
+            "the woken frame paints the icon"
+        );
+        assert!(
+            sync::lock(&cache.inner)
+                .tex
+                .contains_key(DEFAULT_APP_ICON_KEY),
+            "the default icon was warmed before any row asked for it"
         );
     }
 

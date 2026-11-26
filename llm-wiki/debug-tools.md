@@ -164,6 +164,20 @@ normal GUI log.
   `WGPU_POWER_PREF=high` is the opt-in discrete/high-performance override.
 - `TASKMAN_FPS_PROBE=1` forces continuous repaint and displays frame rate, but
   it requires launching the GUI and should be reserved for an interactive run.
+- `TASKMAN_SCROLL_PROBE=<seconds per page>` injects a 3-line wheel scroll at
+  the window centre every frame, reverses direction every 2 s, and cycles through
+  Processes → Details → Users → App history → Startup → Services. It works in a
+  headless sway, where synthetic pointer input never reaches the client. Pair it
+  with `TASKMAN_INPUT_STATS=1` (paint/pass ms) and per-thread CPU from
+  `/proc/<pid>/task/*/stat`. For a GPU-backed headless compositor (Vulkan
+  renderer) start sway with `WLR_BACKENDS=headless WLR_RENDERER=vulkan
+  WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128`. Use `output HEADLESS-1 mode
+  3840x2160@144Hz scale 1.5` to mimic a 4K desktop.
+- Profiling without `perf` (`perf_event_paranoid=2`): build with
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none
+  cargo build --release -p tm-app --target-dir target/prof`, then run it under
+  `valgrind --tool=callgrind` with the scroll probe for ~60 s and read it with
+  `callgrind_annotate --auto=yes`.
 - `TASKMAN_INPUT_STATS=1` logs a once-per-second summary of `CursorMoved`
   decisions (`moves_s`, `dup`, `same_target`, `stable_veto`, `coalesced`,
   `repaint_now`, `trailing`, `active`), software-renderer frame timings

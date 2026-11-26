@@ -179,25 +179,12 @@ fn triangle_impl(
             // Opaque uniform triangle: direct store, no blending or float barycentrics.
             let packed = crate::target::pack_rgb(color.r(), color.g(), color.b());
             for y in bounds.min_y..bounds.max_y {
-                let mut w = row_w;
-                let Some(row) = target.row_mut(y as u32) else {
-                    for k in 0..3 {
-                        row_w[k] += step_y[k];
-                    }
-                    continue;
-                };
-
-                for x in bounds.min_x..bounds.max_x {
-                    if (w[0] | w[1] | w[2]) >= 0
-                        && let Some(dst) = row.get_mut(x as usize)
-                    {
-                        *dst = packed;
-                    }
-                    for k in 0..3 {
-                        w[k] += step_x[k];
-                    }
+                if let Some((xs, xe)) = row_span(row_w, step_x, bounds)
+                    && let Some(row) = target.row_mut(y as u32)
+                    && let Some(span) = row.get_mut(xs..xe.min(row.len()))
+                {
+                    span.fill(packed);
                 }
-
                 for k in 0..3 {
                     row_w[k] += step_y[k];
                 }
@@ -210,32 +197,21 @@ fn triangle_impl(
         let src = [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32];
         let inv_a = 1.0 - src[3] * (1.0 / 255.0);
         for y in bounds.min_y..bounds.max_y {
-            let mut w = row_w;
-            let Some(row) = target.row_mut(y as u32) else {
-                for k in 0..3 {
-                    row_w[k] += step_y[k];
-                }
-                continue;
-            };
-
-            for x in bounds.min_x..bounds.max_x {
-                if (w[0] | w[1] | w[2]) >= 0
-                    && let Some(dst) = row.get_mut(x as usize)
-                {
+            if let Some((xs, xe)) = row_span(row_w, step_x, bounds)
+                && let Some(row) = target.row_mut(y as u32)
+                && let Some(span) = row.get_mut(xs..xe.min(row.len()))
+            {
+                for dst in span {
                     let d = *dst;
                     let dr = ((d >> 16) & 0xff) as f32;
                     let dg = ((d >> 8) & 0xff) as f32;
                     let db = (d & 0xff) as f32;
-                    let r = (src[0] + dr * inv_a).round().clamp(0.0, 255.0) as u32;
-                    let g = (src[1] + dg * inv_a).round().clamp(0.0, 255.0) as u32;
-                    let b = (src[2] + db * inv_a).round().clamp(0.0, 255.0) as u32;
+                    let r = round_to_u8(src[0] + dr * inv_a);
+                    let g = round_to_u8(src[1] + dg * inv_a);
+                    let b = round_to_u8(src[2] + db * inv_a);
                     *dst = (r << 16) | (g << 8) | b;
                 }
-                for k in 0..3 {
-                    w[k] += step_x[k];
-                }
             }
-
             for k in 0..3 {
                 row_w[k] += step_y[k];
             }
@@ -245,30 +221,36 @@ fn triangle_impl(
 
     // General path: textured and/or gouraud-interpolated triangles.
     for y in bounds.min_y..bounds.max_y {
-        let mut w = row_w;
-        let Some(row) = target.row_mut(y as u32) else {
+        let span = row_span(row_w, step_x, bounds);
+        let (Some((xs, xe)), Some(row)) = (span, target.row_mut(y as u32)) else {
             for k in 0..3 {
                 row_w[k] += step_y[k];
             }
             continue;
         };
+        // The edge values at the span's first pixel; inside the span all three are
+        // non-negative by construction, so no pixel needs the inside test.
+        let lead = (xs as i64) - bounds.min_x as i64;
+        let mut w = [
+            row_w[0] + step_x[0] * lead,
+            row_w[1] + step_x[1] * lead,
+            row_w[2] + step_x[2] * lead,
+        ];
 
-        for x in bounds.min_x..bounds.max_x {
-            if (w[0] | w[1] | w[2]) >= 0 {
-                // Barycentrics. The bias shifted the edge values by at most one unit to
-                // implement the fill rule; using the unbiased weights for interpolation
-                // would cost a subtract per pixel for a sub-LSB difference in the result,
-                // so the biased values are used directly.
-                let l0 = w[0] as f32 * inv_area;
-                let l1 = w[1] as f32 * inv_area;
-                let l2 = 1.0 - l0 - l1;
+        for x in xs..xe {
+            // Barycentrics. The bias shifted the edge values by at most one unit to
+            // implement the fill rule; using the unbiased weights for interpolation
+            // would cost a subtract per pixel for a sub-LSB difference in the result,
+            // so the biased values are used directly.
+            let l0 = w[0] as f32 * inv_area;
+            let l1 = w[1] as f32 * inv_area;
+            let l2 = 1.0 - l0 - l1;
 
-                let src = shade(&v, l0, l1, l2, texture, gray_lcd);
-                if src[3] > 0.0
-                    && let Some(dst) = row.get_mut(x as usize)
-                {
-                    *dst = blend_over(src, *dst);
-                }
+            let src = shade(&v, l0, l1, l2, texture, gray_lcd);
+            if src[3] > 0.0
+                && let Some(dst) = row.get_mut(x)
+            {
+                *dst = blend_over(src, *dst);
             }
             for k in 0..3 {
                 w[k] += step_x[k];
@@ -342,10 +324,70 @@ pub(crate) fn blend_over(src: [f32; 4], dst: u32) -> u32 {
     let dr = ((dst >> 16) & 0xff) as f32;
     let dg = ((dst >> 8) & 0xff) as f32;
     let db = (dst & 0xff) as f32;
-    let r = (src[0] + dr * inv_a).round().clamp(0.0, 255.0) as u32;
-    let g = (src[1] + dg * inv_a).round().clamp(0.0, 255.0) as u32;
-    let b = (src[2] + db * inv_a).round().clamp(0.0, 255.0) as u32;
+    let r = round_to_u8(src[0] + dr * inv_a);
+    let g = round_to_u8(src[1] + dg * inv_a);
+    let b = round_to_u8(src[2] + db * inv_a);
     (r << 16) | (g << 8) | b
+}
+
+/// `x.round().clamp(0.0, 255.0) as u32`, bit for bit, without the libm call.
+///
+/// Baseline x86-64 has no rounding instruction (`roundss` is SSE4.1), so `f32::round`
+/// is a call into libm, and it ran three or four times for every blended pixel and every
+/// bilinear sample: 12-14 % of a scrolling frame's whole CPU time went to `roundf`. For
+/// `0 < x < 255` the truncation is exact and so is `x - i` (Sterbenz: `i <= x < i + 1 <=
+/// 2i`, or `i == 0`), so comparing the fraction against one half reproduces
+/// round-half-away-from-zero exactly; NaN and everything at or below zero map to 0 as
+/// the clamp did.
+#[inline(always)]
+pub(crate) fn round_to_u8(x: f32) -> u32 {
+    if x >= 255.0 {
+        255
+    } else if x > 0.0 {
+        let i = x as u32;
+        i + u32::from(x - i as f32 >= 0.5)
+    } else {
+        0
+    }
+}
+
+/// The pixels of one row that lie inside the triangle, as `xs..xe` in target columns,
+/// clipped to `bounds`; `None` when the row misses it.
+///
+/// `w` holds the three edge values at the row's first pixel (`bounds.min_x`) and `step_x`
+/// what each gains per pixel to the right. A pixel is inside when all three are
+/// non-negative, and since each is linear in `x` the boundary of each is one integer
+/// division away: this is the same per-pixel test, solved in closed form over exact
+/// integers, so the covered pixels are identical. What it saves is the scan. Every
+/// triangle used to visit its whole bounding box, and rejecting the outside half of a
+/// rect's two triangles, the sliver of a feathered edge's diagonal box, or the dozens of
+/// overlapping boxes of a rounded rect's triangle fan was most of the rasterizer's time
+/// on a scrolling frame.
+#[inline]
+fn row_span(w: [i64; 3], step_x: [i64; 3], bounds: PixelRect) -> Option<(usize, usize)> {
+    let mut lo = 0i64;
+    let mut hi = (bounds.max_x - bounds.min_x) as i64; // exclusive
+    for k in 0..3 {
+        let (w, s) = (w[k], step_x[k]);
+        if s > 0 {
+            // w + s*x >= 0  <=>  x >= ceil(-w / s)
+            if w < 0 {
+                lo = lo.max((-w + s - 1) / s);
+            }
+        } else if s < 0 {
+            // w + s*x >= 0  <=>  x <= floor(w / -s)
+            if w < 0 {
+                return None;
+            }
+            hi = hi.min(w / -s + 1);
+        } else if w < 0 {
+            return None;
+        }
+    }
+    (lo < hi).then(|| {
+        let base = bounds.min_x as i64;
+        ((base + lo) as usize, (base + hi) as usize)
+    })
 }
 
 #[cfg(test)]
@@ -557,6 +599,78 @@ mod tests {
     fn a_fully_transparent_fragment_leaves_the_destination_untouched() {
         let dst = pack_rgb(200, 100, 50);
         assert_eq!(blend_over([0.0, 0.0, 0.0, 0.0], dst), dst);
+    }
+
+    /// The libm-free rounding must be `round().clamp(0, 255)` bit for bit: every pixel
+    /// of the software renderer goes through it, and the GPU-parity tests are only as
+    /// good as this.
+    #[test]
+    fn round_to_u8_matches_round_and_clamp_exactly() {
+        let reference = |x: f32| x.round().clamp(0.0, 255.0) as u32;
+        let check = |x: f32| assert_eq!(round_to_u8(x), reference(x), "x = {x:?}");
+        for special in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            0.0,
+            f32::MAX,
+        ] {
+            check(special);
+        }
+        // Every 1/1024 step over the range plus margin, and the neighbouring ulps of
+        // each half-integer, where round-half-away-from-zero decides.
+        for i in -4096..(260 * 1024) {
+            check(i as f32 / 1024.0);
+        }
+        for k in -2..260 {
+            let half = k as f32 + 0.5;
+            check(half);
+            check(f32::from_bits(half.to_bits() + 1));
+            check(f32::from_bits(half.to_bits() - 1));
+        }
+    }
+
+    /// Brute force: the pixels of a row with all three edge values non-negative --
+    /// exactly the per-pixel test the closed-form span replaced.
+    fn covered(w: [i64; 3], step_x: [i64; 3], width: i64) -> Vec<i64> {
+        (0..width)
+            .filter(|&x| (0..3).all(|k| w[k] + step_x[k] * x >= 0))
+            .collect()
+    }
+
+    /// `row_span` must cover the same pixels as testing every pixel of the bounding
+    /// box, for every sign combination and at the boundaries where an edge value is
+    /// exactly zero (the fill rule lives there).
+    #[test]
+    fn row_span_covers_exactly_the_pixels_the_per_pixel_test_accepts() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |range: i64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % (2 * range as u64 + 1)) as i64 - range
+        };
+        for case in 0..200_000 {
+            let width = 1 + (next(40).abs());
+            let min_x = next(20);
+            let bounds = PixelRect {
+                min_x: min_x as i32,
+                min_y: 0,
+                max_x: (min_x + width) as i32,
+                max_y: 1,
+            };
+            // Small steps hit exact zeros often; some cases use the 16x scale real
+            // edge steps have.
+            let scale = if case % 3 == 0 { SUB_ONE as i64 } else { 1 };
+            let step_x = [next(5) * scale, next(5) * scale, next(5) * scale];
+            let w = [next(120), next(120), next(120)];
+            let expected = covered(w, step_x, width);
+            let got: Vec<i64> = row_span(w, step_x, bounds)
+                .map(|(xs, xe)| (xs as i64 - min_x..xe as i64 - min_x).collect())
+                .unwrap_or_default();
+            assert_eq!(got, expected, "w={w:?} step_x={step_x:?} width={width}");
+        }
     }
 
     #[test]

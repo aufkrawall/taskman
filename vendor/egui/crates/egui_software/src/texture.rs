@@ -54,8 +54,8 @@ impl Texture {
         // of software renderers looking subtly blurrier than the GPU.
         let x = u * self.width as f32 - 0.5;
         let y = v * self.height as f32 - 0.5;
-        let x0 = x.floor();
-        let y0 = y.floor();
+        let x0 = floor_exact(x);
+        let y0 = floor_exact(y);
         let fx = x - x0;
         let fy = y - y0;
         let (x0, y0) = (x0 as i64, y0 as i64);
@@ -70,7 +70,7 @@ impl Texture {
         for (i, o) in out.iter_mut().enumerate() {
             let top = lerp(c00[i], c10[i], fx);
             let bottom = lerp(c01[i], c11[i], fx);
-            *o = (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
+            *o = crate::raster::round_to_u8(top + (bottom - top) * fy) as u8;
         }
         Color32::from_rgba_premultiplied(out[0], out[1], out[2], out[3])
     }
@@ -90,6 +90,22 @@ impl Texture {
         } else {
             texel
         }
+    }
+}
+
+/// `x.floor()`, bit for bit, without the libm call baseline x86-64 makes for it.
+///
+/// Below 2^23 every `f32` converts to `i32` and back exactly, so truncating and stepping
+/// down for a negative fraction is the floor; larger magnitudes are already integral (or
+/// non-finite) and take the library path. A `-0.0` comes back as `+0.0`, which is equal
+/// and samples the same texel.
+#[inline(always)]
+fn floor_exact(x: f32) -> f32 {
+    if x.abs() < 8_388_608.0 {
+        let t = x as i32 as f32;
+        if t > x { t - 1.0 } else { t }
+    } else {
+        x.floor()
     }
 }
 
@@ -408,6 +424,46 @@ mod tests {
         assert!(gray[0] > 0);
         assert_eq!(tex.sample_gray_lcd(0.5, 0.5).to_array()[0], 128);
         assert_eq!(tex.sample_gray_lcd(5.0 / 6.0, 0.5), color_glyph);
+    }
+
+    /// The libm-free floor must agree with `f32::floor` wherever a sample coordinate
+    /// can land, including negative fractions, exact integers and the non-finite.
+    #[test]
+    fn floor_exact_matches_floor() {
+        for special in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            1e30,
+            -1e30,
+        ] {
+            let (got, want) = (floor_exact(special), special.floor());
+            assert!(
+                got == want || (got.is_nan() && want.is_nan()),
+                "{special:?}"
+            );
+        }
+        for i in -300_000..300_000 {
+            let x = i as f32 / 997.0;
+            assert_eq!(floor_exact(x), x.floor(), "x = {x:?}");
+            for neighbour in [
+                f32::from_bits(x.to_bits() + 1),
+                f32::from_bits(x.to_bits().wrapping_sub(1)),
+            ] {
+                if neighbour.is_finite() {
+                    assert_eq!(
+                        floor_exact(neighbour),
+                        neighbour.floor(),
+                        "x = {neighbour:?}"
+                    );
+                }
+            }
+        }
+        for big in [8_388_607.5f32, 8_388_608.0, -8_388_607.5, -8_388_609.0] {
+            assert_eq!(floor_exact(big), big.floor(), "x = {big:?}");
+        }
     }
 
     #[test]

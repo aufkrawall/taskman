@@ -1,3 +1,24 @@
+## 2026-11-26 - Icon wake-up and CPU-renderer scroll cost
+
+- The user's follow-up report ("scroll CPU still high, icons now delayed") came
+  from a pacman package built at 10:23, before that day's Linux fixes. Check
+  `LANG=C pacman -Qi taskman` (Build Date) before trusting a bare-metal retest.
+- Icons delayed (real at HEAD as well): `icon_worker` published results without
+  waking the UI, so they were painted on the next unrelated repaint, typically the
+  1 s telemetry tick. Timed `grim` captures confirmed it (icons appeared ~1 s
+  after the rows). Fix: `IconCache::set_repaint_context` plus one
+  `request_repaint` per batch from the worker, and `prefetch_snapshot_icons`
+  (all executables plus the default icon) on every new snapshot. Afterwards icons
+  were on screen at 0.36 s together with the rows.
+- Scroll CPU: the icon path was idle during scrolling (no `tm-icons-*` thread
+  time). The cost is rendering. At 1650×1080 the CPU renderer spent 8.8 ms/frame
+  in paint; the egui fork §19 fixes cut that to 7.0 ms. Vulkan in a GPU-backed
+  headless sway scrolled at ~164 fps for 14 % main thread / 21 % process. A
+  full-window software repaint at 4K/144 Hz cannot be cheap; Vulkan is the right
+  renderer there.
+- Open: integer/SIMD blending in `egui_software` (the remaining per-pixel float
+  pipeline), and a texture dedupe for executables that share one icon file.
+
 ## 2026-11-26 - Linux process-icon loading (resolver caches, prefetch, headless icon check)
 
 - Symptom, reported on bare metal (Plasma Wayland, NVIDIA): process icons on

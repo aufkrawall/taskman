@@ -186,6 +186,7 @@
 | `TASKMAN_RENDERER=cpu\|d3d12\|vulkan\|metal\|opengl\|software\|wgpu` | Pin one compiled renderer backend | env var before launch |
 | `TASKMAN_GPU=cpu\|d3d12\|vulkan\|metal` | Override the saved renderer preference for one run (fallbacks allowed) | env var before launch |
 | `TASKMAN_FPS_PROBE=1` | Continuous repaints + fps overlay vs display Hz | env var |
+| `TASKMAN_SCROLL_PROBE=<s>` | Scripted wheel scroll + page cycling (headless-safe) | env var |
 | `TASKMAN_DIALOG=settings\|run` | Open a dialog at startup (UI tests) | env var |
 | `TASKMAN_PERF=<key>` | Preselect Performance resource (`cpu`, `mem`, ...) | env var |
 | `TASKMAN_DATA_DIR` / `TASKMAN_CONFIG_DIR` | Isolate data/config dirs (tests) | env var |

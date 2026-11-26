@@ -733,12 +733,17 @@ pub fn run_icons() -> i32 {
     let actions = tm_platform::create_actions();
     let mut per_key_us: Vec<u64> = Vec::with_capacity(keys.len());
     let mut resolved = 0usize;
+    let mut missing_keys: Vec<&str> = Vec::new();
     let cold = Instant::now();
     for key in &keys {
         let started = Instant::now();
         let icon = actions.process_icon_rgba(key);
         per_key_us.push(elapsed_us(started));
-        resolved += usize::from(icon.is_some());
+        if icon.is_some() {
+            resolved += 1;
+        } else {
+            missing_keys.push(key);
+        }
     }
     let cold_ms = ms_rounded(cold.elapsed());
     // The warm pass only measures time: the answers are the same ones, and
@@ -762,6 +767,10 @@ pub fn run_icons() -> i32 {
         "p50_us": percentile(&per_key_us, 0.50),
         "p95_us": percentile(&per_key_us, 0.95),
         "max_us": percentile(&per_key_us, 1.0),
+        // Which images paint the platform default instead of an icon of their
+        // own: the list to check against the desktop entries when a row that
+        // should have an icon shows the generic one.
+        "missing_keys": missing_keys,
     });
     tracing::info!(
         keys = keys.len(),

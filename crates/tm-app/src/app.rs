@@ -483,6 +483,9 @@ pub struct TaskManApp {
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): forces continuous
     /// repaints, measures achieved fps against the display's refresh rate.
     pub fps_probe: bool,
+    /// Scripted scrolling and page switching (`TASKMAN_SCROLL_PROBE`); see
+    /// [`ScrollProbe`].
+    scroll_probe: Option<ScrollProbe>,
     pub last_frame: Option<std::time::Instant>,
     pub fps_window_start: std::time::Instant,
     pub fps_frames: u32,
@@ -574,6 +577,73 @@ impl InputStatsRecorder {
             icon_prefetch_keys: 0,
             text_measures: 0,
         }
+    }
+}
+
+/// Scripted input for measuring the cost of scrolling and switching pages
+/// without a pointer (`TASKMAN_SCROLL_PROBE=<seconds per page>`).
+///
+/// Every frame it moves the pointer to the middle of the window and scrolls
+/// three lines, reversing every [`ScrollProbe::REVERSE`], and it walks the
+/// row-icon pages in turn. Together with continuous repaints this is the
+/// worst case a wheel or a scrollbar drag produces, and it works in a headless
+/// compositor where synthetic pointer input never reaches the client — the
+/// per-thread CPU in `/proc/<pid>/task` then says what scrolling costs.
+struct ScrollProbe {
+    per_tab: std::time::Duration,
+    started: std::time::Instant,
+    page: usize,
+}
+
+impl ScrollProbe {
+    const REVERSE: std::time::Duration = std::time::Duration::from_secs(2);
+    const PAGES: [Tab; 6] = [
+        Tab::Processes,
+        Tab::Details,
+        Tab::Users,
+        Tab::AppHistory,
+        Tab::Startup,
+        Tab::Services,
+    ];
+
+    fn from_env() -> Option<Self> {
+        let secs: f32 = std::env::var("TASKMAN_SCROLL_PROBE").ok()?.parse().ok()?;
+        (secs > 0.0).then(|| {
+            tracing::info!(
+                secs,
+                "scroll probe active (scripted wheel and page switches)"
+            );
+            Self {
+                per_tab: std::time::Duration::from_secs_f32(secs),
+                started: std::time::Instant::now(),
+                page: usize::MAX,
+            }
+        })
+    }
+
+    /// Inject this frame's input; returns the page to show when it changes.
+    fn drive(&mut self, raw_input: &mut egui::RawInput) -> Option<Tab> {
+        let elapsed = self.started.elapsed();
+        let page =
+            (elapsed.as_secs_f32() / self.per_tab.as_secs_f32()) as usize % Self::PAGES.len();
+        let switched = (page != self.page).then(|| {
+            self.page = page;
+            tracing::info!(page = ?Self::PAGES[page], "scroll probe: page switch");
+            Self::PAGES[page]
+        });
+        if let Some(rect) = raw_input.screen_rect {
+            let down = (elapsed.as_millis() / Self::REVERSE.as_millis()).is_multiple_of(2);
+            raw_input
+                .events
+                .push(egui::Event::PointerMoved(rect.center()));
+            raw_input.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, if down { -3.0 } else { 3.0 }),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        switched
     }
 }
 
@@ -1105,6 +1175,7 @@ impl TaskManApp {
             perf_net_card_painted: false,
             surface_visible: true,
             fps_probe,
+            scroll_probe: ScrollProbe::from_env(),
             last_frame: None,
             fps_window_start: std::time::Instant::now(),
             fps_frames: 0,
@@ -1131,6 +1202,9 @@ impl TaskManApp {
             icons_prefetch: IconPrefetch::default(),
             accesskit_logged: false,
         };
+        // Icon workers wake the UI when an answer lands. Registering the
+        // context spawns nothing: the workers still start on the first request.
+        app.shared.icons.set_repaint_context(&cc.egui_ctx);
         // The creator is about to return: everything from here on is the first
         // pass plus whatever the renderer still needs before the window can be
         // shown.
@@ -1231,6 +1305,7 @@ impl TaskManApp {
                     .collect(),
             };
             push_history_point(&mut self.history, self.history_cap, pt);
+            self.prefetch_snapshot_icons(&latest);
 
             // Feed the persistent app-history database.
             let interval_s = self.engine.interval().as_secs_f64().max(0.05);
@@ -2144,6 +2219,14 @@ fn restored_sort(
 }
 
 impl eframe::App for TaskManApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(probe) = self.scroll_probe.as_mut()
+            && let Some(tab) = probe.drive(raw_input)
+        {
+            self.tab = tab;
+        }
+    }
+
     /// Data pass: runs before each `ui`, and while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Adopt asynchronously loaded app history as soon as it arrives.
@@ -2201,7 +2284,7 @@ impl eframe::App for TaskManApp {
         if self.input_stats.enabled {
             self.update_input_stats(ctx);
         }
-        if self.fps_probe {
+        if self.fps_probe || self.scroll_probe.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(1));
         } else if self.active_dump.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -3305,6 +3388,32 @@ impl TaskManApp {
     /// hover answer.
     pub fn note_text_measures(&mut self, measures: u64) {
         self.input_stats.text_measures += measures;
+    }
+
+    /// Start resolving the icon of every executable in a new snapshot, and the
+    /// platform's default icon, the moment the snapshot arrives.
+    ///
+    /// Every page that paints process rows keys its icons on the executable
+    /// path, so this is the one place that sees a new process first: its icon
+    /// is being looked up while its row is laid out, instead of after a page
+    /// rebuild or a first paint finds it missing, and switching to another page
+    /// finds every icon already resolved. The cache skips what it already holds,
+    /// is resolving, or is backing off from, so a steady snapshot costs one set
+    /// insert per process and one map lookup per distinct executable.
+    fn prefetch_snapshot_icons(&self, snapshot: &Snapshot) {
+        let paths: Vec<std::borrow::Cow<'_, str>> = snapshot
+            .processes
+            .iter()
+            .filter_map(|process| process.exe_path.as_deref())
+            .map(|path| path.to_string_lossy())
+            .collect();
+        let keys = icon_prefetch_keys(
+            paths
+                .iter()
+                .map(|path| crate::icon_cache::usable_icon_path(path)),
+        );
+        self.shared.icons.warm_default_icon(&self.actions);
+        self.shared.icons.prefetch(&self.actions, keys);
     }
 
     /// Warm the icon cache for the rows a page just rebuilt.

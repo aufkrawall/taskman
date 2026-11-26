@@ -631,9 +631,17 @@ impl Painter {
                 color: v.color,
             };
             let vertices = [to_screen(va), to_screen(vb), to_screen(vc)];
-            if !all_white_uv
-                && !self.subpixel.is_off()
-                && mesh.texture_id == epaint::TextureId::default()
+            // The same test per triangle: one textured vertex anywhere in a batch (a
+            // small circle drawn from the atlas's prepared discs, an image) used to send
+            // every flat fill and feathered edge merged into that mesh through a bilinear
+            // fetch of the white texel -- four texel reads and four roundings per pixel to
+            // multiply by one.
+            let white = all_white_uv
+                || (va.uv == epaint::WHITE_UV
+                    && vb.uv == epaint::WHITE_UV
+                    && vc.uv == epaint::WHITE_UV);
+            let sampler = if white { None } else { sampler };
+            if !white && !self.subpixel.is_off() && mesh.texture_id == epaint::TextureId::default()
             {
                 raster::triangle_gray_lcd(target, clip, vertices, sampler);
             } else {
