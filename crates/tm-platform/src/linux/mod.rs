@@ -10,6 +10,7 @@ mod diskstats;
 mod drm;
 mod launch;
 mod net_meta;
+mod nvml;
 pub mod polkit;
 mod process_connections;
 mod process_cpu;
