@@ -814,8 +814,10 @@ fn resolve_client_file(entry: &str, path: &Path) -> Result<Option<InstalledClien
     }
     // The same chain rule the manifest, the service image and the log directory
     // get: a writable parent lets its owner replace the file the identity was
-    // recorded from, which would make the recorded inode a lie.
-    if let Some(problem) = protected_directory_chain(path) {
+    // recorded from, which would make the recorded inode a lie. The rule is
+    // about the chain ABOVE the file: passing the file itself made it report
+    // "is not a directory" and refused startup on a real install.
+    if let Some(problem) = protected_directory_chain_problem(path) {
         return Err(format!("manifest client {entry}: {problem}"));
     }
     Ok(Some(InstalledClient {
@@ -891,7 +893,7 @@ fn resolve_client_directory(
             tracing::warn!(client = %path.display(), %problem, "manifest client is not trusted");
             continue;
         }
-        if let Some(problem) = protected_directory_chain(&path) {
+        if let Some(problem) = protected_directory_chain_problem(&path) {
             tracing::warn!(client = %path.display(), %problem, "manifest client is not trusted");
             continue;
         }
@@ -3096,6 +3098,28 @@ Max realtime timeout      unlimited            unlimited            us        \n
             "the drain must be bounded by one deadline, took {elapsed:?}"
         );
         trickle.join().expect("trickle thread");
+    }
+
+    /// Regression for a real install: the client resolution must check the
+    /// directory chain ABOVE the client file. Passing the file itself made the
+    /// rule answer "is not a directory", and the broker refused every start
+    /// with `manifest client /usr/bin/taskman: /usr/bin/taskman is not a
+    /// directory` — the service never came up on a packaged system.
+    #[test]
+    fn a_client_file_is_judged_through_the_chain_above_it_not_as_a_directory() {
+        let file = Path::new("/usr/bin/env");
+        if !file.exists() {
+            eprintln!("skipping: this host has no /usr/bin/env");
+            return;
+        }
+        assert!(
+            protected_directory_chain_problem(file).is_none(),
+            "a file inside a protected directory has a valid chain"
+        );
+        assert!(
+            protected_directory_chain(file).is_some(),
+            "and calling the directory rule on the file itself is the defect"
+        );
     }
 
     /// The P0's executable pin, exercised against a real kernel: the identity

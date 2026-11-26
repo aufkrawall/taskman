@@ -59,13 +59,16 @@ build() {
     error "no Cargo.toml at %s: run makepkg from packaging/arch inside the checkout" "$_repo_root"
     exit 1
   fi
-  # --offline: a package build must not fetch anything; Cargo.lock plus the
-  # local registry cache is what the checkout was developed against.
+  # `--locked` only: the checkout's Cargo.lock pins every version, so the
+  # build is reproducible, but cargo must be allowed to fetch the crates.
+  # `--offline` looked safer and was wrong: makepkg is the first thing a
+  # package user runs, and their cargo cache is empty, so the build could
+  # never bootstrap. A developer who already built here pays nothing.
   # A private target dir keeps the developer's own target/ untouched and makes
   # the build independent of whatever incremental state is lying there.
   cargo build \
     --manifest-path "$_repo_root/Cargo.toml" \
-    --release --locked --offline \
+    --release --locked \
     --target-dir "$srcdir/target" \
     --bin taskman \
     --bin taskman-service
