@@ -11,6 +11,7 @@
 //! (core product invariant).
 
 use serde::{Deserialize, Serialize};
+use tm_core::model::GpuInfo;
 
 /// One complete sensor poll.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -60,6 +61,11 @@ pub enum SensorKind {
     Voltage,
     Current,
     Power,
+    /// Cumulative energy counter (hwmon `energy*_input`, RAPL `energy_uj`), in
+    /// joules: the total counted so far, NOT the consumption of the sample
+    /// window. A wrapping counter publishes its range in
+    /// [`SensorReading::max`], so a consumer subtracts two samples modulo that
+    /// range instead of reading the value as a rate.
     Energy,
     Humidity,
     Intrusion,
@@ -217,6 +223,24 @@ pub fn kind_of_stem(stem: &str) -> Option<SensorKind> {
     None
 }
 
+/// Sort key of one hwmon attribute file: kind, then the hardware index, then
+/// the attribute, so `temp1_input` precedes `temp1_label` and `temp2_input`
+/// precedes `temp10_input`.
+///
+/// A snapshot ordered by this key lists every chip the way the kernel numbers
+/// its sensors instead of the way the filesystem happens to return dirents.
+pub fn attribute_order(file: &str) -> (SensorKind, u32, String) {
+    let Some((stem, attribute)) = split_attribute(file) else {
+        return (SensorKind::Other, u32::MAX, file.to_string());
+    };
+    let kind = kind_of_stem(stem).unwrap_or(SensorKind::Other);
+    let index = stem
+        .strip_prefix(kind.prefix())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(u32::MAX);
+    (kind, index, attribute.to_string())
+}
+
 /// Convert one raw hwmon integer to base units.
 ///
 /// hwmon publishes fixed-point integers: millidegrees Celsius, millivolts,
@@ -242,7 +266,10 @@ pub fn scale_hwmon(kind: SensorKind, raw: i64) -> Option<f64> {
     }
     let plausible = match kind {
         SensorKind::Temperature => (-20.0..=200.0).contains(&scaled),
-        SensorKind::Fan => (0.0..=100_000.0).contains(&scaled),
+        // 0xffff is how a chip says "there is no tachometer", and the fastest
+        // server fans spin at about 25,000 RPM, so a higher answer is a
+        // sentinel rather than a measurement.
+        SensorKind::Fan => (0.0..=30_000.0).contains(&scaled),
         SensorKind::Voltage => (-5.0..=30.0).contains(&scaled),
         SensorKind::Current => (-200.0..=200.0).contains(&scaled),
         SensorKind::Power => (0.0..=10_000.0).contains(&scaled),
@@ -269,6 +296,31 @@ pub fn unit_of_kind(kind: SensorKind) -> SensorUnit {
     }
 }
 
+/// Decode an hwmon alarm attribute: `0` clear, `1` asserted.
+///
+/// Chips publish the flag as a small integer. Anything else is not an alarm
+/// this model can render, so it stays unknown instead of guessing a state.
+pub fn parse_alarm(text: &str) -> Option<bool> {
+    match text.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// The device a hwmon chip sits on, from its `device` symlink target.
+///
+/// `/sys/class/hwmon/hwmon3/device -> ../../../0000:01:00.0` names the PCI
+/// device the chip belongs to; a platform chip links to something like
+/// `/sys/devices/platform/coretemp.0`. Only the last component is kept: that is
+/// the part a user recognizes, and the rest is kernel topology. A target
+/// without one (`.`, `..`, `/`) yields `None`.
+pub fn hwmon_device_label(target: &str) -> Option<String> {
+    let target = target.trim().trim_end_matches('/');
+    let label = target.rsplit('/').next()?;
+    (!matches!(label, "" | "." | "..")).then(|| label.to_string())
+}
+
 /// Normalize a PCI slot for joining NVML (`00000000:01:00.0`), DRM's
 /// `/proc/driver/nvidia/gpus/<slot>` (`0000:01:00.0`) and a hwmon device
 /// path (`0000:01:00.0`).
@@ -280,29 +332,263 @@ pub fn normalize_pci_slot(slot: &str) -> String {
     // A four-digit domain is the kernel's form; NVML publishes eight hex
     // digits. Both collapse to the low four digits, so the join works across
     // PCI domains up to 0xffff (more than Linux assigns).
+    //
+    // The domain is driver text, not necessarily ASCII: `nvml_text` only
+    // requires valid UTF-8, so `len() - 4` can land inside a multi-byte
+    // character. `get` answers `None` there and the whole domain is kept, which
+    // cannot join wrongly.
     let domain = if domain.len() > 4 {
-        &domain[domain.len() - 4..]
+        domain.get(domain.len() - 4..).unwrap_or(domain)
     } else {
         domain
     };
     format!("{domain}:{rest}")
 }
 
-/// Decode NVML's inline `busId` buffer into a normalized PCI slot.
+/// Read the driver's text out of a fixed NVML buffer.
 ///
-/// The buffer is NUL-terminated ASCII like `00000000:01:00.0`. Anything else
-/// (empty, unterminated, non-ASCII) yields `None` rather than a wrong join.
-pub fn nvml_bus_id_to_pci_slot(buffer: &[u8]) -> Option<String> {
+/// NVML fills caller-owned buffers with NUL-terminated text. A buffer with
+/// nothing before its terminator, or with bytes that are not UTF-8, yields
+/// `None` rather than an empty or garbled name. A buffer the driver filled
+/// completely carries no terminator; what it wrote is still readable.
+pub fn nvml_text(buffer: &[u8]) -> Option<String> {
     let end = buffer
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(buffer.len());
-    let text = std::str::from_utf8(&buffer[..end]).ok()?;
-    let text = text.trim();
-    if text.is_empty() || !text.is_ascii() {
-        return None;
+    let text = std::str::from_utf8(&buffer[..end]).ok()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// NVML reports utilization, memory-controller load and fan speed as integer
+/// percent.
+///
+/// A measured idle adapter really is 0 %, so zero stays a sample; above 100 is
+/// a driver quirk no field can carry.
+pub fn nvml_percent(raw: u32) -> Option<f32> {
+    nvml_bounded(raw, 100).map(|pct| pct as f32)
+}
+
+/// NVML power counters are milliwatts; the model carries watts.
+pub fn nvml_milliwatts_to_watts(raw: u32) -> Option<f32> {
+    let watts = raw as f64 / 1000.0;
+    (watts <= 2_000.0).then_some(watts as f32)
+}
+
+/// NVML temperatures are unsigned degrees Celsius.
+///
+/// No GPU sensor reports 0 °C: drivers that cannot sample the die answer 0, so
+/// that value (and anything past a junction limit) stays unavailable.
+pub fn nvml_temperature_c(raw: u32) -> Option<f32> {
+    (1..=150).contains(&raw).then_some(raw as f32)
+}
+
+/// NVML clocks are MHz, and 0 is a real answer (a gated clock).
+pub fn nvml_clock_mhz(raw: u32) -> Option<u32> {
+    nvml_bounded(raw, 10_000)
+}
+
+/// Sort key of one powercap zone name: `0` is `(0, None)`, `0:2` is
+/// `(0, Some(2))`.
+///
+/// The RAPL tree nests a package's own counter (`intel-rapl:0`) beside its
+/// constraints (`intel-rapl:0:2` is `dram`), and the suffixes share the package
+/// number. The pair keeps every zone of one package together in the kernel's
+/// order: the package's own counter comes first (`None` sorts before any
+/// constraint, and it cannot tie with constraint 0), then its constraints in
+/// index order. A name with a third segment or a non-numeric one is not a zone
+/// this model reads.
+pub fn powercap_zone_index(suffix: &str) -> Option<(u32, Option<u32>)> {
+    let mut segments = suffix.split(':');
+    let package: u32 = segments.next()?.parse().ok()?;
+    let constraint = match segments.next() {
+        Some(segment) => Some(segment.parse().ok()?),
+        None => None,
+    };
+    segments.next().is_none().then_some((package, constraint))
+}
+
+/// A small NVML counter, or `None` when it is outside the range the field can
+/// physically mean (a link width or generation saturated to `u32::MAX` is a
+/// driver sentinel, not a link).
+pub fn nvml_bounded(raw: u32, max: u32) -> Option<u32> {
+    (raw <= max).then_some(raw)
+}
+
+/// Fill the adapter measurements sysfs does not publish from NVML readings.
+///
+/// The join key is [`normalize_pci_slot`], which folds NVML's eight-digit PCI
+/// domain onto the kernel's four, so a card in one domain can never borrow the
+/// readings of a card with the same bus in another. Sysfs wins per measured
+/// pair: a pair sysfs half-measured (a VRAM total with no used counter) is
+/// replaced whole, because NVML's pair is a measurement while sysfs's half is
+/// not. An adapter NVML does not describe keeps every field unavailable, and an
+/// adapter DRM did not enumerate is never created here.
+///
+/// `nvidia` is the adapter whose driver publishes no counter at all; any other
+/// adapter is consulted only when its utilization counter is missing.
+pub fn with_nvml(
+    mut gpu: GpuInfo,
+    slot: Option<&str>,
+    nvidia: bool,
+    nvml: &[GpuSensors],
+) -> GpuInfo {
+    // Nothing to join, or nothing this adapter is missing.
+    let needs_nvml = nvidia || !gpu.util_pct_available;
+    if nvml.is_empty() || !needs_nvml {
+        return gpu;
     }
-    let normalized = normalize_pci_slot(text);
+    let Some(slot) = slot else {
+        return gpu;
+    };
+    let slot = normalize_pci_slot(slot);
+    let Some(readings) = nvml
+        .iter()
+        .find(|readings| readings.pci_slot.as_deref() == Some(slot.as_str()))
+    else {
+        return gpu;
+    };
+    if !gpu.util_pct_available
+        && let Some(pct) = readings.utilization_pct
+    {
+        gpu.util_pct = pct;
+        gpu.util_pct_available = true;
+    }
+    if !gpu.dedicated_mem_available
+        && let (Some(used), Some(total)) = (readings.memory_used_bytes, readings.memory_total_bytes)
+        && total > 0
+        && used <= total
+    {
+        gpu.mem_used_bytes = used;
+        gpu.mem_total_bytes = total;
+        gpu.dedicated_used_bytes = used;
+        gpu.dedicated_mem_available = true;
+    }
+    if gpu.temperature_c.is_none() {
+        gpu.temperature_c = readings.temperature_c;
+    }
+    gpu
+}
+
+/// Whether the brokered sensor fallback may ask the service for readings.
+///
+/// The fallback exists for the readings this token cannot take (an NVIDIA user
+/// outside the `video` group). Asking is paced by a background worker, and this
+/// gate is what keeps that worker from turning a decision into a poll: a
+/// transport failure is transient and retried, while a refusal is an answer
+/// about this client that does not change by asking again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerGate {
+    /// Ask the broker.
+    Ask,
+    /// The broker answered and refused (or answered something unusable).
+    /// Asking resumes only after the broker has been seen unreachable and then
+    /// reachable again, because a restarted or reinstalled service is a
+    /// different peer than the one that refused.
+    Refused {
+        /// Whether the liveness probe has reported the broker gone since the
+        /// refusal.
+        saw_unreachable: bool,
+    },
+    /// The fallback cannot run in this process (its worker could not be
+    /// started). Asking stays off for the process's lifetime: there is nothing
+    /// left that could ask.
+    Disabled,
+}
+
+impl BrokerGate {
+    /// Fold one liveness observation into the gate.
+    ///
+    /// A broker that has been seen gone and then answers again is a different
+    /// peer — restarted, reinstalled, or started after the GUI — so a refusal
+    /// recorded before that no longer applies.
+    ///
+    /// `liveness` is `None` when the probe is still pending, which is no
+    /// observation at all: it neither proves the broker gone (that would let a
+    /// latched gate re-ask and re-latch) nor proves it back.
+    pub fn observe(self, liveness: Option<BrokerLiveness>) -> Self {
+        match (self, liveness) {
+            (Self::Ask | Self::Disabled, _) => self,
+            (
+                Self::Refused {
+                    saw_unreachable: true,
+                },
+                Some(BrokerLiveness::Reachable),
+            ) => Self::Ask,
+            (Self::Refused { saw_unreachable }, liveness) => Self::Refused {
+                saw_unreachable: saw_unreachable || liveness == Some(BrokerLiveness::Unreachable),
+            },
+        }
+    }
+
+    /// Whether a request may be sent now.
+    pub fn may_ask(self) -> bool {
+        matches!(self, Self::Ask)
+    }
+
+    /// One window of the brokered fallback, as one pure step.
+    ///
+    /// `liveness` is this window's observation of the broker (`None` while the
+    /// probe is still pending), and `last` is what the previous window's request
+    /// produced (`None` when it did not ask). The result is the gate to carry
+    /// into the next window and whether this window should ask at all.
+    ///
+    /// A request that never reached a broker is transient, so the next window
+    /// asks again. A refusal latches: it is a decision about this client, and
+    /// repeating it every window would only spam the log until the broker is seen
+    /// gone and back (or the process restarts).
+    pub fn step(
+        self,
+        liveness: Option<BrokerLiveness>,
+        last: Option<BrokerAttempt>,
+    ) -> (Self, bool) {
+        // A fallback that cannot run keeps its state whatever the wire says.
+        if self == Self::Disabled {
+            return (Self::Disabled, false);
+        }
+        let gate = self.observe(liveness);
+        let gate = match last {
+            None | Some(BrokerAttempt::Answered | BrokerAttempt::Unreachable) => gate,
+            Some(BrokerAttempt::Refused) => Self::Refused {
+                saw_unreachable: false,
+            },
+        };
+        (gate, gate.may_ask())
+    }
+}
+
+/// Whether the broker answered a liveness observation.
+///
+/// What it answered does not matter: an answered probe, even a refusal, proves
+/// the service is there, while a probe that reached nobody proves it is not. A
+/// probe that is still pending is neither, and is passed to [`BrokerGate`] as
+/// `None` rather than as a value here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerLiveness {
+    /// The broker answered.
+    Reachable,
+    /// No broker answered.
+    Unreachable,
+}
+
+/// What one window's request to the broker produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerAttempt {
+    /// The broker answered with readings.
+    Answered,
+    /// The broker answered and refused, or answered something unusable.
+    Refused,
+    /// The request never reached a broker.
+    Unreachable,
+}
+
+/// Decode NVML's inline `busId` buffer into a normalized PCI slot.
+///
+/// The buffer carries ASCII like `00000000:01:00.0`; anything that does not
+/// have that exact shape yields `None` rather than a wrong join.
+pub fn nvml_bus_id_to_pci_slot(buffer: &[u8]) -> Option<String> {
+    let text = nvml_text(buffer)?;
+    let normalized = normalize_pci_slot(&text);
     // `normalize_pci_slot` only strips a domain; a bus id must still look like
     // one (`dddd:dd:dd.d`).
     let (domain, rest) = normalized.split_once(':')?;
@@ -374,8 +660,14 @@ pub const NVML_TEMPERATURE_MEMORY: u32 = 1;
 pub const NVML_CLOCK_GRAPHICS: u32 = 0;
 pub const NVML_CLOCK_MEM: u32 = 2;
 
-/// NVML return code for "not supported by this device/driver".
+/// NVML return code for success.
+pub const NVML_SUCCESS: i32 = 0;
+/// NVML return code for "not supported by this device/driver". An ordinary
+/// per-adapter answer: no fan, no PCI id, no memory-junction sensor.
 pub const NVML_ERROR_NOT_SUPPORTED: i32 = 3;
+/// NVML return code for "this token may not query the device". The one failure
+/// a root broker can supply readings for.
+pub const NVML_ERROR_NO_PERMISSION: i32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -435,6 +727,10 @@ mod tests {
         assert_eq!(scale_hwmon(SensorKind::Temperature, i64::MAX), None);
         assert_eq!(scale_hwmon(SensorKind::Temperature, -273_000), None);
         assert_eq!(scale_hwmon(SensorKind::Fan, -1), None);
+        // 0xffff is "this chip has no tachometer": 65,535 RPM is not a fan.
+        assert_eq!(scale_hwmon(SensorKind::Fan, 0xffff), None);
+        assert_eq!(scale_hwmon(SensorKind::Fan, 30_001), None);
+        assert_eq!(scale_hwmon(SensorKind::Fan, 25_000), Some(25_000.0));
         assert_eq!(scale_hwmon(SensorKind::Voltage, 1_000_000), None);
         assert_eq!(scale_hwmon(SensorKind::Power, -1_000_000), None);
         assert_eq!(scale_hwmon(SensorKind::Humidity, 250_000), None);
@@ -448,11 +744,79 @@ mod tests {
     }
 
     #[test]
+    fn attribute_order_numbers_sensors_numerically() {
+        let mut files = [
+            "temp10_input",
+            "temp2_label",
+            "fan1_input",
+            "temp2_input",
+            "temp1_input",
+        ];
+        files.sort_by_key(|file| attribute_order(file));
+        assert_eq!(
+            files,
+            [
+                "temp1_input",
+                "temp2_input",
+                "temp2_label",
+                "temp10_input",
+                "fan1_input",
+            ]
+        );
+        // A name outside the model sorts last instead of panicking.
+        assert_eq!(
+            attribute_order("uevent"),
+            (SensorKind::Other, u32::MAX, "uevent".to_string())
+        );
+    }
+
+    #[test]
+    fn hwmon_alarm_flags_need_a_real_binary_value() {
+        assert_eq!(parse_alarm("1\n"), Some(true));
+        assert_eq!(parse_alarm("0\n"), Some(false));
+        assert_eq!(parse_alarm(""), None);
+        assert_eq!(parse_alarm("2"), None);
+        assert_eq!(parse_alarm("alarm"), None);
+    }
+
+    #[test]
+    fn hwmon_device_labels_keep_the_last_path_component() {
+        assert_eq!(
+            hwmon_device_label("../../../0000:01:00.0").as_deref(),
+            Some("0000:01:00.0")
+        );
+        assert_eq!(
+            hwmon_device_label("/sys/devices/platform/coretemp.0/").as_deref(),
+            Some("coretemp.0")
+        );
+        assert_eq!(
+            hwmon_device_label("../../../nvme/nvme0").as_deref(),
+            Some("nvme0")
+        );
+        // Nothing to name: the chip's own class directory, an empty target, or
+        // a relative step upward.
+        for target in ["", "/", ".", ".."] {
+            assert_eq!(hwmon_device_label(target), None, "{target}");
+        }
+    }
+
+    #[test]
     fn pci_slots_normalize_across_kernel_and_nvml_forms() {
         assert_eq!(normalize_pci_slot("0000:01:00.0"), "0000:01:00.0");
         assert_eq!(normalize_pci_slot("00000000:01:00.0"), "0000:01:00.0");
         assert_eq!(normalize_pci_slot("[0000:0A:00.0]"), "0000:0a:00.0");
         assert_eq!(normalize_pci_slot("00010000:01:00.0"), "0000:01:00.0");
+    }
+
+    #[test]
+    fn a_multi_byte_domain_is_kept_instead_of_panicking() {
+        // NVML text is only required to be UTF-8, so a driver string can put the
+        // low-four-digit cut inside a character. The whole domain is kept, which
+        // at worst fails to join; it must not panic or produce a broken string.
+        assert_eq!(normalize_pci_slot("0é000:01:00.0"), "0é000:01:00.0");
+        assert_eq!(normalize_pci_slot("éé:01:00.0"), "éé:01:00.0");
+        // A cut that lands on a character boundary still folds as before.
+        assert_eq!(normalize_pci_slot("é0000:01:00.0"), "0000:01:00.0");
     }
 
     #[test]
@@ -469,6 +833,38 @@ mod tests {
         let mut junk = [0u8; 32];
         junk[..8].copy_from_slice(b"1:2:3.4\0");
         assert_eq!(nvml_bus_id_to_pci_slot(&junk), None);
+    }
+
+    #[test]
+    fn nvml_buffer_text_stops_at_the_terminator() {
+        let mut name = [0u8; 16];
+        name[..14].copy_from_slice(b" NVIDIA GeForc");
+        assert_eq!(nvml_text(&name).as_deref(), Some("NVIDIA GeForc"));
+        assert_eq!(nvml_text(&[0u8; 16]), None);
+        assert_eq!(nvml_text(&[0xff, 0, 0]), None);
+        // A driver that fills the whole buffer leaves no terminator; what it
+        // wrote is still the name.
+        assert_eq!(nvml_text(b"580.95.05").as_deref(), Some("580.95.05"));
+    }
+
+    #[test]
+    fn nvml_counters_stay_within_what_the_field_can_mean() {
+        assert_eq!(nvml_percent(0), Some(0.0));
+        assert_eq!(nvml_percent(100), Some(100.0));
+        assert_eq!(nvml_percent(101), None);
+        assert_eq!(nvml_percent(u32::MAX), None);
+        assert_eq!(nvml_milliwatts_to_watts(0), Some(0.0));
+        assert_eq!(nvml_milliwatts_to_watts(250_000), Some(250.0));
+        assert_eq!(nvml_milliwatts_to_watts(u32::MAX), None);
+        assert_eq!(nvml_temperature_c(51), Some(51.0));
+        // 0 °C is what a driver without a die sample answers, not a reading.
+        assert_eq!(nvml_temperature_c(0), None);
+        assert_eq!(nvml_temperature_c(u32::MAX), None);
+        assert_eq!(nvml_clock_mhz(0), Some(0));
+        assert_eq!(nvml_clock_mhz(2_640), Some(2_640));
+        assert_eq!(nvml_clock_mhz(u32::MAX), None);
+        assert_eq!(nvml_bounded(16, 16), Some(16));
+        assert_eq!(nvml_bounded(17, 16), None);
     }
 
     #[test]
@@ -503,6 +899,299 @@ mod tests {
         assert!(snapshot.gpu_for_pci_slot("00000000:01:00.0").is_some());
         assert!(snapshot.gpu_for_pci_slot("0000:02:00.0").is_none());
         assert!(!snapshot.is_empty());
+    }
+
+    /// One NVML reading for `slot`, as the enumeration shapes it.
+    fn nvml_reading(slot: &str) -> GpuSensors {
+        GpuSensors {
+            index: 0,
+            pci_slot: Some(normalize_pci_slot(slot)),
+            utilization_pct: Some(37.0),
+            memory_total_bytes: Some(12 << 30),
+            memory_used_bytes: Some(3 << 30),
+            temperature_c: Some(63.0),
+            ..Default::default()
+        }
+    }
+
+    /// The row an adapter with sysfs counters gets from DRM: measured pairs are
+    /// available, the rest is not.
+    fn gpu_row() -> GpuInfo {
+        GpuInfo {
+            id: 0,
+            name: "NVIDIA GPU [10de:2684] (nvidia)".into(),
+            driver_version: "580.95.05".into(),
+            driver_date_epoch_s: None,
+            directx_version: String::new(),
+            pci_location: Some((3, 0, 1)),
+            util_pct_available: false,
+            util_pct: 0.0,
+            dedicated_mem_available: false,
+            shared_mem_available: false,
+            mem_used_bytes: 0,
+            mem_total_bytes: 0,
+            dedicated_used_bytes: 0,
+            shared_used_bytes: 0,
+            shared_total_bytes: 0,
+            hardware_reserved_bytes: 0,
+            temperature_c: None,
+            luid: None,
+            engines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nvml_fills_the_counters_the_nvidia_driver_does_not_publish() {
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:03:00.1")],
+        );
+        assert!(gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 37.0);
+        assert!(gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 3 << 30);
+        assert_eq!(gpu.mem_total_bytes, 12 << 30);
+        assert_eq!(gpu.dedicated_used_bytes, 3 << 30);
+        assert_eq!(gpu.temperature_c, Some(63.0));
+        // An adapter-wide utilization is not an engine instance.
+        assert!(gpu.engines.is_empty());
+    }
+
+    #[test]
+    fn sysfs_counters_win_over_nvml_where_the_driver_publishes_them() {
+        // nouveau answers `gpu_busy_percent`, so its own sample is shown even
+        // with NVML answering for the same card.
+        let mut gpu = gpu_row();
+        gpu.util_pct_available = true;
+        gpu.util_pct = 12.0;
+        gpu.dedicated_mem_available = true;
+        gpu.mem_used_bytes = 512 << 20;
+        gpu.mem_total_bytes = 8 << 30;
+        gpu.dedicated_used_bytes = 512 << 20;
+        gpu.temperature_c = Some(51.0);
+        let gpu = with_nvml(
+            gpu,
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:03:00.1")],
+        );
+        assert!(gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 12.0);
+        assert_eq!(gpu.mem_used_bytes, 512 << 20);
+        assert_eq!(gpu.mem_total_bytes, 8 << 30);
+        assert_eq!(gpu.temperature_c, Some(51.0));
+    }
+
+    #[test]
+    fn a_half_measured_vram_pair_is_replaced_whole() {
+        // gpu_from_card publishes a total it read without a used counter; the
+        // pair stays unavailable, and NVML's complete pair replaces both.
+        let mut gpu = gpu_row();
+        gpu.mem_total_bytes = 8 << 30;
+        let gpu = with_nvml(
+            gpu,
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:03:00.1")],
+        );
+        assert!(gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_total_bytes, 12 << 30);
+        assert_eq!(gpu.mem_used_bytes, 3 << 30);
+        assert_eq!(gpu.dedicated_used_bytes, 3 << 30);
+    }
+
+    #[test]
+    fn nvml_silence_leaves_the_measurements_unavailable() {
+        // NVML enumerated nothing this tick.
+        let gpu = with_nvml(gpu_row(), Some("0000:03:00.1"), true, &[]);
+        assert!(!gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 0.0);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 0);
+        assert_eq!(gpu.temperature_c, None);
+
+        // NVML answered, but only for another card: the join must not borrow
+        // that adapter's numbers.
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("0000:02:00.0")],
+        );
+        assert!(!gpu.util_pct_available);
+        assert_eq!(gpu.util_pct, 0.0);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.temperature_c, None);
+    }
+
+    #[test]
+    fn a_card_in_another_pci_domain_does_not_join() {
+        // The same bus, device and function in segment 1 is a different card;
+        // folding the domain away would have the two share one adapter's
+        // readings.
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0000:03:00.1"),
+            true,
+            &[nvml_reading("00000001:03:00.1")],
+        );
+        assert!(!gpu.util_pct_available);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.temperature_c, None);
+        // The same reading joins the card that really sits in segment 1.
+        let gpu = with_nvml(
+            gpu_row(),
+            Some("0001:03:00.1"),
+            true,
+            &[nvml_reading("00000001:03:00.1")],
+        );
+        assert!(gpu.util_pct_available);
+    }
+
+    #[test]
+    fn nvml_memory_needs_a_total_to_be_a_measurement() {
+        let nvml = GpuSensors {
+            pci_slot: Some("0000:03:00.1".into()),
+            memory_used_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let gpu = with_nvml(gpu_row(), Some("0000:03:00.1"), true, &[nvml]);
+        assert!(!gpu.dedicated_mem_available);
+        assert_eq!(gpu.mem_used_bytes, 0);
+        assert_eq!(gpu.mem_total_bytes, 0);
+    }
+
+    #[test]
+    fn an_adapter_without_a_pci_slot_cannot_be_joined() {
+        let gpu = with_nvml(gpu_row(), None, true, &[nvml_reading("0000:03:00.1")]);
+        assert!(!gpu.util_pct_available);
+        assert!(!gpu.dedicated_mem_available);
+    }
+
+    #[test]
+    fn a_broker_refusal_stops_the_fallback_until_it_restarts() {
+        // First window: nothing was attempted yet, so it asks.
+        let (gate, ask) = BrokerGate::Ask.step(Some(BrokerLiveness::Unreachable), None);
+        assert!(ask, "a window that never asked must ask");
+        // The request reached nobody: transient, so the next window asks again.
+        let (gate, ask) = gate.step(
+            BrokerLiveness::Unreachable,
+            Some(BrokerAttempt::Unreachable),
+        );
+        assert!(ask);
+        let (gate, ask) = gate.step(
+            BrokerLiveness::Unreachable,
+            Some(BrokerAttempt::Unreachable),
+        );
+        assert!(ask);
+        assert_eq!(gate, BrokerGate::Ask);
+        // Readings arrived: nothing latches.
+        let (gate, ask) = gate.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Answered),
+        );
+        assert!(ask);
+        // The broker refused: the very next window must not ask, and ten more
+        // windows of a reachable broker must not reopen it.
+        let (gate, ask) = gate.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Refused),
+        );
+        assert!(!ask, "a refusal must latch before the next ask");
+        let mut latched = gate;
+        for _ in 0..10 {
+            let (next, ask) = latched.step(Some(BrokerLiveness::Reachable), None);
+            assert!(!ask, "a refused policy does not change by asking again");
+            latched = next;
+        }
+        // It went away: still latched, but remembered.
+        let (latched, ask) = latched.step(Some(BrokerLiveness::Unreachable), None);
+        assert!(!ask);
+        // It answered again: a different peer, so ask once more.
+        let (gate, ask) = latched.step(Some(BrokerLiveness::Reachable), None);
+        assert!(ask, "a restarted broker reopens the fallback");
+        assert_eq!(gate, BrokerGate::Ask);
+    }
+
+    #[test]
+    fn an_unusable_answer_latches_without_being_retried() {
+        // The broker answered a sensor poll with another payload: not a
+        // transport failure, so the next window stays quiet.
+        let (gate, ask) = BrokerGate::Ask.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Refused),
+        );
+        assert!(!ask);
+        assert_eq!(
+            gate,
+            BrokerGate::Refused {
+                saw_unreachable: false
+            }
+        );
+        // A window that did not ask keeps whatever it had.
+        let (gate, ask) = BrokerGate::Ask.step(Some(BrokerLiveness::Reachable), None);
+        assert!(ask);
+        assert_eq!(gate, BrokerGate::Ask);
+    }
+
+    #[test]
+    fn a_pending_probe_is_not_an_observation() {
+        // "Still finding out" is neither reachable nor unreachable: it must not
+        // count as the broker being gone, which is what let a latched gate
+        // re-ask and re-latch on every window.
+        let (gate, ask) = BrokerGate::Ask.step(None, None);
+        assert!(ask, "a pending probe leaves an asking gate asking");
+        assert_eq!(gate, BrokerGate::Ask);
+        // A latch survives any number of pending windows.
+        let latched = BrokerGate::Refused {
+            saw_unreachable: false,
+        };
+        let (gate, ask) = latched.step(None, None);
+        assert!(!ask);
+        assert_eq!(gate, latched);
+        // Pending is not the "gone" half of a restart either: a gate that already
+        // saw the broker leave stays latched until a probe really answers.
+        let saw_gone = BrokerGate::Refused {
+            saw_unreachable: true,
+        };
+        let (gate, ask) = saw_gone.step(None, None);
+        assert!(!ask, "a pending probe cannot reopen a latch");
+        assert_eq!(gate, saw_gone);
+    }
+
+    #[test]
+    fn a_fallback_that_could_not_start_never_asks() {
+        // The worker thread could not be spawned, so there is nothing left that
+        // could ask: no observation and no outcome reopens it.
+        let (gate, ask) = BrokerGate::Disabled.step(Some(BrokerLiveness::Reachable), None);
+        assert!(!ask);
+        let (gate, ask) = gate.step(Some(BrokerLiveness::Unreachable), None);
+        assert!(!ask);
+        let (gate, ask) = gate.step(
+            Some(BrokerLiveness::Reachable),
+            Some(BrokerAttempt::Answered),
+        );
+        assert!(!ask);
+        assert_eq!(gate, BrokerGate::Disabled);
+    }
+
+    #[test]
+    fn powercap_zones_include_the_package_constraints() {
+        assert_eq!(powercap_zone_index("0"), Some((0, None)));
+        assert_eq!(powercap_zone_index("0:2"), Some((0, Some(2))));
+        assert_eq!(powercap_zone_index("1:0"), Some((1, Some(0))));
+        // Not a zone this model reads.
+        assert_eq!(powercap_zone_index("0:0:1"), None);
+        assert_eq!(powercap_zone_index("package-0"), None);
+        assert_eq!(powercap_zone_index(""), None);
+        assert_eq!(powercap_zone_index("0:"), None);
+        // A package's own counter comes first, then its constraints in index
+        // order, and it cannot tie with constraint 0.
+        let mut zones: [(u32, Option<u32>); 4] = [(1, None), (0, Some(2)), (0, None), (0, Some(1))];
+        zones.sort();
+        assert_eq!(zones, [(0, None), (0, Some(1)), (0, Some(2)), (1, None)]);
     }
 
     #[test]
