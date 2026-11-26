@@ -13,25 +13,26 @@
 //!   RAPL energy counters and an NVML handle for a user outside the `video`
 //!   group come from.
 //!
-//! When the driver refuses the GUI token's own NVML queries, the snapshot asks
-//! the core service for the same readings — at most once per cache window, with
-//! the client's own bounded deadline, and never in a way that could disable the
-//! direct path.
+//! When the driver refuses the GUI token's own NVML queries, the snapshot falls
+//! back to the readings the root broker takes. That request runs on its own
+//! worker thread: a broker that accepts and never answers costs one deadline
+//! per window there and nothing on the sampling path, so a sample can never
+//! wait on a socket.
 
 use super::core_service::client;
 use super::{hwmon, nvml};
 use crate::linux_core_service::{Request, Response};
-use crate::linux_sensors::{GpuSensors, SensorSnapshot, normalize_pci_slot};
+use crate::linux_sensors::{BrokerGate, GpuSensors, SensorSnapshot, normalize_pci_slot};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// How often the broker may be asked for GPU readings.
+/// How often the broker fallback asks the service.
 ///
-/// One sampling tick asks once; asking a stopped or wedged broker on every tick
-/// would make each tick wait for its deadline. The window matches the direct
-/// NVML cache, so a tick that sees fresh direct readings never asks and a tick
-/// that does not asks at most once.
-const BROKER_TTL: Duration = nvml::CACHE_TTL;
+/// Its own window, not the NVML cache's: that cache exists so one tick asks the
+/// driver once, while this window paces a background worker whose request may
+/// take the client's whole deadline. Two seconds keeps an NVIDIA column fresh
+/// without making the service answer a request per tick.
+const BROKER_TTL: Duration = Duration::from_secs(2);
 
 /// Poll every sensor this process can read.
 ///
@@ -50,7 +51,9 @@ pub fn snapshot() -> SensorSnapshot {
 /// Direct (unelevated) NVML query for every adapter, from a short-lived cache.
 ///
 /// `drm.rs` calls this once per tick to fill the NVIDIA fields sysfs does not
-/// publish (utilization, VRAM use, temperature).
+/// publish (utilization, VRAM use, temperature). It never waits for the core
+/// service: when the driver refuses this token, the answer is whatever the
+/// background worker has stored so far.
 pub fn nvml_gpus() -> Vec<GpuSensors> {
     let direct = nvml::sample();
     if !direct.denied {
@@ -58,9 +61,10 @@ pub fn nvml_gpus() -> Vec<GpuSensors> {
     }
     // The driver refused this token's queries — what a user outside the `video`
     // group and a container without the device node both look like. The broker
-    // runs as root and can take the same readings; a refusal, a failure or an
-    // absent broker leaves the direct answer in place, because the fallback must
-    // never disable the path that works.
+    // runs as root and can take the same readings, so its worker is asked for
+    // them; the answer arrives on a later tick, and a refusal, a failure or an
+    // absent broker leaves the direct readings in place, because the fallback
+    // must never disable the path that works.
     let brokered = brokered_gpus();
     if brokered.is_empty() {
         direct.gpus
@@ -85,51 +89,121 @@ pub fn nvml_available() -> bool {
     nvml::available()
 }
 
-/// One window's answer from the broker.
-struct BrokerCache {
+/// The fallback's shared state: the last broker answer and how far asking got.
+struct BrokerReadings {
     gpus: Vec<GpuSensors>,
-    asked_at: Instant,
+    gate: BrokerGate,
+    /// Whether the worker was started, so one process runs one worker and a
+    /// failed spawn is not retried on every tick.
+    started: bool,
+    /// Whether this run of failures was already reported, so an absent broker
+    /// costs one log line instead of one per window.
+    reported: bool,
 }
 
-fn broker_cache() -> &'static Mutex<Option<BrokerCache>> {
-    static CACHE: OnceLock<Mutex<Option<BrokerCache>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+fn broker_readings() -> &'static Mutex<BrokerReadings> {
+    static READINGS: OnceLock<Mutex<BrokerReadings>> = OnceLock::new();
+    READINGS.get_or_init(|| {
+        Mutex::new(BrokerReadings {
+            gpus: Vec::new(),
+            gate: BrokerGate::Ask,
+            started: false,
+            reported: false,
+        })
+    })
 }
 
-/// GPU readings from the root broker, asked for at most once per window.
+/// The last GPU readings the broker produced, starting its worker on first use.
 ///
 /// An elevated process asks nobody: it is (or is running as) the broker, so its
-/// own poll cannot be denied NVML and a request to itself would wait on its own
-/// worker. The client bounds the request with its own deadline, so this cannot
-/// park the sampler on a wedged socket.
+/// own poll cannot be denied NVML and a request to itself would occupy its own
+/// worker.
+///
+/// This does no I/O. The lock is taken only to read the stored answer and to
+/// start the worker once, so a broker that accepts and never answers delays no
+/// sample and cannot queue an action behind a sampling tick.
 fn brokered_gpus() -> Vec<GpuSensors> {
     if super::is_elevated() {
         return Vec::new();
     }
-    let mut guard = tm_core::sync::lock(broker_cache());
-    if let Some(cache) = guard.as_ref()
-        && cache.asked_at.elapsed() < BROKER_TTL
-    {
-        return cache.gpus.clone();
-    }
-    let gpus = match client::request(&Request::Sensors) {
-        Ok(Response::Sensors(snapshot)) => snapshot.gpus,
-        Ok(_) => {
-            tracing::debug!("the core service answered a sensor poll with another response");
-            Vec::new()
-        }
-        Err(error) => {
-            // One line per window: a stopped broker must not fill the log at
-            // sampling rate.
-            tracing::debug!(?error, "the core service supplied no GPU sensors");
-            Vec::new()
-        }
+    let (start, gpus) = {
+        let mut readings = tm_core::sync::lock(broker_readings());
+        let start = !readings.started;
+        readings.started = true;
+        (start, readings.gpus.clone())
     };
-    *guard = Some(BrokerCache {
-        gpus: gpus.clone(),
-        asked_at: Instant::now(),
-    });
+    if start {
+        start_broker_worker();
+    }
     gpus
+}
+
+/// Start the one worker that asks the broker for sensor readings.
+///
+/// It lives for the process: it owns the only sensor traffic on the client's
+/// single connection, is never joined (a sampling thread must not wait for a
+/// socket at exit either), and a failed spawn disables the fallback instead of
+/// letting a sampling tick ask inline.
+fn start_broker_worker() {
+    if std::thread::Builder::new()
+        .name("tm-sensors-broker".to_string())
+        .spawn(broker_worker)
+        .is_err()
+    {
+        let mut readings = tm_core::sync::lock(broker_readings());
+        readings.gate = BrokerGate::after_failure(false);
+        tracing::warn!("could not start the GPU sensor broker worker; keeping direct GPU readings");
+    }
+}
+
+/// Ask the broker for GPU readings, once per [`BROKER_TTL`], for the process.
+///
+/// The sleep at the end of each round is the broker's polling window, not a
+/// race workaround: the client bounds the request itself, so a wedged broker
+/// costs this thread one deadline and nothing else. A refusal stops the asking
+/// (see [`BrokerGate`]) until a restarted broker answers a liveness probe, so a
+/// policy decision is never retried once per window.
+///
+/// The lock is never held across the request, so a sampling tick only ever
+/// waits for a clone of the stored answer.
+fn broker_worker() {
+    loop {
+        let ask = {
+            let mut readings = tm_core::sync::lock(broker_readings());
+            readings.gate = readings.gate.observe(client::available());
+            readings.gate.may_ask()
+        };
+        if ask {
+            let outcome = client::request(&Request::Sensors);
+            let mut readings = tm_core::sync::lock(broker_readings());
+            match outcome {
+                Ok(Response::Sensors(snapshot)) => {
+                    readings.gpus = snapshot.gpus;
+                    readings.gate = BrokerGate::Ask;
+                    readings.reported = false;
+                }
+                Ok(_) => {
+                    // An answer this poll cannot use is not a transport
+                    // failure, so asking stops until the broker is reachable
+                    // again rather than repeating a broken exchange.
+                    readings.gate = BrokerGate::after_failure(false);
+                    tracing::debug!("the core service answered a sensor poll with another payload");
+                }
+                Err(error) => {
+                    let next = BrokerGate::after_failure(error.may_fall_back());
+                    // One line per outage or decision change: a broker that
+                    // stays away must not fill the log at window rate, while a
+                    // refusal is news.
+                    if !readings.reported || next != readings.gate {
+                        readings.reported = true;
+                        tracing::debug!(?error, "the core service supplied no GPU sensors");
+                    }
+                    readings.gate = next;
+                }
+            }
+        }
+        std::thread::sleep(BROKER_TTL);
+    }
 }
 
 /// Wall-clock stamp of the poll; `0` means "never taken".
