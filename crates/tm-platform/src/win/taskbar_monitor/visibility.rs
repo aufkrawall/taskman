@@ -66,7 +66,10 @@ pub(super) enum HideReason {
     UiaUnavailable,
     NoRenderer,
     MeasureFailed,
-    /// The taskbar is full even for the compact layout.
+    /// The taskbar is full even for the compact layout, or the solved box does
+    /// not fill the bar's cross axis and would leave a strip of the bar taking
+    /// the widget's clicks. The second case also logs its own expected/actual
+    /// cross extent, which is what tells the two apart.
     NoPlacementSlot,
     PresentFailed,
     RenderFailed,

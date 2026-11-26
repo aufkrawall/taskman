@@ -255,22 +255,27 @@ impl WindowCtx {
     }
 
     /// Belt and braces for the placement contract: the box handed to
-    /// `SetWindowPos`, `UpdateLayeredWindow` and the occlusion check is clamped
-    /// into the taskbar here as well, so no code path can place or present the
-    /// widget outside the bar. `None` means the box may not be shown.
+    /// `SetWindowPos`, `UpdateLayeredWindow` and the occlusion check is checked
+    /// against the taskbar here as well, so no code path can place or present
+    /// the widget outside the bar. It returns the rect unchanged when it may be
+    /// shown — a rect that would have to be moved or cut to stay inside the bar
+    /// is refused, never silently adjusted — and `None` means it may not be
+    /// shown at all.
     ///
     /// The cross axis must be filled, not merely respected. The box this gate
     /// replaced was a few pixels short, and that dead band is exactly where a
-    /// click reached the taskbar instead of the widget, so a box that would
-    /// have to be cut down and a box that leaves such a band are both hidden
-    /// and diagnosed once per 30 s rather than presented short.
+    /// click reached the taskbar instead of the widget, so a box that leaves
+    /// such a band is refused on the same terms. `solve_taskbar_placement`
+    /// already refuses it, which makes this branch defence in depth: it can
+    /// only fire if a caller hands this gate a footprint that did not come from
+    /// the solver, and it is diagnosed once per 30 s so that it is not silent.
     fn fit_target_rect(&mut self, rect: PixelRect, bar: PixelRect) -> Option<PixelRect> {
         let (fitted, fills_cross) = clamp_into_taskbar(rect, bar);
         if fitted != rect {
             return None;
         }
         if !fills_cross {
-            let (expected, actual) = if bar.width() >= bar.height() {
+            let (expected, actual) = if bar.is_horizontal() {
                 (bar.height(), fitted.height())
             } else {
                 (bar.width(), fitted.width())
@@ -282,6 +287,9 @@ impl WindowCtx {
                 tracing::warn!(
                     expected,
                     actual,
+                    left = fitted.left,
+                    top = fitted.top,
+                    ?bar,
                     "taskbar monitor box does not fill the taskbar cross axis; staying hidden"
                 );
                 self.last_cross_mismatch = Some(Instant::now());
@@ -479,6 +487,10 @@ impl WindowCtx {
                 bottom: y.saturating_add(h),
             };
             let Some(target_rect) = self.fit_target_rect(target_rect, env.taskbar_rect) else {
+                // Drop the cached footprint too: with unchanged content the fast
+                // path would otherwise re-solve the same refused box every
+                // refresh and never re-measure.
+                self.last_display = None;
                 self.hide(HideReason::NoPlacementSlot);
                 return;
             };
@@ -591,6 +603,10 @@ impl WindowCtx {
             bottom: y.saturating_add(h),
         };
         let Some(target_rect) = self.fit_target_rect(target_rect, env.taskbar_rect) else {
+            // Drop the cached footprint too: with unchanged content the fast
+            // path would otherwise re-solve the same refused box every refresh
+            // and never re-measure.
+            self.last_display = None;
             self.hide(HideReason::NoPlacementSlot);
             return;
         };
@@ -697,9 +713,12 @@ impl WindowCtx {
             return;
         }
         let bounds = LayoutBounds::from_taskbar(env.taskbar_rect, env.dpi);
-        // The current footprint was fitted when it was placed; a bar that has
-        // shrunk since then waits for the next full refresh instead of being
-        // repainted over the taskbar here.
+        // The current footprint was fitted when it was placed. A bar that has
+        // shrunk since then is handled by the geometry path, which hides and
+        // invalidates before this re-render can run, so a footprint that no
+        // longer fits means the frame is simply deferred: this path repaints
+        // content and must not decide visibility, which is why it stays passive
+        // where the placement paths hide.
         let current = PixelRect {
             left: x,
             top: y,

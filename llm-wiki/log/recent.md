@@ -1,3 +1,30 @@
+## 2026-11-26 - Taskbar stats hit area: fill the bar's cross axis exactly
+
+- The taskbar widget's clickable box was the content plus at most 4 DIP of its own
+  padding, capped at `avail_dip_h()` (the bar minus another 4 DIP) and centred in
+  the bar, so the bar always kept at least 2 DIP of itself per side — 2.5 px at
+  100 %, 5 px per side at 250 % — and more whenever the content was shorter than
+  the bar. Two workers fixed it in parallel worktrees and two reviewers read the
+  merged tree; **no P0**, and the durable rule now lives in `current.md`
+  § Windows taskbar monitor.
+- Root cause worth remembering: `LayoutBounds` carried DIP sizes only, so the
+  box's pixel extent and its DIP extent were rounded independently and neither was
+  the bar. `cross_px` (device pixels, taken straight from `taskbar_rect`) is the
+  source of truth now, with `dip = px / scale`.
+- The review rounds changed behaviour, not just style. Round 1: the solver still
+  *centred* a short box, with three tests pinning that centring — after the render
+  fix that was the only remaining way to reproduce the reported dead band — and
+  the window gate merely logged a short box once per 30 s from a path that always
+  runs. Both now refuse it (the gate hides and diagnoses). Round 2 added the
+  assertion that actually distinguishes the implementations: `cross - 1` must
+  hide. The 784-case matrix alone cannot fail for this defect, because it fed
+  `widget == cross`, where the old centring arithmetic produces the same answer as
+  the new rule.
+- Open: nothing is compiled yet; the gate runs once after the final merge. Needs
+  one human pass on a real bar at 150 % and 250 % (the bottom edge especially) and
+  on a 30 px Win10 small bar, where `fit_rows_into_box` can compress rows below
+  glyph height by design.
+
 ## 2026-11-25 - Review pass: ETW session plumbing and the per-file trace
 
 - Reviewed the 314-commit burst's platform side (`win/etw.rs`, `file_etw.rs`,

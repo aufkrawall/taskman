@@ -15,7 +15,7 @@ pub(super) fn context_menu_anchor(
     let Some(bar) = taskbar.filter(|b| !b.is_empty()) else {
         return (cursor, TPM_BOTTOMALIGN.0);
     };
-    if bar.width() >= bar.height() {
+    if bar.is_horizontal() {
         let is_top = monitor
             .filter(|m| !m.is_empty())
             .map_or(bar.top < 200, |m| bar.top - m.top < m.bottom - bar.bottom);
@@ -109,7 +109,7 @@ pub(super) fn clamp_into_taskbar(rect: PixelRect, bar: PixelRect) -> (PixelRect,
         right: rect.right.clamp(bar.left, bar.right),
         bottom: rect.bottom.clamp(bar.top, bar.bottom),
     };
-    let fills_cross = if bar.width() >= bar.height() {
+    let fills_cross = if bar.is_horizontal() {
         clamped.height() == bar.height()
     } else {
         clamped.width() == bar.width()
@@ -143,7 +143,7 @@ pub(super) fn solve_taskbar_placement(
     let hysteresis = ((16.0 * scale).round() as i32).max(8);
     let tray_adj_limit = (320.0 * scale).round() as i32;
 
-    let horizontal = taskbar_rect.width() >= taskbar_rect.height();
+    let horizontal = taskbar_rect.is_horizontal();
     let project = |r: PixelRect| -> (i32, i32) {
         if horizontal {
             (r.left, r.right)
@@ -763,6 +763,29 @@ mod tests {
                                 )
                                 .is_none(),
                                 "{case}: an oversized widget must hide, not escape the bar"
+                            );
+                            // One pixel UNDER it is the reported defect: the old
+                            // solver centred such a box and left a dead band on
+                            // both edges, so this row is the one that tells the
+                            // two implementations apart.
+                            let (short_w, short_h) = if horizontal {
+                                (150, cross - 1)
+                            } else {
+                                (cross - 1, 150)
+                            };
+                            assert!(
+                                solve_taskbar_placement(
+                                    bar,
+                                    Some(notify),
+                                    Some(&uia),
+                                    (short_w, short_h),
+                                    dpi,
+                                    None,
+                                    false,
+                                )
+                                .is_none(),
+                                "{case}: a box one pixel short of the bar must hide, not be \
+                                 centred into a dead band"
                             );
                             checked += 1;
                         }

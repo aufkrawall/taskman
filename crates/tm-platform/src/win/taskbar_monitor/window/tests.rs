@@ -1320,6 +1320,15 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
 
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
     assert!(ctx.is_visible());
+    // The user-visible invariant at pipeline level, not just in the layout: the
+    // footprint handed to the window is the bar's own cross extent. A padded,
+    // centred box a few pixels shorter than this is the reported defect.
+    assert_eq!(
+        ctx.last_size.1,
+        small_bar.height(),
+        "a visible widget must fill a {} px bar's cross axis",
+        small_bar.height()
+    );
     let old_size = ctx.last_size;
 
     // Grow taskbar height from 30 px to 48 px: the first refresh updates
@@ -1342,6 +1351,12 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
     }
     ctx.refresh_taskbar_env(&config, &metrics, grown_env, false);
     assert!(ctx.is_visible());
+    assert_eq!(
+        ctx.last_size.1,
+        grown_bar.height(),
+        "the remeasured widget must fill the grown {} px bar's cross axis",
+        grown_bar.height()
+    );
     let display = build_display(&config, &metrics, false, false, 96, false);
     let expected = ctx
         .renderer

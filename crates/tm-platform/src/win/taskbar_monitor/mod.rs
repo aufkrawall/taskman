@@ -265,6 +265,23 @@ impl PixelRect {
         self.width() <= 0 || self.height() <= 0
     }
 
+    /// Whether the bar's controls run left-to-right, so its cross axis is the
+    /// height. The widget's box fills that cross extent exactly, which is why
+    /// the three layers must agree on which axis it is.
+    fn is_horizontal(self) -> bool {
+        self.width() >= self.height()
+    }
+
+    /// The bar's cross-axis extent in device pixels: the widget box is exactly
+    /// this tall on a horizontal bar and exactly this wide on a vertical one.
+    fn cross_extent(self) -> i32 {
+        if self.is_horizontal() {
+            self.height()
+        } else {
+            self.width()
+        }
+    }
+
     fn covers(self, other: Self) -> bool {
         self.left <= other.left
             && self.top <= other.top

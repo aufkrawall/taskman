@@ -51,16 +51,12 @@ pub(super) struct LayoutBounds {
 impl LayoutBounds {
     pub(super) fn from_taskbar(taskbar_rect: PixelRect, dpi: u32) -> Self {
         let scale = dpi.max(96) as f32 / 96.0;
-        let horizontal = taskbar_rect.width() >= taskbar_rect.height();
+        let horizontal = taskbar_rect.is_horizontal();
         Self {
             horizontal,
             max_dip_w: taskbar_rect.width() as f32 / scale,
             max_dip_h: taskbar_rect.height() as f32 / scale,
-            cross_px: if horizontal {
-                taskbar_rect.height()
-            } else {
-                taskbar_rect.width()
-            },
+            cross_px: taskbar_rect.cross_extent(),
         }
     }
 

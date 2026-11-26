@@ -1354,9 +1354,11 @@ rebase runbook.
 
 - **Module layout (2026-11-17):** `tm-platform/src/win/taskbar_monitor/` —
   `mod.rs` (public `TaskbarMonitorHandle`, shared timer constants,
-  `PixelRect`), `render.rs` (`Renderer`, `DibSurface`, `MeasuredLayout`,
-  `build_display`, light/dark probe), `placement.rs` (`solve_taskbar_placement`,
-  `Gap1D`, `AnchorSlot`, `context_menu_anchor`), `occlusion.rs`
+  `PixelRect` with `is_horizontal`/`cross_extent`), `render.rs` (`Renderer`,
+  `DibSurface`, `MeasuredLayout`, `LayoutBounds::cross_px`/`CONTENT_INSET_DIP`,
+  `fit_rows_into_box`, `build_display`, light/dark probe), `placement.rs`
+  (`solve_taskbar_placement`, `clamp_into_taskbar`, `Gap1D`, `AnchorSlot`,
+  `context_menu_anchor`), `occlusion.rs`
   (`scan_above_tray*`, clip-rect helpers, `occlusion_*`), `identity.rs`
   (class-name / shell-host / cloak / frame helpers), `fullscreen.rs`
   (`probe_taskbar_env`, `fullscreen_covering_monitor_state`), `uia.rs`
@@ -1523,7 +1525,10 @@ rebase runbook.
   cached UIA rects when `TrayNotifyWnd` resizes) while setting `WS_EX_TRANSPARENT`
   to pass clicks through until the latest scan completes; new values are still
   re-rendered in place (`rerender_in_place`) when they fit the unchanged
-  footprint. Moving/resizing applies a new or growing cut-out (or a hide) before
+  footprint, and only while that footprint still lies inside the bar — the
+  in-place path repaints content and never decides visibility, so a shrunken bar
+  is left to the geometry path (hide + invalidate) instead. Moving/resizing
+  applies a new or growing cut-out (or a hide) before
   presenting and drops a vanishing cut-out only afterwards
   (`occlusion_leaves_unclipped`). Widgets hidden only by
   transient fullscreen or
