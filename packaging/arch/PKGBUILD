@@ -18,7 +18,18 @@ pkgdesc='Cross-platform task manager and system monitor'
 arch=('x86_64')
 url='https://github.com/aufkrawall/taskman'
 license=('MIT')
-depends=('glibc')
+# Every library below is dlopened by the window backend rather than linked, so
+# pacman cannot see it as a shared-object dependency and a missing one only
+# shows up as "no backend available" at launch:
+#   libx11            libX11.so.6 and libX11-xcb.so.1 (the X11 backend opens
+#                     both, and libX11-xcb needs libxcb, pulled in transitively)
+#   libxcursor        libXcursor.so.1 (winit fails the whole X11 connection
+#                     without it)
+#   libxi             libXi.so.6 (XInput2 events)
+#   libxkbcommon      libxkbcommon.so.0 (keymap, opened with expect())
+#   libxkbcommon-x11  libxkbcommon-x11.so.0 (the X11 half of that keymap)
+#   wayland           libwayland-client.so.0 (the Wayland backend)
+depends=('glibc' 'libx11' 'libxcursor' 'libxi' 'libxkbcommon' 'libxkbcommon-x11' 'wayland')
 # The `rust` package ships cargo; there is no separate `cargo` package in the
 # official repositories.
 makedepends=('rust')
