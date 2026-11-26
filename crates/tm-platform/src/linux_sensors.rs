@@ -215,6 +215,24 @@ pub fn kind_of_stem(stem: &str) -> Option<SensorKind> {
     None
 }
 
+/// Sort key of one hwmon attribute file: kind, then the hardware index, then
+/// the attribute, so `temp1_input` precedes `temp1_label` and `temp2_input`
+/// precedes `temp10_input`.
+///
+/// A snapshot ordered by this key lists every chip the way the kernel numbers
+/// its sensors instead of the way the filesystem happens to return dirents.
+pub fn attribute_order(file: &str) -> (SensorKind, u32, String) {
+    let Some((stem, attribute)) = split_attribute(file) else {
+        return (SensorKind::Other, u32::MAX, file.to_string());
+    };
+    let kind = kind_of_stem(stem).unwrap_or(SensorKind::Other);
+    let index = stem
+        .strip_prefix(kind.prefix())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(u32::MAX);
+    (kind, index, attribute.to_string())
+}
+
 /// Convert one raw hwmon integer to base units.
 ///
 /// hwmon publishes fixed-point integers: millidegrees Celsius, millivolts,
@@ -267,6 +285,31 @@ pub fn unit_of_kind(kind: SensorKind) -> SensorUnit {
     }
 }
 
+/// Decode an hwmon alarm attribute: `0` clear, `1` asserted.
+///
+/// Chips publish the flag as a small integer. Anything else is not an alarm
+/// this model can render, so it stays unknown instead of guessing a state.
+pub fn parse_alarm(text: &str) -> Option<bool> {
+    match text.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// The device a hwmon chip sits on, from its `device` symlink target.
+///
+/// `/sys/class/hwmon/hwmon3/device -> ../../../0000:01:00.0` names the PCI
+/// device the chip belongs to; a platform chip links to something like
+/// `/sys/devices/platform/coretemp.0`. Only the last component is kept: that is
+/// the part a user recognizes, and the rest is kernel topology. A target
+/// without one (`.`, `..`, `/`) yields `None`.
+pub fn hwmon_device_label(target: &str) -> Option<String> {
+    let target = target.trim().trim_end_matches('/');
+    let label = target.rsplit('/').next()?;
+    (!matches!(label, "" | "." | "..")).then(|| label.to_string())
+}
+
 /// Normalize a PCI slot for joining NVML (`00000000:01:00.0`), DRM's
 /// `/proc/driver/nvidia/gpus/<slot>` (`0000:01:00.0`) and a hwmon device
 /// path (`0000:01:00.0`).
@@ -286,18 +329,63 @@ pub fn normalize_pci_slot(slot: &str) -> String {
     format!("{domain}:{rest}")
 }
 
+/// Read the driver's text out of a fixed NVML buffer.
+///
+/// NVML fills caller-owned buffers with NUL-terminated text. A buffer with
+/// nothing before its terminator, or with bytes that are not UTF-8, yields
+/// `None` rather than an empty or garbled name. A buffer the driver filled
+/// completely carries no terminator; what it wrote is still readable.
+pub fn nvml_text(buffer: &[u8]) -> Option<String> {
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    let text = std::str::from_utf8(&buffer[..end]).ok()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// NVML reports utilization, memory-controller load and fan speed as integer
+/// percent.
+///
+/// A measured idle adapter really is 0 %, so zero stays a sample; above 100 is
+/// a driver quirk no field can carry.
+pub fn nvml_percent(raw: u32) -> Option<f32> {
+    nvml_bounded(raw, 100).map(|pct| pct as f32)
+}
+
+/// NVML power counters are milliwatts; the model carries watts.
+pub fn nvml_milliwatts_to_watts(raw: u32) -> Option<f32> {
+    let watts = raw as f64 / 1000.0;
+    (watts <= 2_000.0).then_some(watts as f32)
+}
+
+/// NVML temperatures are unsigned degrees Celsius.
+///
+/// No GPU sensor reports 0 °C: drivers that cannot sample the die answer 0, so
+/// that value (and anything past a junction limit) stays unavailable.
+pub fn nvml_temperature_c(raw: u32) -> Option<f32> {
+    (1..=150).contains(&raw).then_some(raw as f32)
+}
+
+/// NVML clocks are MHz, and 0 is a real answer (a gated clock).
+pub fn nvml_clock_mhz(raw: u32) -> Option<u32> {
+    nvml_bounded(raw, 10_000)
+}
+
+/// A small NVML counter, or `None` when it is outside the range the field can
+/// physically mean (a link width or generation saturated to `u32::MAX` is a
+/// driver sentinel, not a link).
+pub fn nvml_bounded(raw: u32, max: u32) -> Option<u32> {
+    (raw <= max).then_some(raw)
+}
+
 /// Decode NVML's inline `busId` buffer into a normalized PCI slot.
 ///
-/// The buffer is NUL-terminated ASCII like `00000000:01:00.0`. Anything else
-/// (empty, unterminated, non-ASCII) yields `None` rather than a wrong join.
+/// The buffer carries ASCII like `00000000:01:00.0`; anything that does not
+/// have that exact shape yields `None` rather than a wrong join.
 pub fn nvml_bus_id_to_pci_slot(buffer: &[u8]) -> Option<String> {
-    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
-    let text = std::str::from_utf8(&buffer[..end]).ok()?;
-    let text = text.trim();
-    if text.is_empty() || !text.is_ascii() {
-        return None;
-    }
-    let normalized = normalize_pci_slot(text);
+    let text = nvml_text(buffer)?;
+    let normalized = normalize_pci_slot(&text);
     // `normalize_pci_slot` only strips a domain; a bus id must still look like
     // one (`dddd:dd:dd.d`).
     let (domain, rest) = normalized.split_once(':')?;
@@ -437,6 +525,63 @@ mod tests {
     }
 
     #[test]
+    fn attribute_order_numbers_sensors_numerically() {
+        let mut files = [
+            "temp10_input",
+            "temp2_label",
+            "fan1_input",
+            "temp2_input",
+            "temp1_input",
+        ];
+        files.sort_by_key(|file| attribute_order(file));
+        assert_eq!(
+            files,
+            [
+                "temp1_input",
+                "temp2_input",
+                "temp2_label",
+                "temp10_input",
+                "fan1_input",
+            ]
+        );
+        // A name outside the model sorts last instead of panicking.
+        assert_eq!(
+            attribute_order("uevent"),
+            (SensorKind::Other, u32::MAX, "uevent".to_string())
+        );
+    }
+
+    #[test]
+    fn hwmon_alarm_flags_need_a_real_binary_value() {
+        assert_eq!(parse_alarm("1\n"), Some(true));
+        assert_eq!(parse_alarm("0\n"), Some(false));
+        assert_eq!(parse_alarm(""), None);
+        assert_eq!(parse_alarm("2"), None);
+        assert_eq!(parse_alarm("alarm"), None);
+    }
+
+    #[test]
+    fn hwmon_device_labels_keep_the_last_path_component() {
+        assert_eq!(
+            hwmon_device_label("../../../0000:01:00.0").as_deref(),
+            Some("0000:01:00.0")
+        );
+        assert_eq!(
+            hwmon_device_label("/sys/devices/platform/coretemp.0/").as_deref(),
+            Some("coretemp.0")
+        );
+        assert_eq!(
+            hwmon_device_label("../../../nvme/nvme0").as_deref(),
+            Some("nvme0")
+        );
+        // Nothing to name: the chip's own class directory, an empty target, or
+        // a relative step upward.
+        for target in ["", "/", ".", ".."] {
+            assert_eq!(hwmon_device_label(target), None, "{target}");
+        }
+    }
+
+    #[test]
     fn pci_slots_normalize_across_kernel_and_nvml_forms() {
         assert_eq!(normalize_pci_slot("0000:01:00.0"), "0000:01:00.0");
         assert_eq!(normalize_pci_slot("00000000:01:00.0"), "0000:01:00.0");
@@ -458,6 +603,38 @@ mod tests {
         let mut junk = [0u8; 32];
         junk[..8].copy_from_slice(b"1:2:3.4\0");
         assert_eq!(nvml_bus_id_to_pci_slot(&junk), None);
+    }
+
+    #[test]
+    fn nvml_buffer_text_stops_at_the_terminator() {
+        let mut name = [0u8; 16];
+        name[..14].copy_from_slice(b" NVIDIA GeForc");
+        assert_eq!(nvml_text(&name).as_deref(), Some("NVIDIA GeForc"));
+        assert_eq!(nvml_text(&[0u8; 16]), None);
+        assert_eq!(nvml_text(&[0xff, 0, 0]), None);
+        // A driver that fills the whole buffer leaves no terminator; what it
+        // wrote is still the name.
+        assert_eq!(nvml_text(b"580.95.05").as_deref(), Some("580.95.05"));
+    }
+
+    #[test]
+    fn nvml_counters_stay_within_what_the_field_can_mean() {
+        assert_eq!(nvml_percent(0), Some(0.0));
+        assert_eq!(nvml_percent(100), Some(100.0));
+        assert_eq!(nvml_percent(101), None);
+        assert_eq!(nvml_percent(u32::MAX), None);
+        assert_eq!(nvml_milliwatts_to_watts(0), Some(0.0));
+        assert_eq!(nvml_milliwatts_to_watts(250_000), Some(250.0));
+        assert_eq!(nvml_milliwatts_to_watts(u32::MAX), None);
+        assert_eq!(nvml_temperature_c(51), Some(51.0));
+        // 0 °C is what a driver without a die sample answers, not a reading.
+        assert_eq!(nvml_temperature_c(0), None);
+        assert_eq!(nvml_temperature_c(u32::MAX), None);
+        assert_eq!(nvml_clock_mhz(0), Some(0));
+        assert_eq!(nvml_clock_mhz(2_640), Some(2_640));
+        assert_eq!(nvml_clock_mhz(u32::MAX), None);
+        assert_eq!(nvml_bounded(16, 16), Some(16));
+        assert_eq!(nvml_bounded(17, 16), None);
     }
 
     #[test]
