@@ -338,6 +338,15 @@ require_root() {
   fi
 }
 
+# Whether the account that would be authorized can be resolved, without dying.
+# --post-install uses this so a SUDO_USER that no longer exists cannot fail a
+# package transaction; an explicit --user still fails loudly, because that is an
+# operator typo rather than a guess.
+can_resolve_user() {
+  local spec=${TARGET_USER:-${SUDO_USER:-}}
+  [ -n "$spec" ] && id -u -- "$spec" >/dev/null 2>&1
+}
+
 resolve_user() {
   local spec=${TARGET_USER:-} uid name
   if [ -z "$spec" ]; then
@@ -820,7 +829,9 @@ do_post_install() {
   if [ ! -f "$LIB_DIR/$SERVICE_BINARY" ] || [ ! -f "$UNIT_DIR/$UNIT_NAME" ]; then
     die "$UNIT_DIR/$UNIT_NAME or $LIB_DIR/$SERVICE_BINARY is missing: the package payload is incomplete"
   fi
-  if [ -n "${TARGET_USER:-}${SUDO_USER:-}" ]; then
+  if [ -n "${TARGET_USER:-}" ]; then
+    resolve_user
+  elif [ -n "${SUDO_USER:-}" ] && can_resolve_user; then
     resolve_user
   elif read_manifest_uids "$CONF_DIR/$MANIFEST_NAME" && [ "${#AUTHORIZED_UIDS[@]}" -gt 0 ]; then
     # A root login ran pacman: the package just replaced the manifest with its
@@ -832,6 +843,9 @@ do_post_install() {
     unconfigured=1
   fi
   if [ "$unconfigured" -eq 1 ]; then
+    if [ -n "${SUDO_USER:-}" ]; then
+      warn "SUDO_USER names $SUDO_USER, which is not an account on this system"
+    fi
     warn "no invoking user could be determined and $CONF_DIR/$MANIFEST_NAME authorizes nobody yet"
     warn "the core service is enabled but will not start until you name its user:"
     warn "  $LIB_DIR/install-linux.sh --user <name>"
