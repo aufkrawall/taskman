@@ -38,8 +38,12 @@ use serde::{Deserialize, Serialize};
 use crate::linux_sensors::SensorSnapshot;
 use tm_core::model::PriorityClass;
 
-/// Version of the request/response schema. Bumped whenever a field changes
-/// meaning or a required field is added; the manifest pins it as well.
+/// Version of the request/response schema. This is the FIRST released schema,
+/// so it stays 1 while the feature is still being assembled: the GUI and the
+/// service always ship from one release. Every wire-shape change AFTER this
+/// release — a new variant, a field whose meaning shifts, a removed field —
+/// must bump it, because a GUI and a service from different releases then fail
+/// at the handshake instead of misreading each other.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Root-owned runtime directory that systemd creates for the service.
@@ -386,8 +390,11 @@ pub enum Request {
     /// Every thread of one exact process.
     ProcessThreads { pid: u32, start_ticks: i64 },
     /// Socket endpoints attributed to one process (`/proc/<pid>/fd` needs
-    /// CAP_SYS_PTRACE for another user's process).
-    ProcessConnections { pid: u32 },
+    /// CAP_SYS_PTRACE for another user's process). The creation identity is
+    /// required, like every other per-process request: the connection table
+    /// carries no creation time, so the identity must be pinned before the
+    /// read or a recycled pid would hand back another process's sockets.
+    ProcessConnections { pid: u32, start_ticks: i64 },
     /// Files one exact process has open, with its per-file I/O totals.
     ProcessFileIo { pid: u32, start_ticks: i64 },
     /// Container/hardening evidence the kernel withholds from other users.
@@ -607,7 +614,10 @@ pub enum WireThreadState {
     Dead,
     Idle,
     Parked,
-    Other,
+    /// A kernel state this schema does not name, carrying the raw `/proc`
+    /// character so the client can render the same evidence the direct
+    /// reader would, instead of collapsing every unknown state to one value.
+    Other(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1157,6 +1167,32 @@ mod tests {
             let decoded: Response = decode_frame(body).expect("decode");
             assert_eq!(decoded, response);
         }
+    }
+
+    #[test]
+    fn requests_round_trip_with_their_identity_and_raw_state() {
+        for request in [
+            Request::ProcessConnections {
+                pid: 42,
+                start_ticks: 1234,
+            },
+            Request::ProcessFileIo {
+                pid: 42,
+                start_ticks: 1234,
+            },
+        ] {
+            let encoded = encode_frame(&request, MAX_REQUEST_BYTES).expect("encode");
+            let body = &encoded[4..];
+            let decoded: Request = decode_frame(body).expect("decode");
+            assert_eq!(decoded, request);
+        }
+
+        // An unnamed kernel state keeps its raw byte, so the brokered answer
+        // renders exactly what the direct reader would.
+        let state = WireThreadState::Other(b'P');
+        let encoded = encode_frame(&state, MAX_RESPONSE_BYTES).expect("encode");
+        let decoded: WireThreadState = decode_frame(&encoded[4..]).expect("decode");
+        assert_eq!(decoded, WireThreadState::Other(80));
     }
 
     #[test]
