@@ -11,12 +11,12 @@
 //! Linux-only; nothing here may touch a socket, `/proc`, or any platform API.
 
 use crate::actions::{
-    ConnectionProtocol, ProcessConnection, ProcessModule, ProcessThread, ProcessThreads,
-    ServiceAction, TcpState, ThreadState,
+    ConnectionProtocol, CoreServiceState, ProcessConnection, ProcessModule, ProcessThread,
+    ProcessThreads, ServiceAction, TcpState, ThreadState,
 };
 use crate::linux_core_service::{
-    Refusal, Response, ServiceFailure, ServiceVerb, WireConnection, WireModule, WireThread,
-    WireThreadState, WireThreads,
+    Refusal, Response, ServiceFailure, ServiceStatusInfo, ServiceVerb, WireConnection, WireModule,
+    WireThread, WireThreadState, WireThreads,
 };
 use std::net::{IpAddr, SocketAddr};
 use tm_core::error::TmError;
@@ -144,6 +144,51 @@ pub(crate) fn service_verb(action: ServiceAction) -> ServiceVerb {
         ServiceAction::Start => ServiceVerb::Start,
         ServiceAction::Stop => ServiceVerb::Stop,
         ServiceAction::Restart => ServiceVerb::Restart,
+    }
+}
+
+/// Classify the broker for the Settings surface.
+///
+/// The whole mapping lives here so it is decided once and table-tested:
+///
+/// - a missing manifest means the installer never ran: `NotInstalled`;
+/// - a live Status answer is `Running` with the service's own version;
+/// - no answer at all is `Stopped`, because the manifest proves the install and
+///   starting the unit is the fix;
+/// - a refusal that names this client or this user (`unauthorized-user`,
+///   `missing-client-image`, `client-not-listed`, `unprotected-client`) is
+///   `ForeignClient`: reinstall or reauthorize this binary, do not start a
+///   service that is running fine and will keep refusing;
+/// - a protocol mismatch and every other answer are `Degraded` in the service's
+///   own words.
+///
+/// A missing *socket* is deliberately `Stopped` rather than `NotInstalled`: only
+/// systemd knows whether the unit exists, and "install" would offer the wrong
+/// remedy for a service that is simply not running.
+pub(crate) fn core_service_state(
+    manifest_installed: bool,
+    status: Result<ServiceStatusInfo, ClientError>,
+) -> CoreServiceState {
+    if !manifest_installed {
+        return CoreServiceState::NotInstalled;
+    }
+    match status {
+        Ok(info) => CoreServiceState::Running {
+            version: info.service_version,
+        },
+        Err(ClientError::Unavailable(_)) => CoreServiceState::Stopped,
+        Err(ClientError::Failed(detail)) => CoreServiceState::Degraded(detail),
+        Err(ClientError::Refused { code, detail }) => match code {
+            Refusal::UnauthorizedUser
+            | Refusal::MissingClientImage
+            | Refusal::ClientNotListed
+            | Refusal::UnprotectedClient => CoreServiceState::ForeignClient,
+            Refusal::ProtocolMismatch => CoreServiceState::Degraded("protocol mismatch".into()),
+            // Every other refusal still says why, but an empty detail would
+            // render as a blank state, so the code names itself instead.
+            _ if detail.is_empty() => CoreServiceState::Degraded(code.as_str().to_string()),
+            _ => CoreServiceState::Degraded(detail),
+        },
     }
 }
 
@@ -532,6 +577,92 @@ mod tests {
         assert_eq!(service_verb(ServiceAction::Start), ServiceVerb::Start);
         assert_eq!(service_verb(ServiceAction::Stop), ServiceVerb::Stop);
         assert_eq!(service_verb(ServiceAction::Restart), ServiceVerb::Restart);
+    }
+
+    #[test]
+    fn the_core_service_state_mapping_is_decided_in_one_place() {
+        let ok = || Ok(status_info());
+        let refused = |code: Refusal| {
+            Err(ClientError::Refused {
+                code,
+                detail: "service said why".into(),
+            })
+        };
+        let unavailable = || Err(ClientError::Unavailable("no socket".into()));
+        let cases: Vec<(
+            bool,
+            Result<ServiceStatusInfo, ClientError>,
+            CoreServiceState,
+        )> = vec![
+            // A manifest-less machine is not installed, whatever arrived.
+            (false, ok(), CoreServiceState::NotInstalled),
+            (false, unavailable(), CoreServiceState::NotInstalled),
+            // A live answer is the only running evidence, and it carries the
+            // version the service reports.
+            (
+                true,
+                ok(),
+                CoreServiceState::Running {
+                    version: "0.1.34".into(),
+                },
+            ),
+            // Installed but not answering: starting the unit is the fix.
+            (true, unavailable(), CoreServiceState::Stopped),
+            // A refusal that names this binary or this user is not a start
+            // problem: reinstalling or reauthorizing is.
+            (
+                true,
+                refused(Refusal::UnauthorizedUser),
+                CoreServiceState::ForeignClient,
+            ),
+            (
+                true,
+                refused(Refusal::MissingClientImage),
+                CoreServiceState::ForeignClient,
+            ),
+            (
+                true,
+                refused(Refusal::ClientNotListed),
+                CoreServiceState::ForeignClient,
+            ),
+            (
+                true,
+                refused(Refusal::UnprotectedClient),
+                CoreServiceState::ForeignClient,
+            ),
+            // A version gap is its own condition; an OS failure keeps its words.
+            (
+                true,
+                refused(Refusal::ProtocolMismatch),
+                CoreServiceState::Degraded("protocol mismatch".into()),
+            ),
+            (
+                true,
+                refused(Refusal::Rejected),
+                CoreServiceState::Degraded("service said why".into()),
+            ),
+            (
+                true,
+                Err(ClientError::Failed("EPERM".into())),
+                CoreServiceState::Degraded("EPERM".into()),
+            ),
+            // An empty detail would render as a blank state, so the code speaks.
+            (
+                true,
+                Err(ClientError::Refused {
+                    code: Refusal::Busy,
+                    detail: String::new(),
+                }),
+                CoreServiceState::Degraded("busy".into()),
+            ),
+        ];
+        for (manifest_installed, status, expected) in cases {
+            assert_eq!(
+                core_service_state(manifest_installed, status),
+                expected,
+                "manifest={manifest_installed}"
+            );
+        }
     }
 
     #[test]

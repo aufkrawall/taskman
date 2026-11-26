@@ -28,12 +28,10 @@ use self::core_service::client::{self, ClientError};
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
 use crate::linux_core_bridge::{
-    client_error, connections_from_wire, module_from_wire, response_label, service_verb,
-    threads_from_wire,
+    client_error, connections_from_wire, core_service_state, module_from_wire, response_label,
+    service_verb, threads_from_wire,
 };
-use crate::linux_core_service::{
-    ActionRequest, MANIFEST_PATH, Request, Response, ServiceStatusInfo,
-};
+use crate::linux_core_service::{ActionRequest, MANIFEST_PATH, Request, Response};
 use crate::linux_telemetry;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1124,13 +1122,20 @@ impl PlatformActions for LinuxActions {
     }
 
     fn core_service_state(&self) -> CoreServiceState {
-        // Both inputs are cheap: the manifest is one `stat`, and the status
-        // answer is cached for ten seconds with a deadline-bounded probe. The
-        // probe itself only runs on an installed machine, and the caller polls
-        // this off the render path, as the Windows surface does.
+        // Both inputs are cheap: the manifest is one `stat`, and `status()` is a
+        // cache read that refreshes on its own thread, so this cannot block the
+        // render path it is called from.
         let installed = manifest_installed();
-        let status = if installed { client::status() } else { None };
-        core_service_state_from(installed, status)
+        // A manifest-less machine has nothing to ask, so the probe is skipped
+        // entirely and the reason travels with the state.
+        let status = if installed {
+            client::status()
+        } else {
+            Err(ClientError::Unavailable(
+                "the core service is not installed".into(),
+            ))
+        };
+        core_service_state(installed, status)
     }
 
     fn open_file_location(&self, path: &str) -> Result<()> {
@@ -1394,28 +1399,6 @@ fn broker_diagnostic_allowed() -> bool {
 /// proof this machine has no core service; the socket alone could be stale.
 fn manifest_installed() -> bool {
     std::fs::metadata(MANIFEST_PATH).is_ok()
-}
-
-/// Classify the broker for the Settings surface.
-///
-/// `Running` needs a live Status answer, `NotInstalled` needs the missing
-/// manifest, and everything else is installed but not serving. `Unsupported` is
-/// never reported: every Linux build carries this client, whether or not the
-/// machine has the service.
-fn core_service_state_from(
-    manifest_installed: bool,
-    status: Option<ServiceStatusInfo>,
-) -> CoreServiceState {
-    match (manifest_installed, status) {
-        (false, _) => CoreServiceState::NotInstalled,
-        (true, Some(info)) => CoreServiceState::Running {
-            version: info.service_version,
-        },
-        // Installed, but nothing answered the status probe: the unit is
-        // stopped, crashed, or its socket is wedged. A restart is the fix, and
-        // that is what this state offers.
-        (true, None) => CoreServiceState::Stopped,
-    }
 }
 
 fn set_priority_direct(
@@ -2032,25 +2015,6 @@ mod tests {
         assert_eq!(process.creation_identity(), Some(ticks));
     }
 
-    fn status_info(version: &str) -> ServiceStatusInfo {
-        ServiceStatusInfo {
-            protocol: crate::linux_core_service::PROTOCOL_VERSION,
-            service_version: version.into(),
-            pid: 900,
-            uid: 0,
-            started_unix_s: 1_700_000_000,
-            uptime_s: 60,
-            socket: crate::linux_core_service::SOCKET_PATH.into(),
-            authorized_uids: vec![1000],
-            sensors_available: false,
-            nvml_available: false,
-            install_verified: true,
-            last_sensor_sample_unix_ms: 0,
-            requests_served: 1,
-            refusals: 0,
-        }
-    }
-
     #[test]
     fn only_a_permission_failure_with_a_known_identity_reaches_the_broker() {
         let denied: Result<()> = Err(tm_core::TmError::platform(
@@ -2096,29 +2060,5 @@ mod tests {
         assert!(unavailable.may_fall_back());
         let message = client_error("process-modules", &unavailable).to_string();
         assert!(message.contains("unavailable"), "{message}");
-    }
-
-    #[test]
-    fn core_service_state_never_reports_something_this_backend_cannot_have() {
-        assert_eq!(
-            core_service_state_from(false, Some(status_info("0.1.34"))),
-            CoreServiceState::NotInstalled,
-            "a manifest-less machine is not installed even if a socket lingers"
-        );
-        assert_eq!(
-            core_service_state_from(true, None),
-            CoreServiceState::Stopped
-        );
-        assert_eq!(
-            core_service_state_from(true, Some(status_info("0.1.34"))),
-            CoreServiceState::Running {
-                version: "0.1.34".into()
-            }
-        );
-        assert_ne!(
-            core_service_state_from(false, None),
-            CoreServiceState::Unsupported,
-            "every Linux build carries this client"
-        );
     }
 }
