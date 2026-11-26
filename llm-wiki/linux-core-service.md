@@ -144,6 +144,17 @@ NVML access lives in `linux/sensors.rs`.
   the Arch package when the packaging tools exist; a missing tool is a skip,
   not a failure. The musl artifact stays headless: it carries the two binaries
   and the README, no desktop entry and no unit.
+- A Windows host without `cross`/`zig` can only produce that headless
+  fallback, so `packaging/linux/build-artifact.sh` builds the GUI-capable
+  glibc tarball natively on any Linux host (desktop, WSL2, CI container) with
+  the same layout, and `build.py` keeps such an archive in `dist/` when it
+  rebuilds only musl. The Arch package is the other GUI-capable path.
+- CI runs the Linux half in two extra jobs (`.github/workflows/ci.yml`): the
+  tests/clippy/scripts/artifact job, and an `archlinux:latest` job that diffs
+  `makepkg --printsrcinfo` against `.SRCINFO` and validates the unit and the
+  desktop entry. The Windows gate can type-check Linux code but cannot execute
+  any of it — a broker that refused every start and two Linux-only test
+  fixtures all passed it.
 
 ## Invariants
 

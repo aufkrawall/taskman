@@ -3148,8 +3148,10 @@ Max realtime timeout      unlimited            unlimited            us        \n
         let directory = TestDirectory::new("installed-client");
         let client = directory.path().join("taskman");
         std::fs::write(&client, b"#!/bin/sh\n").expect("client file");
-        let mut manifest = Manifest::default();
-        manifest.clients = vec![client.to_string_lossy().into_owned()];
+        let manifest = Manifest {
+            clients: vec![client.to_string_lossy().into_owned()],
+            ..Manifest::default()
+        };
         let error = resolve_installed_clients(&manifest).expect_err("a foreign client");
         assert!(error.contains("owned by root"), "{error}");
     }
@@ -3160,19 +3162,23 @@ Max realtime timeout      unlimited            unlimited            us        \n
             return;
         }
         let directory = TestDirectory::new("client-directory");
-        let mut manifest = Manifest::default();
-        manifest.clients = vec![format!("{}/", directory.path().to_string_lossy())];
+        let manifest = Manifest {
+            clients: vec![format!("{}/", directory.path().to_string_lossy())],
+            ..Manifest::default()
+        };
         let error = resolve_installed_clients(&manifest).expect_err("a foreign directory");
         assert!(error.contains("owned by root"), "{error}");
     }
 
     #[test]
     fn a_missing_client_is_skipped_and_an_empty_install_is_refused() {
-        let mut manifest = Manifest::default();
-        manifest.clients = vec![
-            "/nonexistent/taskman-client".into(),
-            "/nonexistent/taskman-helper/".into(),
-        ];
+        let manifest = Manifest {
+            clients: vec![
+                "/nonexistent/taskman-client".into(),
+                "/nonexistent/taskman-helper/".into(),
+            ],
+            ..Manifest::default()
+        };
         let error = resolve_installed_clients(&manifest).expect_err("nothing resolved");
         assert!(error.contains("no manifest client resolved"), "{error}");
     }

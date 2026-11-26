@@ -94,7 +94,7 @@ fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
         return None;
     }
     let mut octets = [0u8; 16];
-    for (index, chunk) in hex.as_bytes().chunks_exact(8).enumerate() {
+    for (index, chunk) in hex.as_bytes().as_chunks::<8>().0.iter().enumerate() {
         let word = std::str::from_utf8(chunk).ok()?;
         octets[index * 4..index * 4 + 4]
             .copy_from_slice(&u32::from_str_radix(word, 16).ok()?.to_le_bytes());

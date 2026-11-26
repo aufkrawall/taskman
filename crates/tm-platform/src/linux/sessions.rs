@@ -67,8 +67,7 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
             cooldown_message(last_failure.as_deref()),
         ));
     }
-    let loginctl =
-        loginctl_path().ok_or_else(|| TmError::Unsupported("user sessions (loginctl path)"))?;
+    let loginctl = loginctl_path().ok_or(TmError::Unsupported("user sessions (loginctl path)"))?;
     let deadline = Instant::now() + LOGINCTL_DEADLINE;
     let output = run_loginctl(
         &loginctl,

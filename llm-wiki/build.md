@@ -67,6 +67,26 @@ is compiled by nothing on this host, and a broken Linux test would only
 surface on a Linux machine. It still skips a target whose std is not
 installed (CI installs them), and it never links.
 
+The glibc Linux artifact needs `cross` or `cargo-zigbuild`+`zig`; without
+either, `build.py` produces only the headless musl fallback. That fallback no
+longer deletes a GUI-capable gnu archive already in `dist/`: the host cannot
+rebuild it, so removing it would downgrade the release directory. On a Linux
+host the same artifact is a plain native build:
+`packaging/linux/build-artifact.sh [--verify]` writes the identical layout
+(binaries, installer, unit, manifest template, desktop entry, icon, AppStream,
+README) and refuses a static target or a statically linked GUI. `makepkg` in
+`packaging/arch` is the other GUI-capable path.
+
+CI has three jobs (`.github/workflows/ci.yml`): the Windows `build.py --check`
+gate, a Linux job (fmt, clippy `-D warnings` for the Linux code, the full test
+suite including the Linux-only modules, `bash -n` + `shellcheck -S warning` on
+the scripts, the python build tests, and `build-artifact.sh --verify`), and an
+`archlinux:latest` job that diffs `makepkg --printsrcinfo` against `.SRCINFO`
+and validates the unit and desktop entry. The Linux jobs exist because the
+Windows gate can type-check that code but can never run it: a packaged service
+that refused to start, and two Linux-only test fixtures, all survived the
+Windows-only gate.
+
 Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
 `--no-package`, `--require-all-targets`, `--check`, `--audit`,
 `--live-tests`.

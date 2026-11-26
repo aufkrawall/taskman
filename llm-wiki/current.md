@@ -49,6 +49,13 @@ once (`cargo check --workspace --all-targets` for the host and for
 - **Linux-only test code needs a compiler in the gate.** `cross_check()` now
   type-checks with `--all-targets`, which is the only thing that compiles
   `cfg(target_os = "linux")` test modules on the Windows host.
+- **The Linux half is executed now, not just type-checked** (2026-11-26, WSL2
+  Arch): three CI jobs (`ci.yml`) cover the Windows gate, Linux
+  tests/clippy/scripts plus the glibc artifact, and `makepkg`'s `.SRCINFO`.
+  `packaging/linux/build-artifact.sh` builds the GUI-capable glibc tarball
+  natively. A real `pacman -U` found a broker that refused every start (a file
+  passed to a directory-chain check) — invisible to the Windows gate by
+  construction.
 
 ## Four-week review round (2026-11-25)
 

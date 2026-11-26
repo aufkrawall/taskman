@@ -549,11 +549,26 @@ def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, 
 
 
 def clean_stale_linux_artifacts(version: str, active_flavor: str) -> None:
-    """Remove opposite-flavor x86_64 Linux archives so stale musl/gnu files do not linger."""
+    """Remove the archive this build replaces — never a better one.
+
+    A gnu build replaces an older musl fallback for the same version. A musl
+    build must NOT delete a GUI-capable gnu archive: this host cannot rebuild
+    it (no `cross`/`zig`), and `packaging/linux/build-artifact.sh` produces it
+    on a Linux host or CI, so deleting it would silently downgrade `dist/` to
+    the headless artifact. It is reported instead.
+    """
+    gnu_base = f"taskman-v{version}-linux-x86_64.tar.gz"
+    musl_base = f"taskman-v{version}-linux-x86_64-musl.tar.gz"
     if active_flavor == "gnu":
-        stale_base = f"taskman-v{version}-linux-x86_64-musl.tar.gz"
+        stale_base = musl_base
     elif active_flavor == "musl":
-        stale_base = f"taskman-v{version}-linux-x86_64.tar.gz"
+        gnu = DIST / gnu_base
+        if gnu.exists():
+            log(
+                "keeping the GUI-capable linux artifact already in dist "
+                f"({gnu.name}); this host cannot rebuild it"
+            )
+        return
     else:
         return
     for name in (stale_base, f"{stale_base}.sha256"):

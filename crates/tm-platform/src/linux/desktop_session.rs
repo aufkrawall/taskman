@@ -229,7 +229,7 @@ fn systemd_system_manager_available() -> bool {
 fn pid1_comm_is_systemd(raw: &[u8]) -> bool {
     std::str::from_utf8(raw)
         .ok()
-        .is_some_and(|comm| comm.trim_end_matches(|c| matches!(c, '\r' | '\n')) == "systemd")
+        .is_some_and(|comm| comm.trim_end_matches(['\r', '\n']) == "systemd")
 }
 
 fn read_bounded_file(path: &str, max_bytes: usize) -> Option<Vec<u8>> {
@@ -347,7 +347,7 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
 
     let Some(uid) = components
         .get(1)
-        .and_then(|component| parse_user_slice(*component))
+        .and_then(|component| parse_user_slice(component))
     else {
         return Some(DesktopEvidence::default());
     };
@@ -356,17 +356,16 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
     };
 
     let (session_id, session_root) =
-        if let Some(session_id) = parse_session_scope(*session_or_manager) {
+        if let Some(session_id) = parse_session_scope(session_or_manager) {
             (Some(session_id), true)
-        } else if let Some(manager_uid) = parse_user_manager(*session_or_manager) {
+        } else {
+            let manager_uid = parse_user_manager(session_or_manager)?;
             if manager_uid != uid {
                 // Mismatched user identities cannot be attributed to one desktop
                 // session. Do not even use the environment as a weaker fallback.
                 return None;
             }
             (None, false)
-        } else {
-            return None;
         };
 
     let user_scope = Some(format!("/{}", components[..=2].join("/")));
@@ -396,11 +395,7 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
             evidence.environment_eligible = false;
         }
         "background.slice" | "session.slice" => {
-            if rest
-                .get(1)
-                .copied()
-                .is_some_and(|unit| valid_user_unit(unit))
-            {
+            if rest.get(1).copied().is_some_and(valid_user_unit) {
                 evidence.role = Some(DesktopRoleEvidence::Background);
             }
             evidence.environment_eligible = false;

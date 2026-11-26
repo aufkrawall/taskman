@@ -24,3 +24,77 @@ jobs:
           python-version: '3.12'
       - name: Full quality gate
         run: python build.py --check
+
+  # The Windows gate can type-check the Linux backend but it cannot RUN any of
+  # it: every `#[cfg(target_os = "linux")]` test is compiled away, and two
+  # Linux-only fixtures sat broken that way. This job is the compiler and the
+  # executor for that half of the product. It also produces the GUI-capable
+  # glibc artifact, which the Windows host cannot link without cross/zig.
+  linux:
+    name: Linux backend (tests, clippy, glibc artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install script-lint tooling
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (Linux code, warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (Linux-only modules included)
+        # --no-fail-fast so one crate's failure still reports the others.
+        run: cargo test --workspace --all-features --no-fail-fast
+      - name: Packaging scripts
+        run: |
+          bash -n packaging/linux/install-linux.sh
+          bash -n packaging/linux/uninstall-linux.sh
+          bash -n packaging/linux/build-artifact.sh
+          bash -n packaging/arch/PKGBUILD
+          # Warning level, not the style/info chatter: a real quoting or
+          # control-flow mistake is a warning, and "-S warning" keeps the gate
+          # about correctness instead of formatting taste.
+          shellcheck -x -S warning packaging/linux/install-linux.sh packaging/linux/uninstall-linux.sh packaging/linux/build-artifact.sh
+      - name: Python build tests
+        run: python tools/tests/test_build_linux.py && python tools/tests/test_build_host.py
+      - name: glibc GUI artifact (build.py cannot make this on Windows)
+        run: packaging/linux/build-artifact.sh --verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskman-linux-glibc
+          path: dist/taskman-v*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # makepkg is the only authority on .SRCINFO's field set and order, and the
+  # Windows host has no makepkg, so this is the one place the Arch package
+  # description is checked against the tool that consumes it.
+  arch-package:
+    name: Arch package description
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Tooling
+        run: pacman -Syu --noconfirm --needed git base-devel shellcheck systemd desktop-file-utils
+      - uses: actions/checkout@v4
+      - name: .SRCINFO matches makepkg
+        working-directory: packaging/arch
+        # Process substitution, so this step needs bash rather than the
+        # container's /bin/sh. makepkg is the authority on the field set.
+        shell: bash
+        run: diff <(makepkg --printsrcinfo) .SRCINFO
+      - name: PKGBUILD and scriptlets
+        run: |
+          bash -n packaging/arch/PKGBUILD
+          shellcheck -s bash -S warning packaging/arch/taskman.install
+      - name: Unit and desktop entry
+        run: |
+          # No `|| true`: a directive typo is exactly what this must catch. The
+          # missing ExecStart binary is a warning, not an error.
+          systemd-analyze verify packaging/linux/taskman-core.service
+          desktop-file-validate packaging/linux/io.github.aufkrawall.Taskman.desktop

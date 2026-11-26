@@ -73,7 +73,9 @@ fn run(opts: Options) -> i32 {
     {
         let _ = opts;
         eprintln!("taskman-setup: the installer is Windows-only");
-        return 1;
+        // The tail expression, not a `return`: on a non-Windows target this
+        // block IS the function, and a needless `return` is a lint error.
+        1
     }
     #[cfg(windows)]
     {

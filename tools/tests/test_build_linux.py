@@ -73,7 +73,7 @@ class LinuxBuildToolingTests(unittest.TestCase):
         )
         self.assertTrue(out_dir.endswith(str(Path("x86_64-unknown-linux-gnu") / "release")))
 
-    def test_clean_stale_linux_artifacts_removes_only_opposite_flavor(self):
+    def test_clean_stale_linux_artifacts_never_deletes_a_gui_capable_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
             gnu = dist / "taskman-v1.2.3-linux-x86_64.tar.gz"
@@ -88,6 +88,7 @@ class LinuxBuildToolingTests(unittest.TestCase):
                 patch.object(build, "DIST", dist),
                 patch.object(build, "log", lambda _msg: None),
             ):
+                # A gnu build replaces the headless fallback it supersedes.
                 build.clean_stale_linux_artifacts("1.2.3", "gnu")
                 self.assertTrue(gnu.exists())
                 self.assertTrue(gnu_sha.exists())
@@ -96,9 +97,11 @@ class LinuxBuildToolingTests(unittest.TestCase):
 
                 musl.write_bytes(b"test")
                 musl_sha.write_bytes(b"test")
+                # A musl build cannot rebuild the gnu archive, so it keeps it:
+                # deleting it would downgrade dist to the headless artifact.
                 build.clean_stale_linux_artifacts("1.2.3", "musl")
-                self.assertFalse(gnu.exists())
-                self.assertFalse(gnu_sha.exists())
+                self.assertTrue(gnu.exists())
+                self.assertTrue(gnu_sha.exists())
                 self.assertTrue(musl.exists())
                 self.assertTrue(musl_sha.exists())
 

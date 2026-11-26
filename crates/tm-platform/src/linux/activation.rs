@@ -16,7 +16,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -109,10 +109,7 @@ impl ActivationInbox {
 
     /// Take the next request for the UI thread to apply.
     pub fn try_recv(&self) -> Option<ActivationRequest> {
-        match tm_core::sync::lock(&self.shared.receiver).try_recv() {
-            Ok(request) => Some(request),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        tm_core::sync::lock(&self.shared.receiver).try_recv().ok()
     }
 
     fn wake(&self) {

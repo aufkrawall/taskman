@@ -28,19 +28,38 @@ be a committed artifact nobody rebuilds.
 
 Every Linux artifact ships `bin/taskman-service`, and `build.py` refuses to
 package one without it: an installer that stages a missing broker would leave a
-GUI talking to nothing. Until the elevated-service work lands, that binary is the
-base `tm-service` stub, which prints "taskman-service is only supported on
-Windows" and exits **0**. A zero exit is a success as far as systemd is
-concerned, so `Restart=on-failure` does not fire and the unit stays quietly dead
-instead of crash-looping. Install the service only from a build whose
-`taskman-service --run` actually serves the socket (check
-`systemctl is-active taskman-core.service`, which the installer prints).
+GUI talking to nothing. The shipped binary is the real service — it serves the
+socket the unit starts it for — and the packaging test (build, `pacman -U`,
+`systemctl is-active`, `taskman-service --selfcheck`) is what proves it.
 
 The static musl fallback artifact is different on purpose: it has no `dlopen`, so
 winit cannot load Wayland/X11 and the GUI cannot start on a glibc desktop. It
 therefore carries only `bin/taskman`, `bin/taskman-service` and this README — no
 installer, unit, desktop entry or icon — because an install surface for a GUI
-that cannot run would be a promise the artifact does not keep.
+that cannot run would be a promise the artifact does not keep. `build.py` keeps
+an existing GUI-capable archive in `dist/` when it rebuilds only that fallback:
+a host without a linker for glibc cannot produce the better artifact, so it must
+not delete it.
+
+## Building a GUI-capable artifact on Linux
+
+`build.py` cross-builds from Windows and needs `cross` or `cargo-zigbuild` plus
+`zig` to link a glibc binary; without them it can only produce the musl
+fallback. On a glibc Linux host (a desktop, a WSL2 distro, a CI container) the
+same artifact is a plain native build, and
+[`build-artifact.sh`](build-artifact.sh) produces exactly the layout `build.py`
+does:
+
+```sh
+packaging/linux/build-artifact.sh --verify   # writes dist/taskman-v<version>-linux-x86_64.tar.gz
+```
+
+It refuses to run on a static (musl) target, refuses to package a statically
+linked GUI, writes the archive deterministically (sorted names, owner 0/0), and
+with `--verify` runs the freshly built GUI's headless `--selfcheck --mock`
+first. The Arch package below is the other GUI-capable path, and the two are
+interchangeable: both end in the same `install-linux.sh` layout.
+
 
 ## Installing from the release tarball
 
