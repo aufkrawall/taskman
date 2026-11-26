@@ -8,6 +8,7 @@ mod cpu_stat;
 mod desktop_session;
 mod diskstats;
 mod drm;
+mod hwmon;
 mod launch;
 mod net_meta;
 mod nvml;
