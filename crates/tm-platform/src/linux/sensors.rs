@@ -19,10 +19,12 @@
 //! per window there and nothing on the sampling path, so a sample can never
 //! wait on a socket.
 
-use super::core_service::client;
+use super::core_service::client::{self, ClientError};
 use super::{hwmon, nvml};
-use crate::linux_core_service::{Request, Response};
-use crate::linux_sensors::{BrokerGate, GpuSensors, SensorSnapshot, normalize_pci_slot};
+use crate::linux_core_service::{Request, Response, ServiceStatusInfo};
+use crate::linux_sensors::{
+    BrokerAttempt, BrokerGate, BrokerLiveness, GpuSensors, SensorSnapshot, normalize_pci_slot,
+};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -151,7 +153,7 @@ fn start_broker_worker() {
         .is_err()
     {
         let mut readings = tm_core::sync::lock(broker_readings());
-        readings.gate = BrokerGate::after_failure(false);
+        readings.gate = BrokerGate::Disabled;
         tracing::warn!("could not start the GPU sensor broker worker; keeping direct GPU readings");
     }
 }
@@ -160,49 +162,82 @@ fn start_broker_worker() {
 ///
 /// The sleep at the end of each round is the broker's polling window, not a
 /// race workaround: the client bounds the request itself, so a wedged broker
-/// costs this thread one deadline and nothing else. A refusal stops the asking
-/// (see [`BrokerGate`]) until a restarted broker answers a liveness probe, so a
-/// policy decision is never retried once per window.
+/// costs this thread one deadline and nothing else. The decision for each window
+/// — one observation, one optional request, one folded outcome — is
+/// [`BrokerGate::step`], so it is testable where the tests run.
 ///
 /// The lock is never held across the request, so a sampling tick only ever
 /// waits for a clone of the stored answer.
 fn broker_worker() {
+    // What the previous window's request produced, folded into this window's
+    // decision together with a fresh observation.
+    let mut attempt: Option<BrokerAttempt> = None;
     loop {
         let ask = {
+            // The gate's liveness input is observed here, by the owner of the
+            // gate: `client::status()` is a cache read that starts the client's
+            // single background probe, so a broker nobody probes is never
+            // mistaken for one that is gone, and a refusal sees the service
+            // leave and return instead of following a cache somebody else fills.
+            let liveness = liveness_of(&client::status());
             let mut readings = tm_core::sync::lock(broker_readings());
-            readings.gate = readings.gate.observe(client::available());
-            readings.gate.may_ask()
+            let (gate, ask) = readings.gate.step(liveness, attempt);
+            readings.gate = gate;
+            ask
         };
-        if ask {
-            let outcome = client::request(&Request::Sensors);
-            let mut readings = tm_core::sync::lock(broker_readings());
-            match outcome {
-                Ok(Response::Sensors(snapshot)) => {
-                    readings.gpus = snapshot.gpus;
-                    readings.gate = BrokerGate::Ask;
-                    readings.reported = false;
-                }
-                Ok(_) => {
-                    // An answer this poll cannot use is not a transport
-                    // failure, so asking stops until the broker is reachable
-                    // again rather than repeating a broken exchange.
-                    readings.gate = BrokerGate::after_failure(false);
-                    tracing::debug!("the core service answered a sensor poll with another payload");
-                }
-                Err(error) => {
-                    let next = BrokerGate::after_failure(error.may_fall_back());
-                    // One line per outage or decision change: a broker that
-                    // stays away must not fill the log at window rate, while a
-                    // refusal is news.
-                    if !readings.reported || next != readings.gate {
-                        readings.reported = true;
-                        tracing::debug!(?error, "the core service supplied no GPU sensors");
-                    }
-                    readings.gate = next;
-                }
+        attempt = ask.then(ask_broker);
+        std::thread::sleep(BROKER_TTL);
+    }
+}
+
+/// Ask the broker once, keep what it answered, and report what the attempt was.
+fn ask_broker() -> BrokerAttempt {
+    let outcome = client::request(&Request::Sensors);
+    let attempt = attempt_of(&outcome);
+    let mut readings = tm_core::sync::lock(broker_readings());
+    match outcome {
+        Ok(Response::Sensors(snapshot)) => {
+            readings.gpus = snapshot.gpus;
+            readings.reported = false;
+        }
+        Ok(_) => {
+            readings.reported = true;
+            tracing::debug!("the core service answered a sensor poll with another payload");
+        }
+        Err(error) => {
+            // One line per outage or decision change: a broker that stays away
+            // must not fill the log at window rate, while a refusal is news.
+            if !readings.reported || attempt == BrokerAttempt::Refused {
+                readings.reported = true;
+                tracing::debug!(?error, "the core service supplied no GPU sensors");
             }
         }
-        std::thread::sleep(BROKER_TTL);
+    }
+    attempt
+}
+
+/// What one request to the broker produced, as the gate understands it.
+///
+/// Only a request that did not reach a broker is transient; a refusal or an
+/// unusable answer came from the broker and is final.
+fn attempt_of(outcome: &Result<Response, ClientError>) -> BrokerAttempt {
+    match outcome {
+        Ok(Response::Sensors(_)) => BrokerAttempt::Answered,
+        Ok(_) => BrokerAttempt::Refused,
+        Err(error) if error.may_fall_back() => BrokerAttempt::Unreachable,
+        Err(_) => BrokerAttempt::Refused,
+    }
+}
+
+/// Whether the status answer proves a broker is there.
+///
+/// An answered probe proves it whatever it said, including a refusal; only a
+/// probe that reached nobody means the service is gone.
+fn liveness_of(status: &Result<ServiceStatusInfo, ClientError>) -> BrokerLiveness {
+    match status {
+        Ok(_) => BrokerLiveness::Reachable,
+        Err(error) if error.may_fall_back() => BrokerLiveness::Unreachable,
+        Err(_) => BrokerLiveness::Reachable,
     }
 }
 
