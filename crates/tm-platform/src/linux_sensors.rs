@@ -484,7 +484,8 @@ mod tests {
     #[test]
     fn pci_info_prefers_the_modern_bus_id() {
         let mut info = NvmlPciInfo::default();
-        info.bus_id_legacy[..16].copy_from_slice(b"0000:02:00.0\0\0\0");
+        // A 16-byte NUL-padded buffer: the literal is 12 bytes plus 4 NULs.
+        info.bus_id_legacy[..16].copy_from_slice(b"0000:02:00.0\0\0\0\0");
         info.bus_id[..16].copy_from_slice(b"00000000:01:00.0");
         assert_eq!(info.slot().as_deref(), Some("0000:01:00.0"));
     }
