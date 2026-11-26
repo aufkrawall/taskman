@@ -930,12 +930,11 @@ impl PlatformActions for LinuxActions {
         sessions::list_sessions()
     }
     fn set_start_with_system(&self, enabled: bool, start_minimized: bool) -> Result<()> {
-        if enabled && start_minimized {
-            tracing::debug!(
-                "Linux XDG autostart has no supported hidden-start mode; starting visibly"
-            );
-        }
-        autostart::set_enabled(enabled)
+        // `start_minimized` becomes `--minimized-to-tray` in the entry's Exec.
+        // That is safe where the icon cannot exist: the GUI hides itself only
+        // once an icon really is registered and shows the window otherwise, so a
+        // session that cannot hide behind a tray still starts visibly.
+        autostart::set_enabled_for_start(enabled, start_minimized)
     }
 
     fn kill_single(&self, pid: u32) -> Result<()> {
