@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-11-25 (Linux sampling cost, positive-only caches, and the absence of a Linux test runner)
+Last verified: 2026-11-26 (Linux bare-metal audit: per-process telemetry limits, Wayland tray, SVG icons)
 
 Primary sources:
 - `AGENTS.md`
@@ -506,11 +506,10 @@ remain follow-up rather than being simulated in headless tests:
   opens normally, but later launches continue probing the old owner until its
   own handoff deadline expires. The lock is deliberately not force-reclaimed;
   the remedy is to terminate the wedged owner or let it exit.
-- **Linux autostart starts visibly.** This backend has no tray implementation
-  or supported hidden-start mode, so Settings passes `start_minimized=false`
-  and the desktop entry omits `--minimized-to-tray`. Adding a tray needs
-  desktop-shell/system-package assumptions that are intentionally out of
-  scope.
+- **Linux autostart starts visibly: RESOLVED (2026-11-26).** The entry
+  carries `--minimized-to-tray`, and Wayland can now hide the window (winit
+  fork §5), so the start goes to the tray on X11 and Wayland once the icon is
+  registered. Without an icon (GNOME without AppIndicator) it still shows.
 - **The autostart entry pins the current executable path.** Moving an
   unpacked binary after enabling startup leaves the old `Exec` until the user
   toggles the setting again. Startup does not silently rewrite the entry,
@@ -616,6 +615,38 @@ remain follow-up rather than being simulated in headless tests:
   crate is consumed externally, introduce a builder/accessor contract or a
   deliberate compatibility major bump.
 
+### 2026-11-26 Linux bare-metal audit residuals
+
+- **Per-process network is TCP only.** `sock_diag` exposes lifetime byte
+  counters per TCP socket (`tcpi_bytes_acked`/`tcpi_bytes_received`); UDP
+  sockets — QUIC/HTTP-3 included — carry none, so that traffic is not
+  attributed. Sockets are joined to processes through `/proc/<pid>/fd`, which
+  an unprivileged GUI can read only for its own user's processes: other users'
+  rows stay "—". A socket that opens and closes between two dumps is missed. A
+  full answer needs eBPF in the root service.
+- **Per-process disk active time is an attribution, not a measurement.**
+  Linux keeps no per-process disk service time. The drive's measured busy time
+  is shared out by each readable process' block-layer bytes over
+  max(readable processes' bytes, bytes the drives moved), assuming a process'
+  I/O spreads over busy drives like the machine's (procfs does not say which
+  drive). Exact with one busy drive up to the byte/time relation; writes are
+  attributed when dirtied, not when written back. Delay accounting
+  (`kernel.task_delayacct`) is off by default and was not used.
+- **NVIDIA has no shared GPU memory source on Linux.** The proprietary driver
+  publishes no GTT/system-memory figure, so the GPU page hides the shared
+  chart and stat there (amdgpu/Intel show GTT). Per-process GPU on NVIDIA
+  comes from NVML's sampled SM/encoder/decoder utilization and framebuffer
+  memory; NVML enumerates GPU users system-wide, so every process is covered
+  (non-users read a measured 0 %).
+- **CPU renderer cost on Wayland is a full repaint per frame** (~3.4 ms at
+  1600×1000). The busy-wait that made scrolling cost a full core is fixed
+  (eframe fork §18); restoring partial repaints still needs per-buffer-slot
+  damage history (see the 2026-11-24 entry below).
+- **A second launch on Wayland while the window is visible opens a new
+  window.** Restoring from the tray is acknowledged (remap), but raising a
+  visible window needs the launcher's xdg-activation token forwarded over the
+  activation socket and applied by winit, which is not implemented.
+
 ### 2026-11-24 Linux CPU-renderer, per-process CPU, and icon residuals
 
 - **A Wayland frame is always painted in full.** The tile tracker may only
@@ -640,14 +671,14 @@ remain follow-up rather than being simulated in headless tests:
   reports `None` — one dash for one window — rather than a fabricated 0 %;
   Windows credits newborn processes their in-window time, which is the honest
   difference between the two accountants, not a bug to be evened out.
-- **Icons: PNG only, and a miss costs a chain walk.** The resolver has no SVG
-  rasterizer (an offline build cannot link one), so an app whose theme icon
-  exists only as SVG falls back to the generic `application-x-executable` glyph.
-  A footprint miss walks the whole transitive theme chain and every size
-  directory in it before giving up — roughly 3.4k `stat` calls per distinct
-  missing image, deduped by the icon cache's 30 s failure retry TTL and, on
-  Processes/Details, behind the per-frame icon memo, so neither a repaint nor a
-  scroll frame repeats it. A footprint hit is cheap.
+- **Icons: SVG supported since 2026-11-26; a miss still costs a chain walk.**
+  PNG, SVG and SVGZ are decoded (`resvg`, no text/fonts/raster images —
+  Breeze ships everything as SVG). XPM is not. A footprint miss walks the whole
+  transitive theme chain and every size directory in it before giving up,
+  deduped by the icon cache's 30 s failure retry TTL and, on Processes/Details,
+  behind the per-frame icon memo, so neither a repaint nor a scroll frame
+  repeats it. Symbolic SVGs that rely on a host stylesheet render with their
+  own fallback colours.
 - **Icon theme resolution is a process-lifetime snapshot.** The theme chain and
   the desktop-file index are resolved once per process (the texture half of the
   same rule is § 2026-11-22 above), so switching the desktop icon theme keeps the
@@ -682,6 +713,13 @@ remain follow-up rather than being simulated in headless tests:
   a new `RenderState`, as kittest does.
 
 ## Platform test coverage: the Linux backend is never executed (2026-11-25)
+
+**Update 2026-11-26:** the gate now also runs on a native Arch Linux host
+(bare-metal audit), where `cargo test --workspace` executes the Linux-only
+tests; two of them had never run and failed there (a fork-inheritance flake in
+`activation::stale_socket_is_removed_only_after_refused_connect`, a Windows-path
+assumption in `app_history`), both fixed. CI is still Windows-only, so the
+paragraphs below remain true for CI.
 
 - The gate type-checks Linux (`cargo check --workspace --target
   x86_64-unknown-linux-gnu`, plus `-p tm-platform --all-targets` when a change

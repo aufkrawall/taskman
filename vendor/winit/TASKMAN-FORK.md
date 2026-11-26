@@ -2,7 +2,7 @@
 
 This directory is a vendored copy of [`winit`](https://github.com/rust-windowing/winit)
 **0.30.13** (crates.io), reached only through `[patch.crates-io]` in the root
-`Cargo.toml`. It carries four patches.
+`Cargo.toml`. It carries five patches.
 
 ## 1. Window band for always-on-top
 
@@ -143,11 +143,47 @@ not strictly "minimized". A compositor that does not advertise xdg-shell v6's
 suspended state keeps the `None` answer: reporting `Some(false)` there would
 fabricate a measurement, and every hidden window would claim to be visible.
 
+## 5. Wayland windows can be hidden and shown
+
+Upstream's Wayland `Window::set_visible` is a no-op ("not possible on
+Wayland"), which made close-to-tray and start-minimized impossible on every
+Wayland desktop. xdg-shell defines a client unmap: committing a null buffer
+unmaps the toplevel, and committing again without a buffer is the initial
+commit that maps it anew; the compositor answers with a fresh configure.
+
+### Files touched
+
+- `src/platform_impl/linux/wayland/window/state.rs`
+  - `hidden`, `presented`, `needs_initial_commit` and
+    `awaiting_remap_configure` on `WindowState`. `presented` is set by
+    `request_frame_callback()` — i.e. by `pre_present_notify()`, which both
+    eframe renderers call right before every present — so a window that never
+    received a buffer is not "unmapped" (there is nothing to unmap).
+  - `set_hidden()` resets the frame-callback throttle (an unmapped surface
+    gets no frame callbacks; a stale `Requested` would block the first redraw
+    after remapping forever) and returns a `VisibilityChange` from the pure
+    `visibility_change()` rule, which has a unit test.
+  - `is_hidden()` is also true between a remap's initial commit and its
+    configure (cleared in `configure()`): attaching a buffer before that
+    configure is a protocol error that kills the connection.
+- `src/platform_impl/linux/wayland/window/mod.rs`
+  - `set_visible()` issues the request the rule asks for: `attach(None)` +
+    `commit` to unmap, a bare `commit` to remap (winit already queues a redraw
+    for every configure), or a plain redraw for a window that was never
+    unmapped.
+  - `is_visible()` reports `Some(false)` while `is_hidden()`, otherwise `None`
+    as upstream.
+
+The client side of the contract lives in eframe (`vendor/egui/TASKMAN-FORK.md`):
+painters must not present while `is_visible() == Some(false)` — including the
+CPU renderer's first-frame exception — or the present maps the surface (or
+violates the protocol while a remap configure is pending).
+
 ## Rebase procedure
 
 1. Copy the new upstream crate over this directory (keep the deleted
    `Cargo.lock` deleted).
-2. Re-apply the four changes above; the marker comments start with
+2. Re-apply the five changes above; the marker comments start with
    `TaskMan fork:` (`grep -n "TaskMan fork:" vendor/winit/src` lists them).
 3. `pwsh tools/check-fork.ps1` (clippy + tests for this fork; `cargo fmt` is
    deliberately skipped because upstream's tree is not formatted with this

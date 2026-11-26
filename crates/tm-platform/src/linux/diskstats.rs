@@ -6,10 +6,11 @@ use std::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct DiskStat {
     pub device: String,
-    #[allow(dead_code)] // informational; kept for future columns
     pub reads_completed: u64,
-    #[allow(dead_code)]
     pub writes_completed: u64,
+    /// Milliseconds spent on completed reads / writes since boot.
+    pub read_ms: u64,
+    pub write_ms: u64,
     pub read_sectors: u64,
     pub write_sectors: u64,
     /// Milliseconds spent doing I/O since boot.
@@ -23,6 +24,8 @@ pub struct Prev {
     io_ticks_ms: u64,
     read_sectors: u64,
     write_sectors: u64,
+    ios: u64,
+    io_ms: u64,
 }
 
 /// Rates need two samples: on first sight of a device there is no previous
@@ -40,6 +43,24 @@ impl DiskStat {
             (self.read_sectors.saturating_sub(prev.read_sectors)) as f64 * 512.0
                 / interval_s.max(0.001),
         )
+    }
+
+    /// Average milliseconds per completed I/O in the window (iostat's
+    /// `await`); `None` on a first sample or a window without a completed I/O.
+    pub fn avg_resp_ms(&self) -> Option<f64> {
+        let prev = self.prev?;
+        crate::linux_disks::average_response_ms(
+            self.io_ms().saturating_sub(prev.io_ms),
+            self.ios().saturating_sub(prev.ios),
+        )
+    }
+
+    fn ios(&self) -> u64 {
+        self.reads_completed.saturating_add(self.writes_completed)
+    }
+
+    fn io_ms(&self) -> u64 {
+        self.read_ms.saturating_add(self.write_ms)
     }
 
     pub fn write_bps(&self, interval_s: f64) -> Option<f64> {
@@ -90,6 +111,8 @@ pub fn read() -> Vec<DiskStat> {
                     io_ticks_ms: s.io_ticks_ms,
                     read_sectors: s.read_sectors,
                     write_sectors: s.write_sectors,
+                    ios: s.ios(),
+                    io_ms: s.io_ms(),
                 },
             )
         })
@@ -108,6 +131,8 @@ fn carried_prev(current: &DiskStat, previous: Option<Prev>) -> Option<Prev> {
         current.io_ticks_ms >= prev.io_ticks_ms
             && current.read_sectors >= prev.read_sectors
             && current.write_sectors >= prev.write_sectors
+            && current.ios() >= prev.ios
+            && current.io_ms() >= prev.io_ms
     })
 }
 
@@ -138,6 +163,8 @@ fn parse_diskstats(text: &str) -> Vec<DiskStat> {
                 device: device.to_string(),
                 reads_completed: num(3)?,
                 writes_completed: num(7)?,
+                read_ms: num(6)?,
+                write_ms: num(10)?,
                 read_sectors: num(5)?,
                 write_sectors: num(9)?,
                 io_ticks_ms: num(12)?,
@@ -157,6 +184,8 @@ mod tests {
             device: "nvme0n1".into(),
             reads_completed: 10,
             writes_completed: 20,
+            read_ms: 30,
+            write_ms: 50,
             read_sectors: 100,
             write_sectors: 200,
             io_ticks_ms: 50,
@@ -171,10 +200,14 @@ mod tests {
             io_ticks_ms: 40,
             read_sectors: 60,
             write_sectors: 120,
+            ios: 26,
+            io_ms: 64,
         });
         assert_eq!(s.active_pct(1.0), Some(1.0)); // 10ms of IO in 1s
         assert_eq!(s.read_bps(1.0), Some((100 - 60) as f64 * 512.0));
         assert_eq!(s.write_bps(1.0), Some((200 - 120) as f64 * 512.0));
+        // 16 ms over 4 completed I/Os.
+        assert_eq!(s.avg_resp_ms(), Some(4.0));
     }
 
     /// A row with a counter this build cannot read is not a zero counter: it is
@@ -209,6 +242,8 @@ mod tests {
             device: "dm-0".into(),
             reads_completed: 0,
             writes_completed: 0,
+            read_ms: 0,
+            write_ms: 0,
             read_sectors: 5,
             write_sectors: 0,
             io_ticks_ms: 3,
@@ -218,6 +253,8 @@ mod tests {
             io_ticks_ms: 900,
             read_sectors: 4_000,
             write_sectors: 2_000,
+            ios: 0,
+            io_ms: 0,
         });
         assert!(carried_prev(&current, restarted).is_none());
 
@@ -232,6 +269,8 @@ mod tests {
             io_ticks_ms: 1,
             read_sectors: 1,
             write_sectors: 0,
+            ios: 0,
+            io_ms: 0,
         });
         assert!(carried_prev(&current, monotonic).is_some());
     }

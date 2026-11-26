@@ -1,6 +1,6 @@
 //! See [`ScrollArea`] for docs.
 
-#![expect(clippy::needless_range_loop)]
+#![allow(clippy::needless_range_loop)] // TaskMan fork: no longer fires on every toolchain, so `expect` broke the lint gate
 
 use std::ops::{Add, AddAssign, BitOr, BitOrAssign};
 

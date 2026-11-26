@@ -119,7 +119,9 @@ impl ColorImage {
             rgba.len()
         );
         let pixels = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
             .collect();
         Self::new(size, pixels)
@@ -134,7 +136,9 @@ impl ColorImage {
             rgba.len()
         );
         let pixels = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
             .collect();
         Self::new(size, pixels)
@@ -199,7 +203,9 @@ impl ColorImage {
             rgb.len()
         );
         let pixels = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|p| Color32::from_rgb(p[0], p[1], p[2]))
             .collect();
         Self::new(size, pixels)

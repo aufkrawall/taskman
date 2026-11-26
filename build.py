@@ -1105,9 +1105,54 @@ def check_fork() -> bool:
                 "the vendored fork gate cannot run"
             )
             return False
-        log("no pwsh/powershell found - skipping fork gate (CI must provide one)")
-        return True
+        # A Linux/macOS host normally has no PowerShell at all. Skipping there
+        # left both vendored forks — the CPU renderer, the event loop, the
+        # Wayland window code — outside every local gate on exactly the hosts
+        # whose code paths they carry, so run the same steps from Python.
+        log("no pwsh/powershell found - running the fork gate steps directly")
+        return all(run(cmd, cwd=cwd) for cwd, cmd in fork_gate_commands())
     return run([shell, "-NoProfile", "-File", str(script)])
+
+
+# The crates taskman ships from the egui fork; must match `$packages` in
+# tools/check-fork.ps1 (a build test pins that).
+FORK_PACKAGES = (
+    "emath",
+    "ecolor",
+    "epaint",
+    "epaint_default_fonts",
+    "egui",
+    "egui-winit",
+    "egui_glow",
+    "egui-wgpu",
+    "eframe",
+    "egui_software",
+)
+# eframe's feature set for the software renderer, as in tools/check-fork.ps1.
+FORK_EFRAME_SOFTWARE = "accesskit,default_fonts,software,wayland,x11"
+
+
+def fork_gate_commands() -> list[tuple[Path, list[str]]]:
+    """The steps of tools/check-fork.ps1 (check mode), for hosts without PowerShell."""
+    egui = ROOT / "vendor" / "egui"
+    winit = ROOT / "vendor" / "winit"
+    c = cargo()
+    pkgs = [arg for name in FORK_PACKAGES for arg in ("-p", name)]
+    software = ["-p", "eframe", "--no-default-features", "--features", FORK_EFRAME_SOFTWARE]
+    steps: list[tuple[Path, list[str]]] = [
+        (egui, [c, "fmt", *pkgs, "--", "--check"]),
+        (egui, [c, "clippy", *pkgs, "--all-targets"]),
+        (egui, [c, "clippy", "-p", "egui_software", "--all-targets", "--", "-D", "warnings"]),
+        (egui, [c, "clippy", *software, "--all-targets"]),
+        (egui, [c, "test", *pkgs]),
+        (egui, [c, "test", *software]),
+    ]
+    if (winit / "Cargo.toml").exists():
+        steps += [
+            (winit, [c, "clippy", "--all-targets", "--", "-D", "warnings"]),
+            (winit, [c, "test"]),
+        ]
+    return steps
 
 
 def is_elevated() -> bool:

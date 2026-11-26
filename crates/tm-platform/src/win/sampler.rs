@@ -1261,6 +1261,8 @@ impl Sampler {
                 avg_resp_ms: perf.avg_resp_ms,
                 total_read_bytes: 0,
                 total_written_bytes: 0,
+                model: String::new(),
+                volumes: Vec::new(),
             });
         }
         for (i, (mount, media, total_bytes, free_bytes)) in volumes.into_iter().enumerate() {
@@ -1285,6 +1287,8 @@ impl Sampler {
                 avg_resp_ms: 0.0,
                 total_read_bytes: 0,
                 total_written_bytes: 0,
+                model: String::new(),
+                volumes: Vec::new(),
             });
         }
         disks

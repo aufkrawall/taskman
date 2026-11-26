@@ -70,6 +70,57 @@ type ClockInfo = unsafe extern "C" fn(*mut c_void, c_uint, *mut c_uint) -> c_int
 type Quantity = unsafe extern "C" fn(*mut c_void, *mut c_uint) -> c_int;
 /// `nvmlDeviceGetCurrentClocksThrottleReasons`.
 type ThrottleReasons = unsafe extern "C" fn(*mut c_void, *mut c_ulonglong) -> c_int;
+/// `nvmlDeviceGetGraphicsRunningProcesses_v3` / `…ComputeRunningProcesses_v3`.
+type RunningProcesses =
+    unsafe extern "C" fn(*mut c_void, *mut c_uint, *mut NvmlProcessInfo) -> c_int;
+/// `nvmlDeviceGetProcessUtilization`.
+type ProcessUtilization = unsafe extern "C" fn(
+    *mut c_void,
+    *mut NvmlProcessUtilizationSample,
+    *mut c_uint,
+    c_ulonglong,
+) -> c_int;
+/// `nvmlDeviceGetEncoderUtilization` / `…DecoderUtilization` (value, period).
+type CodecUtilization = unsafe extern "C" fn(*mut c_void, *mut c_uint, *mut c_uint) -> c_int;
+
+/// `nvmlProcessInfo_t` (= `nvmlProcessInfo_v2_t`, the `_v3` query's element):
+/// `unsigned int pid; unsigned long long usedGpuMemory; unsigned int
+/// gpuInstanceId; unsigned int computeInstanceId;` — 24 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct NvmlProcessInfo {
+    pid: c_uint,
+    used_gpu_memory: c_ulonglong,
+    gpu_instance_id: c_uint,
+    compute_instance_id: c_uint,
+}
+
+/// `nvmlProcessUtilizationSample_t`: pid, CPU timestamp (µs), then SM,
+/// frame-buffer, encoder and decoder utilization in percent — 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct NvmlProcessUtilizationSample {
+    pid: c_uint,
+    time_stamp: c_ulonglong,
+    sm_util: c_uint,
+    mem_util: c_uint,
+    enc_util: c_uint,
+    dec_util: c_uint,
+}
+
+// The element strides the driver writes; a mismatch would misread every entry
+// after the first, so it is pinned at compile time.
+const _: () = assert!(std::mem::size_of::<NvmlProcessInfo>() == 24);
+const _: () = assert!(std::mem::size_of::<NvmlProcessUtilizationSample>() == 32);
+
+/// `NVML_ERROR_INSUFFICIENT_SIZE` / `NVML_ERROR_NOT_FOUND`.
+const NVML_ERROR_INSUFFICIENT_SIZE: c_int = 7;
+const NVML_ERROR_NOT_FOUND: c_int = 6;
+/// `usedGpuMemory` when the driver cannot attribute memory (WDDM, some vGPU).
+const NVML_VALUE_NOT_AVAILABLE: c_ulonglong = c_ulonglong::MAX;
+/// More processes than this on one GPU is not a desktop; the bound keeps a
+/// misbehaving driver from making the buffer unbounded.
+const MAX_PROCESSES: c_uint = 4096;
 
 /// Every entry point this module queries.
 ///
@@ -91,6 +142,11 @@ struct Library {
     pcie_link_generation: Option<Quantity>,
     pcie_link_width: Option<Quantity>,
     throttle_reasons: Option<ThrottleReasons>,
+    graphics_processes: Option<RunningProcesses>,
+    compute_processes: Option<RunningProcesses>,
+    process_utilization: Option<ProcessUtilization>,
+    encoder_utilization: Option<CodecUtilization>,
+    decoder_utilization: Option<CodecUtilization>,
 }
 
 /// One window's NVML answer for every adapter.
@@ -242,6 +298,11 @@ unsafe fn bind(handle: *mut c_void) -> Option<(Init, Library)> {
             pcie_link_generation: resolve(handle, "nvmlDeviceGetCurrPcieLinkGeneration"),
             pcie_link_width: resolve(handle, "nvmlDeviceGetCurrPcieLinkWidth"),
             throttle_reasons: resolve(handle, "nvmlDeviceGetCurrentClocksThrottleReasons"),
+            graphics_processes: resolve(handle, "nvmlDeviceGetGraphicsRunningProcesses_v3"),
+            compute_processes: resolve(handle, "nvmlDeviceGetComputeRunningProcesses_v3"),
+            process_utilization: resolve(handle, "nvmlDeviceGetProcessUtilization"),
+            encoder_utilization: resolve(handle, "nvmlDeviceGetEncoderUtilization"),
+            decoder_utilization: resolve(handle, "nvmlDeviceGetDecoderUtilization"),
         };
         Some((init, library))
     }
@@ -458,4 +519,182 @@ fn load_denied() -> bool {
 fn control_device_denied() -> bool {
     std::fs::File::open(CONTROL_DEVICE)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+/// One process's use of one NVIDIA adapter in the last window.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ProcessUsage {
+    /// Normalized PCI slot of the adapter (the DRM join key).
+    pub pci_slot: String,
+    pub pid: u32,
+    /// SM (3D/compute), encoder and decoder utilization in percent; `None`
+    /// where the driver reported no sample for that engine.
+    pub sm_pct: Option<f32>,
+    pub enc_pct: Option<f32>,
+    pub dec_pct: Option<f32>,
+    /// Framebuffer (VRAM) bytes the driver attributes to the process.
+    pub vram_bytes: Option<u64>,
+}
+
+/// Adapter-wide codec engine load, for the GPU page's engine graphs.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AdapterEngines {
+    pub pci_slot: String,
+    pub enc_pct: Option<f32>,
+    pub dec_pct: Option<f32>,
+}
+
+/// Every process using an NVIDIA adapter, with its engine and VRAM use.
+///
+/// `None` when NVML is not available or the per-process queries are not
+/// published by this driver; `Some(empty)` when they answered and no process
+/// uses the GPU. Utilization is "since the previous call" per adapter, so the
+/// window follows the sampler's tick.
+pub(super) fn process_usage() -> Option<(Vec<ProcessUsage>, Vec<AdapterEngines>)> {
+    let library = library()?;
+    library.graphics_processes.or(library.compute_processes)?;
+    let mut denied = false;
+    let count = field(&mut denied, |out: &mut c_uint| unsafe {
+        (library.device_count)(out)
+    })?
+    .min(MAX_DEVICES);
+    let mut usage = Vec::new();
+    let mut engines = Vec::new();
+    for index in 0..count {
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the index comes from the driver's own count.
+        let code = unsafe { (library.handle_by_index)(index, &mut handle) };
+        if code != NVML_SUCCESS || handle.is_null() {
+            continue;
+        }
+        let Some(slot) = library.pci_info.and_then(|get| {
+            field(&mut denied, |out: &mut NvmlPciInfo| unsafe {
+                get(handle, out)
+            })
+            .and_then(|info| info.slot())
+        }) else {
+            continue;
+        };
+        let slot = crate::linux_sensors::normalize_pci_slot(&slot);
+        let mut by_pid: std::collections::BTreeMap<u32, ProcessUsage> =
+            std::collections::BTreeMap::new();
+        for query in [library.graphics_processes, library.compute_processes]
+            .into_iter()
+            .flatten()
+        {
+            for info in running_processes(query, handle) {
+                let entry = by_pid.entry(info.pid).or_insert_with(|| ProcessUsage {
+                    pci_slot: slot.clone(),
+                    pid: info.pid,
+                    sm_pct: None,
+                    enc_pct: None,
+                    dec_pct: None,
+                    vram_bytes: None,
+                });
+                if info.used_gpu_memory != NVML_VALUE_NOT_AVAILABLE {
+                    // A process in both lists reports the same allocation
+                    // twice; it is one allocation.
+                    entry.vram_bytes =
+                        Some(entry.vram_bytes.unwrap_or(0).max(info.used_gpu_memory));
+                }
+            }
+        }
+        if let Some(query) = library.process_utilization {
+            for sample in process_utilization(query, handle, index) {
+                let entry = by_pid.entry(sample.pid).or_insert_with(|| ProcessUsage {
+                    pci_slot: slot.clone(),
+                    pid: sample.pid,
+                    sm_pct: None,
+                    enc_pct: None,
+                    dec_pct: None,
+                    vram_bytes: None,
+                });
+                let max = |current: Option<f32>, value: c_uint| {
+                    nvml_percent(value).map(|value| current.map_or(value, |c| c.max(value)))
+                };
+                entry.sm_pct = max(entry.sm_pct, sample.sm_util).or(entry.sm_pct);
+                entry.enc_pct = max(entry.enc_pct, sample.enc_util).or(entry.enc_pct);
+                entry.dec_pct = max(entry.dec_pct, sample.dec_util).or(entry.dec_pct);
+            }
+        }
+        usage.extend(by_pid.into_values());
+        let codec = |get: Option<CodecUtilization>| {
+            let get = get?;
+            let mut value: c_uint = 0;
+            let mut period: c_uint = 0;
+            // SAFETY: two writable `unsigned int`s for a live handle.
+            let code = unsafe { get(handle, &mut value, &mut period) };
+            (code == NVML_SUCCESS)
+                .then(|| nvml_percent(value))
+                .flatten()
+        };
+        engines.push(AdapterEngines {
+            pci_slot: slot,
+            enc_pct: codec(library.encoder_utilization),
+            dec_pct: codec(library.decoder_utilization),
+        });
+    }
+    Some((usage, engines))
+}
+
+/// One `…RunningProcesses_v3` query: size probe, then the list.
+fn running_processes(query: RunningProcesses, handle: *mut c_void) -> Vec<NvmlProcessInfo> {
+    let mut count: c_uint = 0;
+    // SAFETY: a null buffer with count 0 is the documented size probe.
+    let code = unsafe { query(handle, &mut count, std::ptr::null_mut()) };
+    if code == NVML_SUCCESS || code != NVML_ERROR_INSUFFICIENT_SIZE {
+        return Vec::new();
+    }
+    // Head room for processes that start between the probe and the read.
+    let mut capacity = count.saturating_add(8).min(MAX_PROCESSES);
+    let mut buffer = vec![NvmlProcessInfo::default(); capacity as usize];
+    // SAFETY: `buffer` holds `capacity` elements of the driver's 24-byte
+    // layout, and `capacity` tells the driver how many it may write.
+    let code = unsafe { query(handle, &mut capacity, buffer.as_mut_ptr()) };
+    if code != NVML_SUCCESS {
+        return Vec::new();
+    }
+    buffer.truncate((capacity as usize).min(buffer.len()));
+    buffer
+}
+
+/// The per-process utilization samples newer than this adapter's previous
+/// query. `NVML_ERROR_NOT_FOUND` means no process ran on it since then: an
+/// empty answer, which is a measured idle window.
+fn process_utilization(
+    query: ProcessUtilization,
+    handle: *mut c_void,
+    index: u32,
+) -> Vec<NvmlProcessUtilizationSample> {
+    static LAST_SEEN: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
+        OnceLock::new();
+    let last_seen = LAST_SEEN.get_or_init(Default::default);
+    let since = tm_core::sync::lock(last_seen)
+        .get(&index)
+        .copied()
+        .unwrap_or(0);
+    let mut count: c_uint = 0;
+    // SAFETY: a null buffer is the documented size probe.
+    let code = unsafe { query(handle, std::ptr::null_mut(), &mut count, since) };
+    if code != NVML_ERROR_INSUFFICIENT_SIZE && code != NVML_SUCCESS {
+        if code != NVML_ERROR_NOT_FOUND {
+            tracing::trace!(code, "nvmlDeviceGetProcessUtilization probe failed");
+        }
+        return Vec::new();
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut capacity = count.saturating_add(8).min(MAX_PROCESSES);
+    let mut buffer = vec![NvmlProcessUtilizationSample::default(); capacity as usize];
+    // SAFETY: `buffer` holds `capacity` elements of the 32-byte layout.
+    let code = unsafe { query(handle, buffer.as_mut_ptr(), &mut capacity, since) };
+    if code != NVML_SUCCESS {
+        return Vec::new();
+    }
+    buffer.truncate((capacity as usize).min(buffer.len()));
+    if let Some(newest) = buffer.iter().map(|sample| sample.time_stamp).max() {
+        tm_core::sync::lock(last_seen).insert(index, newest.max(since));
+    }
+    buffer
 }

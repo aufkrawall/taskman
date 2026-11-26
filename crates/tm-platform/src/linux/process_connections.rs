@@ -49,7 +49,7 @@ fn socket_inode_link(link: &str) -> Option<u64> {
         .ok()
 }
 
-fn process_socket_inodes(pid: u32) -> Result<HashSet<u64>> {
+pub(super) fn process_socket_inodes(pid: u32) -> Result<HashSet<u64>> {
     let fd_path = format!("/proc/{pid}/fd");
     let entries = std::fs::read_dir(&fd_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {

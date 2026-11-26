@@ -833,6 +833,10 @@ keys! {
         "Ohne erhöhte Rechte ausgeführt; Aktionen für geschützte Prozesse können eingeschränkt sein.",
         "Running without elevated privileges; actions on protected processes may be limited."
     ],
+    ElevatedViaService => [
+        "Ohne Root-Rechte ausgeführt; Aktionen für geschützte Prozesse und Dienste übernimmt der installierte TaskMan-Dienst.",
+        "Running without root; actions on protected processes and services are carried out by the installed TaskMan service."
+    ],
     RestartElevated => ["Mit erhöhten Rechten neu starten", "Restart with elevated privileges"],
     ElevatedUnknown => [
         "Status der erhöhten Rechte unbekannt.",
@@ -1020,6 +1024,7 @@ keys! {
     KvCommitLimit => ["Commit-Limit:", "Commit limit:"],
     KvSsid => ["SSID:", "SSID:"],
     KvPagefile => ["Auslagerungsdatei:", "Page file:"],
+    KvSwap => ["Auslagerungsspeicher:", "Swap:"],
     KvRamSpeed => ["Geschwindigkeit:", "Speed:"],
     KvSlotsUsed => ["Belegte Steckplätze:", "Slots used:"],
     KvFormFactor => ["Bauform:", "Form factor:"],
@@ -1031,6 +1036,8 @@ keys! {
     StatWrite => ["Schreiben", "Write"],
     KvAvgResponse => ["Durchschnittl. Reaktionszeit:", "Average response time:"],
     KvCapacity => ["Kapazität:", "Capacity:"],
+    KvVolumes => ["Volumes:", "Volumes:"],
+    KvDiskType => ["Typ:", "Type:"],
     KvUsedSpace => ["Belegt:", "Used space:"],
     KvFreeSpace => ["Frei:", "Free space:"],
     StatReceive => ["Empfangen", "Receive"],

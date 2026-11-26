@@ -105,11 +105,22 @@ NVML access lives in `linux/sensors.rs`.
 - The tray lifecycle is the Windows one: the window is hidden only once the
   icon is registered, `--minimized-to-tray` falls back to showing the window
   when there is no icon, and a tray click restores it.
-- Wayland cannot hide a window (winit ignores `ViewportCommand::Visible(false)`
-  and refuses to un-minimize), so the backend is detected once from the
-  window's display handle with `WAYLAND_DISPLAY` as the fallback, and a Wayland
-  session refuses to close-to-tray rather than leaving the window on screen
-  while the app believes it is hidden.
+- Wayland hides the window by unmapping it (winit fork §5: null-buffer
+  commit; a bare commit remaps, and presents wait for the fresh configure).
+  `can_hide_window` accepts X11 and Wayland, so close-to-tray and the
+  autostart entry's `--minimized-to-tray` work on both (2026-11-26; before
+  that a Wayland session refused to hide and the autostart opened the window).
+  The backend is detected once from the window's display handle with
+  `WAYLAND_DISPLAY` as the fallback; an unresolved backend still never hides.
+- Second launch while the window is in the tray: the activation handoff
+  acknowledges on Wayland too, because remapping is a restore the client
+  controls. A second launch while the window is *visible* on Wayland is still
+  rejected (a new window opens): raising an existing toplevel needs a focus
+  grant (xdg-activation token from the launcher) that is not forwarded yet.
+- Settings → Elevated privileges reads the broker's state on Linux (the
+  Windows-only core-service block is not shown there): with the service
+  running it says protected actions go through the service instead of "may be
+  limited".
 - A panel restart replaces the watcher; the tray thread records the watcher's
   unique owner and re-registers on every 30 s tick when it changed or vanished.
   A failed re-registration stores `FAILED` and wakes the UI, so an already

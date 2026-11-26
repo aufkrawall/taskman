@@ -1201,6 +1201,25 @@ fn settings_elevation_visibility(capabilities: Capabilities) -> SettingsElevatio
     }
 }
 
+/// The one-line status of the privileged core service, shared by the Windows
+/// management block and the Linux elevation section.
+fn core_service_state_text(state: Option<&tm_platform::actions::CoreServiceState>) -> String {
+    use tm_platform::actions::CoreServiceState;
+    match state {
+        None => i18n::tr(K::CheckingAdvancedState).into(),
+        Some(CoreServiceState::Unsupported) => i18n::tr(K::CoreServiceNotInstalled).into(),
+        Some(CoreServiceState::NotInstalled) => i18n::tr(K::CoreServiceNotInstalled).into(),
+        Some(CoreServiceState::Stopped) => i18n::tr(K::CoreServiceStopped).into(),
+        Some(CoreServiceState::InstallIntegrityFailed) => {
+            i18n::tr(K::CoreServiceIntegrityFailed).into()
+        }
+        Some(CoreServiceState::Starting) => i18n::tr(K::CoreServiceStarting).into(),
+        Some(CoreServiceState::Running { version }) => i18n::trf(K::CoreServiceRunning, &[version]),
+        Some(CoreServiceState::ForeignClient) => i18n::tr(K::CoreServiceForeignClient).into(),
+        Some(CoreServiceState::Degraded(detail)) => i18n::trf(K::CoreServiceDegraded, &[detail]),
+    }
+}
+
 pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let capabilities = app.actions.capabilities();
     let elevation = settings_elevation_visibility(capabilities);
@@ -1728,29 +1747,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 ui.heading(i18n::tr(K::CoreServiceHeading));
                 app.poll_advanced_state(ctx);
                 let core_state = app.core_service_state.clone();
-                let state_text = match core_state.as_ref() {
-                    None => i18n::tr(K::CheckingAdvancedState).into(),
-                    Some(CoreServiceState::Unsupported) => {
-                        i18n::tr(K::CoreServiceNotInstalled).into()
-                    }
-                    Some(CoreServiceState::NotInstalled) => {
-                        i18n::tr(K::CoreServiceNotInstalled).into()
-                    }
-                    Some(CoreServiceState::Stopped) => i18n::tr(K::CoreServiceStopped).into(),
-                    Some(CoreServiceState::InstallIntegrityFailed) => {
-                        i18n::tr(K::CoreServiceIntegrityFailed).into()
-                    }
-                    Some(CoreServiceState::Starting) => i18n::tr(K::CoreServiceStarting).into(),
-                    Some(CoreServiceState::Running { version }) => {
-                        i18n::trf(K::CoreServiceRunning, &[version])
-                    }
-                    Some(CoreServiceState::ForeignClient) => {
-                        i18n::tr(K::CoreServiceForeignClient).into()
-                    }
-                    Some(CoreServiceState::Degraded(detail)) => {
-                        i18n::trf(K::CoreServiceDegraded, &[detail])
-                    }
-                };
+                let state_text = core_service_state_text(core_state.as_ref());
                 ui.label(
                     egui::RichText::new(state_text)
                         .size(11.5)
@@ -1880,15 +1877,38 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             if elevation.section {
                 ui.add_space(10.0);
                 ui.heading(i18n::tr(K::ElevatedHeading));
+                // On Linux the privileged surface is the installed service, not
+                // a root GUI: with the broker answering, protected actions are
+                // NOT limited, and saying so would misdescribe the session.
+                #[cfg(target_os = "linux")]
+                app.poll_advanced_state(ctx);
+                #[cfg(target_os = "linux")]
+                let broker_running = matches!(
+                    app.core_service_state,
+                    Some(tm_platform::actions::CoreServiceState::Running { .. })
+                );
+                #[cfg(not(target_os = "linux"))]
+                let broker_running = false;
                 ui.label(
                     egui::RichText::new(match app.is_elevated {
                         Some(true) => i18n::tr(K::ElevatedRunning),
+                        Some(false) if broker_running => i18n::tr(K::ElevatedViaService),
                         Some(false) => i18n::tr(K::ElevatedNotRunning),
                         None => i18n::tr(K::ElevatedUnknown),
                     })
                     .size(11.5)
                     .color(_pal.text_dim),
                 );
+                #[cfg(target_os = "linux")]
+                if app.core_service_state.is_some() {
+                    ui.label(
+                        egui::RichText::new(core_service_state_text(
+                            app.core_service_state.as_ref(),
+                        ))
+                        .size(11.5)
+                        .color(_pal.text_dim),
+                    );
+                }
                 if elevation.relaunch
                     && app.is_elevated != Some(true)
                     && ui.button(i18n::tr(K::RestartElevated)).clicked()

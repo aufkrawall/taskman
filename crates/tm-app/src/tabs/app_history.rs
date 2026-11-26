@@ -495,10 +495,32 @@ pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &the
 mod tests {
     use super::*;
 
+    /// Linux's contract differs on purpose: a bare command name IS a lookup
+    /// key there (the `.desktop` index resolves it), so a blank stored path
+    /// falls back to the key itself rather than to the live snapshot. A stored
+    /// path still wins.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_blank_stored_icon_paths_fall_back_to_the_bare_key() {
+        let mut icons = std::collections::BTreeMap::new();
+        icons.insert("dolphin".to_string(), String::new());
+        icons.insert("konsole".to_string(), "/usr/bin/konsole".to_string());
+        assert_eq!(
+            resolve_row_icon_path(&icons, "dolphin", "dolphin", None).as_deref(),
+            Some("dolphin")
+        );
+        assert_eq!(
+            resolve_row_icon_path(&icons, "konsole", "konsole", None).as_deref(),
+            Some("/usr/bin/konsole")
+        );
+        assert_eq!(resolve_row_icon_path(&icons, "  ", "x", None), None);
+    }
+
     /// A stored blank path is no icon source. It used to be handed to the
     /// shell, which answered with the current directory's folder icon; the row
     /// must instead use the live snapshot, and nothing at all when the app is
-    /// not running.
+    /// not running. (Windows/macOS semantics: a bare name is not an image.)
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn blank_stored_icon_paths_fall_back_to_the_live_snapshot() {
         let mut icons = std::collections::BTreeMap::new();

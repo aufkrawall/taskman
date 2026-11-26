@@ -516,7 +516,7 @@ impl Painter {
             // strike-through stays over them. A glyph quad is four consecutive vertices,
             // so it is blitted once, when its first triangle appears.
             let mut last_quad_base: Option<usize> = None;
-            for tri in mesh.indices.chunks_exact(3) {
+            for tri in mesh.indices.as_chunks::<3>().0 {
                 let idx = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
                 if idx.iter().any(|i| *i >= mesh.vertices.len()) {
                     continue;
@@ -610,7 +610,7 @@ impl Painter {
         let all_white_uv = mesh.vertices.iter().all(|v| v.uv == epaint::WHITE_UV);
         let sampler = if all_white_uv { None } else { Some(texture) };
 
-        for tri in mesh.indices.chunks_exact(3) {
+        for tri in mesh.indices.as_chunks::<3>().0 {
             let (Some(&a), Some(&b), Some(&c)) = (tri.first(), tri.get(1), tri.get(2)) else {
                 continue;
             };

@@ -434,6 +434,25 @@ pass), the plausibility clamp, that a residual between the new epsilon and the o
 gets its frame, and that the follow-up chain terminates. The tests are deterministic and do not
 sleep.
 
+### 18. `eframe`: wait (not poll) for a throttled redraw, and frame-clock the CPU renderer
+
+Measured on Wayland (headless sway, 60 Hz output, `TASKMAN_FPS_PROBE=1`): the
+CPU renderer repainted uncapped at ~350 fps, and once its presents were tied to
+frame callbacks it still burned 100 % of a core at 62 fps. Real scrolls,
+scrollbar drags and animations showed the same load on the Vulkan renderer.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/eframe/src/native/run.rs` | `check_redraw_requests` sets `control_flow_after_redraw_request()` — `ControlFlow::Wait` off Windows, upstream's `Poll` on Windows — before `request_redraw()`. | Wayland holds a requested redraw until the previous present's frame callback arrives; with `Poll` the loop spun at full speed for that whole wait, every frame. The deferred redraw is itself an event (the frame callback wakes the loop; X11/macOS queue it), so `Wait` loses nothing. Windows' redraw is an immediate `WM_PAINT`, so nothing spins there and the measured path stays. Continuous repaint: 102 % → 21 % of a core at the same 62 fps. |
+| `crates/eframe/src/native/software_integration.rs` | `window.pre_present_notify()` before both `present_rects` calls. | Without it winit had no frame callback to throttle on, so every pointer-motion or wheel event of a drag repainted the whole window at the event rate (a 1000 Hz mouse is 1000 fps). `egui-wgpu` already does this. |
+| `crates/eframe/src/native/software_integration.rs` | `paintable` no longer makes its first-frame exception for a hidden **Wayland** window (`is_wayland()` from the raw window handle). | On Wayland a present maps the surface. A window the app hid before its first present (start minimized to the tray), or one waiting for its remap configure (`vendor/winit/TASKMAN-FORK.md` §5), must never present. Windows keeps the exception its reveal relies on. |
+
+**Coverage:** behavioural, verified in a headless sway (`WLR_BACKENDS=headless`,
+own `XDG_RUNTIME_DIR`): continuous-repaint CPU before/after, and a tray round
+trip (start minimized → second launch restores → close to tray → restore). The
+winit side's transition rule has a unit test; the event-loop and present paths
+need a compositor and have no automated test.
+
 ## Rebase runbook
 
 ```

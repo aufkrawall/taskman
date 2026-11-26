@@ -53,6 +53,12 @@ pub(super) struct DesktopEvidence {
     /// under `app.slice`.
     pub(super) app_group: Option<String>,
     pub(super) session_id: Option<u32>,
+    /// UID whose `user@UID.service` manager this process runs under, when it
+    /// is not inside a `session-N.scope`. Such a process belongs to that
+    /// user's service manager rather than to one login, so the collector
+    /// attributes it to the user's display session (see
+    /// [`super::sessions::display_session_for_uid`]).
+    pub(super) manager_uid: Option<u32>,
     /// Validated user `app.slice` family awaiting the graphical-environment
     /// gate. It becomes `app_group` only when that gate is positive.
     app_unit_group: Option<String>,
@@ -355,9 +361,9 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
         return Some(DesktopEvidence::default());
     };
 
-    let (session_id, session_root) =
+    let (session_id, session_root, manager_uid) =
         if let Some(session_id) = parse_session_scope(session_or_manager) {
-            (Some(session_id), true)
+            (Some(session_id), true, None)
         } else {
             let manager_uid = parse_user_manager(session_or_manager)?;
             if manager_uid != uid {
@@ -365,13 +371,14 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
                 // session. Do not even use the environment as a weaker fallback.
                 return None;
             }
-            (None, false)
+            (None, false, Some(manager_uid))
         };
 
     let user_scope = Some(format!("/{}", components[..=2].join("/")));
     let rest = &components[3..];
     let mut evidence = DesktopEvidence {
         session_id,
+        manager_uid,
         user_session: true,
         user_scope,
         environment_eligible: true,
@@ -939,6 +946,15 @@ mod tests {
         ] {
             assert_eq!(parse_v2(path), None, "{path}");
         }
+        let manager = parse_v2("/user.slice/user-1000.slice/user@1000.service/init.scope")
+            .expect("user manager path");
+        assert_eq!(manager.manager_uid, Some(1000));
+        assert_eq!(manager.session_id, None);
+        let session = parse_v2("/user.slice/user-1000.slice/session-4.scope").expect("session");
+        assert_eq!(
+            session.manager_uid, None,
+            "a login scope is not the manager"
+        );
         let malformed_unit =
             parse_v2("/user.slice/user-1000.slice/user@1000.service/app.slice/not-a-unit")
                 .expect("recognizable user path");

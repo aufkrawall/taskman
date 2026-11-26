@@ -15,8 +15,10 @@ mod nvml;
 pub mod polkit;
 mod process_connections;
 mod process_cpu;
+mod process_gpu;
 mod process_io;
 mod process_modules;
+mod process_net;
 mod process_threads;
 mod process_tree;
 mod sensors;
@@ -69,6 +71,30 @@ pub struct LinuxCollector {
     cache_kb: [u64; 3],
     window_observer: x11_windows::WindowObserver,
     desktop_evidence: desktop_session::DesktopEvidenceCache,
+    /// Physical drives and the drives each mounted block device resolves to.
+    /// Hotplug is rare and the sysfs walk is not free, so both are re-read on
+    /// [`DISK_TOPOLOGY_TTL`], not every tick.
+    disk_topology: Option<DiskTopology>,
+    process_net: process_net::ProcessNet,
+    process_gpu: process_gpu::ProcessGpu,
+    /// Whether each process generation's image is a 32-bit ELF (the Details
+    /// Platform column); the header is read once per generation.
+    elf_classes: HashMap<u32, (Option<i64>, Option<bool>)>,
+    /// Previous I/O and fault counters per process generation.
+    activity: HashMap<u32, Activity>,
+    /// Per-process TCP byte totals since TaskMan first measured the process,
+    /// keyed by pid with the start ticks that identify its generation.
+    net_totals: HashMap<u32, (Option<i64>, u64, u64)>,
+}
+
+/// How long the physical-drive list and the volume → drive resolution stay
+/// valid. A drive plugged in shows up within this long.
+const DISK_TOPOLOGY_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct DiskTopology {
+    read_at: Instant,
+    disks: Vec<crate::linux_disks::PhysicalDisk>,
+    backing: HashMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl SystemCollector for LinuxCollector {
@@ -120,7 +146,6 @@ impl SystemCollector for LinuxCollector {
             true,
             ProcessRefreshKind::nothing()
                 .with_memory()
-                .with_disk_usage()
                 .with_user(UpdateKind::OnlyIfNotSet)
                 .with_exe(UpdateKind::OnlyIfNotSet),
         );
@@ -181,6 +206,11 @@ impl SystemCollector for LinuxCollector {
             .zip(linux_clk_tck());
         let mut processes = Vec::with_capacity(n_procs);
         let mut live_pids = HashSet::with_capacity(n_procs);
+        // Block-layer bytes each readable process caused this window, for the
+        // disk-time attribution after the drives are read.
+        let mut block_bytes: HashMap<u32, u64> = HashMap::new();
+        // One logind record read per user per tick, not per process.
+        let mut display_sessions: HashMap<u32, Option<u32>> = HashMap::new();
         for (pid, p) in self.sys.processes() {
             // sysinfo 0.39 keeps `tasks` enabled even in
             // `ProcessRefreshKind::nothing()`, so every Linux task (thread) is
@@ -222,9 +252,14 @@ impl SystemCollector for LinuxCollector {
             );
             let category = classify_collected_process(pid_u, &name, has_window, desktop_role);
 
-            let du = p.disk_usage();
-            let mut entry = ProcessEntry::new(pid_u, name.clone());
-            entry.display = name.clone();
+            let command_line = cached_cmdline(&mut self.cmdlines, pid_u, boot_start_ticks);
+            // The kernel's `comm` holds at most 15 bytes; the executable or
+            // argv name it was cut from is what the user knows the process by.
+            // Classification above keeps the kernel name it was written for.
+            let full_name =
+                linux_telemetry::untruncated_comm(&name, p.exe(), command_line.as_deref());
+            let mut entry = ProcessEntry::new(pid_u, full_name.clone());
+            entry.display = full_name;
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
             entry.desktop_role = desktop_role;
@@ -242,10 +277,14 @@ impl SystemCollector for LinuxCollector {
                         linux_start_timestamp(btime_s, ticks, clk_tck)
                     });
             entry.cpu_time_s = proc_cpu.and_then(|cpu| cpu.cpu_time_s);
-            entry.disk_read_bps = du.read_bytes as f64 / interval_s;
-            entry.disk_write_bps = du.written_bytes as f64 / interval_s;
-            entry.disk_read_total = du.total_read_bytes;
-            entry.disk_write_total = du.total_written_bytes;
+            if let Some(bytes) = apply_activity(
+                &mut self.activity,
+                &mut entry,
+                stat_bytes.as_deref(),
+                interval_s,
+            ) {
+                block_bytes.insert(pid_u, bytes);
+            }
             entry.has_window = has_window == Some(true);
             entry.app_group = if category == ProcCategory::App {
                 desktop_evidence.app_group.clone()
@@ -253,6 +292,12 @@ impl SystemCollector for LinuxCollector {
                 None
             };
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
+            entry.wow64 = cached_elf_32bit(
+                &mut self.elf_classes,
+                pid_u,
+                boot_start_ticks,
+                entry.exe_path.as_deref(),
+            );
             entry.user = p
                 .user_id()
                 .and_then(|uid| username_for_uid(&self.users, uid));
@@ -261,13 +306,19 @@ impl SystemCollector for LinuxCollector {
                 _ => ProcStatus::Running,
             };
             if sessions_available {
-                entry.session_id = desktop_evidence.session_id;
+                entry.session_id = desktop_evidence.session_id.or_else(|| {
+                    desktop_evidence.manager_uid.and_then(|uid| {
+                        *display_sessions
+                            .entry(uid)
+                            .or_insert_with(|| sessions::display_session_for_uid(uid))
+                    })
+                });
             }
             // sysinfo's task set excludes the leader; Windows' count includes
             // it, so add the main thread back for parity.
             entry.threads = p.tasks().map(|tasks| tasks.len() as u32 + 1);
             entry.handles = fd_count(pid_u);
-            entry.command_line = cached_cmdline(&mut self.cmdlines, pid_u, boot_start_ticks);
+            entry.command_line = command_line;
             entry.priority = proc_priority(stat_bytes.as_deref());
             entry.elevated = entry.user.as_deref().map(|u| u == "root");
             processes.push(entry);
@@ -275,7 +326,17 @@ impl SystemCollector for LinuxCollector {
         self.desktop_evidence.retain_live(&live_pids);
         self.process_cpu.retain_live(&live_pids);
         self.cmdlines.retain(|pid, _| live_pids.contains(pid));
+        self.activity.retain(|pid, _| live_pids.contains(pid));
+        self.elf_classes.retain(|pid, _| live_pids.contains(pid));
         mark_desktop_app_roots(&mut processes);
+        apply_process_net(
+            &mut self.process_net,
+            &mut self.net_totals,
+            &mut processes,
+            &live_pids,
+            interval_s,
+            providers.process_net,
+        );
 
         // Disk rates and active time are one `/proc/diskstats` read per tick;
         // they follow the demand that shows them. Forgetting the previous
@@ -287,45 +348,16 @@ impl SystemCollector for LinuxCollector {
             diskstats::forget();
             Vec::new()
         };
-        let mut disks = Vec::new();
-        for d in self.disks.list() {
-            let mount = d.mount_point().to_string_lossy().to_string();
-            let dev = d.name().to_string_lossy().to_string();
-            let block = block_device_name(&dev);
-            let parent = parent_block_device(&block);
-            let media = match d.kind() {
-                sysinfo::DiskKind::SSD => MediaKind::Ssd,
-                sysinfo::DiskKind::HDD => MediaKind::Hdd,
-                _ => MediaKind::Unknown,
-            };
-            let ds = diskstats
-                .iter()
-                .find(|s| s.device == block || parent.as_deref() == Some(s.device.as_str()));
-            // Both rates need the same previous sample, so they are measured
-            // together or not at all.
-            let read_bps = ds.and_then(|s| s.read_bps(interval_s));
-            let write_bps = ds.and_then(|s| s.write_bps(interval_s));
-            disks.push(DiskInfo {
-                id: dev.clone(),
-                number: None,
-                mount,
-                label: String::new(),
-                media,
-                total_bytes: d.total_space(),
-                free_bytes: d.available_space(),
-                active_pct: ds.and_then(|s| s.active_pct(interval_s)),
-                // The model has no "unknown" byte rate, so an unmatched device
-                // or a first sample still writes 0 B/s below — but it says so
-                // here, and the page renders a gap and "—" instead.
-                rates_measured: read_bps.is_some() && write_bps.is_some(),
-                read_bps: read_bps.unwrap_or(0.0),
-                write_bps: write_bps.unwrap_or(0.0),
-                avg_resp_ms: 0.0,
-                total_read_bytes: ds.map(|s| s.read_sectors * 512).unwrap_or(0),
-                total_written_bytes: ds.map(|s| s.write_sectors * 512).unwrap_or(0),
-            });
+        let disks = collect_disks(
+            &self.disks,
+            &mut self.disk_topology,
+            &diskstats,
+            interval_s,
+            started,
+        );
+        if providers.process_disk && providers.disk_rates {
+            apply_disk_time(&mut processes, &block_bytes, &disks, interval_s);
         }
-
         let network_metadata = net_meta::collect();
         let mut nets = Vec::new();
         for (name, data) in &self.networks {
@@ -373,6 +405,14 @@ impl SystemCollector for LinuxCollector {
         let meminfo = std::fs::read_to_string("/proc/meminfo")
             .map(|text| linux_telemetry::parse_meminfo(&text))
             .unwrap_or_default();
+        let page_lists = linux_telemetry::page_lists(&meminfo);
+        let mut gpus = drm::gpus(providers.measure_gpus);
+        if providers.process_gpu {
+            self.process_gpu
+                .apply(&mut processes, &mut gpus, interval_s, started);
+        } else {
+            self.process_gpu.forget();
+        }
 
         let snap = Snapshot {
             timestamp_ms: now_ms(),
@@ -406,7 +446,7 @@ impl SystemCollector for LinuxCollector {
                 l1_kb: self.cache_kb[0],
                 l2_kb: self.cache_kb[1],
                 l3_kb: self.cache_kb[2],
-                virtualization: "Unknown".into(),
+                virtualization: cpu_virtualization().into(),
             },
             memory: MemoryInfo {
                 total_bytes: self.sys.total_memory(),
@@ -415,6 +455,7 @@ impl SystemCollector for LinuxCollector {
                 cached_bytes: meminfo
                     .cached_bytes
                     .unwrap_or(0)
+                    .saturating_add(meminfo.buffers_bytes.unwrap_or(0))
                     .saturating_add(meminfo.sreclaimable_bytes.unwrap_or(0)),
                 commit_total_bytes: meminfo.commit_limit_bytes.unwrap_or(0),
                 commit_used_bytes: meminfo.committed_as_bytes.unwrap_or(0),
@@ -422,11 +463,14 @@ impl SystemCollector for LinuxCollector {
                 non_paged_pool_bytes: 0,
                 swap_total_bytes: self.sys.total_swap(),
                 swap_used_bytes: self.sys.used_swap(),
+                modified_bytes: page_lists.map_or(0, |(modified, _, _)| modified),
+                standby_bytes: page_lists.map_or(0, |(_, standby, _)| standby),
+                free_bytes: page_lists.map_or(0, |(_, _, free)| free),
                 ..Default::default()
             },
             disks,
             networks: nets,
-            gpus: drm::gpus(providers.measure_gpus),
+            gpus,
             processes,
             system: SystemMisc {
                 hostname: hostname(),
@@ -443,6 +487,277 @@ impl SystemCollector for LinuxCollector {
         self.first_tick_done = true;
         Ok(snap)
     }
+}
+
+/// Fill the per-process network columns from the TCP accountant.
+///
+/// A process whose descriptors this token can read (`handles` is known)
+/// is measured: no traffic is a real 0 B/s. One whose descriptors are
+/// hidden keeps `None` — its sockets cannot be joined to it, so a 0 would
+/// be invented.
+fn apply_process_net(
+    accountant: &mut process_net::ProcessNet,
+    net_totals: &mut HashMap<u32, (Option<i64>, u64, u64)>,
+    processes: &mut [ProcessEntry],
+    live_pids: &HashSet<u32>,
+    interval_s: f64,
+    wanted: bool,
+) {
+    if !wanted {
+        accountant.forget();
+        net_totals.clear();
+        return;
+    }
+    let Some(window) = accountant.sample(live_pids) else {
+        return;
+    };
+    net_totals.retain(|pid, _| live_pids.contains(pid));
+    for process in processes.iter_mut() {
+        if process.handles.is_none() {
+            continue;
+        }
+        let (received, sent) = window.get(&process.pid).copied().unwrap_or((0, 0));
+        let totals = net_totals
+            .entry(process.pid)
+            .or_insert((process.boot_start_ticks, 0, 0));
+        if totals.0 != process.boot_start_ticks {
+            *totals = (process.boot_start_ticks, 0, 0);
+        }
+        totals.1 = totals.1.saturating_add(received);
+        totals.2 = totals.2.saturating_add(sent);
+        process.net_recv_bps = Some(received as f64 / interval_s);
+        process.net_sent_bps = Some(sent as f64 / interval_s);
+        process.net_recv_total = Some(totals.1);
+        process.net_sent_total = Some(totals.2);
+    }
+}
+
+/// Whether a process image is 32-bit on this 64-bit host — Windows' WOW64
+/// "Platform" fact, read from the ELF header's class byte. `None` when the
+/// image cannot be read (kernel threads, another user's process whose
+/// executable link is hidden) or is not ELF.
+fn cached_elf_32bit(
+    cache: &mut HashMap<u32, (Option<i64>, Option<bool>)>,
+    pid: u32,
+    start_ticks: Option<i64>,
+    exe: Option<&Path>,
+) -> Option<bool> {
+    if let Some((ticks, value)) = cache.get(&pid)
+        && *ticks == start_ticks
+        && value.is_some()
+    {
+        return *value;
+    }
+    let value = exe.and_then(|exe| {
+        use std::io::Read;
+        let mut header = [0u8; 5];
+        std::fs::File::open(exe)
+            .ok()?
+            .read_exact(&mut header)
+            .ok()?;
+        linux_telemetry::elf_is_32bit(&header)
+    });
+    cache.insert(pid, (start_ticks, value));
+    value
+}
+
+/// One process generation's previous lifetime counters.
+struct Activity {
+    start_ticks: Option<i64>,
+    io: Option<linux_telemetry::ProcIo>,
+    faults: Option<(u64, u64)>,
+}
+
+/// Fill a row's I/O and fault columns from `/proc/<pid>/io` and its stat
+/// record, differenced against the previous tick of the same generation.
+///
+/// Returns the block-layer bytes the process caused this window, when that
+/// was measured. A process whose `io` file this token cannot read (another
+/// user's, without root) keeps every I/O column unknown; the byte columns,
+/// which the model cannot mark unknown, stay 0.
+fn apply_activity(
+    activity: &mut HashMap<u32, Activity>,
+    entry: &mut ProcessEntry,
+    stat: Option<&[u8]>,
+    interval_s: f64,
+) -> Option<u64> {
+    let io = std::fs::read_to_string(format!("/proc/{}/io", entry.pid))
+        .ok()
+        .and_then(|text| linux_telemetry::parse_proc_io(&text));
+    let faults = stat.and_then(linux_telemetry::parse_proc_stat_faults);
+    let previous = activity
+        .get(&entry.pid)
+        .filter(|previous| previous.start_ticks == entry.boot_start_ticks);
+    let rate = |delta: u64| delta as f64 / interval_s;
+    let mut block = None;
+    if let Some(io) = io {
+        entry.disk_read_total = io.read_bytes;
+        entry.disk_write_total = io.write_bytes;
+        entry.io_read_ops = Some(io.syscr);
+        entry.io_write_ops = Some(io.syscw);
+        if let Some(before) = previous.and_then(|previous| previous.io) {
+            let read = io.read_bytes.saturating_sub(before.read_bytes);
+            let write = io.write_bytes.saturating_sub(before.write_bytes);
+            let reads = io.syscr.saturating_sub(before.syscr);
+            let writes = io.syscw.saturating_sub(before.syscw);
+            entry.disk_read_bps = rate(read);
+            entry.disk_write_bps = rate(write);
+            entry.disk_phys_read_bps = Some(rate(read));
+            entry.disk_phys_write_bps = Some(rate(write));
+            entry.io_read_ops_delta = Some(reads);
+            entry.io_write_ops_delta = Some(writes);
+            entry.io_read_bytes_delta = Some(io.rchar.saturating_sub(before.rchar));
+            entry.io_write_bytes_delta = Some(io.wchar.saturating_sub(before.wchar));
+            entry.io_ops_per_s = Some(rate(reads.saturating_add(writes)));
+            block = Some(read.saturating_add(write));
+        }
+    }
+    if let (Some((minor, major)), Some((minor_before, major_before))) =
+        (faults, previous.and_then(|previous| previous.faults))
+    {
+        let all = minor
+            .saturating_add(major)
+            .saturating_sub(minor_before.saturating_add(major_before));
+        entry.page_faults_per_s = u32::try_from(rate(all).round() as u64).ok();
+        entry.hard_faults_per_s = Some(rate(major.saturating_sub(major_before)));
+    }
+    activity.insert(
+        entry.pid,
+        Activity {
+            start_ticks: entry.boot_start_ticks,
+            io,
+            faults,
+        },
+    );
+    block
+}
+
+/// Share the drives' measured active time out to the processes that caused
+/// block I/O (see [`linux_telemetry::disk_time_shares`] for the model). Only
+/// processes whose block bytes were measured get a value; the rest stay
+/// unknown.
+fn apply_disk_time(
+    processes: &mut [ProcessEntry],
+    block_bytes: &HashMap<u32, u64>,
+    disks: &[DiskInfo],
+    interval_s: f64,
+) {
+    let measured: Vec<(u32, f32, u64)> = disks
+        .iter()
+        .filter_map(|disk| {
+            let active = disk.active_pct?;
+            let number = disk.number?;
+            let moved = if disk.rates_measured {
+                ((disk.read_bps + disk.write_bps) * interval_s) as u64
+            } else {
+                0
+            };
+            Some((number, active, moved))
+        })
+        .collect();
+    if measured.is_empty() {
+        return;
+    }
+    let order: Vec<usize> = (0..processes.len())
+        .filter(|&index| block_bytes.contains_key(&processes[index].pid))
+        .collect();
+    let bytes: Vec<u64> = order
+        .iter()
+        .map(|&index| block_bytes[&processes[index].pid])
+        .collect();
+    for (index, (busiest, per_disk)) in order
+        .into_iter()
+        .zip(linux_telemetry::disk_time_shares(&bytes, &measured))
+    {
+        let process = &mut processes[index];
+        process.disk_active_pct = Some(busiest);
+        process.disk_active_by_disk = per_disk
+            .into_iter()
+            .map(|(disk, active_pct)| DiskActiveShare { disk, active_pct })
+            .collect();
+    }
+}
+
+/// One row per PHYSICAL drive, Windows-style: `id` is "<n> (<kernel
+/// name>)", the mounted volumes on it are listed in `volumes`, and every
+/// counter comes from that drive's own `/proc/diskstats` row. A partition,
+/// an md array or a dm volume is never a row of its own — its I/O is the
+/// I/O of the drives beneath it.
+fn collect_disks(
+    mounted: &Disks,
+    topology_slot: &mut Option<DiskTopology>,
+    diskstats: &[diskstats::DiskStat],
+    interval_s: f64,
+    now: Instant,
+) -> Vec<DiskInfo> {
+    let sys = Path::new("/sys");
+    let stale = topology_slot
+        .as_ref()
+        .is_none_or(|topology| now.duration_since(topology.read_at) >= DISK_TOPOLOGY_TTL);
+    if stale {
+        *topology_slot = Some(DiskTopology {
+            read_at: now,
+            disks: crate::linux_disks::physical_disks(sys),
+            backing: HashMap::new(),
+        });
+    }
+    let Some(topology) = topology_slot.as_mut() else {
+        return Vec::new();
+    };
+    let volumes: Vec<crate::linux_disks::Volume> = mounted
+        .list()
+        .iter()
+        .map(|d| crate::linux_disks::Volume {
+            device: block_device_name(&d.name().to_string_lossy()),
+            mount: d.mount_point().to_string_lossy().into_owned(),
+            total_bytes: d.total_space(),
+            free_bytes: d.available_space(),
+        })
+        .collect();
+    for volume in &volumes {
+        if !topology.backing.contains_key(&volume.device) {
+            let resolved = crate::linux_disks::backing_disks(sys, &volume.device);
+            topology.backing.insert(volume.device.clone(), resolved);
+        }
+    }
+    let backing = &topology.backing;
+    let grouped = crate::linux_disks::group_volumes(&volumes, |device| {
+        backing.get(device).cloned().unwrap_or_default()
+    });
+
+    let mut out = Vec::with_capacity(topology.disks.len());
+    for (number, disk) in topology.disks.iter().enumerate() {
+        let ds = diskstats.iter().find(|s| s.device == disk.name);
+        // Both rates need the same previous sample, so they are measured
+        // together or not at all.
+        let read_bps = ds.and_then(|s| s.read_bps(interval_s));
+        let write_bps = ds.and_then(|s| s.write_bps(interval_s));
+        let on_disk = grouped.get(&disk.name).cloned().unwrap_or_default();
+        out.push(DiskInfo {
+            id: format!("{number} ({})", disk.name),
+            number: Some(number as u32),
+            // The device path is the stable history key; mount points can
+            // come and go on the same drive.
+            mount: format!("/dev/{}", disk.name),
+            label: String::new(),
+            media: disk.media,
+            total_bytes: on_disk.total_bytes,
+            free_bytes: on_disk.free_bytes,
+            active_pct: ds.and_then(|s| s.active_pct(interval_s)),
+            // The model has no "unknown" byte rate, so a first sample
+            // still writes 0 B/s below — but it says so here, and the page
+            // renders a gap and "—" instead.
+            rates_measured: read_bps.is_some() && write_bps.is_some(),
+            read_bps: read_bps.unwrap_or(0.0),
+            write_bps: write_bps.unwrap_or(0.0),
+            avg_resp_ms: ds.and_then(|s| s.avg_resp_ms()).unwrap_or(0.0) as f32,
+            total_read_bytes: ds.map(|s| s.read_sectors * 512).unwrap_or(0),
+            total_written_bytes: ds.map(|s| s.write_sectors * 512).unwrap_or(0),
+            model: disk.model.clone(),
+            volumes: on_disk.mounts,
+        });
+    }
+    out
 }
 
 fn username_for_uid(users: &sysinfo::Users, uid: &sysinfo::Uid) -> Option<String> {
@@ -768,11 +1083,22 @@ fn parse_cache_size(text: &str) -> Option<u64> {
     }
 }
 
-/// Highest cpufreq `base_frequency` in MHz. The base clock describes static
+/// VT-x/AMD-V state; the CPU flags are static, so `/proc/cpuinfo` is read once.
+fn cpu_virtualization() -> &'static str {
+    static STATE: OnceLock<&'static str> = OnceLock::new();
+    STATE.get_or_init(|| {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .map(|text| linux_telemetry::virtualization_from_cpuinfo(&text))
+            .unwrap_or("Unknown")
+    })
+}
+
+/// Highest published base clock in MHz (see
+/// [`linux_telemetry::base_frequency_mhz`]). The base clock describes static
 /// hardware, so it is derived once; 0 (unknown) when the kernel publishes none.
 fn base_freq_from_cpufreq() -> f32 {
     static BASE_MHZ: OnceLock<f32> = OnceLock::new();
-    let root = Path::new("/sys/devices/system/cpu/cpufreq");
+    let root = Path::new("/sys/devices/system/cpu");
     *BASE_MHZ.get_or_init(|| linux_telemetry::base_frequency_mhz(root))
 }
 
@@ -787,18 +1113,6 @@ fn block_device_name(dev: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dev.to_string())
-}
-
-fn parent_block_device(dev: &str) -> Option<String> {
-    let class = Path::new("/sys/class/block").join(dev);
-    if !class.join("partition").exists() {
-        return None;
-    }
-    let target = std::fs::canonicalize(class).ok()?;
-    target
-        .parent()?
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
 }
 
 fn hostname() -> String {
@@ -867,7 +1181,9 @@ impl PlatformActions for LinuxActions {
             efficiency_mode: false,
             run_new_task: true,
             run_elevated: false,
-            per_process_network: false,
+            // TCP throughput per process through `sock_diag` (UDP is not
+            // attributable without tracing; see `linux_net_accounting`).
+            per_process_network: true,
             process_modules: true,
             process_threads: true,
             process_connections: true,
@@ -1740,6 +2056,12 @@ pub fn create_collector() -> LinuxCollector {
         cache_kb: cache_totals_kb(&read_cache_indexes()),
         window_observer: x11_windows::WindowObserver::new(),
         desktop_evidence: desktop_session::DesktopEvidenceCache::new(),
+        disk_topology: None,
+        process_net: process_net::ProcessNet::default(),
+        process_gpu: process_gpu::ProcessGpu::default(),
+        activity: HashMap::new(),
+        elf_classes: HashMap::new(),
+        net_totals: HashMap::new(),
     }
 }
 

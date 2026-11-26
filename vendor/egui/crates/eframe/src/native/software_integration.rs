@@ -110,6 +110,14 @@ pub(crate) fn software_frame_stats_take() -> crate::SoftwareFrameStats {
     }
 }
 
+/// Whether `window` is a Wayland surface.
+fn is_wayland(window: &winit::window::Window) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    window
+        .window_handle()
+        .is_ok_and(|handle| matches!(handle.as_raw(), RawWindowHandle::Wayland(_)))
+}
+
 fn should_force_full_paint(
     has_presented_once: bool,
     presented_while_visible: bool,
@@ -1094,7 +1102,15 @@ impl SoftwareWinitRunning<'_> {
         let hidden = self.window.is_visible() == Some(false)
             || self.window.is_minimized() == Some(true)
             || self.info.occluded == Some(true);
-        let paintable = size.width > 0 && size.height > 0 && (!hidden || !self.has_presented_once);
+        // TaskMan fork: the first-frame exception paints a still-hidden window so
+        // Windows' reveal has a frame behind it. On Wayland a present maps the
+        // surface, so a window the app hid (start minimized to the tray) or one
+        // still waiting for its remap configure must never present: winit
+        // reports both as `is_visible() == Some(false)`.
+        let wayland_hidden = self.window.is_visible() == Some(false) && is_wayland(&self.window);
+        let paintable = size.width > 0
+            && size.height > 0
+            && (!hidden || (!self.has_presented_once && !wayland_hidden));
 
         if hidden {
             self.presented_while_visible = false;
@@ -1216,6 +1232,14 @@ impl SoftwareWinitRunning<'_> {
                                 .fetch_add(1, Ordering::Relaxed);
                         } else {
                             let present_start = Instant::now();
+                            // TaskMan fork: announce the present so winit can
+                            // throttle the next redraw to the compositor's
+                            // frame callback (Wayland). Without it every input
+                            // event of a scroll or scrollbar drag repainted the
+                            // whole window at the event rate, not the display
+                            // rate — a full core on a 1000 Hz mouse. The GPU
+                            // backends already do this in `egui-wgpu`.
+                            self.window.pre_present_notify();
                             match state.present_rects(&present_rects, full_screen) {
                                 Ok(()) => {
                                     let present_ns = present_start.elapsed().as_nanos() as u64;
@@ -1269,6 +1293,7 @@ impl SoftwareWinitRunning<'_> {
                 if let Ok(mut state) = self.surface.try_borrow_mut()
                     && state.buffer_mut().is_ok_and(|b| b.age() == 1)
                 {
+                    self.window.pre_present_notify();
                     match state.present_rects(&[full_rect], true) {
                         Ok(()) => presented_now = true,
                         Err(err) => {

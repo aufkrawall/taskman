@@ -3,6 +3,7 @@ name = "tm-installer"
 description = "Self-contained Windows setup installer for Task Man (100% Rust)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
@@ -23,23 +24,24 @@ path = "src/bin/taskman-payload.rs"
 
 [dependencies]
 tm-core = { workspace = true }
-tm-platform = { workspace = true }
-tm-ui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 # Pure-Rust deflate (miniz_oxide) for the embedded payload archive.
 flate2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tm-platform = { workspace = true }
 egui = { version = "=0.36.1" }
-# The setup wizard renders through the same egui stack as the app so it can
-# mirror the app's theming exactly. Software (CPU) rendering only: the wizard
-# is a short-lived window, and this backend supports sub-pixel text.
+# The setup wizard (`ui.rs`, Windows-only) renders through the same egui stack
+# as the app so it can mirror the app's theming exactly. Software (CPU)
+# rendering only: the wizard is a short-lived window, and this backend supports
+# sub-pixel text.
+tm-ui = { workspace = true }
 eframe = { version = "=0.36.1", default-features = false, features = [
   "software",
   "default_fonts",
 ] }
-
-[target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6.2"
 windows = { workspace = true, features = [
   "Win32_Foundation",

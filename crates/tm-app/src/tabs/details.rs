@@ -420,7 +420,9 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::Uac,
         col: || TmColumn::text("uac", i18n::tr(K::ColUac), 160.0),
-        default_visible: true,
+        // UAC file/registry virtualization exists only on Windows; elsewhere
+        // every row would read "Unknown". Still selectable from the menu.
+        default_visible: cfg!(target_os = "windows"),
     },
     ColSpec {
         cid: ColumnId::GpuUtil,
@@ -5840,14 +5842,14 @@ mod tests {
         restored.apply_saved_prefs(Some(&s.saved_visibility()), None);
         assert!(restored.is_visible(ColumnId::Threads));
         // …and so must hiding a default-visible one.
-        s.set_visible(ColumnId::Uac, false);
+        s.set_visible(ColumnId::Elevated, false);
         let vis = s.saved_visibility();
-        assert_eq!(vis.get("uac"), Some(&false));
+        assert_eq!(vis.get("elevated"), Some(&false));
         // Unchanged columns produce no entry.
         assert!(!vis.contains_key("name"));
         let mut restored2 = State::default();
         restored2.apply_saved_prefs(Some(&vis), None);
-        assert!(!restored2.is_visible(ColumnId::Uac));
+        assert!(!restored2.is_visible(ColumnId::Elevated));
         assert!(restored2.is_visible(ColumnId::Name));
     }
 
@@ -5895,11 +5897,14 @@ mod tests {
         // Hiding the current sort column via prefs falls back to a visible
         // one, same as hiding it through the dialog.
         let mut s2 = State {
-            sort_col: ColumnId::Uac,
+            sort_col: ColumnId::Elevated,
             ..State::default()
         };
-        s2.apply_saved_prefs(Some(&BTreeMap::from([("uac".to_string(), false)])), None);
-        assert!(!s2.is_visible(ColumnId::Uac));
+        s2.apply_saved_prefs(
+            Some(&BTreeMap::from([("elevated".to_string(), false)])),
+            None,
+        );
+        assert!(!s2.is_visible(ColumnId::Elevated));
         assert!(s2.is_visible(s2.sort_col));
         assert_eq!(s2.sort_order, SortOrder::Ascending);
     }

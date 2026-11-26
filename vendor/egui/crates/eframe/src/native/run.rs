@@ -242,7 +242,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                     } else {
                         self.last_invisible_repaint.remove(window_id);
                         log::trace!("request_redraw for {window_id:?}");
-                        event_loop.set_control_flow(ControlFlow::Poll);
+                        event_loop.set_control_flow(control_flow_after_redraw_request());
                         window.request_redraw();
                     }
                 } else {
@@ -286,7 +286,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                             .is_some_and(|t| *t <= now)
                         {
                             self.windows_next_repaint_times.remove(window_id);
-                            event_loop.set_control_flow(ControlFlow::Poll);
+                            event_loop.set_control_flow(control_flow_after_redraw_request());
                             window.request_redraw();
                         }
                     }
@@ -300,6 +300,24 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         }
 
         self.in_check_redraw = false;
+    }
+}
+
+/// TASKMAN-FORK: the control flow to wait in once a redraw was requested.
+///
+/// Upstream polls. On Wayland winit defers a requested redraw until the
+/// compositor's frame callback for the previous present arrives, so `Poll`
+/// spun the event loop at 100 % of a core for the whole wait — every frame of
+/// a scroll, a scrollbar drag or any animation, on the CPU and the GPU
+/// renderers alike. The deferred redraw is delivered as an event (the frame
+/// callback wakes the loop; X11 and macOS queue the redraw as an event too),
+/// so `Wait` loses nothing there. Windows keeps upstream's `Poll`: its redraw
+/// is an immediate `WM_PAINT`, so nothing spins, and that path is measured.
+fn control_flow_after_redraw_request() -> ControlFlow {
+    if cfg!(target_os = "windows") {
+        ControlFlow::Poll
+    } else {
+        ControlFlow::Wait
     }
 }
 

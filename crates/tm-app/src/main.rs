@@ -1038,16 +1038,16 @@ const LINUX_ACTIVATION_CONFIRM_DEADLINE: std::time::Duration =
 /// What the running session can do with the window.
 ///
 /// The tray promises that a hidden window comes back, so it may only hide the
-/// window where hiding works. Wayland's winit backend ignores
-/// `ViewportCommand::Visible(false)` (and the un-minimize that would undo it),
-/// so on Wayland a "hidden" window would stay on screen while the app believed
-/// it was in the tray.
+/// window where hiding works. Upstream winit ignores
+/// `ViewportCommand::Visible(false)` on Wayland; the vendored fork unmaps the
+/// surface instead (`vendor/winit/TASKMAN-FORK.md` §5), so both display
+/// servers can hide — an unresolved one still cannot.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxDisplay {
     /// X11/XCB: show and hide really take the window off screen.
     X11,
-    /// Wayland: the window stays composed, whatever the app asks for.
+    /// Wayland: hiding unmaps the surface (winit fork), showing remaps it.
     Wayland,
 }
 
@@ -1424,6 +1424,13 @@ impl eframe::App for NativeApp {
         #[cfg(not(target_os = "linux"))]
         let activation_requests: Vec<()> = Vec::new();
         if !activation_requests.is_empty() {
+            // A window in the tray comes back by being mapped again, which a
+            // Wayland compositor shows (and normally focuses) as a new
+            // toplevel: unlike raising an already-visible window, that restore
+            // does not depend on a focus grant the client cannot confirm.
+            #[cfg(target_os = "linux")]
+            let restored_from_tray =
+                (self.hidden_to_tray || self.initial_hide_pending) && self.can_hide_window();
             self.hidden_to_tray = false;
             self.initial_hide_pending = false;
             #[cfg(target_os = "linux")]
@@ -1437,6 +1444,9 @@ impl eframe::App for NativeApp {
                             queued_ui_seq: ui_seq,
                             deadline: std::time::Instant::now() + LINUX_ACTIVATION_CONFIRM_DEADLINE,
                         });
+                    } else if restored_from_tray {
+                        tracing::info!("Linux activation restored the window from the tray");
+                        request.acknowledge();
                     } else {
                         tracing::info!(
                             "Linux activation cannot confirm restoration on Wayland; new window will open"
@@ -2419,12 +2429,16 @@ impl NativeApp {
         true
     }
 
-    /// Wayland ignores the hide request (and the un-minimize that would undo
-    /// it), so only a positively identified X11 session may hide the window; an
-    /// unresolved backend keeps the window where the user can see it.
+    /// X11 unmaps the window; Wayland unmaps it through the winit fork's
+    /// null-buffer commit (`vendor/winit/TASKMAN-FORK.md` §5) and maps it
+    /// again with a fresh initial commit. An unresolved backend keeps the
+    /// window where the user can see it.
     #[cfg(target_os = "linux")]
     fn can_hide_window(&self) -> bool {
-        self.linux_display == Some(LinuxDisplay::X11)
+        matches!(
+            self.linux_display,
+            Some(LinuxDisplay::X11 | LinuxDisplay::Wayland)
+        )
     }
 
     /// A start that asked to minimize keeps the window visible on a session

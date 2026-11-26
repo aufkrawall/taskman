@@ -11,12 +11,15 @@
 //! `$XDG_DATA_DIRS/icons` and finally the legacy pixmaps dirs. An absolute
 //! `Icon=` path is used directly.
 //!
-//! Only PNG icons are decoded (the overwhelmingly common case in hicolor and
-//! shipped themes); SVG/XPM candidates are skipped while a size directory is
-//! scanned — the next candidate size or theme still gets its turn — so an app
-//! whose icon exists only as SVG falls back to the generic glyph. The module is
-//! platform-neutral on purpose: only the Linux backend calls it, but compiling
-//! it everywhere lets its unit tests run on the Windows dev box and CI.
+//! PNG, SVG and SVGZ icons are decoded: Breeze (KDE's default) and Adwaita
+//! ship most of their icons — the generic application icon included — only as
+//! SVG, so a PNG-only resolver left most rows on those desktops without any
+//! icon. Within one size directory a PNG is preferred over an SVG of the same
+//! name; XPM is not supported and is skipped. SVGs are rasterized with `resvg`
+//! (no text, no system fonts, no embedded raster images — an icon needs none of
+//! them). The module is platform-neutral on purpose: only the Linux backend
+//! calls it, but compiling it everywhere lets its unit tests run on the Windows
+//! dev box and CI.
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
@@ -38,6 +41,11 @@ const MAX_ICON_SOURCE_EDGE: u32 = 2048;
 const MAX_ICON_DECODE_BYTES: usize = 32 * 1024 * 1024;
 /// The GUI paints icons at ~18 px; 32 is the size desktop shells hand out.
 const TARGET_SIZE: u32 = 32;
+/// Edge an SVG icon is rasterized at: enough for the ~18 px cell at 2× display
+/// scaling without the blur of upscaling a 32 px raster.
+const SVG_RENDER_EDGE: u32 = 48;
+/// Largest SVG/SVGZ file this module parses; theme icons are a few KiB.
+const MAX_SVG_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Longest text file this module parses: a theme's `index.theme`, a `.desktop`
 /// entry, GTK's `settings.ini` or KDE's `kdeglobals`.
@@ -590,43 +598,55 @@ impl IconResolver {
         if !is_themed_icon_name(name) {
             return None;
         }
-        let file_name = png_file_name(name);
+        let file_names = icon_file_names(name);
         let icon_dirs = self.lookup.icon_dirs();
         for theme in &self.themes {
             for dir in &icon_dirs {
-                if let Some(f) = self.find_in_theme(dir, theme, &file_name) {
+                if let Some(f) = self.find_in_theme(dir, theme, &file_names) {
                     return Some(f);
                 }
             }
         }
         // Legacy pixmaps dirs hold plain files: `<pixmaps>/<name>.png`.
-        self.lookup
-            .pixmaps
-            .iter()
-            .map(|px| px.join(&file_name))
-            .find(|f| f.is_file())
+        self.lookup.pixmaps.iter().find_map(|px| {
+            file_names
+                .iter()
+                .map(|file_name| px.join(file_name))
+                .find(|f| f.is_file())
+        })
     }
 
     /// Find `<icon_dir>/<theme>/<size>/<context>/<file_name>`, choosing the size
     /// closest to [`TARGET_SIZE`]. Uses the theme's `index.theme` directory list
     /// when present; otherwise walks the two-level `<size>/<context>` layout.
-    fn find_in_theme(&self, icon_dir: &Path, theme: &str, file_name: &str) -> Option<PathBuf> {
+    fn find_in_theme(
+        &self,
+        icon_dir: &Path,
+        theme: &str,
+        file_names: &[String],
+    ) -> Option<PathBuf> {
         let theme_dir = icon_dir.join(theme);
         if !theme_dir.is_dir() {
             return None;
         }
         for dir in self.size_dirs(&theme_dir).iter() {
-            // The icon may sit directly in the size dir (rare) or one context
-            // level deeper (the standard layout).
-            let direct = dir.path.join(file_name);
-            if direct.is_file() {
-                return Some(direct);
-            }
-            // Sorted like every other directory walk here: one icon name can
-            // exist in more than one context of the same size dir, and a
-            // filesystem-defined order must not decide which file wins.
-            if let Some(f) = first_in_contexts(&sorted_dir_paths(&dir.path), file_name) {
-                return Some(f);
+            // Listed once per size dir, not once per candidate extension.
+            let mut contexts: Option<Vec<PathBuf>> = None;
+            for file_name in file_names {
+                // The icon may sit directly in the size dir (Breeze's
+                // `apps/48/` layout) or one context level deeper (the
+                // standard `48x48/apps/` layout).
+                let direct = dir.path.join(file_name);
+                if direct.is_file() {
+                    return Some(direct);
+                }
+                // Sorted like every other directory walk here: one icon name
+                // can exist in more than one context of the same size dir, and
+                // a filesystem-defined order must not decide which file wins.
+                let contexts = contexts.get_or_insert_with(|| sorted_dir_paths(&dir.path));
+                if let Some(f) = first_in_contexts(contexts, file_name) {
+                    return Some(f);
+                }
             }
         }
         None
@@ -676,9 +696,9 @@ impl IconResolver {
         if let Some(cached) = cached {
             return Some(cached);
         }
-        // Decoded outside the guard: a PNG read and decode is the expensive
-        // half and must not hold the map lock.
-        let decoded = decode_png_rgba(file)?;
+        // Decoded outside the guard: a read and decode is the expensive half
+        // and must not hold the map lock.
+        let decoded = decode_icon_rgba(file)?;
         tm_core::sync::lock(&self.caches)
             .decoded
             .insert(file.to_path_buf(), decoded.clone());
@@ -1073,15 +1093,23 @@ fn is_themed_icon_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
-/// The file name to look for inside a theme: `<name>.png`, unless the icon
-/// name already carries the extension (some desktop files name a file instead
-/// of a themed icon, and `<name>.png.png` never exists).
-fn png_file_name(name: &str) -> String {
-    if name.ends_with(".png") {
-        name.to_string()
-    } else {
-        format!("{name}.png")
+/// The file names to look for inside a theme, best format first: `<name>.png`,
+/// `<name>.svg`, `<name>.svgz` — unless the icon name already carries one of
+/// those extensions (some desktop files name a file instead of a themed icon,
+/// and `<name>.png.png` never exists).
+fn icon_file_names(name: &str) -> Vec<String> {
+    let lower = name.to_ascii_lowercase();
+    if [".png", ".svg", ".svgz"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+    {
+        return vec![name.to_string()];
     }
+    vec![
+        format!("{name}.png"),
+        format!("{name}.svg"),
+        format!("{name}.svgz"),
+    ]
 }
 
 /// One candidate size directory of a theme.
@@ -1275,6 +1303,63 @@ fn is_theme_subdirectory(subdir: &str) -> bool {
         && Path::new(subdir)
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+/// Decode an icon file — PNG, SVG or SVGZ by extension — to straight-alpha
+/// RGBA.
+pub fn decode_icon_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("svg" | "svgz") => rasterize_svg(path),
+        _ => decode_png_rgba(path),
+    }
+}
+
+/// Rasterize an SVG/SVGZ icon so its longer edge is [`SVG_RENDER_EDGE`].
+///
+/// `usvg` detects and inflates SVGZ itself. The output is converted from
+/// tiny-skia's premultiplied pixels to the straight alpha the GUI uploads.
+fn rasterize_svg(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    use resvg::{tiny_skia, usvg};
+    let file = std::fs::File::open(path).ok()?;
+    let mut data = Vec::new();
+    file.take(MAX_SVG_BYTES + 1).read_to_end(&mut data).ok()?;
+    if data.len() as u64 > MAX_SVG_BYTES {
+        return None;
+    }
+    let tree = usvg::Tree::from_data(&data, &usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let (width, height) = (size.width(), size.height());
+    if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let scale = SVG_RENDER_EDGE as f32 / width.max(height);
+    let out_w = ((width * scale).round() as u32).clamp(1, SVG_RENDER_EDGE);
+    let out_h = ((height * scale).round() as u32).clamp(1, SVG_RENDER_EDGE);
+    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut rgba = pixmap.take();
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        let alpha = pixel[3];
+        if alpha != 0 && alpha != 255 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u16::from(*channel) * 255 + u16::from(alpha) / 2) / u16::from(alpha))
+                    .min(255) as u8;
+            }
+        }
+    }
+    // An icon that rendered fully transparent (all-CSS symbolic glyphs
+    // without a stylesheet) is no icon: let the next candidate win.
+    if rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0) {
+        return None;
+    }
+    Some((out_w, out_h, rgba))
 }
 
 /// Decode a PNG file to straight-alpha RGBA, box-downsampling anything larger
@@ -2479,31 +2564,53 @@ mod tests {
         assert!(f.ends_with("16x16@2/apps/plain.png"), "{f:?}");
     }
 
-    /// SVG is skipped while a size directory is scanned, so the PNG in the
-    /// next-best size still gets its turn instead of the row losing its icon.
+    /// Regression: Breeze ships its icons (the generic application icon
+    /// included) only as SVG, and a PNG-only resolver left most rows on KDE
+    /// without any icon. An SVG in the best size dir is used and rasterized;
+    /// within one dir a PNG of the same name still wins.
     #[test]
-    fn svg_only_size_dir_falls_through_to_a_png() {
-        let sb = Sandbox::new("svg-fallthrough");
+    fn svg_icons_are_found_and_rasterized_and_png_wins_a_tie() {
+        let sb = Sandbox::new("svg-icons");
         write_desktop(
             &sb.root.join("share/icons/custom/index.theme"),
-            "[Icon Theme]\nName=Custom\nDirectories=32x32/apps,48x48/apps\n\n\
-             [32x32/apps]\nSize=32\nType=Fixed\n\n\
-             [48x48/apps]\nSize=48\nType=Fixed\n",
+            "[Icon Theme]\nName=Custom\nDirectories=apps/32,apps/48\n\n\
+             [apps/32]\nSize=32\nType=Fixed\n\n\
+             [apps/48]\nSize=48\nType=Fixed\n",
         );
-        // A text stand-in is enough: the resolver looks for `.png` only.
         write_desktop(
-            &sb.root.join("share/icons/custom/32x32/apps/vector.svg"),
-            "<svg/>\n",
+            &sb.root.join("share/icons/custom/apps/32/vector.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"8\">\
+             <rect width=\"16\" height=\"8\" fill=\"#ff0000\" fill-opacity=\"0.5\"/></svg>\n",
         );
         write_png(
-            &sb.root.join("share/icons/custom/48x48/apps/vector.png"),
+            &sb.root.join("share/icons/custom/apps/48/vector.png"),
             48,
             48,
             [4, 4, 4, 255],
         );
         let r = IconResolver::new(sb.lookup());
-        let f = r.find_icon_file("vector").expect("png fallback");
-        assert!(f.ends_with("48x48/apps/vector.png"), "{f:?}");
+        let f = r
+            .find_icon_file("vector")
+            .expect("svg in the best size dir");
+        assert!(f.ends_with("apps/32/vector.svg"), "{f:?}");
+        let (w, h, rgba) = decode_icon_rgba(&f).expect("rasterized");
+        assert_eq!((w, h), (SVG_RENDER_EDGE, SVG_RENDER_EDGE / 2));
+        // Straight alpha: half-transparent pure red, not premultiplied.
+        assert_eq!(&rgba[..4], &[255, 0, 0, 128]);
+
+        write_png(
+            &sb.root.join("share/icons/custom/apps/32/vector.png"),
+            32,
+            32,
+            [4, 4, 4, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let f = r.find_icon_file("vector").expect("png");
+        assert!(f.ends_with("apps/32/vector.png"), "{f:?}");
+
+        // Markup that is not an SVG is no icon.
+        write_desktop(&sb.root.join("broken.svg"), "<svg");
+        assert!(decode_icon_rgba(&sb.root.join("broken.svg")).is_none());
     }
 
     /// The `<context>` directory a resolved icon file lives in.

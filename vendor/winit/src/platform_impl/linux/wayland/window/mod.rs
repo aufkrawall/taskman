@@ -29,6 +29,7 @@ use crate::window::{
 };
 
 use super::event_loop::sink::EventSink;
+use state::VisibilityChange;
 use super::output::MonitorHandle;
 use super::state::WinitState;
 use super::types::xdg_activation::XdgActivationTokenData;
@@ -249,14 +250,45 @@ impl Window {
         self.window_state.lock().unwrap().set_title(new_title);
     }
 
+    /// TaskMan fork: upstream ignored this ("not possible on Wayland"), which
+    /// made close-to-tray and start-minimized impossible on every Wayland
+    /// desktop. xdg-shell does define a client unmap: committing a null buffer
+    /// unmaps the toplevel, and committing again without a buffer is the
+    /// initial commit that maps it anew — the compositor answers with a fresh
+    /// configure, which winit turns into a redraw whose present attaches the
+    /// first buffer. The renderers must not present while hidden (attaching a
+    /// buffer before that configure is a protocol error); eframe's painters
+    /// skip a window whose `is_visible()` is `Some(false)`, which is what this
+    /// reports while unmapped. See `TASKMAN-FORK.md` §5.
     #[inline]
-    pub fn set_visible(&self, _visible: bool) {
-        // Not possible on Wayland.
+    pub fn set_visible(&self, visible: bool) {
+        let change = self.window_state.lock().unwrap().set_hidden(!visible);
+        let surface = self.window.wl_surface();
+        match change {
+            VisibilityChange::None | VisibilityChange::HideUnmapped => return,
+            VisibilityChange::Unmap => {
+                surface.attach(None, 0, 0);
+                surface.commit();
+            }
+            // The compositor answers the initial commit with a configure, and
+            // winit requests a redraw for every configure; presenting earlier
+            // would attach a buffer to an unconfigured surface.
+            VisibilityChange::Remap => surface.commit(),
+            VisibilityChange::Redraw => {
+                self.request_redraw();
+                return;
+            }
+        }
+        // The requests go out with the loop's next flush; wake it so that
+        // happens now rather than at the next unrelated event.
+        self.event_loop_awakener.ping();
     }
 
+    /// TaskMan fork: `Some(false)` while the client keeps its surface unmapped
+    /// through [`Self::set_visible`]; otherwise unknown, as upstream reports.
     #[inline]
     pub fn is_visible(&self) -> Option<bool> {
-        None
+        self.window_state.lock().unwrap().is_hidden().then_some(false)
     }
 
     #[inline]

@@ -112,9 +112,7 @@ impl Mesh {
 
     /// Iterate over the triangles of this mesh, returning vertex indices.
     pub fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_ {
-        self.indices
-            .chunks_exact(3)
-            .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        self.indices.as_chunks::<3>().0.iter().copied()
     }
 
     /// Calculate a bounding rectangle.

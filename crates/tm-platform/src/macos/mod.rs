@@ -262,6 +262,8 @@ impl SystemCollector for MacCollector {
                         avg_resp_ms: 0.0,
                         total_read_bytes: io.total_read_bytes,
                         total_written_bytes: io.total_written_bytes,
+                        model: String::new(),
+                        volumes: Vec::new(),
                     }
                 })
                 .collect(),

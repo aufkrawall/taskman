@@ -326,7 +326,6 @@ struct ProcessRuleResult {
     error: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
 struct AdvancedStateResult {
     core_service: tm_platform::actions::CoreServiceState,
     task_manager: tm_platform::actions::TaskManagerReplacementState,
@@ -501,15 +500,10 @@ pub struct TaskManApp {
     process_rules_enabled: bool,
     /// Machine-wide integration state is queried off the UI thread. A stuck
     /// service/SCM must never freeze the Settings window.
-    #[cfg(target_os = "windows")]
     pub core_service_state: Option<tm_platform::actions::CoreServiceState>,
-    #[cfg(target_os = "windows")]
     pub task_manager_replacement_state: Option<tm_platform::actions::TaskManagerReplacementState>,
-    #[cfg(target_os = "windows")]
     advanced_state_result: Arc<Mutex<Option<AdvancedStateResult>>>,
-    #[cfg(target_os = "windows")]
     advanced_state_inflight: bool,
-    #[cfg(target_os = "windows")]
     advanced_state_last_refresh: Option<std::time::Instant>,
     #[cfg(target_os = "windows")]
     pub core_service_change_inflight: Arc<AtomicBool>,
@@ -1003,15 +997,10 @@ impl TaskManApp {
             process_rule_failures: HashMap::new(),
             process_rule_results: Arc::new(Mutex::new(Vec::new())),
             process_rules_enabled: !mock,
-            #[cfg(target_os = "windows")]
             core_service_state: None,
-            #[cfg(target_os = "windows")]
             task_manager_replacement_state: None,
-            #[cfg(target_os = "windows")]
             advanced_state_result: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "windows")]
             advanced_state_inflight: false,
-            #[cfg(target_os = "windows")]
             advanced_state_last_refresh: None,
             #[cfg(target_os = "windows")]
             core_service_change_inflight: Arc::new(AtomicBool::new(false)),
@@ -1029,7 +1018,6 @@ impl TaskManApp {
         app
     }
 
-    #[cfg(target_os = "windows")]
     pub fn poll_advanced_state(&mut self, ctx: &egui::Context) {
         if let Some(result) = tm_core::sync::lock(&self.advanced_state_result).take() {
             self.core_service_state = Some(result.core_service);

@@ -47,10 +47,10 @@ impl<T> SerializableAny for T where
 }
 
 #[cfg(not(feature = "persistence"))]
-pub trait SerializableAny: 'static + Any + Clone + for<'a> Send + Sync {}
+pub trait SerializableAny: 'static + Any + Clone + Send + Sync {}
 
 #[cfg(not(feature = "persistence"))]
-impl<T> SerializableAny for T where T: 'static + Any + Clone + for<'a> Send + Sync {}
+impl<T> SerializableAny for T where T: 'static + Any + Clone + Send + Sync {}
 
 // -----------------------------------------------------------------------------------------------
 

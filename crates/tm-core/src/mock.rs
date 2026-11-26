@@ -108,6 +108,8 @@ pub fn snapshot(seed: u32) -> Snapshot {
             avg_resp_ms: 0.3,
             total_read_bytes: 123456789,
             total_written_bytes: 987654321,
+            model: String::new(),
+            volumes: Vec::new(),
         }],
         networks: vec![NetworkInfo {
             name: "Ethernet".into(),

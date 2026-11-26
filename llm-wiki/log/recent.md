@@ -1,3 +1,41 @@
+## 2026-11-26 - Linux bare-metal audit (KDE Plasma Wayland, NVIDIA, Arch)
+
+- First test on real Linux hardware; 13 user reports plus findings of our own.
+  Root causes worth remembering:
+  - Scroll/drag CPU: eframe set `ControlFlow::Poll` after `request_redraw`,
+    and Wayland defers the redraw to the frame callback → busy loop on both
+    renderers. Now `Wait` off Windows (egui fork §18); the CPU renderer also
+    calls `pre_present_notify`. Measured in a headless sway: 102 % → 21 % of a
+    core at the same 62 fps. perf is unavailable in the agent sandbox
+    (`perf_event_paranoid=2`); the FPS overlay plus `/proc/<pid>/stat` was the
+    instrument.
+  - Missing icons: Breeze is SVG-only; `resvg` now renders SVG/SVGZ.
+  - Wayland close-to-tray/autostart: winit's `set_visible` was a no-op; fork
+    §5 unmaps with a null-buffer commit and remaps with a fresh initial commit.
+  - Disks at "100 %"/duplicated: one row per mount, each partition repeating
+    its parent's counters. Now physical drives (`linux_disks.rs`). The literal
+    constant 100 % was not reproduced (kernel counters were sane); the
+    duplication is the confirmed defect.
+  - Users duplicated: systemd ≥ 256 registers `user@UID.service` as a session
+    of class `manager`; and `loginctl show-session --property=A,B` prints
+    NOTHING on current systemd (comma lists unsupported), so session
+    state/logon time had never been read.
+  - Truncated names: `/proc/<pid>/stat` comm is 15 bytes.
+  - Settings "without privileges" with the broker running: the Linux UI only
+    showed the GUI token's state.
+- New per-process providers: `sock_diag` TCP accountant
+  (`linux_net_accounting.rs` + `linux/process_net.rs`), NVML per-process
+  queries + DRM fdinfo (`linux_gpu_clients.rs` + `linux/process_gpu.rs`),
+  `/proc/<pid>/io` activity and disk-time attribution (`linux_telemetry.rs`).
+  Limits in `known-debt.md` § 2026-11-26.
+- Verification harness used (not committed): headless sway with
+  `WLR_BACKENDS=headless`, a private `XDG_RUNTIME_DIR` (so the activation
+  coordinator does not hand launches to the user's running instance), isolated
+  `TASKMAN_CONFIG_DIR`/`TASKMAN_DATA_DIR`, `grim` screenshots. Synthetic
+  pointer input does not reach clients there (no pointer device), so scroll
+  cost was proxied by `TASKMAN_FPS_PROBE=1`. Vulkan cannot start on the pixman
+  headless compositor.
+
 ## 2026-11-26 - Processes: retire busy-helper promotion into Background
 
 - User compared the Processes tree with the Details tree: under an editor,

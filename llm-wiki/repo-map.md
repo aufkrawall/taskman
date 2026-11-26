@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-11-24 (Linux per-process CPU accountant, icon theme chain, and the table repaint caches)
+Last cross-checked: 2026-11-26 (Linux per-process network/GPU/disk providers, physical disks, SVG icons)
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -226,7 +226,19 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     detection, regressing-counter rejection and a never-exceeds-machine clamp.
     Anything unmeasurable is `None`, never 0 % — including the first window of
     a process. One `/proc/<pid>/stat` read feeds both the identity bracket and
-    the accountant. Linux/macOS backends exist and are built by default
+    the accountant. Per-process network is `linux/process_net.rs` (netlink
+    `sock_diag` TCP dumps, socket-inode → pid ownership cached and rescanned
+    only for unowned active sockets) over the platform-neutral
+    `linux_net_accounting.rs` (message decoding, per-cookie deltas). Per-process
+    GPU is `linux/process_gpu.rs` (DRM fd discovery cached per process for 5 s,
+    fdinfo reads per tick, NVML `…RunningProcesses_v3` +
+    `nvmlDeviceGetProcessUtilization` from `linux/nvml.rs`, adapter engine
+    lists) over the neutral `linux_gpu_clients.rs` (fdinfo parsing, engine
+    deltas, engine naming). Physical disks are `linux_disks.rs` (drives from
+    `/sys/block/*/device`, partition/md/dm → drive resolution, volume grouping).
+    `linux_telemetry.rs` also holds `/proc/<pid>/io`/fault parsing, the
+    disk-time attribution, the ELF platform check, comm de-truncation and
+    meminfo page lists. Linux/macOS backends exist and are built by default
     (`build.py`). The Linux
     window observer uses a dedicated non-blocking `linux/x11_windows.rs`
     thread: EWMH client lists are merged, X-Resource supplies local client

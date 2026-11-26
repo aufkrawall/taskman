@@ -3,6 +3,7 @@ name = "tm-ui"
 description = "Shared Windows-11-Task-Manager theme palette and font setup"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

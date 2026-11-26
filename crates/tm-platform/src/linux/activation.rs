@@ -1280,11 +1280,44 @@ mod tests {
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(remove_stale_socket(&socket).is_err());
         assert!(socket.exists());
-
         drop(listener);
-        remove_stale_socket(&socket).unwrap();
-        assert!(!socket.exists());
+
+        // The stale case uses a socket that was bound but never listened on.
+        // Dropping a real listener is not a deterministic "stale" fixture: any
+        // test in this process that spawns a child duplicates every open
+        // descriptor between fork and exec (CLOEXEC only acts at exec), so the
+        // "dropped" listener can still accept for that instant.
+        let stale = dir.join("stale.sock");
+        bind_without_listening(&stale);
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+        remove_stale_socket(&stale).unwrap();
+        assert!(!stale.exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Create a socket file whose socket refuses every connection.
+    fn bind_without_listening(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: plain socket creation; the descriptor is closed below.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0);
+        // SAFETY: zero is the unused state of `sockaddr_un`.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in address.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+            *slot = *byte as libc::c_char;
+        }
+        // SAFETY: `address` is initialized and outlives the call.
+        let bound = unsafe {
+            libc::bind(
+                fd,
+                &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(bound, 0, "{}", io::Error::last_os_error());
+        // SAFETY: `fd` is owned here and closed once.
+        unsafe { libc::close(fd) };
     }
 
     #[test]

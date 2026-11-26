@@ -141,6 +141,25 @@ pub struct WindowState {
     /// The state of the frame callback.
     frame_callback_state: FrameCallbackState,
 
+    /// TaskMan fork: the client asked for its window to be hidden through
+    /// `set_visible(false)`. See `TASKMAN-FORK.md` §5.
+    hidden: bool,
+
+    /// TaskMan fork: a buffer was presented since the surface was last
+    /// (re)mapped — i.e. the surface is mapped, and hiding it needs an unmap.
+    /// Set by `pre_present_notify`, which both eframe renderers call right
+    /// before every present.
+    presented: bool,
+
+    /// TaskMan fork: the surface was unmapped by a null-buffer commit and must
+    /// make the initial commit again (then wait for its configure) before the
+    /// next buffer may be attached.
+    needs_initial_commit: bool,
+
+    /// TaskMan fork: the initial commit of a remap was sent and its configure
+    /// has not arrived yet.
+    awaiting_remap_configure: bool,
+
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     blur: Option<OrgKdeKwinBlur>,
@@ -189,6 +208,44 @@ fn reported_suspended(last_configure: Option<XdgWindowState>, version: u32) -> O
     (version >= SUSPENDED_VERSION).then_some(is_suspended_state(state))
 }
 
+/// TaskMan fork: what `Window::set_visible` has to send for one transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityChange {
+    /// Nothing changed.
+    None,
+    /// Hide a mapped surface: attach a null buffer and commit.
+    Unmap,
+    /// Hide a surface that never received a buffer: there is nothing to unmap,
+    /// and the renderers simply do not present while hidden.
+    HideUnmapped,
+    /// Show an unmapped surface: commit without a buffer (the initial commit),
+    /// then present only after the compositor's new configure.
+    Remap,
+    /// Show a surface that was never unmapped: ask for a redraw so it presents.
+    Redraw,
+}
+
+/// TaskMan fork: the pure transition rule, kept testable without a compositor.
+fn visibility_change(
+    hidden: bool,
+    presented: &mut bool,
+    needs_initial_commit: &mut bool,
+) -> VisibilityChange {
+    if hidden {
+        if *presented {
+            *presented = false;
+            *needs_initial_commit = true;
+            VisibilityChange::Unmap
+        } else {
+            VisibilityChange::HideUnmapped
+        }
+    } else if std::mem::take(needs_initial_commit) {
+        VisibilityChange::Remap
+    } else {
+        VisibilityChange::Redraw
+    }
+}
+
 impl WindowState {
     /// Create new window state.
     pub fn new(
@@ -223,6 +280,10 @@ impl WindowState {
             fractional_scale,
             frame: None,
             frame_callback_state: FrameCallbackState::None,
+            hidden: false,
+            presented: false,
+            needs_initial_commit: false,
+            awaiting_remap_configure: false,
             seat_focus: Default::default(),
             has_pending_move: None,
             ime_allowed: false,
@@ -271,6 +332,34 @@ impl WindowState {
         self.frame_callback_state = FrameCallbackState::Received;
     }
 
+    /// TaskMan fork: whether the window must not present: hidden by the
+    /// client, or remapped and still waiting for the configure that answers
+    /// its initial commit (a buffer attached before it is a protocol error).
+    pub fn is_hidden(&self) -> bool {
+        self.hidden || self.awaiting_remap_configure
+    }
+
+    /// TaskMan fork: the hide/show bookkeeping behind `Window::set_visible`.
+    /// Returns which Wayland request the caller must issue.
+    pub fn set_hidden(&mut self, hidden: bool) -> VisibilityChange {
+        if self.hidden == hidden {
+            return VisibilityChange::None;
+        }
+        self.hidden = hidden;
+        // An unmapped surface receives no frame callbacks, so a pending
+        // throttle is dropped either way: a stale `Requested` state would
+        // otherwise block the remapped window's first redraw forever.
+        self.frame_callback_state = FrameCallbackState::None;
+        let change = visibility_change(hidden, &mut self.presented, &mut self.needs_initial_commit);
+        self.awaiting_remap_configure = change == VisibilityChange::Remap;
+        change
+    }
+
+    /// TaskMan fork: a present is about to attach a buffer.
+    pub fn note_present(&mut self) {
+        self.presented = true;
+    }
+
     /// Reset the frame callbacks state.
     pub fn frame_callback_reset(&mut self) {
         self.frame_callback_state = FrameCallbackState::None;
@@ -278,6 +367,8 @@ impl WindowState {
 
     /// Request a frame callback if we don't have one for this window in flight.
     pub fn request_frame_callback(&mut self) {
+        // TaskMan fork: `pre_present_notify` is the present marker.
+        self.note_present();
         let surface = self.window.wl_surface();
         match self.frame_callback_state {
             FrameCallbackState::None | FrameCallbackState::Received => {
@@ -421,6 +512,9 @@ impl WindowState {
 
         // NOTE: Set the configure before doing a resize, since we query it during it.
         self.last_configure = Some(configure);
+        // TaskMan fork: this configure answers a remap's initial commit; the
+        // surface may receive a buffer again.
+        self.awaiting_remap_configure = false;
         if suspended_changed {
             // TaskMan fork: a suspended surface does not necessarily receive the
             // frame callback that normally throttles redraws. Let the
@@ -1274,6 +1368,23 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TaskMan fork: hiding a mapped window unmaps it, the next show makes
+    /// the initial commit again (and waits for its configure), and a window
+    /// hidden before its first present is neither unmapped nor remapped.
+    #[test]
+    fn visibility_changes_unmap_only_mapped_surfaces_and_remap_once() {
+        let (mut presented, mut initial) = (true, false);
+        assert_eq!(visibility_change(true, &mut presented, &mut initial), VisibilityChange::Unmap);
+        assert_eq!(visibility_change(false, &mut presented, &mut initial), VisibilityChange::Remap);
+        assert!(!initial && !presented);
+        // Hidden again before the remapped window presented: nothing to unmap.
+        assert_eq!(
+            visibility_change(true, &mut presented, &mut initial),
+            VisibilityChange::HideUnmapped
+        );
+        assert_eq!(visibility_change(false, &mut presented, &mut initial), VisibilityChange::Redraw);
+    }
 
     #[test]
     fn suspended_state_detection_tracks_xdg_window_state() {

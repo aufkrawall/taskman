@@ -9,6 +9,15 @@ pub mod actions;
 /// Linux core-service wire protocol, protected manifest and peer policy.
 /// Platform-neutral on purpose so its tests run on every host.
 pub mod linux_core_service;
+/// Linux physical-disk enumeration and volume grouping.
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_disks;
+/// Linux per-process GPU usage (DRM fdinfo parsing and engine deltas).
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_gpu_clients;
+/// Linux per-process TCP accounting (`sock_diag` decoding and deltas).
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_net_accounting;
 /// Linux sensor reading types and their `/sys` + NVML conversions.
 /// Platform-neutral on purpose so its tests run on every host.
 pub mod linux_sensors;

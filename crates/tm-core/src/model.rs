@@ -212,6 +212,15 @@ pub struct DiskInfo {
     pub avg_resp_ms: f32,
     pub total_read_bytes: u64,
     pub total_written_bytes: u64,
+    /// Drive model ("Samsung SSD 970 EVO 1TB") where the platform reports
+    /// one; empty = unknown.
+    #[serde(default)]
+    pub model: String,
+    /// Mount points / volume paths stored on this disk, for a platform whose
+    /// `id` does not already name them (Linux). Empty = none mounted or not
+    /// reported.
+    #[serde(default)]
+    pub volumes: Vec<String>,
 }
 
 /// One physical disk's active time spent on one process.

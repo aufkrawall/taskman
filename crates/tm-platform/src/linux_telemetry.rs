@@ -49,6 +49,38 @@ pub struct Meminfo {
     pub sreclaimable_bytes: Option<u64>,
     pub commit_limit_bytes: Option<u64>,
     pub committed_as_bytes: Option<u64>,
+    pub mem_free_bytes: Option<u64>,
+    pub dirty_bytes: Option<u64>,
+    pub writeback_bytes: Option<u64>,
+    pub shmem_bytes: Option<u64>,
+    pub buffers_bytes: Option<u64>,
+}
+
+/// Windows-style page lists derived from `/proc/meminfo`, for the memory
+/// composition bar: `(modified, standby, free)` in bytes.
+///
+/// - Modified: dirty page cache and pages under writeback (`Dirty` +
+///   `Writeback`) — data that must reach the disk before the page can be
+///   reused, which is what Windows' modified list holds.
+/// - Standby: the reclaimable cache (`Cached` + `Buffers` + `SReclaimable`)
+///   minus the part
+///   that cannot simply be dropped: shared memory/tmpfs (`Shmem`, counted in
+///   `Cached` but only freeable by swapping) and the modified pages above.
+/// - Free: `MemFree`.
+///
+/// `None` unless every counter it needs was published: a bar assembled from a
+/// missing counter would claim an empty list.
+pub fn page_lists(meminfo: &Meminfo) -> Option<(u64, u64, u64)> {
+    let modified = meminfo
+        .dirty_bytes?
+        .saturating_add(meminfo.writeback_bytes?);
+    let standby = meminfo
+        .cached_bytes?
+        .saturating_add(meminfo.buffers_bytes.unwrap_or(0))
+        .saturating_add(meminfo.sreclaimable_bytes.unwrap_or(0))
+        .saturating_sub(meminfo.shmem_bytes.unwrap_or(0))
+        .saturating_sub(modified);
+    Some((modified, standby, meminfo.mem_free_bytes?))
 }
 
 /// Every counter the backend reports from one `/proc/meminfo` read.
@@ -63,6 +95,11 @@ pub fn parse_meminfo(text: &str) -> Meminfo {
             "SReclaimable" => &mut out.sreclaimable_bytes,
             "CommitLimit" => &mut out.commit_limit_bytes,
             "Committed_AS" => &mut out.committed_as_bytes,
+            "MemFree" => &mut out.mem_free_bytes,
+            "Dirty" => &mut out.dirty_bytes,
+            "Writeback" => &mut out.writeback_bytes,
+            "Shmem" => &mut out.shmem_bytes,
+            "Buffers" => &mut out.buffers_bytes,
             _ => continue,
         };
         *slot = parse_kib(value);
@@ -126,29 +163,239 @@ pub fn cpu_topology(cpu_root: &Path) -> (usize, usize) {
     (cores.len(), packages.len())
 }
 
-/// Highest base clock (MHz) any cpufreq policy reports, 0 when the kernel
-/// exposes none. A base clock the kernel does not publish is unknown, not an
+/// Highest base clock (MHz) the kernel publishes for any CPU, 0 when it
+/// publishes none. A base clock the kernel does not publish is unknown, not an
 /// estimate: the caller renders 0 as unavailable.
-pub fn base_frequency_mhz(cpufreq_root: &Path) -> f32 {
-    let Ok(entries) = std::fs::read_dir(cpufreq_root) else {
+///
+/// The sources are tried in order of how directly they name the base clock:
+///
+/// 1. `cpufreq/policy*/base_frequency` (kHz) — intel_pstate.
+/// 2. `cpufreq/policy*/amd_pstate_nominal_freq` (kHz) — amd-pstate on the
+///    kernels that still publish it.
+/// 3. `cpu*/acpi_cppc/nominal_freq` (MHz) — the firmware's CPPC nominal
+///    performance level, which is the rated base clock. amd-pstate kernels
+///    that dropped (2) and acpi-cpufreq on CPPC firmware publish only this.
+///
+/// `cpuinfo_max_freq` is deliberately NOT a source: with boost enabled it is
+/// the boost ceiling, not the base clock.
+pub fn base_frequency_mhz(cpu_root: &Path) -> f32 {
+    let cpufreq = cpu_root.join("cpufreq");
+    let from_policies = |file: &str| {
+        max_over(&cpufreq, "policy", |dir| {
+            read_f32(dir.join(file)).map(|khz| khz / 1000.0)
+        })
+    };
+    let mhz = from_policies("base_frequency");
+    if mhz > 0.0 {
+        return mhz;
+    }
+    let mhz = from_policies("amd_pstate_nominal_freq");
+    if mhz > 0.0 {
+        return mhz;
+    }
+    max_over(cpu_root, "cpu", |dir| {
+        read_f32(dir.join("acpi_cppc").join("nominal_freq"))
+    })
+}
+
+/// The largest positive value `read` yields for the entries of `root` named
+/// `<prefix><digits>`; 0 when none yields one.
+fn max_over(root: &Path, prefix: &str, read: impl Fn(&Path) -> Option<f32>) -> f32 {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return 0.0;
     };
     entries
         .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("policy"))
-        .filter_map(|entry| {
-            std::fs::read_to_string(entry.path().join("base_frequency"))
-                .ok()?
-                .trim()
-                .parse::<f32>()
-                .ok()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix(prefix)
+                .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
         })
-        .map(|khz| khz / 1000.0)
+        .filter_map(|entry| read(&entry.path()))
+        .filter(|mhz| mhz.is_finite() && *mhz > 0.0)
         .fold(0.0f32, f32::max)
+}
+
+fn read_f32(path: impl AsRef<Path>) -> Option<f32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn read_u32(path: impl AsRef<Path>) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whether an ELF identification header names a 32-bit image on a 64-bit
+/// host (`EI_CLASS` 1); `Some(false)` for a 64-bit image, `None` for a header
+/// that is not ELF or a host that is not 64-bit.
+pub fn elf_is_32bit(header: &[u8]) -> Option<bool> {
+    if !cfg!(target_pointer_width = "64") || header.get(..4)? != b"\x7fELF" {
+        return None;
+    }
+    match header.get(4)? {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Hardware virtualization state from `/proc/cpuinfo`: `"Enabled"` when the
+/// CPU advertises VT-x (`vmx`) or AMD-V (`svm`) — the kernel hides both flags
+/// when the firmware disables the feature — and `"Unknown"` otherwise, since a
+/// missing flag cannot tell "disabled in firmware" from "not supported".
+pub fn virtualization_from_cpuinfo(cpuinfo: &str) -> &'static str {
+    let enabled = cpuinfo
+        .lines()
+        .filter(|line| line.starts_with("flags"))
+        .filter_map(|line| line.split_once(':'))
+        .any(|(_, flags)| flags.split_whitespace().any(|f| f == "vmx" || f == "svm"));
+    if enabled { "Enabled" } else { "Unknown" }
+}
+
+/// `TASK_COMM_LEN - 1`: the longest name `/proc/<pid>/stat` can carry.
+const COMM_MAX: usize = 15;
+
+/// The full process name a kernel `comm` was truncated from.
+///
+/// A `comm` shorter than [`COMM_MAX`] is complete. A full-length one is
+/// replaced by the first candidate that starts with it: the executable's file
+/// name, then the base names of the first two command-line words (an
+/// interpreter's `comm` is its script's name, which is `argv[1]`). Anything
+/// else keeps the kernel's name — a renamed thread or a process that set its
+/// own `comm` is not guessed at.
+pub fn untruncated_comm(comm: &str, exe: Option<&Path>, command_line: Option<&str>) -> String {
+    if comm.len() < COMM_MAX {
+        return comm.to_string();
+    }
+    let exe_name = exe
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
+    let argv_names = command_line
+        .into_iter()
+        .flat_map(|line| line.split_whitespace().take(2))
+        .filter_map(|word| Path::new(word).file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    exe_name
+        .into_iter()
+        .chain(argv_names)
+        .find(|candidate| candidate.len() > comm.len() && candidate.starts_with(comm))
+        .unwrap_or_else(|| comm.to_string())
+}
+
+/// Lifetime I/O counters of one process (`/proc/<pid>/io`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcIo {
+    /// Bytes passed to read()/write()-family calls (files, pipes, sockets).
+    pub rchar: u64,
+    pub wchar: u64,
+    /// Read / write system calls issued.
+    pub syscr: u64,
+    pub syscw: u64,
+    /// Bytes this process caused to be fetched from / sent to the storage
+    /// layer (block I/O), net of truncated dirty pages for writes.
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+/// Parse `/proc/<pid>/io`. `None` unless every counter used here parsed: a
+/// partial record must not be differenced against a complete one.
+pub fn parse_proc_io(text: &str) -> Option<ProcIo> {
+    let mut fields: [Option<u64>; 7] = [None; 7];
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let index = match key.trim() {
+            "rchar" => 0,
+            "wchar" => 1,
+            "syscr" => 2,
+            "syscw" => 3,
+            "read_bytes" => 4,
+            "write_bytes" => 5,
+            "cancelled_write_bytes" => 6,
+            _ => continue,
+        };
+        fields[index] = value.trim().parse().ok();
+    }
+    let [
+        rchar,
+        wchar,
+        syscr,
+        syscw,
+        read_bytes,
+        write_bytes,
+        cancelled,
+    ] = fields;
+    Some(ProcIo {
+        rchar: rchar?,
+        wchar: wchar?,
+        syscr: syscr?,
+        syscw: syscw?,
+        read_bytes: read_bytes?,
+        write_bytes: write_bytes?.saturating_sub(cancelled.unwrap_or(0)),
+    })
+}
+
+/// Minor and major page-fault counts (stat fields 10 and 12) of a
+/// `/proc/<pid>/stat` record; positional fields are counted from the final
+/// `')'` because `comm` may contain anything.
+pub fn parse_proc_stat_faults(stat: &[u8]) -> Option<(u64, u64)> {
+    let after_comm = stat.iter().rposition(|&byte| byte == b')')? + 1;
+    let mut fields = stat[after_comm..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    // Index 0 is field 3 (state): minflt is field 10, majflt field 12.
+    let field =
+        |raw: Option<&[u8]>| -> Option<u64> { std::str::from_utf8(raw?).ok()?.parse().ok() };
+    let minflt = field(fields.nth(7))?;
+    let majflt = field(fields.nth(1))?;
+    Some((minflt, majflt))
+}
+
+/// Each process' share of the machine's disk time, estimated from block I/O.
+///
+/// Linux keeps no per-process disk service time (Windows measures it from
+/// disk events). What it keeps per process is the bytes it caused at the
+/// block layer, and per drive the bytes moved and the time spent busy. A
+/// process' share of each busy drive is taken as its block bytes over the
+/// window's block bytes — where the denominator is the larger of the bytes
+/// all readable processes caused and the bytes the drives themselves moved,
+/// so I/O of processes this token cannot read (root daemons, kernel
+/// writeback) is never handed to the processes it can.
+///
+/// The model assumes a process' I/O spreads over the busy drives like the
+/// machine's does (procfs does not say which drive a process used), so with
+/// one busy drive the estimate is exact up to the byte/time relation, and
+/// with several it attributes proportionally.
+///
+/// `process_bytes` is each process' block bytes in the window; `disks` is
+/// `(disk number, active %, bytes moved)`. Returns, per input process, its
+/// busiest drive share and the per-drive shares that are non-zero.
+pub fn disk_time_shares(
+    process_bytes: &[u64],
+    disks: &[(u32, f32, u64)],
+) -> Vec<(f32, Vec<(u32, f32)>)> {
+    let readable_total: u64 = process_bytes.iter().copied().fold(0, u64::saturating_add);
+    let disk_total: u64 = disks.iter().map(|d| d.2).fold(0, u64::saturating_add);
+    let denominator = readable_total.max(disk_total);
+    process_bytes
+        .iter()
+        .map(|&bytes| {
+            if bytes == 0 || denominator == 0 {
+                return (0.0, Vec::new());
+            }
+            let share = bytes as f64 / denominator as f64;
+            let per_disk: Vec<(u32, f32)> = disks
+                .iter()
+                .filter(|(_, active, _)| *active > 0.0)
+                .map(|(number, active, _)| (*number, (share * f64::from(*active)) as f32))
+                .filter(|(_, pct)| *pct > 0.0)
+                .collect();
+            let busiest = per_disk.iter().map(|(_, pct)| *pct).fold(0.0, f32::max);
+            (busiest, per_disk)
+        })
+        .collect()
 }
 
 /// Which optional providers the current [`TelemetryDemand`] keeps switched on.
@@ -167,9 +414,13 @@ fn read_u32(path: impl AsRef<Path>) -> Option<u32> {
 /// cpufreq is absent (VMs, containers) sysinfo re-reads the whole `/proc/cpuinfo`
 /// once per CPU — its own comment calls that "very slow".
 ///
-/// Bits whose provider Linux does not have (per-process network or disk tracing,
-/// WLAN details, token security) select nothing, and the columns they would fill
-/// stay unavailable.
+/// Per-process providers follow their Windows bits: `PROCESS_NET` runs the
+/// `sock_diag` TCP accountant, `PROCESS_GPU`/`PROCESS_GPU_MEMORY` the per-process
+/// GPU readers (DRM fdinfo, NVML), and `PROCESS_DISK` the per-process physical
+/// I/O read and its disk-time attribution.
+///
+/// Bits whose provider Linux does not have (WLAN details, token security)
+/// select nothing, and the columns they would fill stay unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Providers {
     /// Measure GPU utilization, VRAM use and temperature.
@@ -178,6 +429,12 @@ pub struct Providers {
     pub disk_rates: bool,
     /// Refresh the per-CPU current frequency.
     pub cpu_speed: bool,
+    /// Per-process TCP throughput (`sock_diag`).
+    pub process_net: bool,
+    /// Per-process GPU engine time and memory.
+    pub process_gpu: bool,
+    /// Per-process physical disk I/O and disk-time share.
+    pub process_disk: bool,
 }
 
 pub fn providers(demand: TelemetryDemand) -> Providers {
@@ -185,6 +442,10 @@ pub fn providers(demand: TelemetryDemand) -> Providers {
         measure_gpus: demand.any_gpu(),
         disk_rates: demand.wants(TelemetryDemand::DISK_RATE),
         cpu_speed: demand.wants(TelemetryDemand::CPU_SPEED),
+        process_net: demand.wants(TelemetryDemand::PROCESS_NET),
+        process_gpu: demand.wants(TelemetryDemand::PROCESS_GPU)
+            || demand.wants(TelemetryDemand::PROCESS_GPU_MEMORY),
+        process_disk: demand.wants(TelemetryDemand::PROCESS_DISK),
     }
 }
 
@@ -209,6 +470,133 @@ Committed_AS:   12345 kB
         assert_eq!(meminfo.sreclaimable_bytes, Some(512 * 1024));
         assert_eq!(meminfo.commit_limit_bytes, Some(16384 * 1024));
         assert_eq!(meminfo.committed_as_bytes, Some(12345 * 1024));
+    }
+
+    #[test]
+    fn page_lists_split_the_cache_into_modified_and_standby() {
+        let meminfo = parse_meminfo(
+            "MemFree: 1000 kB\nCached: 8000 kB\nSReclaimable: 500 kB\n\
+             Shmem: 1500 kB\nDirty: 200 kB\nWriteback: 100 kB\nBuffers: 700 kB\n",
+        );
+        let (modified, standby, free) = page_lists(&meminfo).unwrap();
+        assert_eq!(modified, 300 * 1024);
+        // Regression: block-device buffers are cache too; leaving them out
+        // put gigabytes of cache into "In use" on a machine with RAID/ext4
+        // metadata traffic. 8000 + 700 + 500 - 1500 (shmem) - 300 (modified)
+        assert_eq!(standby, 7400 * 1024);
+        assert_eq!(free, 1000 * 1024);
+        // A missing counter leaves the bar undrawn rather than claiming an
+        // empty list.
+        assert_eq!(page_lists(&parse_meminfo("Cached: 8000 kB\n")), None);
+    }
+
+    #[test]
+    fn proc_io_reads_every_counter_and_nets_cancelled_writes() {
+        let io = parse_proc_io(
+            "rchar: 100\nwchar: 200\nsyscr: 3\nsyscw: 4\nread_bytes: 4096\n\
+             write_bytes: 8192\ncancelled_write_bytes: 4096\n",
+        )
+        .unwrap();
+        assert_eq!(
+            io,
+            ProcIo {
+                rchar: 100,
+                wchar: 200,
+                syscr: 3,
+                syscw: 4,
+                read_bytes: 4096,
+                write_bytes: 4096
+            }
+        );
+        assert_eq!(parse_proc_io("rchar: 1\nwchar: 2\n"), None);
+    }
+
+    /// Regression: Linux rows read "DiscoverNotifie", "plasma-browser-" and
+    /// "kactivitymanage" — the kernel's 15-byte `comm`, not the program name.
+    #[test]
+    fn truncated_comm_is_restored_from_the_image_or_argv() {
+        let exe = Path::new("/usr/lib/DiscoverNotifier");
+        assert_eq!(
+            untruncated_comm("DiscoverNotifie", Some(exe), None),
+            "DiscoverNotifier"
+        );
+        assert_eq!(
+            untruncated_comm(
+                "plasma-browser-",
+                None,
+                Some("/usr/bin/plasma-browser-integration-host /path")
+            ),
+            "plasma-browser-integration-host"
+        );
+        // An interpreter's comm is its script's name: argv[1].
+        assert_eq!(
+            untruncated_comm(
+                "my-long-script-",
+                Some(Path::new("/usr/bin/python3.13")),
+                Some("/usr/bin/python3 /opt/tools/my-long-script-name.py")
+            ),
+            "my-long-script-name.py"
+        );
+        // Short names are complete; an unrelated candidate is not adopted.
+        assert_eq!(
+            untruncated_comm("bash", Some(Path::new("/usr/bin/zsh")), None),
+            "bash"
+        );
+        assert_eq!(
+            untruncated_comm(
+                "worker-thread-x",
+                Some(Path::new("/usr/bin/app")),
+                Some("app")
+            ),
+            "worker-thread-x"
+        );
+    }
+
+    #[test]
+    fn virtualization_is_read_from_the_cpu_flags() {
+        assert_eq!(
+            virtualization_from_cpuinfo("flags\t\t: fpu vme svm lm\n"),
+            "Enabled"
+        );
+        assert_eq!(virtualization_from_cpuinfo("flags\t: fpu vmx\n"), "Enabled");
+        assert_eq!(
+            virtualization_from_cpuinfo("flags\t: fpu vme lm\n"),
+            "Unknown"
+        );
+        assert_eq!(virtualization_from_cpuinfo("model name : svm\n"), "Unknown");
+    }
+
+    #[test]
+    fn elf_class_names_the_platform() {
+        assert_eq!(elf_is_32bit(b"\x7fELF\x02"), Some(false));
+        assert_eq!(elf_is_32bit(b"\x7fELF\x01"), Some(true));
+        assert_eq!(elf_is_32bit(b"#!/bi"), None);
+        assert_eq!(elf_is_32bit(b"\x7fEL"), None);
+    }
+
+    #[test]
+    fn stat_faults_are_counted_after_a_hostile_comm() {
+        let stat = b"42 (a) b) c) S 1 42 42 0 -1 4194304 77 0 9 0 5 6";
+        assert_eq!(parse_proc_stat_faults(stat), Some((77, 9)));
+        assert_eq!(parse_proc_stat_faults(b"42 (x) S 1"), None);
+    }
+
+    /// The share is of the drives' measured time, never of more than the
+    /// drives moved: a user process writing 1 MiB while a root process this
+    /// token cannot read moves 99 MiB gets 1 %, not 100 %, of the busy time.
+    #[test]
+    fn disk_time_is_shared_against_the_bytes_the_drives_moved() {
+        let mib = 1024 * 1024;
+        let shares = disk_time_shares(&[mib, 0], &[(0, 100.0, 100 * mib), (1, 0.0, 0)]);
+        assert_eq!(shares[0].1, [(0, 1.0)]);
+        assert_eq!(shares[0].0, 1.0);
+        assert_eq!(shares[1], (0.0, Vec::new()));
+
+        // Readable processes caused more than the drives reported (writes
+        // still in the page cache): their own total is the denominator.
+        let shares = disk_time_shares(&[3 * mib, mib], &[(0, 40.0, mib)]);
+        assert_eq!(shares[0].0, 30.0);
+        assert_eq!(shares[1].0, 10.0);
     }
 
     #[test]
@@ -306,14 +694,35 @@ Committed_AS:   12345 kB
     #[test]
     fn base_frequency_is_the_highest_reported_policy() {
         let sysfs = Sysfs::new("cpufreq");
-        sysfs.write("policy0/base_frequency", "2200000\n");
-        sysfs.write("policy8/base_frequency", "3600000\n");
-        sysfs.mkdir("policy4");
-        sysfs.write("boost", "1\n");
+        sysfs.write("cpufreq/policy0/base_frequency", "2200000\n");
+        sysfs.write("cpufreq/policy8/base_frequency", "3600000\n");
+        sysfs.mkdir("cpufreq/policy4");
+        sysfs.write("cpufreq/boost", "1\n");
+        // A lower CPPC nominal clock never overrides the direct source.
+        sysfs.write("cpu0/acpi_cppc/nominal_freq", "3000\n");
         assert_eq!(base_frequency_mhz(&sysfs.root), 3600.0);
         assert_eq!(base_frequency_mhz(&sysfs.root.join("absent")), 0.0);
         let empty = Sysfs::new("cpufreq-empty");
         assert_eq!(base_frequency_mhz(&empty.root), 0.0);
+    }
+
+    /// amd-pstate kernels that no longer publish `amd_pstate_nominal_freq` (and
+    /// never publish `base_frequency`) still expose the firmware's CPPC nominal
+    /// clock — the source a Ryzen 7 5700X reports its 3.4 GHz base through.
+    /// The boost ceiling in `cpuinfo_max_freq` must never stand in for it.
+    #[test]
+    fn base_frequency_falls_back_to_amd_pstate_then_cppc_nominal() {
+        let sysfs = Sysfs::new("cpufreq-amd");
+        sysfs.write("cpufreq/policy0/cpuinfo_max_freq", "4866949\n");
+        sysfs.write("cpufreq/policy0/amd_pstate_max_freq", "4866949\n");
+        sysfs.write("cpu0/acpi_cppc/nominal_freq", "3401\n");
+        sysfs.write("cpu1/acpi_cppc/nominal_freq", "3401\n");
+        sysfs.write("cpu2/acpi_cppc/nominal_freq", "garbage\n");
+        sysfs.write("cpufreq/policy0/amd_pstate_nominal_freq", "");
+        assert_eq!(base_frequency_mhz(&sysfs.root), 3401.0);
+
+        sysfs.write("cpufreq/policy0/amd_pstate_nominal_freq", "3400000\n");
+        assert_eq!(base_frequency_mhz(&sysfs.root), 3400.0);
     }
 
     #[test]
@@ -329,11 +738,20 @@ Committed_AS:   12345 kB
                 measure_gpus: true,
                 disk_rates: true,
                 cpu_speed: true,
+                process_net: true,
+                process_gpu: true,
+                process_disk: true,
             }
         );
 
+        assert_eq!(
+            providers(TelemetryDemand::GPU_ADAPTER),
+            Providers {
+                measure_gpus: true,
+                ..Providers::default()
+            }
+        );
         for gpu in [
-            TelemetryDemand::GPU_ADAPTER,
             TelemetryDemand::PROCESS_GPU,
             TelemetryDemand::PROCESS_GPU_MEMORY,
         ] {
@@ -341,11 +759,26 @@ Committed_AS:   12345 kB
                 providers(gpu),
                 Providers {
                     measure_gpus: true,
+                    process_gpu: true,
                     ..Providers::default()
                 },
                 "every GPU bit measures the adapters"
             );
         }
+        assert_eq!(
+            providers(TelemetryDemand::PROCESS_NET),
+            Providers {
+                process_net: true,
+                ..Providers::default()
+            }
+        );
+        assert_eq!(
+            providers(TelemetryDemand::PROCESS_DISK),
+            Providers {
+                process_disk: true,
+                ..Providers::default()
+            }
+        );
         assert_eq!(
             providers(TelemetryDemand::DISK_RATE),
             Providers {
@@ -366,8 +799,6 @@ Committed_AS:   12345 kB
             TelemetryDemand::CORE_PROCESS,
             TelemetryDemand::NET_ADAPTER_RATE,
             TelemetryDemand::TOKEN_SECURITY,
-            TelemetryDemand::PROCESS_NET,
-            TelemetryDemand::PROCESS_DISK,
             TelemetryDemand::WIFI_DETAILS,
         ] {
             assert_eq!(providers(bit), Providers::default());

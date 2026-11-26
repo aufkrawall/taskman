@@ -42,6 +42,35 @@ struct SessionProperties {
     name: Option<String>,
     state: Option<String>,
     timestamp_monotonic_us: Option<u64>,
+    class: Option<String>,
+}
+
+/// Whether a logind session class is a user's service manager rather than a
+/// login. systemd 256+ registers `user@UID.service` as its own session of class
+/// `manager` (`manager-early` for lingering users); listing it would show the
+/// same user twice, once for the login and once for the manager.
+fn is_manager_class(class: Option<&str>) -> bool {
+    matches!(class, Some("manager" | "manager-early"))
+}
+
+/// The session a user's service-manager processes belong to: logind's display
+/// session for that user, the record `sd_uid_get_display()` reads.
+///
+/// Processes under `user@UID.service` (most of a modern desktop: portals,
+/// D-Bus activated services, apps started through systemd) live outside any
+/// `session-N.scope`, so without this they would count toward no session and
+/// the Users page would show the user with only the few processes in the
+/// login scope. `None` when the user has no display session or the record is
+/// unreadable — the process then stays unattributed rather than guessed.
+pub(super) fn display_session_for_uid(uid: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("/run/systemd/users/{uid}")).ok()?;
+    parse_user_display(&text)
+}
+
+fn parse_user_display(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("DISPLAY="))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Whether this host can enumerate logind sessions at all.
@@ -98,6 +127,9 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
         } else {
             SessionProperties::default()
         };
+        if is_manager_class(properties.class.as_deref()) {
+            continue;
+        }
         let user = properties
             .name
             .filter(|name| !name.is_empty())
@@ -122,6 +154,16 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
     Ok(out)
 }
 
+/// One `--property` per field: current loginctl treats a comma list as ONE
+/// (unknown) property name and prints nothing at all, which left every
+/// session's state, logon time and class unread.
+const SHOW_SESSION_PROPERTIES: [&str; 4] = [
+    "--property=Name",
+    "--property=State",
+    "--property=TimestampMonotonic",
+    "--property=Class",
+];
+
 fn show_session(loginctl: &Path, id: u32, deadline: Instant) -> Option<SessionProperties> {
     let id = id.to_string();
     let output = run_loginctl(
@@ -129,7 +171,10 @@ fn show_session(loginctl: &Path, id: u32, deadline: Instant) -> Option<SessionPr
         &[
             "show-session",
             "--no-pager",
-            "--property=Name,State,TimestampMonotonic",
+            SHOW_SESSION_PROPERTIES[0],
+            SHOW_SESSION_PROPERTIES[1],
+            SHOW_SESSION_PROPERTIES[2],
+            SHOW_SESSION_PROPERTIES[3],
             &id,
         ],
         deadline,
@@ -227,6 +272,7 @@ fn parse_session_properties(text: &str) -> SessionProperties {
             "Name" => out.name = Some(value.to_string()),
             "State" => out.state = Some(value.to_string()),
             "TimestampMonotonic" => out.timestamp_monotonic_us = value.parse().ok(),
+            "Class" => out.class = Some(value.to_string()),
             _ => {}
         }
     }
@@ -278,6 +324,27 @@ fn loginctl_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// systemd 256+ lists the user's service manager as session class
+    /// `manager`; it must neither appear as a second row for the same user nor
+    /// leave the manager's processes unattributed.
+    #[test]
+    fn manager_sessions_are_hidden_and_their_processes_join_the_display_session() {
+        assert!(is_manager_class(Some("manager")));
+        assert!(is_manager_class(Some("manager-early")));
+        assert!(!is_manager_class(Some("user")));
+        assert!(
+            !is_manager_class(None),
+            "an older logind without Class keeps the row"
+        );
+        let properties = parse_session_properties("Name=alice\nClass=manager\n");
+        assert_eq!(properties.class.as_deref(), Some("manager"));
+
+        let record =
+            "# This is private data. Do not parse.\nNAME=alice\nDISPLAY=2\nSESSIONS=3 2\n";
+        assert_eq!(parse_user_display(record), Some(2));
+        assert_eq!(parse_user_display("NAME=alice\nSESSIONS=3\n"), None);
+    }
 
     #[test]
     fn session_list_parses_ids_and_users() {

@@ -3,6 +3,7 @@ name = "tm-app"
 description = "Cross-platform task manager GUI (Wayland/X11/Win32/Metal)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

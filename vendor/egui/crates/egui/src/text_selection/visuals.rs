@@ -43,8 +43,13 @@ pub fn paint_text_selection(
     let min = galley.layout_from_cursor(min);
     let max = galley.layout_from_cursor(max);
 
-    for ri in min.row..=max.row {
-        let placed_row = &mut galley.rows[ri];
+    for (ri, placed_row) in galley
+        .rows
+        .iter_mut()
+        .enumerate()
+        .take(max.row + 1)
+        .skip(min.row)
+    {
         let row = Arc::make_mut(&mut placed_row.row);
 
         let left = if ri == min.row {
@@ -84,8 +89,8 @@ pub fn paint_text_selection(
                 .get(last_glyph_index)
                 .map_or(row.visuals.glyph_vertex_range.end, |g| g.first_vertex as _);
 
-            for vi in first_vertex_index..last_vertex_index {
-                mesh.vertices[vi].color = text_color;
+            for vertex in &mut mesh.vertices[first_vertex_index..last_vertex_index] {
+                vertex.color = text_color;
             }
         }
 
@@ -237,8 +242,13 @@ fn paint_underlines(
     max: LayoutCursor,
     stroke: Stroke,
 ) {
-    for ri in min.row..=max.row {
-        let placed_row = &galley.rows[ri];
+    for (ri, placed_row) in galley
+        .rows
+        .iter()
+        .enumerate()
+        .take(max.row + 1)
+        .skip(min.row)
+    {
         let row = &placed_row.row;
 
         let left = if ri == min.row {

@@ -3,6 +3,7 @@ name = "tm-platform"
 description = "OS-specific system collectors and control actions"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -14,13 +15,17 @@ tracing = { workspace = true }
 # snapshot are JSON on the wire as well.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Image hashes for the protected install manifest (Windows broker, Linux
-# service image verification).
-sha2 = { workspace = true }
 # XDG icon-theme decoding (xdg_icons); already in the tree via tm-app.
 png = "0.18"
+# SVG/SVGZ theme icons (Breeze and Adwaita ship most icons only as SVG).
+# Pure Rust; text, system fonts and embedded raster images are not needed to
+# draw an icon and stay off.
+resvg = { version = "0.49.0", default-features = false, features = ["svgz"] }
 
 [target.'cfg(windows)'.dependencies]
+# Image hashes for the Windows broker's protected install manifest (the Linux
+# service identifies its clients by inode, not by hash).
+sha2 = { workspace = true }
 windows = { workspace = true, features = [
   "Wdk_Foundation",
   "Wdk_Storage_FileSystem",

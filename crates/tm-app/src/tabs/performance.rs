@@ -2938,6 +2938,26 @@ fn pools_reported(m: &tm_core::model::MemoryInfo) -> bool {
     cached_reported(m) || paged_pool_reported(m) || non_paged_pool_reported(m)
 }
 
+/// "Page file" on Windows; Linux and macOS call the same backing store swap.
+fn swap_label_key() -> K {
+    if cfg!(target_os = "windows") {
+        K::KvPagefile
+    } else {
+        K::KvSwap
+    }
+}
+
+/// Swap usage against its size ("1.2 GB / 32.0 GB"): the used figure alone
+/// reads as a bare "0 B" on a machine that has swap but is not using it, which
+/// says nothing about how much there is.
+fn swap_usage_text(m: &tm_core::model::MemoryInfo) -> String {
+    format!(
+        "{} / {}",
+        format::format_bytes_loc(m.swap_used_bytes),
+        format::format_bytes_loc(m.swap_total_bytes)
+    )
+}
+
 fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let Some(snap) = app.latest_snapshot() else {
         return;
@@ -3094,12 +3114,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     );
                 }
                 if m.swap_total_bytes > 0 {
-                    kv_row(
-                        ui,
-                        pal,
-                        i18n::tr(K::KvPagefile),
-                        &format::format_bytes_loc(m.swap_used_bytes),
-                    );
+                    kv_row(ui, pal, i18n::tr(swap_label_key()), &swap_usage_text(m));
                 }
                 // Hardware facts (SMBIOS) — the original Task Manager's
                 // Speed / Slots used / Form factor / Hardware reserved rows.
@@ -3150,7 +3165,13 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     let Some(disk) = snap.disks.iter().find(|d| d.mount == entry.key) else {
         return;
     };
-    page_title(ui, pal, &entry.title, &disk_media_label(disk));
+    // Native Task Manager names the drive model at the right of the title.
+    let title_detail = if disk.model.is_empty() {
+        disk_media_label(disk)
+    } else {
+        disk.model.clone()
+    };
+    page_title(ui, pal, &entry.title, &title_detail);
     let window_text = window_label(app.shared.settings.graph_seconds);
     caption(
         ui,
@@ -3260,6 +3281,12 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
                         i18n::tr(K::KvAvgResponse),
                         &format!("{:.1} ms", disk.avg_resp_ms),
                     );
+                }
+                if !disk.media.label().is_empty() {
+                    kv_row(ui, pal, i18n::tr(K::KvDiskType), disk.media.label());
+                }
+                if !disk.volumes.is_empty() {
+                    kv_row(ui, pal, i18n::tr(K::KvVolumes), &disk.volumes.join(", "));
                 }
                 // A disk without a mounted volume has no formatted capacity
                 // to report; "0 B" would be a fabricated measurement.
@@ -3708,20 +3735,27 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         mem_chart_h,
         axis,
     );
-    let shared_chart = gpu_memory_chart(
-        ui,
-        pal,
-        "gpu-shared-chart",
-        i18n::tr(K::GpuSharedStat),
-        K::GpuSharedWindow,
-        &window_text,
-        gpu_series(win, &entry.key, GpuField::Shared),
-        gpu.shared_total_bytes,
-        gpu.shared_mem_available,
-        width,
-        mem_chart_h,
-        axis,
-    );
+    // Windows always has a shared pool (its counters may only be asleep). A
+    // Linux driver either publishes one (amdgpu/i915 GTT) or has no such
+    // concept exposed at all (the proprietary NVIDIA driver): an always-empty
+    // chart and a permanent "—" there would only read as a broken reading.
+    let shows_shared = cfg!(target_os = "windows") || gpu.shared_mem_available;
+    let shared_chart = shows_shared.then(|| {
+        gpu_memory_chart(
+            ui,
+            pal,
+            "gpu-shared-chart",
+            i18n::tr(K::GpuSharedStat),
+            K::GpuSharedWindow,
+            &window_text,
+            gpu_series(win, &entry.key, GpuField::Shared),
+            gpu.shared_total_bytes,
+            gpu.shared_mem_available,
+            width,
+            mem_chart_h,
+            axis,
+        )
+    });
 
     ui.add_space(10.0);
     stats_block(
@@ -3760,17 +3794,19 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                         },
                         w,
                     );
-                    big_stat(
-                        ui,
-                        pal,
-                        i18n::tr(K::PropGpuShared),
-                        &if gpu.shared_mem_available {
-                            gpu_mem_ratio_value(gpu.shared_used_bytes, gpu.shared_total_bytes)
-                        } else {
-                            "\u{2014}".into()
-                        },
-                        w,
-                    );
+                    if shows_shared {
+                        big_stat(
+                            ui,
+                            pal,
+                            i18n::tr(K::PropGpuShared),
+                            &if gpu.shared_mem_available {
+                                gpu_mem_ratio_value(gpu.shared_used_bytes, gpu.shared_total_bytes)
+                            } else {
+                                "\u{2014}".into()
+                            },
+                            w,
+                        );
+                    }
                     if let Some(t) = gpu.temperature_c {
                         big_stat(
                             ui,
@@ -3844,6 +3880,8 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         gpu_graph_context_menu(app, chart, *slot, &engines);
     }
     time_window_context_menu(app, &dedicated_chart);
-    time_window_context_menu(app, &shared_chart);
+    if let Some(shared_chart) = &shared_chart {
+        time_window_context_menu(app, shared_chart);
+    }
     ui.add_space(16.0);
 }

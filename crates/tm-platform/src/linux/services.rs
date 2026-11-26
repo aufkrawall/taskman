@@ -38,7 +38,114 @@ pub fn list_systemd_units() -> Result<Vec<ServiceInfo>> {
     // inits) systemctl fails with empty stdout; that is "unavailable", not
     // an empty service list.
     check_exit(out.status, &out.stderr)?;
-    Ok(parse_units(&String::from_utf8_lossy(&out.stdout)))
+    let mut units = parse_units(&String::from_utf8_lossy(&out.stdout));
+    attach_unit_properties(&mut units);
+    Ok(units)
+}
+
+/// Properties `list-units` does not print: the main PID, the enablement state
+/// and the account. One `systemctl show` for every listed unit, so the cost is
+/// a second daemon round trip, not one per unit.
+///
+/// A failed query keeps the list it enriches: the PID column then reads "—"
+/// for every row, which is true (it was not read), instead of losing the
+/// whole service list over an optional column.
+fn attach_unit_properties(units: &mut [ServiceInfo]) {
+    if units.is_empty() {
+        return;
+    }
+    let Ok(systemctl) = systemctl_path() else {
+        return;
+    };
+    let mut arguments: Vec<&str> = vec![
+        "show",
+        "--no-pager",
+        // One `--property` per field, which every systemctl accepts (the
+        // comma form is not understood by every systemd tool).
+        "--property=Id",
+        "--property=MainPID",
+        "--property=UnitFileState",
+        "--property=User",
+        "--property=DynamicUser",
+        "--",
+    ];
+    arguments.extend(units.iter().map(|unit| unit.name.as_str()));
+    let output = match run_systemctl(&systemctl, &arguments, QUERY_DEADLINE, "systemctl show") {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            tracing::debug!(status = %output.status, "systemctl show failed; service PIDs stay unknown");
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(%error, "systemctl show failed; service PIDs stay unknown");
+            return;
+        }
+    };
+    let properties = parse_show(&String::from_utf8_lossy(&output.stdout));
+    for unit in units.iter_mut() {
+        if let Some(props) = properties.get(unit.name.as_str()) {
+            apply_properties(unit, props);
+        }
+    }
+}
+
+/// The `systemctl show` properties this backend reads for one unit.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct UnitProperties {
+    main_pid: Option<u32>,
+    unit_file_state: String,
+    user: String,
+    dynamic_user: bool,
+}
+
+/// `systemctl show` output: one `Key=Value` block per unit, separated by
+/// blank lines, each carrying its `Id=`.
+fn parse_show(text: &str) -> std::collections::HashMap<String, UnitProperties> {
+    let mut out = std::collections::HashMap::new();
+    let mut id: Option<String> = None;
+    let mut props = UnitProperties::default();
+    let mut flush = |id: &mut Option<String>, props: &mut UnitProperties| {
+        if let Some(id) = id.take() {
+            out.insert(id, std::mem::take(props));
+        } else {
+            *props = UnitProperties::default();
+        }
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            flush(&mut id, &mut props);
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "Id" => id = Some(value.to_string()),
+            // systemd reports 0 for a unit without a running main process.
+            "MainPID" => props.main_pid = value.parse().ok().filter(|pid: &u32| *pid != 0),
+            "UnitFileState" => props.unit_file_state = value.to_string(),
+            "User" => props.user = value.to_string(),
+            "DynamicUser" => props.dynamic_user = value == "yes",
+            _ => {}
+        }
+    }
+    flush(&mut id, &mut props);
+    out
+}
+
+fn apply_properties(unit: &mut ServiceInfo, props: &UnitProperties) {
+    unit.pid = props.main_pid;
+    unit.startup_type = props.unit_file_state.clone();
+    // A system unit without `User=` runs as root; a `DynamicUser=` unit gets
+    // an ephemeral account whose name is only known while it runs, so it is
+    // left blank rather than guessed.
+    unit.account = if !props.user.is_empty() {
+        props.user.clone()
+    } else if props.dynamic_user {
+        String::new()
+    } else {
+        "root".to_string()
+    };
 }
 
 /// Run one `systemctl` invocation under an absolute deadline.
@@ -98,7 +205,10 @@ fn parse_units(text: &str) -> Vec<ServiceInfo> {
         }
         units.push(ServiceInfo {
             name: unit.to_string(),
-            display_name: String::new(),
+            // The unit's `Description=` is what Windows calls the display
+            // name ("D-Bus System Message Bus"), and that is the column the
+            // Services page labels Description.
+            display_name: description.to_string(),
             description: description.to_string(),
             pid: None,
             status: map_status(active, sub),
@@ -282,6 +392,33 @@ mod tests {
                 ("idle.service", "", ServiceStatus::Stopped),
             ]
         );
+    }
+
+    #[test]
+    fn listed_description_doubles_as_the_display_name() {
+        let units = parse_units("dbus.service loaded active running D-Bus System Message Bus\n");
+        assert_eq!(units[0].display_name, "D-Bus System Message Bus");
+    }
+
+    #[test]
+    fn show_blocks_supply_pid_state_and_account_per_unit() {
+        let props = parse_show(
+            "Id=dbus-broker.service\nUnitFileState=disabled\nMainPID=704\nUser=\nDynamicUser=no\n\n\
+             Id=sshd.service\nUnitFileState=enabled\nMainPID=0\nUser=\nDynamicUser=no\n\n\
+             Id=systemd-resolved.service\nMainPID=512\nUser=systemd-resolve\nDynamicUser=no\n\n\
+             Id=dyn.service\nMainPID=9\nUser=\nDynamicUser=yes\n",
+        );
+        let mut unit = parse_units("dbus-broker.service loaded active running Bus\n").remove(0);
+        apply_properties(&mut unit, &props["dbus-broker.service"]);
+        assert_eq!(unit.pid, Some(704));
+        assert_eq!(unit.startup_type, "disabled");
+        assert_eq!(unit.account, "root");
+
+        // A stopped unit reports MainPID=0, which is "no process", not PID 0.
+        assert_eq!(props["sshd.service"].main_pid, None);
+        assert_eq!(props["systemd-resolved.service"].user, "systemd-resolve");
+        apply_properties(&mut unit, &props["dyn.service"]);
+        assert_eq!(unit.account, "", "a dynamic user is not guessed");
     }
 
     #[test]
