@@ -13,9 +13,14 @@ verified at install time.
 Linux builds produce a self-contained install tarball: `bin/taskman`,
 `bin/taskman-service` and the `packaging/linux` tree (installer, systemd unit,
 manifest template, desktop entry, icon, AppStream metadata), so the archive is
-installable by extracting it and running `install-linux.sh`. `--arch-package`
-additionally builds the pacman package with `makepkg` when it is installed;
-a missing `makepkg` is a documented skip, never a failure.
+installable by extracting it and running `install-linux.sh`.
+
+Every packaging run also builds the pacman package
+(`dist/taskman-<version>-<pkgrel>-x86_64.pkg.tar.zst`) from
+`packaging/arch`. `makepkg` runs natively on an Arch host and through `wsl.exe`
+in an Arch WSL distro on Windows, where pacman is not installed at all; a host
+with neither is a documented skip, never a failure. `--no-arch-package` skips
+it on purpose.
 """
 
 from __future__ import annotations
@@ -26,11 +31,13 @@ import importlib.util
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
@@ -612,7 +619,190 @@ def linux_payload_files(
     return files
 
 
-def arch_srcinfo_matches(makepkg: str) -> bool:
+# Names the distro that provides `makepkg` when the host has none. Setting it
+# skips the discovery below, which has to start each candidate to look inside.
+ARCH_WSL_DISTRO_ENV = "TASKMAN_ARCH_WSL_DISTRO"
+
+
+@dataclass(frozen=True)
+class ArchPackageHost:
+    """A `makepkg` this run can package with, and the paths it understands.
+
+    `wsl is None` is a native `makepkg` on an Arch host, where the working
+    directory and PKGDEST are the paths this process already has. Otherwise
+    `makepkg` runs inside that distro and every path is the `/mnt/<drive>/...`
+    spelling `wslpath` gave it: makepkg writes the package where PKGDEST
+    points, so handing it a Windows path would fail the run instead of filling
+    `dist/`.
+    """
+
+    makepkg: str
+    arch_dir: str
+    dist_dir: str
+    wsl: str | None = None
+    distro: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.distro is None:
+            return self.makepkg
+        return f"makepkg in WSL distro {self.distro}"
+
+    def argv(self, args: list[str], env: dict[str, str] | None = None) -> list[str]:
+        """The command that runs `makepkg args` from `arch_dir`."""
+        if self.wsl is None or self.distro is None:
+            return [self.makepkg, *args]
+        # One `bash -lc` carries the working directory, the environment and the
+        # command: `wsl.exe` has no cwd or env of its own, and a PKGDEST set on
+        # the Windows side would never reach the distro.
+        command = " ".join(
+            [
+                *(f"{name}={shlex.quote(value)}" for name, value in (env or {}).items()),
+                self.makepkg,
+                *(shlex.quote(arg) for arg in args),
+            ]
+        )
+        return [
+            self.wsl,
+            "-d",
+            self.distro,
+            "--",
+            "bash",
+            "-lc",
+            f"cd {shlex.quote(self.arch_dir)} && {command}",
+        ]
+
+    def capture(self, args: list[str]) -> subprocess.CompletedProcess:
+        if self.wsl is None:
+            return subprocess.run(
+                [self.makepkg, *args],
+                cwd=ARCH_PACKAGING,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        return subprocess.run(
+            self.argv(args),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def run(self, args: list[str], env: dict[str, str]) -> bool:
+        if self.wsl is None:
+            return run([self.makepkg, *args], env=env, cwd=ARCH_PACKAGING)
+        return run(self.argv(args, env))
+
+
+def wsl_path(wsl: str, distro: str, path: Path) -> str | None:
+    """`path` as that distro spells it, or None when the translation fails.
+
+    `/mnt/c/...` is only the default: a distro that sets `root=` in
+    /etc/wsl.conf mounts the Windows drives somewhere else, and `wslpath` is
+    the only authority on the spelling that distro actually resolves.
+    """
+    proc = subprocess.run(
+        [wsl, "-d", distro, "--", "wslpath", "-a", "-u", str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    translated = proc.stdout.strip()
+    if proc.returncode != 0 or not translated:
+        log(f"cannot translate {path} for WSL distro {distro}")
+        if proc.stderr.strip():
+            log(proc.stderr.strip())
+        return None
+    return translated
+
+
+def wsl_distro_names(wsl: str) -> list[str]:
+    """The installed distros, the ones named like Arch first.
+
+    `wsl --list --quiet` writes UTF-16LE with a byte-order mark, but a
+    redirected pipe has been seen in UTF-8 on newer builds, so the decode
+    follows the bytes instead of assuming one. Ordering matters for time, not
+    for correctness: every candidate has to be started to read its
+    /etc/os-release, so the likely distro goes first and a host with several
+    pays for one start instead of all of them.
+    """
+    configured = os.environ.get(ARCH_WSL_DISTRO_ENV, "").strip()
+    if configured:
+        return [configured]
+    proc = subprocess.run([wsl, "--list", "--quiet"], capture_output=True)
+    if proc.returncode != 0:
+        return []
+    if proc.stdout[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = proc.stdout.decode("utf-16", errors="replace")
+    elif b"\x00" in proc.stdout:
+        text = proc.stdout.decode("utf-16-le", errors="replace")
+    else:
+        text = proc.stdout.decode("utf-8", errors="replace")
+    names = [
+        line.replace("\ufeff", "").replace("\x00", "").strip()
+        for line in text.splitlines()
+    ]
+    return sorted(
+        (name for name in names if name),
+        key=lambda name: 0 if "arch" in name.lower() else 1,
+    )
+
+
+def wsl_has_makepkg(wsl: str, distro: str) -> bool:
+    """True when the distro is Arch and has makepkg, which the PKGBUILD needs.
+
+    The distribution check is not decoration: the same probe run in a Debian
+    distro would look for a package manager that distro does not have, and a
+    half-matched distro would fail the whole run instead of being skipped.
+    """
+    proc = subprocess.run(
+        [
+            wsl,
+            "-d",
+            distro,
+            "--",
+            "bash",
+            "-lc",
+            "grep -q '^ID=arch$' /etc/os-release && command -v makepkg >/dev/null",
+        ],
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
+@cache
+def arch_package_host() -> ArchPackageHost | None:
+    """The `makepkg` this run packages with, or None when the host has none.
+
+    A native `makepkg` wins: on an Arch machine the package builds without
+    crossing another filesystem layer. Windows has no pacman, so there the only
+    `makepkg` lives in an Arch WSL distro, and this driver reaches it with
+    `wsl.exe` instead of giving up — the package is one of the artifacts a
+    release ships, not an extra step someone has to remember.
+    """
+    native = shutil.which("makepkg")
+    if native:
+        return ArchPackageHost(native, str(ARCH_PACKAGING), str(DIST))
+    if platform.system() != "Windows":
+        return None
+    wsl = shutil.which("wsl.exe") or shutil.which("wsl")
+    if wsl is None:
+        return None
+    for distro in wsl_distro_names(wsl):
+        if not wsl_has_makepkg(wsl, distro):
+            continue
+        arch_dir = wsl_path(wsl, distro, ARCH_PACKAGING)
+        dist_dir = wsl_path(wsl, distro, DIST)
+        if arch_dir is None or dist_dir is None:
+            continue
+        return ArchPackageHost("makepkg", arch_dir, dist_dir, wsl=wsl, distro=distro)
+    return None
+
+
+def arch_srcinfo_matches(host: ArchPackageHost) -> bool:
     """Check that the committed .SRCINFO is what makepkg prints for the PKGBUILD.
 
     .SRCINFO is the artifact AUR helpers read, and the one place where a stale
@@ -620,12 +810,7 @@ def arch_srcinfo_matches(makepkg: str) -> bool:
     authority on the exact field set and order, so the comparison uses its
     output instead of a hand-maintained expectation.
     """
-    proc = subprocess.run(
-        [makepkg, "--printsrcinfo"],
-        cwd=ARCH_PACKAGING,
-        capture_output=True,
-        text=True,
-    )
+    proc = host.capture(["--printsrcinfo"])
     if proc.returncode != 0:
         log("makepkg --printsrcinfo failed")
         if proc.stderr.strip():
@@ -660,18 +845,25 @@ def arch_srcinfo_matches(makepkg: str) -> bool:
 
 
 def build_arch_package(version: str) -> bool:
-    """Opt-in: build the Arch package from `packaging/arch` with makepkg.
+    """Build the pacman package from `packaging/arch` into `dist/`.
 
-    Returns False only for a real failure. `makepkg` missing is a documented
-    skip, not a failure: pacman exists on Arch hosts only, and the portable
-    artifact of this run is the tarball. The PKGBUILD has no `source` array —
-    it compiles the two binaries from THIS checkout — so the packaged version
-    must be the version this run just built; a bump that forgets the PKGBUILD
-    would otherwise silently package a different release.
+    Returns False only for a real failure. A host with no makepkg anywhere is
+    a documented skip, not a failure: the tarball and the installers are the
+    artifacts this driver owns unconditionally, and an Arch user can always run
+    `makepkg` from `packaging/arch` by hand. The PKGBUILD has no `source`
+    array — it compiles the two binaries from THIS checkout — so the packaged
+    version must be the version this run just built; a bump that forgets the
+    PKGBUILD would otherwise silently package a different release.
     """
-    makepkg = shutil.which("makepkg")
-    if makepkg is None:
-        log("makepkg not found - skipping the arch package (Arch hosts only)")
+    # `package()` writes `dist/`, and the WSL path has to exist before `wslpath`
+    # is asked to translate it.
+    DIST.mkdir(exist_ok=True)
+    host = arch_package_host()
+    if host is None:
+        log(
+            "no makepkg on this host and no Arch WSL distro - skipping the arch "
+            f"package (set {ARCH_WSL_DISTRO_ENV} to name the distro to use)"
+        )
         return True
     pkgbuild = ARCH_PACKAGING / "PKGBUILD"
     if not pkgbuild.is_file():
@@ -689,17 +881,12 @@ def build_arch_package(version: str) -> bool:
             f"is {version} - bump the PKGBUILD and its .SRCINFO"
         )
         return False
-    if not arch_srcinfo_matches(makepkg):
+    if not arch_srcinfo_matches(host):
         return False
-    log(f"building the arch package with {makepkg}")
+    log(f"building the arch package with {host.label}")
     # PKGDEST keeps the package next to the other artifacts instead of littering
     # the packaging directory.
-    DIST.mkdir(exist_ok=True)
-    return run(
-        [makepkg, "--force", "--noconfirm"],
-        env={"PKGDEST": str(DIST)},
-        cwd=ARCH_PACKAGING,
-    )
+    return host.run(["--force", "--noconfirm"], {"PKGDEST": host.dist_dir})
 
 
 def package_zip(name: str, files: list[tuple[Path, str]]) -> Path:
@@ -950,9 +1137,9 @@ def main() -> int:
         "--no-package", action="store_true", help="build but skip dist/ packaging"
     )
     ap.add_argument(
-        "--arch-package",
+        "--no-arch-package",
         action="store_true",
-        help="also build the Arch package with makepkg (skipped when it is not installed)",
+        help="skip the pacman package (its build compiles the Linux binaries again)",
     )
     ap.add_argument(
         "--require-all-targets",
@@ -1120,10 +1307,10 @@ def main() -> int:
         if linux_x86_64_flavor is not None:
             clean_stale_linux_artifacts(version, linux_x86_64_flavor)
 
-    # Opt-in and packaging, so `--no-package` and `--host-only` both skip it:
-    # the PKGBUILD compiles the Linux binaries itself, which a host-only run
-    # deliberately avoids.
-    if args.arch_package and not args.no_package and linux_requested:
+    # Packaging like the other artifacts, so `--no-package` and `--host-only`
+    # skip it with the rest: the PKGBUILD compiles the Linux binaries itself,
+    # which a host-only run deliberately avoids.
+    if not args.no_package and not args.no_arch_package and linux_requested:
         if not build_arch_package(version):
             failures += 1
 

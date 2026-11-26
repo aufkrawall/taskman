@@ -56,10 +56,14 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    metadata and the README), which is what
    `packaging/linux/install-linux.sh` expects to find next to `bin/`. The
    musl archive stays headless: two binaries and the README only.
-   `--arch-package` additionally runs `makepkg` from `packaging/arch` after
-   checking that `pkgver` matches `Cargo.toml` and that the committed
-   `.SRCINFO` matches `makepkg --printsrcinfo`; a missing `makepkg` is a
-   logged skip, never a failed build.
+   The pacman package is part of the same run: `makepkg` runs from
+   `packaging/arch` with `PKGDEST` pointed at `dist/`, natively on an Arch
+   host or through `wsl.exe` in an Arch WSL distro on Windows
+   (`TASKMAN_ARCH_WSL_DISTRO` names one instead of searching). It runs
+   after checking that `pkgver` matches `Cargo.toml` and that the committed
+   `.SRCINFO` matches `makepkg --printsrcinfo`; a host with no `makepkg`
+   anywhere is a logged skip, never a failed build, and `--no-arch-package`
+   skips it on purpose.
 
 `cross_check()` type-checks every non-host target with `--all-targets` on
 purpose: without it, `#[cfg(test)]` code behind `cfg(target_os = "linux")`

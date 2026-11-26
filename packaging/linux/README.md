@@ -183,12 +183,18 @@ when it decided the installed policy should stand. `options` carries `!strip`
 because the release profile deliberately keeps the symbol table for crash
 records.
 
-`python build.py --arch-package` runs that `makepkg` for you and copies the
-result into `dist/`; it skips with a note when `makepkg` is not installed
-(pacman is Arch-only, so a missing build tool is never a build failure). Before
-building it checks that the PKGBUILD's `pkgver` is the version this run built and
-that `.SRCINFO` is exactly what `makepkg --printsrcinfo` generates; the fix for a
-mismatch is printed as `cd packaging/arch && makepkg --printsrcinfo > .SRCINFO`.
+`python build.py` builds that package as part of every run and points
+`makepkg`'s `PKGDEST` at `dist/`. On an Arch host it is the installed
+`makepkg`. Windows has no pacman at all, so there it uses the first Arch WSL
+distro that has `makepkg` — set `TASKMAN_ARCH_WSL_DISTRO` to name one instead
+of searching. The build happens inside that distro, so a first run compiles
+the Linux binaries a second time there; `--no-arch-package` skips the step, and
+`--no-package`/`--host-only` skip it with the rest. A host with neither
+`makepkg` nor an Arch WSL distro is a logged skip, never a failed build
+(pacman is Arch-only). Before building it checks that the PKGBUILD's `pkgver`
+is the version this run built and that `.SRCINFO` is exactly what
+`makepkg --printsrcinfo` generates; the fix for a mismatch is printed as
+`cd packaging/arch && makepkg --printsrcinfo > .SRCINFO`.
 
 ## Development install
 

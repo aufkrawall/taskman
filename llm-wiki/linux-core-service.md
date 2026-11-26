@@ -140,9 +140,11 @@ NVML access lives in `linux/sensors.rs`.
   it warns, leaves the unit disabled and names the one command that fixes it —
   a scriptlet must never fail the pacman transaction, and enabling a unit with
   an empty policy would only burn its start limit.
-- `build.py` ships the packaging tree with the Linux artifact and can build
-  the Arch package when the packaging tools exist; a missing tool is a skip,
-  not a failure. The musl artifact stays headless: it carries the two binaries
+- `build.py` ships the packaging tree with the Linux artifact and builds the
+  Arch package on every run: a native `makepkg` on an Arch host, or the first
+  Arch WSL distro that has one on Windows (`TASKMAN_ARCH_WSL_DISTRO` names a
+  distro instead of searching for it). A host with neither is a skip, not a
+  failure. The musl artifact stays headless: it carries the two binaries
   and the README, no desktop entry and no unit.
 - A Windows host without `cross`/`zig` can only produce that headless
   fallback, so `packaging/linux/build-artifact.sh` builds the GUI-capable
