@@ -14,7 +14,8 @@
 //! that field absent. Nothing here invents a value.
 
 use crate::linux_sensors::{
-    GpuSensors, NVML_CLOCK_GRAPHICS, NVML_CLOCK_MEM, NVML_TEMPERATURE_GPU, NVML_TEMPERATURE_MEMORY,
+    GpuSensors, NVML_CLOCK_GRAPHICS, NVML_CLOCK_MEM, NVML_ERROR_NO_PERMISSION,
+    NVML_ERROR_NOT_SUPPORTED, NVML_SUCCESS, NVML_TEMPERATURE_GPU, NVML_TEMPERATURE_MEMORY,
     NvmlMemory, NvmlPciInfo, NvmlUtilization, nvml_bounded, nvml_clock_mhz,
     nvml_milliwatts_to_watts, nvml_percent, nvml_temperature_c, nvml_text,
 };
@@ -22,10 +23,6 @@ use std::ffi::{CString, c_char, c_int, c_uint, c_ulonglong, c_void};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// `NVML_SUCCESS`.
-const NVML_SUCCESS: c_int = 0;
-/// `NVML_ERROR_NO_PERMISSION`: the driver refused this token.
-const NVML_ERROR_NO_PERMISSION: c_int = 4;
 /// `dlopen` mode from `<dlfcn.h>`, which `libc` does not expose for Linux.
 /// Every Linux libc (glibc, musl) uses 2.
 const RTLD_NOW: c_int = 0x2;
@@ -39,7 +36,7 @@ const DRIVER_VERSION_BUFFER: usize = 80;
 const MAX_DEVICES: u32 = 32;
 /// One sampling tick asks once, and the answer describes every adapter, so a
 /// tick never calls the driver once per card.
-pub(super) const CACHE_TTL: Duration = Duration::from_secs(1);
+const CACHE_TTL: Duration = Duration::from_secs(1);
 /// The driver's control device. It exists only while the kernel module is
 /// loaded, and its mode decides whether an unprivileged token may use NVML at
 /// all (Debian and Ubuntu ship it group `video` readable).
@@ -182,11 +179,15 @@ fn open_library() -> Option<*mut c_void> {
         }
         tracing::debug!(library = name, "NVML library could not be opened");
     }
-    // One line carrying the loader's own reason: "no such file" and "wrong ELF
-    // class" are indistinguishable from an absent GPU everywhere else.
-    tracing::debug!(
+    // Once per process, and at warn: without this library NVIDIA telemetry can
+    // never appear here, and a self-contained musl artifact (`crt-static`) has
+    // no dynamic loader at all, so `dlopen` cannot succeed there however the
+    // driver is installed. The loader's own reason distinguishes "no such file"
+    // from "wrong ELF class", which look like an absent GPU everywhere else.
+    tracing::warn!(
         reason = %loader_error(),
-        "the NVIDIA management library is not available"
+        static_libc = cfg!(target_feature = "crt-static"),
+        "the NVIDIA management library could not be loaded; NVIDIA telemetry stays unavailable"
     );
     None
 }
@@ -408,8 +409,14 @@ fn field<T: Default>(denied: &mut bool, call: impl FnOnce(&mut T) -> c_int) -> O
 
 /// Remember a permission refusal, so the brokered fallback can be asked for.
 fn note(denied: &mut bool, code: c_int) {
-    if code == NVML_ERROR_NO_PERMISSION {
-        *denied = true;
+    match code {
+        // An answered query, and an adapter without that sensor, are both
+        // ordinary: nothing to remember.
+        NVML_SUCCESS | NVML_ERROR_NOT_SUPPORTED => {}
+        NVML_ERROR_NO_PERMISSION => *denied = true,
+        // Anything else is unusual enough to name: a GPU that fell off the bus,
+        // a driver that lost the device.
+        other => tracing::trace!(code = other, "NVML query failed"),
     }
 }
 
