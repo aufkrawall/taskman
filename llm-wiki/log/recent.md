@@ -1,3 +1,39 @@
+## 2026-11-26 - Linux process-icon loading (resolver caches, prefetch, headless icon check)
+
+- Symptom, reported on bare metal (Plasma Wayland, NVIDIA): process icons on
+  Processes, Details and App history loaded very slowly, one core stayed busy until
+  they finished, and some icons re-loaded in bursts while scrolling.
+- Measured with a Python mirror of `xdg_icons::find_icon_file` against this box's real
+  theme tree (Adwaita + AdwaitaLegacy + hicolor + default): ONE icon name no theme
+  ships cost ~12,300 `stat`/`open` probes and ~1,400 `read_dir`s; 400 distinct missing
+  executables ≈ 4.9 M probes and 554 k directory reads. `hicolor`'s `index.theme`
+  declares ~700 directories of which ~28 exist, and every lookup walked all 700. The
+  miss was never cached, so the GUI's 30 s `FAILURE_RETRY_TTL` re-walked the chain for
+  every icon-less row for the life of the process — the intermittent burst.
+- Fix, in three independent parts. (1) `xdg_icons.rs` answers the walk from a
+  `LISTING_TTL` (60 s) directory-listing cache, so a warm lookup performs no
+  filesystem calls at all; declared-but-uninstalled size directories are pruned once
+  per theme; a name miss is remembered for `MISS_RETRY_TTL` (30 s) unless the walk met
+  a directory it could not read (`Resolution::Unsettled`), which keeps transient
+  `EACCES`/`EMFILE` failures immediately retryable. (2) `icon_cache.rs` gained
+  `prefetch` (a page's key set handed over on its model rebuild, never from the paint
+  path), batched LRU eviction (1024 high / 768 low water) instead of a full-map sort
+  per insert, a 30 s → 30 min per-key failure ladder, a 32-texture per-pass upload
+  budget and `stats()` for the `TASKMAN_INPUT_STATS=1` summary. (3) The pages prefetch
+  from their rebuild (`IconPrefetch` gates the three pages that rebuild every frame),
+  and `taskman --selfcheck-icons` prints one JSON line with cold/warm per-key
+  timings — the only way to measure icon cost without a GUI.
+- Verification: `cargo test -p tm-platform -p tm-app` (1121 tests) green after the
+  three branches merged; the new `a_warm_lookup_performs_no_filesystem_probes` test
+  pins the zero-probe warm path directly. Re-running the instrumented model with the
+  fixed algorithm's caching on the same theme tree: 21 names cost 752 directory reads
+  in total (one per distinct directory) and **0** probes, a warm pass costs **0**
+  filesystem calls, and 400 distinct missing executables cost 0 (was ~4.9 M probes and
+  554 k `read_dir`s).
+- Rejected: caching a name miss for the process lifetime (it cancels the "an icon or
+  theme installed later must appear" recovery), and re-reading XSettings or walking
+  `index.theme` per lookup to soften the process-lifetime theme snapshot.
+
 ## 2026-11-26 - Linux bare-metal audit (KDE Plasma Wayland, NVIDIA, Arch)
 
 - First test on real Linux hardware; 13 user reports plus findings of our own.

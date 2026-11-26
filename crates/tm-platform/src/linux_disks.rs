@@ -244,12 +244,18 @@ fn read_trim(path: impl AsRef<Path>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
+    /// A fake sysfs tree. `unix`-gated like the only test that builds one: the
+    /// module itself is platform-neutral, so on a Windows test run this helper
+    /// would otherwise be dead code (the gate builds `--all-targets`).
+    #[cfg(unix)]
     struct Sysfs {
         root: PathBuf,
     }
 
+    #[cfg(unix)]
     impl Sysfs {
         fn new(name: &str) -> Self {
             let root =
@@ -310,6 +316,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Sysfs {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);

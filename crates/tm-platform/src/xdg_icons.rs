@@ -3342,10 +3342,10 @@ mod tests {
     }
 
     /// The point of the listing cache: a walk over a tree it has already read
-    /// performs no filesystem calls. Measured against a real theme tree (Adwaita
-    /// + AdwaitaLegacy + hicolor + default), one icon name no theme ships used to
-    /// cost ~12,300 `is_file()` probes and ~1,400 `read_dir`s — on the icon
-    /// worker, for every distinct executable, and again on every retry.
+    /// performs no filesystem calls. Measured against a real theme tree
+    /// (Adwaita, AdwaitaLegacy, hicolor and default), one icon name no theme
+    /// ships used to cost ~12,300 `is_file()` probes and ~1,400 `read_dir`s — on
+    /// the icon worker, for every distinct executable, and again on every retry.
     #[test]
     fn a_warm_lookup_performs_no_filesystem_probes() {
         let sb = Sandbox::new("warm-lookup");

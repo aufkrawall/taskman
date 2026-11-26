@@ -22,15 +22,16 @@ use std::sync::{Arc, Mutex};
 use tm_core::sync;
 
 /// Maximum textures kept alive, i.e. the eviction high-water mark. Windows
-/// icons are 32×32 RGBA (~4 KiB each, ~8 MiB at the cap); the Linux resolver
+/// icons are 32×32 RGBA (~4 KiB each, ~4 MiB at the cap); the Linux resolver
 /// caps at 64×64 (`MAX_ICON_EDGE` in `xdg_icons.rs`), i.e. ~16 KiB each and
-/// ~32 MiB at the cap. That holds every distinct image a desktop ever shows at
-/// once (a few hundred), so scrolling no longer evicts the page it is scrolling
-/// through.
-const CACHE_CAP: usize = 2048;
+/// ~16 MiB at the cap — and the icons a real theme hands out are 9-16 KiB, so
+/// the ceiling is the pessimistic one. That holds every distinct image a
+/// desktop shows at once (a few hundred), so scrolling no longer evicts the
+/// page it is scrolling through.
+const CACHE_CAP: usize = 1024;
 /// Where a batch eviction stops: once the cap is exceeded, one quarter of the
 /// map goes at once. Evicting a single entry per insert rebuilt and sorted the
-/// whole map for every new icon (`Vec` + `sort_by_key` over ~2 000 entries on
+/// whole map for every new icon (`Vec` + `sort_by_key` over ~1 000 entries on
 /// the UI thread, i.e. a full sort per frame while a page streamed in);
 /// batching pays it once per `CACHE_CAP / 4` inserts instead.
 const CACHE_LOW_WATER: usize = CACHE_CAP - CACHE_CAP / 4;

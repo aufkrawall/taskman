@@ -209,9 +209,14 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `ScaledDirectories=`, rank by `Size × Scale` (a missing `Scale=` derived
     from an `@N` directory suffix) and prefer the directory native at the target
     size over an upscaled tie; search roots are `$XDG_DATA_HOME/icons`,
-    `$XDG_DATA_DIRS/icons`, `$HOME/.icons` and every data dir's `pixmaps`. PNG
-    only — SVG/XPM candidates are skipped per size directory, so an SVG-only app
-    falls back to the generic glyph. PNG decode is capped at 64 px
+    `$XDG_DATA_DIRS/icons`, `$HOME/.icons` and every data dir's `pixmaps`.
+    Directory contents are cached for `LISTING_TTL` (60 s) and a name miss for
+    `MISS_RETRY_TTL` (30 s), so a warm lookup performs no filesystem calls at
+    all; the size directories a theme declares but does not install are pruned
+    once per theme (hicolor: ~700 declared, ~28 installed), and a walk that
+    could not read a directory never settles a miss. PNG, SVG and SVGZ are
+    decoded (`resvg` renders the SVGs Breeze/Adwaita ship; XPM is skipped), and
+    a PNG's decode is capped at 64 px
     (`EXPAND | STRIP_16`); plus `default_app_icon_rgba`, the theme's
     `application-x-executable` / `application-default-icon` / `image-missing`
     chain, which is what a row without an icon of its own paints;
@@ -374,7 +379,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
      plus `keyboard_sample`/`chart_accessible_value` — a keyboard cursor
      pinned to a sample TIMESTAMP so live telemetry cannot slide it, and the
      selected sample published as the chart's accesskit value),
-    `icon_cache.rs` (lazy worker, per-egui-pass upload budget, true-LRU cap; single entry
+    `icon_cache.rs` (lazy worker, per-egui-pass upload budget, batched-LRU cap,
+    per-key failure backoff, `stats()` counters for the
+    `TASKMAN_INPUT_STATS=1` summary; `prefetch` hands a page's key set over when
+    its row model is rebuilt, so rows paint their real icon on the first frame
+    instead of filling in one answer per frame; single entry
     point `icon_or_default` — the row's executable icon, else the platform's
     `default_app_icon_rgba` when the row has no path or the OS has no icon for
     that image, else nothing while extraction is in flight; the UI draws no

@@ -340,8 +340,7 @@ mod tests {
         let properties = parse_session_properties("Name=alice\nClass=manager\n");
         assert_eq!(properties.class.as_deref(), Some("manager"));
 
-        let record =
-            "# This is private data. Do not parse.\nNAME=alice\nDISPLAY=2\nSESSIONS=3 2\n";
+        let record = "# This is private data. Do not parse.\nNAME=alice\nDISPLAY=2\nSESSIONS=3 2\n";
         assert_eq!(parse_user_display(record), Some(2));
         assert_eq!(parse_user_display("NAME=alice\nSESSIONS=3\n"), None);
     }

@@ -671,14 +671,23 @@ remain follow-up rather than being simulated in headless tests:
   reports `None` — one dash for one window — rather than a fabricated 0 %;
   Windows credits newborn processes their in-window time, which is the honest
   difference between the two accountants, not a bug to be evened out.
-- **Icons: SVG supported since 2026-11-26; a miss still costs a chain walk.**
+- **Icons: SVG supported since 2026-11-26; a name miss is now a cached answer.**
   PNG, SVG and SVGZ are decoded (`resvg`, no text/fonts/raster images —
-  Breeze ships everything as SVG). XPM is not. A footprint miss walks the whole
-  transitive theme chain and every size directory in it before giving up,
-  deduped by the icon cache's 30 s failure retry TTL and, on Processes/Details,
-  behind the per-frame icon memo, so neither a repaint nor a scroll frame
-  repeats it. Symbolic SVGs that rely on a host stylesheet render with their
-  own fallback colours.
+  Breeze ships everything as SVG). XPM is not. A miss used to walk the whole
+  transitive theme chain and every size directory in it with live `is_file()`
+  probes — measured at ~12,300 probes and ~1,400 `read_dir`s for ONE name no
+  theme ships — and it was never remembered, so the GUI's 30 s retry repeated it
+  per icon-less process. Since 2026-11-26 the walk answers from a
+  directory-listing cache (a warm lookup performs no filesystem calls at all),
+  the declared-but-uninstalled size directories are pruned once per theme
+  (hicolor declares ~700 and installs ~28), and a miss is remembered for
+  `MISS_RETRY_TTL` (30 s, the GUI's own retry window). Remaining limits: an icon
+  added *inside an existing directory* can take up to `LISTING_TTL` (60 s) to
+  appear; a theme that declares directories of which none are installed is
+  treated as an install in progress and never settles a miss; and a walk that
+  consulted a directory it could not read (`EACCES`, `EMFILE`, a network home)
+  is never remembered. Symbolic SVGs that rely on a host stylesheet render with
+  their own fallback colours.
 - **Icon theme resolution is a process-lifetime snapshot.** The theme chain and
   the desktop-file index are resolved once per process (the texture half of the
   same rule is § 2026-11-22 above), so switching the desktop icon theme keeps the
@@ -686,8 +695,9 @@ remain follow-up rather than being simulated in headless tests:
   XSettings and walking `index.theme` files on the UI thread for every row.
   Cached *answers* are a narrower rule: an icon name's file, its decoded pixels
   and a theme's parsed layout are remembered for the process, but only when they
-  resolved (a miss and an empty layout are retried), because the GUI's own
-  `FAILURE_RETRY_TTL` retry is the only thing that recovers a transient failure.
+  resolved — a name miss is remembered for `MISS_RETRY_TTL` (30 s) and a
+  directory listing for `LISTING_TTL` (60 s), because an icon or a theme
+  installed while TaskMan runs still has to appear (see the icons bullet above).
 
 ## The D3D12 reveal is only as fast as its first frame (2026-11-25)
 
