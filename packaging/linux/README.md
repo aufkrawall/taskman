@@ -105,9 +105,12 @@ result into `dist/`; it skips with a note when `makepkg` is not installed
 
 ```sh
 python build.py --host-only          # or --linux-only
-sudo ./packaging/linux/install-linux.sh --dev --source-dir target/release
-sudo ./packaging/linux/install-linux.sh --uninstall
+sudo bash ./packaging/linux/install-linux.sh --dev --source-dir target/release
+sudo bash ./packaging/linux/install-linux.sh --uninstall
 ```
+
+`bash` because the checkout keeps the script at the repository's 0644 script
+mode; the installed copy and the tarball entry are 0755.
 
 `--dev` accepts any binary of the authorized user and records the image it
 installed, so a rebuild does not need a manifest change. Never use it on a
