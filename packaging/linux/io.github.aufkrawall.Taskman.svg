@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TaskMan application mark: the same dark monitor panel and cyan activity trace
+  as crates/tm-app/assets/icon_64.raw, rebuilt as pure vector geometry so the
+  scalable hicolor directory needs no raster fallback. Everything is inline —
+  no filters, gradients referencing external files or embedded fonts — because
+  icon caches and desktop shells rasterize this at dozens of sizes.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="TaskMan">
+  <defs>
+    <linearGradient id="panel" x1="0.1" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#17375c"/>
+      <stop offset="0.55" stop-color="#0e2440"/>
+      <stop offset="1" stop-color="#0a1526"/>
+    </linearGradient>
+    <linearGradient id="bars" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#1d6f9e" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#43d7e0" stop-opacity="0.72"/>
+    </linearGradient>
+    <linearGradient id="trace" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#26c8dc"/>
+      <stop offset="0.5" stop-color="#7cf9f7"/>
+      <stop offset="1" stop-color="#26c8dc"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="6" width="244" height="244" rx="56" ry="56" fill="url(#panel)"/>
+  <rect x="7" y="7" width="242" height="242" rx="55" ry="55" fill="none"
+        stroke="#5fe9f0" stroke-opacity="0.26" stroke-width="2"/>
+
+  <g fill="url(#bars)">
+    <rect x="44" y="152" width="14" height="40" rx="7"/>
+    <rect x="66" y="134" width="14" height="58" rx="7"/>
+    <rect x="88" y="160" width="14" height="32" rx="7"/>
+    <rect x="154" y="142" width="14" height="50" rx="7"/>
+    <rect x="176" y="128" width="14" height="64" rx="7"/>
+    <rect x="198" y="154" width="14" height="38" rx="7"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M36 116 H78 L94 82 L112 150 L130 62 L148 116 H220"
+          stroke="url(#trace)" stroke-opacity="0.2" stroke-width="19"/>
+    <path d="M36 116 H78 L94 82 L112 150 L130 62 L148 116 H220"
+          stroke="url(#trace)" stroke-width="9"/>
+  </g>
+</svg>

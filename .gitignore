@@ -12,6 +12,13 @@ __pycache__/
 CLAUDE.md
 vendor/winit/target
 
+# makepkg scratch space: the Arch PKGBUILD builds from this checkout, so its
+# src/ and pkg/ directories and the package it writes appear next to it (see
+# packaging/arch/PKGBUILD)
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*
+
 # Local tool paths and discovery manifests
 tool-paths.env
 debug-tool-manifest.json

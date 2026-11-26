@@ -9,13 +9,18 @@ license.workspace = true
 tm-core = { workspace = true }
 sysinfo = { workspace = true }
 tracing = { workspace = true }
+# Cross-platform serialization: the Windows broker has always needed it, and
+# the Linux core-service protocol, its protected manifest and the sensor
+# snapshot are JSON on the wire as well.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Image hashes for the protected install manifest (Windows broker, Linux
+# service image verification).
+sha2 = { workspace = true }
 # XDG icon-theme decoding (xdg_icons); already in the tree via tm-app.
 png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
 windows = { workspace = true, features = [
   "Wdk_Foundation",
   "Wdk_Storage_FileSystem",

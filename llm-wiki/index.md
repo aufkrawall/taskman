@@ -30,6 +30,10 @@ When they disagree, code and observed behavior win.
 - `repo-map.md` — crate/module ownership, high-risk files, and test matrix.
 - `core-service.md` — privileged broker, IPC trust boundary, filesystem ACLs,
   install/upgrade/uninstall lifecycle, and fallback behavior.
+- `linux-core-service.md` — the Linux counterpart of the broker: systemd
+  unit, Unix-socket protocol and manifest, inode-based peer identity, the
+  sensor/NVML path, the StatusNotifierItem tray, and the install/Arch
+  packaging layout.
 - `installer.md` — the self-contained Windows setup (`taskman-setup.exe`):
   payload format, service-helper contract reuse, elevation model, uninstall
   self-relocation, and silent flags.

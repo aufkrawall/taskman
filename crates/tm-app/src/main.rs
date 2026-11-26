@@ -32,6 +32,8 @@ mod tabs;
 /// Side-by-side comparison of the text-smoothing profiles; see the module docs.
 #[cfg(test)]
 mod text_compare;
+/// System tray icon: the contract both desktops share plus the Linux icon.
+mod tray;
 mod ui_state;
 mod widgets;
 
@@ -44,6 +46,11 @@ pub use tm_ui::theme;
 use std::time::Instant;
 
 use tm_core::settings::RenderMode;
+
+#[cfg(target_os = "linux")]
+use tray::TrayShell;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use tray::{INITIAL_HIDE_TRAY_WAIT, InitialHideAction, initial_hide_action};
 
 /// The backend that initialized the current window.
 static ACTIVE_RENDER_MODE: std::sync::Mutex<RenderMode> = std::sync::Mutex::new(RenderMode::Cpu);
@@ -106,10 +113,17 @@ const fn native_gpu_mode() -> RenderMode {
 const APP_ID: &str = "io.github.aufkrawall.Taskman";
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
 
-#[cfg(target_os = "windows")]
+/// Set by a path that closes this window as part of a handover (a relaunch, the
+/// core-service switch) rather than because the user closed it: close-to-tray
+/// must let that close through, or the old instance would linger with no window
+/// while the replacement waits for it.
 static PROGRAMMATIC_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(target_os = "windows")]
+/// Mark the next close as a handover rather than a user close.
+///
+/// Deliberately not platform-gated: every desktop that can close to a tray has
+/// to tell those two apart, and a desktop without one simply never reads the
+/// flag. A gated setter with an ungated caller is how this invariant broke once.
 pub(crate) fn request_programmatic_exit() {
     PROGRAMMATIC_EXIT.store(true, std::sync::atomic::Ordering::Release);
 }
@@ -944,39 +958,6 @@ fn compiled_wgpu_backends() -> eframe::wgpu::Backends {
     }
 }
 
-/// How long a start-minimized launch waits for the tray icon before showing
-/// the window instead: a window hidden behind an icon that never appears
-/// cannot be brought back.
-#[cfg(target_os = "windows")]
-const INITIAL_HIDE_TRAY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// What a start-minimized launch should do while the tray icon is not ready.
-#[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InitialHideAction {
-    /// The icon exists: it is safe to disappear into it.
-    Hide,
-    /// Still being created: keep the window hidden and look again shortly.
-    Wait,
-    /// The icon can never appear (or the wait expired): show the window.
-    Show,
-}
-
-/// Decide a start-minimized launch's visibility for one frame.
-///
-/// `Wait` still means "assert hidden": the window is created invisible, but
-/// eframe's first-frame reveal keys off the app's own `Visible` command, so
-/// sending nothing here would let `post_rendering` show the window until the
-/// tray poll notices `READY`.
-#[cfg(target_os = "windows")]
-fn initial_hide_action(tray: Option<(bool, bool)>, before_deadline: bool) -> InitialHideAction {
-    match tray {
-        Some((true, _)) => InitialHideAction::Hide,
-        Some((false, false)) if before_deadline => InitialHideAction::Wait,
-        _ => InitialHideAction::Show,
-    }
-}
-
 /// Upper bound on frames a reveal waits for a painted frame before it
 /// uncloaks anyway, so the window can never stay invisible.
 #[cfg(target_os = "windows")]
@@ -1054,6 +1035,22 @@ struct NativeActivation {
 const LINUX_ACTIVATION_CONFIRM_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(700);
 
+/// What the running session can do with the window.
+///
+/// The tray promises that a hidden window comes back, so it may only hide the
+/// window where hiding works. Wayland's winit backend ignores
+/// `ViewportCommand::Visible(false)` (and the un-minimize that would undo it),
+/// so on Wayland a "hidden" window would stay on screen while the app believed
+/// it was in the tray.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxDisplay {
+    /// X11/XCB: show and hide really take the window off screen.
+    X11,
+    /// Wayland: the window stays composed, whatever the app asks for.
+    Wayland,
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxActivationPending {
     request: tm_platform::linux::activation::ActivationRequest,
@@ -1125,9 +1122,12 @@ struct NativeApp {
     linux_activation_acks: Vec<LinuxActivationPending>,
     #[cfg(target_os = "linux")]
     linux_activation_ui_seq: u64,
-    #[cfg(target_os = "windows")]
+    /// Display backend of this session, resolved once from the window.
+    #[cfg(target_os = "linux")]
+    linux_display: Option<LinuxDisplay>,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     tray: Option<TrayShell>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     tray_init_attempted: bool,
     hidden_to_tray: bool,
     initial_hide_pending: bool,
@@ -1136,7 +1136,7 @@ struct NativeApp {
     /// repeating on every later frame.
     first_logic_logged: bool,
     first_ui_logged: bool,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     exit_requested: bool,
     /// Native window handle, cached the first time a frame hands it over.
     #[cfg(target_os = "windows")]
@@ -1192,10 +1192,10 @@ struct NativeApp {
     last_text_rendering_key: Option<tm_platform::text_rendering::WindowPlacementKey>,
     /// A close request arrived (seen in the raw input, so it is also seen
     /// while the window is minimized and `ui` does not run).
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     close_request_seen: bool,
     /// Give up waiting for the tray icon at this time and show the window.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     initial_hide_deadline: std::time::Instant,
 }
 
@@ -1207,17 +1207,18 @@ impl NativeApp {
         activation: NativeActivation,
     ) -> Self {
         activation.install_waker(ctx);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
-            // The single-instance show event needs a repaint target even when
-            // close-to-tray is disabled and no tray icon has been created.
+            // The single-instance show event (a second launch, a tray click)
+            // needs a repaint target even when close-to-tray is disabled and no
+            // tray icon has been created.
             *tm_core::sync::lock(TRAY_CONTEXT.get_or_init(Default::default)) = Some(ctx.clone());
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         let tray_requested = initially_hidden
             || inner.shared.settings.close_to_tray
             || inner.shared.settings.taskbar_monitor_enabled;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         let tray = if tray_requested {
             TrayShell::new(true)
         } else {
@@ -1232,15 +1233,17 @@ impl NativeApp {
             linux_activation_acks: Vec::new(),
             #[cfg(target_os = "linux")]
             linux_activation_ui_seq: 0,
-            #[cfg(target_os = "windows")]
+            #[cfg(target_os = "linux")]
+            linux_display: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             tray,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             tray_init_attempted: tray_requested,
             hidden_to_tray: initially_hidden,
             initial_hide_pending: initially_hidden,
             first_logic_logged: false,
             first_ui_logged: false,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             exit_requested: false,
             #[cfg(target_os = "windows")]
             hwnd: None,
@@ -1266,11 +1269,47 @@ impl NativeApp {
             last_monitor_size: None,
             #[cfg(target_os = "windows")]
             last_text_rendering_key: None,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             close_request_seen: false,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             initial_hide_deadline: std::time::Instant::now() + INITIAL_HIDE_TRAY_WAIT,
         }
+    }
+
+    /// Decide once what this session's display server can do with the window.
+    ///
+    /// The window's own display handle is the only honest source; when it is
+    /// not available (an eframe backend that does not hand one out), the
+    /// environment is the fallback and a set `WAYLAND_DISPLAY` counts as
+    /// Wayland: mistaking a Wayland session for X11 would promise a hide that
+    /// cannot happen, while the other way round only withholds a hide that
+    /// would have worked.
+    #[cfg(target_os = "linux")]
+    fn resolve_linux_display(&mut self, frame: &eframe::Frame) {
+        if self.linux_display.is_some() {
+            return;
+        }
+        use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        let from_handle = match frame.display_handle().map(|handle| handle.as_raw()) {
+            Ok(RawDisplayHandle::Wayland(_)) => Some(LinuxDisplay::Wayland),
+            Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => Some(LinuxDisplay::X11),
+            _ => None,
+        };
+        let backend = from_handle.unwrap_or_else(|| {
+            let wayland =
+                std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
+            if wayland {
+                LinuxDisplay::Wayland
+            } else {
+                LinuxDisplay::X11
+            }
+        });
+        tracing::info!(
+            backend = ?backend,
+            from_display_handle = from_handle.is_some(),
+            "resolved the Linux display backend"
+        );
+        self.linux_display = Some(backend);
     }
 
     #[cfg(target_os = "linux")]
@@ -1318,7 +1357,7 @@ impl NativeApp {
         // the HWND dies so nothing is left behind for the shell to paint with.
         #[cfg(target_os = "windows")]
         tm_platform::remove_present_gate();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(tray) = &mut self.tray {
             tray.shutdown();
         }
@@ -1376,6 +1415,8 @@ impl eframe::App for NativeApp {
             self.first_logic_logged = true;
             StartupTrace::mark("first_logic_enter");
         }
+        #[cfg(target_os = "linux")]
+        self.resolve_linux_display(frame);
         #[cfg(target_os = "linux")]
         self.resolve_linux_activations(ctx);
         #[cfg(target_os = "linux")]
@@ -1457,14 +1498,16 @@ impl eframe::App for NativeApp {
         // one of the frames it is owed on the frame that requested it.
         #[cfg(target_os = "windows")]
         self.finish_reveal(ctx);
-        #[cfg(target_os = "windows")]
-        self.handle_tray_actions(ctx);
-        #[cfg(target_os = "windows")]
+        // In `logic`, not `ui`: a window hidden to the tray runs no `ui` at
+        // all, and the icon is exactly how such a window comes back.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        self.maintain_tray(ctx);
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.handle_close_request(ctx);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.rescue_window_hidden_without_tray(ctx);
         if self.initial_hide_pending {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 let tray_state = self
                     .tray
@@ -1474,6 +1517,11 @@ impl eframe::App for NativeApp {
                     tray_state,
                     std::time::Instant::now() < self.initial_hide_deadline,
                 );
+                // A session that cannot hide the window must not ask to: the
+                // window would stay on screen with the app believing it is in
+                // the tray.
+                #[cfg(target_os = "linux")]
+                let action = self.linux_initial_hide_action(action);
                 match action {
                     // The icon exists: it is now safe to disappear into it.
                     InitialHideAction::Hide => {
@@ -1489,12 +1537,16 @@ impl eframe::App for NativeApp {
                         ctx.request_repaint_after(std::time::Duration::from_millis(25));
                     }
                     InitialHideAction::Show => {
-                        tracing::warn!(
-                            "tray icon unavailable for a start-minimized launch; showing the window"
-                        );
+                        // The reason was logged where the decision was made
+                        // (no tray icon, or a display server that cannot hide);
+                        // repeating it here as "no icon" would be wrong on
+                        // Wayland, where the icon exists and only the hide does
+                        // not.
+                        tracing::info!("start-minimized is unavailable here; showing the window");
                         self.hidden_to_tray = false;
                         // The window has never been shown, so it has nothing to
                         // show: take the gate before asking for it.
+                        #[cfg(target_os = "windows")]
                         if let Some(hwnd) = self.hwnd {
                             self.begin_present_gate(hwnd, "start-minimized fallback");
                         }
@@ -1503,7 +1555,7 @@ impl eframe::App for NativeApp {
                     }
                 }
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             {
                 self.hidden_to_tray = false;
                 ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
@@ -1532,7 +1584,7 @@ impl eframe::App for NativeApp {
         // `ui` does not run while the window is minimized or hidden, and
         // `logic` cannot read the viewport's close request from the context
         // then; the raw input reaches both paths.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if raw_input.viewport().close_requested() {
             self.close_request_seen = true;
         }
@@ -1568,18 +1620,6 @@ impl eframe::App for NativeApp {
         }
         #[cfg(target_os = "windows")]
         {
-            self.handle_tray_actions(ui.ctx());
-            let keep_in_tray = self.inner.shared.settings.close_to_tray
-                || self.inner.shared.settings.taskbar_monitor_enabled;
-            let tray_enabled = keep_in_tray || self.hidden_to_tray;
-            if tray_enabled && self.tray.is_none() && !self.tray_init_attempted {
-                self.tray_init_attempted = true;
-                self.tray = TrayShell::new(tray_enabled);
-            }
-            if let Some(tray) = &mut self.tray {
-                tray.set_visible(tray_enabled);
-                tray.sync_menu_theme(ui.ctx().theme());
-            }
             // eframe runs `ui` only for a viewport that is on screen and not
             // minimized (apart from the first pass, which it runs before the
             // first reveal), so this pass really painted into the window.
@@ -1648,21 +1688,30 @@ impl eframe::App for NativeApp {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) const TRAY_ACTION_OPEN: u8 = 1;
-#[cfg(target_os = "windows")]
-pub(crate) const TRAY_ACTION_SETTINGS: u8 = 2;
-#[cfg(target_os = "windows")]
-pub(crate) const TRAY_ACTION_EXIT: u8 = 3;
-#[cfg(target_os = "windows")]
+/// Actions a tray menu hands to the UI thread. The codes come from
+/// [`tray::TrayAction`], so every desktop's menu maps to the same requests
+/// however it numbers its own rows.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) const TRAY_ACTION_OPEN: u8 = tray::TrayAction::Open.signal_code();
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) const TRAY_ACTION_SETTINGS: u8 = tray::TrayAction::Settings.signal_code();
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) const TRAY_ACTION_EXIT: u8 = tray::TrayAction::Exit.signal_code();
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 static TRAY_ACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 static TRAY_CONTEXT: std::sync::OnceLock<std::sync::Mutex<Option<eframe::egui::Context>>> =
     std::sync::OnceLock::new();
 #[cfg(target_os = "windows")]
 static TRAY_HANDLERS: std::sync::Once = std::sync::Once::new();
 
-#[cfg(target_os = "windows")]
+/// Queue one tray request for the UI thread and wake it.
+///
+/// Called from whichever thread owns the menu: the Windows tray thread, the
+/// taskbar-monitor callback, or the StatusNotifierItem method on the session
+/// bus. Only the highest request is kept, which is why `Exit` outranks the
+/// others — it ends the app either way.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) fn signal_tray(action: u8) {
     TRAY_ACTION.fetch_max(action, std::sync::atomic::Ordering::AcqRel);
     if let Some(context) = TRAY_CONTEXT.get()
@@ -2271,10 +2320,62 @@ impl NativeApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// The tray lifecycle both desktops share: create the icon when the settings or
+/// a start-minimized launch ask for it, keep it in step, and run the paths that
+/// depend on it — restoring the window from a menu entry, closing into the tray,
+/// and rescuing a window whose icon failed.
+///
+/// Everything here is called from `logic`, because a window hidden to the tray
+/// runs no `ui` at all and the icon is exactly how such a window comes back.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+impl NativeApp {
+    /// Handle what the icon asked for and keep it in step with the settings.
+    fn maintain_tray(&mut self, ctx: &eframe::egui::Context) {
+        self.handle_tray_actions(ctx);
+        // Close-to-tray and the taskbar monitor both need an icon to come back
+        // from; a window that is already in the tray keeps it too.
+        let keep_in_tray = self.inner.shared.settings.close_to_tray
+            || self.inner.shared.settings.taskbar_monitor_enabled;
+        let tray_enabled = keep_in_tray || self.hidden_to_tray;
+        if tray_enabled && self.tray.is_none() && !self.tray_init_attempted {
+            self.tray_init_attempted = true;
+            self.tray = TrayShell::new(tray_enabled);
+        }
+        if let Some(tray) = &mut self.tray {
+            // A passive icon is one a panel that hides passive items may drop,
+            // so the window is never hidden behind an icon nobody can see.
+            tray.set_visible(tray_enabled);
+            tray.sync_menu_theme(ctx.theme());
+        }
+    }
+
+    /// Bring the window back from the tray icon.
+    ///
+    /// Windows has to cloak and repaint the window first, otherwise the shell
+    /// composes an empty surface (`restore_window`); Linux uses the same three
+    /// viewport commands as its activation path.
+    #[cfg(target_os = "windows")]
+    fn show_window_from_tray(&mut self, ctx: &eframe::egui::Context) {
+        self.restore_window(ctx);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn show_window_from_tray(&mut self, ctx: &eframe::egui::Context) {
+        self.hidden_to_tray = false;
+        // A launch that arrives while this instance is still starting minimized
+        // must win: the pending hide would otherwise put the window straight
+        // back into the tray in the same frame.
+        self.initial_hide_pending = false;
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
 
     /// Act on a close request: close to the tray when that is configured AND
-    /// the icon really exists, otherwise let the window close. Runs from
-    /// `logic`, so it also works for a minimized window, where `ui` does not.
+    /// the icon really exists, otherwise let the window close.
     fn handle_close_request(&mut self, ctx: &eframe::egui::Context) {
         if !std::mem::take(&mut self.close_request_seen) {
             return;
@@ -2285,6 +2386,16 @@ impl NativeApp {
         let keep_in_tray = self.inner.shared.settings.close_to_tray
             || self.inner.shared.settings.taskbar_monitor_enabled;
         if self.exit_requested || !keep_in_tray {
+            return;
+        }
+        if !self.can_hide_window() {
+            // Cancelling the close here would leave a window that is still on
+            // screen while the app believes it is in the tray: the X button
+            // would look broken and the icon would offer to "restore" a window
+            // that never left. Closing is what the user asked for.
+            tracing::warn!(
+                "close-to-tray needs a window that can be hidden, which this display server does not support; closing"
+            );
             return;
         }
         if self.tray.as_ref().is_some_and(TrayShell::is_ready) {
@@ -2298,6 +2409,37 @@ impl NativeApp {
         }
     }
 
+    /// Whether this desktop can really take the window off screen.
+    ///
+    /// Everything that hides the window behind the icon goes through this: a
+    /// hide that the display server ignores would strand the window on screen
+    /// with no way for the user to tell that the app thinks it is in the tray.
+    #[cfg(target_os = "windows")]
+    fn can_hide_window(&self) -> bool {
+        true
+    }
+
+    /// Wayland ignores the hide request (and the un-minimize that would undo
+    /// it), so only a positively identified X11 session may hide the window; an
+    /// unresolved backend keeps the window where the user can see it.
+    #[cfg(target_os = "linux")]
+    fn can_hide_window(&self) -> bool {
+        self.linux_display == Some(LinuxDisplay::X11)
+    }
+
+    /// A start that asked to minimize keeps the window visible on a session
+    /// that cannot hide it, instead of hiding a window nobody can restore.
+    #[cfg(target_os = "linux")]
+    fn linux_initial_hide_action(&self, action: InitialHideAction) -> InitialHideAction {
+        if self.can_hide_window() || action == InitialHideAction::Show {
+            return action;
+        }
+        tracing::warn!(
+            "this display server ignores hiding the window; showing it instead of minimising to the tray"
+        );
+        InitialHideAction::Show
+    }
+
     /// A window hidden "to the tray" whose icon failed (or whose thread
     /// ended) cannot be restored by the user: bring it back.
     fn rescue_window_hidden_without_tray(&mut self, ctx: &eframe::egui::Context) {
@@ -2306,17 +2448,17 @@ impl NativeApp {
             && self.tray.as_ref().is_none_or(TrayShell::has_failed)
         {
             tracing::warn!("window is hidden but the tray icon is unavailable; restoring it");
-            self.restore_window(ctx);
+            self.show_window_from_tray(ctx);
         }
     }
 
     fn handle_tray_actions(&mut self, ctx: &eframe::egui::Context) {
         match TRAY_ACTION.swap(0, std::sync::atomic::Ordering::AcqRel) {
             TRAY_ACTION_OPEN => {
-                self.restore_window(ctx);
+                self.show_window_from_tray(ctx);
             }
             TRAY_ACTION_SETTINGS => {
-                self.restore_window(ctx);
+                self.show_window_from_tray(ctx);
                 self.inner.show_settings = true;
             }
             TRAY_ACTION_EXIT => {
@@ -2476,20 +2618,6 @@ mod tests {
             RenderMode::Vulkan
         };
         assert_eq!(configured_render_mode(foreign), RenderMode::Cpu);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn start_minimized_keeps_the_window_hidden_until_the_tray_is_ready() {
-        use InitialHideAction::{Hide, Show, Wait};
-        assert_eq!(initial_hide_action(Some((true, false)), true), Hide);
-        assert_eq!(initial_hide_action(Some((true, true)), false), Hide);
-        // Regression: a slow tray must still assert hidden; the old wait arm
-        // sent no command and eframe's first-frame reveal showed the window.
-        assert_eq!(initial_hide_action(Some((false, false)), true), Wait);
-        assert_eq!(initial_hide_action(Some((false, false)), false), Show);
-        assert_eq!(initial_hide_action(Some((false, true)), true), Show);
-        assert_eq!(initial_hide_action(None, true), Show);
     }
 
     #[cfg(target_os = "windows")]

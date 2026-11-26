@@ -9,11 +9,19 @@ Windows builds also produce the self-contained setup installer
 (`dist/taskman-v<version>-windows-<arch>-setup.exe`): a single 100%-Rust
 `taskman-setup.exe` with the application payload embedded and SHA-256
 verified at install time.
+
+Linux builds produce a self-contained install tarball: `bin/taskman`,
+`bin/taskman-service` and the `packaging/linux` tree (installer, systemd unit,
+manifest template, desktop entry, icon, AppStream metadata), so the archive is
+installable by extracting it and running `install-linux.sh`. `--arch-package`
+additionally builds the pacman package with `makepkg` when it is installed;
+a missing `makepkg` is a documented skip, never a failure.
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import importlib.util
 import os
 import platform
@@ -36,18 +44,44 @@ WINDOWS_ARM64_TARGET = "aarch64-pc-windows-msvc"
 LINUX_MUSL_TARGET = "x86_64-unknown-linux-musl"
 MUSL_STUB_DIR = ROOT / "target" / "cross-stubs"
 LINUX_DESKTOP = ROOT / "packaging" / "linux" / "io.github.aufkrawall.Taskman.desktop"
+# The Linux payload. `packaging/linux/install-linux.sh` owns the destination of
+# every file below and the two binary paths, so the tarball only has to
+# reproduce the layout that script expects to find next to itself — the same
+# directory the Arch PKGBUILD stages from.
+LINUX_PACKAGING = ROOT / "packaging" / "linux"
+ARCH_PACKAGING = ROOT / "packaging" / "arch"
+LINUX_SERVICE_BINARY = "taskman-service"
+LINUX_PAYLOAD_FILES = (
+    "install-linux.sh",
+    "uninstall-linux.sh",
+    "taskman-core.service",
+    "core-service.json.in",
+    "io.github.aufkrawall.Taskman.desktop",
+    "io.github.aufkrawall.Taskman.svg",
+    "io.github.aufkrawall.Taskman.metainfo.xml",
+    "README.md",
+)
+# The static musl fallback is headless-only: no `dlopen`, so winit cannot load
+# Wayland/X11 and the GUI does not start on a glibc desktop. An installer, a
+# desktop entry and a unit next to that binary would promise an install the
+# artifact cannot deliver, so it carries the binaries and the README only.
+LINUX_MUSL_PAYLOAD_FILES = ("README.md",)
+# Tar entries carry a mode, and the extracted file keeps it. Data files are
+# 0644; binaries and scripts are 0755. Windows has no POSIX modes, so this is
+# the only place the distinction can be made.
+TEXT_ARTIFACT_SUFFIXES = (".desktop", ".service", ".svg", ".xml", ".md", ".in")
 
 
 def log(msg: str) -> None:
     print(f"[build] {msg}", flush=True)
 
 
-def run(cmd: list[str], env: dict | None = None) -> bool:
+def run(cmd: list[str], env: dict | None = None, cwd: Path | None = None) -> bool:
     print(f"$ {' '.join(cmd)}", flush=True)
     merged = os.environ.copy()
     if env:
         merged.update(env)
-    proc = subprocess.run(cmd, cwd=ROOT, env=merged)
+    proc = subprocess.run(cmd, cwd=cwd or ROOT, env=merged)
     return proc.returncode == 0
 
 
@@ -284,6 +318,12 @@ def cross_check() -> bool:
     exactly what catches a cfg-gating mistake that the host build cannot see
     (the 2026-09 Linux/macOS build breakage). Skipped per target when its std
     is missing; CI installs both targets so the gate is complete there.
+
+    `--all-targets` matters as much as the target itself: without it cargo
+    builds no `#[cfg(test)]` code, so the unit tests of a Linux-only module are
+    compiled NOWHERE -- not by the host gate (the module is cfg-gated out) and
+    not here. That is how a broken Linux test stays invisible until someone
+    builds on a Linux box.
     """
     installed = installed_rust_targets()
     ok = True
@@ -293,7 +333,9 @@ def cross_check() -> bool:
         if target not in installed:
             log(f"target {target} not installed - skipping cross check")
             continue
-        if not run([cargo(), "check", "--workspace", "--target", target]):
+        if not run(
+            [cargo(), "check", "--workspace", "--all-targets", "--target", target]
+        ):
             ok = False
     return ok
 
@@ -521,6 +563,130 @@ def clean_stale_linux_artifacts(version: str, active_flavor: str) -> None:
             log(f"removed stale linux artifact: {stale}")
 
 
+def linux_payload_files(
+    gui_exe: Path, flavor: str = "gnu"
+) -> list[tuple[Path, str]] | None:
+    """Contents of one Linux install tarball, or None when a part is missing.
+
+    The archive reproduces the directory `packaging/linux/install-linux.sh`
+    expects to run from: both binaries below `bin/`, the packaging files next to
+    the script. A tarball without the broker is not installable at all, so a
+    missing piece fails the run instead of shipping half a product. The static
+    musl flavor carries only the binaries and the README (see
+    [`LINUX_MUSL_PAYLOAD_FILES`]).
+    """
+    names = LINUX_MUSL_PAYLOAD_FILES if flavor == "musl" else LINUX_PAYLOAD_FILES
+    service_exe = gui_exe.with_name(LINUX_SERVICE_BINARY)
+    missing: list[str] = []
+    if not service_exe.exists():
+        missing.append(str(service_exe))
+    missing += [
+        str(LINUX_PACKAGING / name)
+        for name in names
+        if not (LINUX_PACKAGING / name).is_file()
+    ]
+    if missing:
+        for path in missing:
+            log(f"linux artifact is incomplete: {path} is missing")
+        return None
+    files = [
+        (gui_exe, f"bin/{gui_exe.name}"),
+        (service_exe, f"bin/{service_exe.name}"),
+    ]
+    files += [(LINUX_PACKAGING / name, name) for name in names]
+    return files
+
+
+def arch_srcinfo_matches(makepkg: str) -> bool:
+    """Check that the committed .SRCINFO is what makepkg prints for the PKGBUILD.
+
+    .SRCINFO is the artifact AUR helpers read, and the one place where a stale
+    copy describes a package this build is not producing. makepkg is the only
+    authority on the exact field set and order, so the comparison uses its
+    output instead of a hand-maintained expectation.
+    """
+    proc = subprocess.run(
+        [makepkg, "--printsrcinfo"],
+        cwd=ARCH_PACKAGING,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        log("makepkg --printsrcinfo failed")
+        if proc.stderr.strip():
+            log(proc.stderr.strip())
+        return False
+    committed_file = ARCH_PACKAGING / ".SRCINFO"
+    committed = (
+        committed_file.read_text(encoding="utf-8") if committed_file.is_file() else ""
+    )
+
+    def lines(text: str) -> list[str]:
+        # Blank lines and trailing whitespace are formatting, not content.
+        return [
+            line.rstrip()
+            for line in text.replace("\r\n", "\n").splitlines()
+            if line.strip()
+        ]
+
+    if lines(committed) == lines(proc.stdout):
+        return True
+    log(f"{committed_file} does not match `makepkg --printsrcinfo`")
+    log(f"regenerate it: (cd {ARCH_PACKAGING} && makepkg --printsrcinfo > .SRCINFO)")
+    for line in difflib.unified_diff(
+        lines(committed),
+        lines(proc.stdout),
+        fromfile=".SRCINFO (committed)",
+        tofile="makepkg --printsrcinfo",
+        lineterm="",
+    ):
+        log(line)
+    return False
+
+
+def build_arch_package(version: str) -> bool:
+    """Opt-in: build the Arch package from `packaging/arch` with makepkg.
+
+    Returns False only for a real failure. `makepkg` missing is a documented
+    skip, not a failure: pacman exists on Arch hosts only, and the portable
+    artifact of this run is the tarball. The PKGBUILD has no `source` array —
+    it compiles the two binaries from THIS checkout — so the packaged version
+    must be the version this run just built; a bump that forgets the PKGBUILD
+    would otherwise silently package a different release.
+    """
+    makepkg = shutil.which("makepkg")
+    if makepkg is None:
+        log("makepkg not found - skipping the arch package (Arch hosts only)")
+        return True
+    pkgbuild = ARCH_PACKAGING / "PKGBUILD"
+    if not pkgbuild.is_file():
+        log(f"arch packaging missing: {pkgbuild}")
+        return False
+    match = re.search(
+        r"^pkgver=(.+)$", pkgbuild.read_text(encoding="utf-8"), re.MULTILINE
+    )
+    if not match:
+        log(f"cannot read pkgver from {pkgbuild}")
+        return False
+    if match.group(1).strip() != version:
+        log(
+            f"{pkgbuild} declares pkgver {match.group(1).strip()} but the workspace "
+            f"is {version} - bump the PKGBUILD and its .SRCINFO"
+        )
+        return False
+    if not arch_srcinfo_matches(makepkg):
+        return False
+    log(f"building the arch package with {makepkg}")
+    # PKGDEST keeps the package next to the other artifacts instead of littering
+    # the packaging directory.
+    DIST.mkdir(exist_ok=True)
+    return run(
+        [makepkg, "--force", "--noconfirm"],
+        env={"PKGDEST": str(DIST)},
+        cwd=ARCH_PACKAGING,
+    )
+
+
 def package_zip(name: str, files: list[tuple[Path, str]]) -> Path:
     DIST.mkdir(exist_ok=True)
     dest = DIST / f"{name}.zip"
@@ -541,7 +707,7 @@ def package_tar(name: str, files: list[tuple[Path, str]]) -> Path:
             # was unusable until the user ran `chmod +x`. Stamp the
             # conventional release modes instead, and the release ownership
             # so the archive does not carry the build host's identity.
-            info.mode = 0o644 if arc.endswith(".desktop") else 0o755
+            info.mode = 0o644 if arc.endswith(TEXT_ARTIFACT_SUFFIXES) else 0o755
             info.uid = 0
             info.gid = 0
             info.uname = "root"
@@ -765,7 +931,14 @@ def main() -> int:
         action="store_true",
         help="also build Windows ARM64 and Linux ARM64 artifacts",
     )
-    ap.add_argument("--no-package", action="store_true", help="build but skip dist/ packaging")
+    ap.add_argument(
+        "--no-package", action="store_true", help="build but skip dist/ packaging"
+    )
+    ap.add_argument(
+        "--arch-package",
+        action="store_true",
+        help="also build the Arch package with makepkg (skipped when it is not installed)",
+    )
     ap.add_argument(
         "--require-all-targets",
         action="store_true",
@@ -895,13 +1068,12 @@ def main() -> int:
         if exe is not None:
             linux_x86_64_flavor = flavor
             log(f"linux binary ready ({flavor}): {exe}")
-            files = [(exe, "taskman")]
-            if LINUX_DESKTOP.exists():
-                files.append(
-                    (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
-                )
-            suffix = "" if flavor == "gnu" else f"-{flavor}"
-            artifacts.append((f"taskman-v{version}-linux-x86_64{suffix}", files))
+            files = linux_payload_files(exe, flavor)
+            if files is None:
+                failures += 1
+            else:
+                suffix = "" if flavor == "gnu" else f"-{flavor}"
+                artifacts.append((f"taskman-v{version}-linux-x86_64{suffix}", files))
         elif attempted:
             failures += 1
         elif args.require_all_targets:
@@ -912,12 +1084,11 @@ def main() -> int:
         exe, attempted, flavor = build_linux(profile, LINUX_ARM64_TARGET)
         if exe is not None:
             log(f"linux arm64 binary ready ({flavor}): {exe}")
-            files = [(exe, "taskman")]
-            if LINUX_DESKTOP.exists():
-                files.append(
-                    (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
-                )
-            artifacts.append((f"taskman-v{version}-linux-arm64", files))
+            files = linux_payload_files(exe, flavor)
+            if files is None:
+                failures += 1
+            else:
+                artifacts.append((f"taskman-v{version}-linux-arm64", files))
         elif attempted:
             failures += 1
         elif args.require_all_targets:
@@ -933,6 +1104,13 @@ def main() -> int:
             log(f"packaged: {dest}")
         if linux_x86_64_flavor is not None:
             clean_stale_linux_artifacts(version, linux_x86_64_flavor)
+
+    # Opt-in and packaging, so `--no-package` and `--host-only` both skip it:
+    # the PKGBUILD compiles the Linux binaries itself, which a host-only run
+    # deliberately avoids.
+    if args.arch_package and not args.no_package and linux_requested:
+        if not build_arch_package(version):
+            failures += 1
 
     if failures:
         log(f"DONE with {failures} failure(s)")

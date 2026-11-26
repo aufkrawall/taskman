@@ -4,7 +4,15 @@
 //! driver-specific: when those files are absent, the fields stay unavailable
 //! and `engines` stays empty. No engine is synthesized from a missing usage
 //! counter.
+//!
+//! The proprietary NVIDIA driver publishes neither `gpu_busy_percent` nor
+//! `mem_info_vram_used`, so those adapters get their measurements from NVML
+//! (`sensors::gpu_for_slot`) joined on the normalized PCI slot. Sysfs wins per
+//! measured pair — a pair sysfs half-measured is replaced whole — and an
+//! adapter NVML says nothing about keeps its fields unavailable: no row is
+//! invented for a card DRM did not enumerate.
 
+use super::sensors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -97,6 +105,14 @@ fn card_cache() -> &'static Mutex<Option<CardCache>> {
 /// adapters are still listed — as Windows lists the adapters it enumerated —
 /// while their measurements stay unavailable.
 pub fn gpus(measure: bool) -> Vec<GpuInfo> {
+    // Warm the one-second NVML window before the identity cache lock: the first
+    // call in a process loads the driver library, and that should not happen
+    // while the adapter cache is held. The per-adapter lookups below then hit
+    // the same cached enumeration, and none of them waits on a socket — the
+    // brokered fallback lives on its own worker thread.
+    if measure {
+        let _ = sensors::nvml_gpus();
+    }
     let mut guard = tm_core::sync::lock(card_cache());
     let stale = guard
         .as_ref()
@@ -146,7 +162,28 @@ fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> 
     } else {
         card.facts.clone()
     };
-    gpu_from_card(id, facts, &cache.nvidia_names)
+    let slot = facts.pci_slot.clone();
+    let nvidia = is_nvidia_card(&facts);
+    let gpu = gpu_from_card(id, facts, &cache.nvidia_names);
+    if !measure {
+        // Identity only: an unmeasured row has no counters to fill, and asking
+        // the driver for them would be a measurement nobody asked for.
+        return gpu;
+    }
+    // One adapter's NVML readings, from the cached enumeration: no adapter that
+    // DRM did not enumerate can appear here.
+    let readings = slot.as_deref().and_then(sensors::gpu_for_slot);
+    crate::linux_sensors::with_nvml(gpu, slot.as_deref(), nvidia, readings.as_slice())
+}
+
+/// Whether this adapter uses the proprietary NVIDIA driver, which publishes no
+/// utilization or VRAM counter through sysfs.
+///
+/// The vendor id covers a card whose driver link could not be read; a driver
+/// that does answer a counter keeps it, because the overlay only fills fields
+/// that are still unavailable.
+fn is_nvidia_card(facts: &CardFacts) -> bool {
+    facts.driver.as_deref() == Some("nvidia") || facts.vendor_id == Some(0x10de)
 }
 
 /// The cards sysfs lists, lowest name order. `None` when the directory cannot be

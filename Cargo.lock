@@ -3514,6 +3514,7 @@ dependencies = [
  "tray-icon",
  "wgpu",
  "windows",
+ "zbus",
 ]
 
 [[package]]

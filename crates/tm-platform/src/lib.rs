@@ -6,6 +6,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod actions;
+/// Linux core-service wire protocol, protected manifest and peer policy.
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_core_service;
+/// Linux sensor reading types and their `/sys` + NVML conversions.
+/// Platform-neutral on purpose so its tests run on every host.
+pub mod linux_sensors;
 /// Linux host-fact parsing and telemetry-demand selection, shared by the
 /// Linux backend. Platform-neutral on purpose so its tests run on every host.
 pub mod linux_telemetry;
@@ -21,6 +27,13 @@ mod fontconfig_text;
 /// Parsing and construction for a future protected Linux helper.
 #[cfg(any(target_os = "linux", test))]
 mod linux_action_support;
+/// Pure decision and mapping logic for the Linux core-service bridge: which
+/// failures may fall back to another token, how a broker answer becomes the
+/// existing model types, and what the capability state means. Compiled on
+/// every host so the normal gate actually runs its tests — the transport
+/// itself stays Linux-only.
+#[cfg(any(target_os = "linux", test))]
+mod linux_core_bridge;
 
 #[cfg(target_os = "windows")]
 pub mod win;

@@ -1,0 +1,28 @@
+# pacman scriptlets for taskman.
+#
+# The payload is placed by packaging/linux/install-linux.sh --packaged during
+# package(), so the scriptlet only does what a RUNNING system needs: load the
+# new unit, write the manifest for the user who ran pacman, and refresh the
+# desktop/icon caches. Everything it calls lives in /usr/lib/taskman, so a
+# missing payload fails loudly instead of silently installing a dead service.
+
+post_install() {
+  # --post-install resolves the authorized user from SUDO_USER, so an install
+  # through `sudo pacman -S taskman` authorizes the invoking user rather than
+  # root. A root login must pass --user explicitly:
+  #   /usr/lib/taskman/install-linux.sh --user <name>
+  /usr/lib/taskman/install-linux.sh --post-install
+}
+
+post_upgrade() {
+  # The manifest is regenerated for this user (existing uids are kept) and the
+  # broker is restarted so it loads the new binary and policy.
+  /usr/lib/taskman/install-linux.sh --post-install
+}
+
+pre_remove() {
+  # Stop the broker before pacman unlinks the image it is running from.
+  systemctl stop taskman-core.service 2>/dev/null || true
+  systemctl disable taskman-core.service 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+}

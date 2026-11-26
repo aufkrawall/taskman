@@ -1,0 +1,87 @@
+# Maintainer: aufkrawall
+#
+# This PKGBUILD builds taskman from THIS repository checkout, not from a
+# tarball source: run makepkg from packaging/arch inside the checkout
+# (`cd packaging/arch && makepkg -si`). It has no `source` array and needs no
+# network, because the release binaries are compiled from the checkout that
+# already contains the vendored egui/winit patches.
+#
+# The payload itself is produced by packaging/linux/install-linux.sh --packaged,
+# the same installer the tarball uses. Do not add file paths here: a second
+# description of the layout is exactly how a package and a manual install start
+# to disagree.
+
+pkgname=taskman
+pkgver=0.1.34
+pkgrel=1
+pkgdesc='Cross-platform task manager and system monitor'
+arch=('x86_64')
+url='https://github.com/aufkrawall/taskman'
+license=('MIT')
+# Every library below is dlopened by the window backend rather than linked, so
+# pacman cannot see it as a shared-object dependency and a missing one only
+# shows up as "no backend available" at launch:
+#   libx11            libX11.so.6 and libX11-xcb.so.1 (the X11 backend opens
+#                     both, and libX11-xcb needs libxcb, pulled in transitively)
+#   libxcursor        libXcursor.so.1 (winit fails the whole X11 connection
+#                     without it)
+#   libxi             libXi.so.6 (XInput2 events)
+#   libxkbcommon      libxkbcommon.so.0 (keymap, opened with expect())
+#   libxkbcommon-x11  libxkbcommon-x11.so.0 (the X11 half of that keymap)
+#   wayland           libwayland-client.so.0 (the Wayland backend)
+depends=('glibc' 'libx11' 'libxcursor' 'libxi' 'libxkbcommon' 'libxkbcommon-x11' 'wayland')
+# The `rust` package ships cargo; there is no separate `cargo` package in the
+# official repositories.
+makedepends=('rust')
+# The manifest is the authorization policy: the package ships an unconfigured
+# placeholder and `taskman.install` fills it in for the installing user, so
+# pacman must keep the live file and hand the placeholder over as `.pacnew`
+# instead of overwriting a working list of authorized uids on every upgrade.
+backup=('etc/taskman/core-service.json')
+# `!lto`: the workspace release profile already decides LTO, and makepkg's LTO
+# flags are C/C++ buildflags. `!debug`: release packaging must not grow a
+# debuginfo tree. `!strip`: the profile deliberately keeps the symbol table
+# (`strip = "debuginfo"`) because crash records must name functions; makepkg's
+# strip would take it away again.
+options=('!lto' '!debug' '!strip')
+install=taskman.install
+source=()
+sha256sums=()
+
+# The PKGBUILD is sourced with the working directory set to its own folder, and
+# build()/package() may run in $srcdir; resolving once here is what makes the
+# relative steps below work in both phases.
+_pkgbuild_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-${startdir:-.}/PKGBUILD}")" && pwd -P)
+_repo_root=$(cd -- "$_pkgbuild_dir/../.." && pwd -P)
+
+build() {
+  if [ ! -f "$_repo_root/Cargo.toml" ]; then
+    error "no Cargo.toml at %s: run makepkg from packaging/arch inside the checkout" "$_repo_root"
+    exit 1
+  fi
+  # --offline: a package build must not fetch anything; Cargo.lock plus the
+  # local registry cache is what the checkout was developed against.
+  # A private target dir keeps the developer's own target/ untouched and makes
+  # the build independent of whatever incremental state is lying there.
+  cargo build \
+    --manifest-path "$_repo_root/Cargo.toml" \
+    --release --locked --offline \
+    --target-dir "$srcdir/target" \
+    --bin taskman \
+    --bin taskman-service
+}
+
+package() {
+  local payload="$srcdir/payload"
+  install -d "$payload/bin"
+  install -m755 "$srcdir/target/release/taskman" "$payload/bin/taskman"
+  install -m755 "$srcdir/target/release/taskman-service" "$payload/bin/taskman-service"
+
+  # --packaged: stage the exact tarball payload below $pkgdir and leave every
+  # systemd action, plus the manifest's authorized uid, to taskman.install after
+  # pacman has written the files.
+  bash "$_pkgbuild_dir/../linux/install-linux.sh" \
+    --packaged \
+    --root "$pkgdir" \
+    --source-dir "$payload"
+}

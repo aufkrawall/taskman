@@ -94,9 +94,12 @@ pub(crate) fn is_privileged_helper_arg(argument: &str) -> bool {
 ///
 /// No value is ever concatenated into a shell command. Every action field is
 /// carried by its own typed flag, and relaunch arguments remain distinct argv
-/// entries even when they contain spaces or shell metacharacters. The current
-/// portable GUI does not pass this argv to `pkexec`; only trusted `systemctl`
-/// is elevated until a protected helper image is installed.
+/// entries even when they contain spaces or shell metacharacters.
+///
+/// The installed core service speaks its own framed protocol instead, so this
+/// argv form remains the contract of the hidden helper mode and is exercised
+/// by the tests below; the GUI never passes it to `pkexec` with a user-writable
+/// image, and a relaunch through it stays refused.
 #[cfg(test)]
 pub(crate) fn invocation_args(action: &PrivilegedAction) -> Result<Vec<String>, String> {
     let mut args = Vec::new();

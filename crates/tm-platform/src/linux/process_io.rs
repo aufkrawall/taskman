@@ -47,15 +47,38 @@ struct HandleFact {
     is_write: bool,
 }
 
+/// Why an open-handle walk could not see everything it wanted to.
+///
+/// The distinction decides whether another identity is worth asking: the kernel
+/// refusing the descriptor table is a privilege problem, while a cutoff is not —
+/// no other reader would have seen more of the same table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HandleCoverage {
+    /// Every descriptor in the table was inspected.
+    Complete,
+    /// The walk was cut short: one entry could not be inspected, or the budget
+    /// ran out. The list is partial, and the same token would see exactly this.
+    Partial,
+    /// The kernel refused the descriptor directory itself, so nothing about this
+    /// process' handles can be read with this token.
+    Refused,
+}
+
+/// One per-file I/O read: the rows plus how much of the handle table they cover.
+pub(super) struct FileIoRead {
+    pub(super) snapshot: ProcessFileIoSnapshot,
+    pub(super) coverage: HandleCoverage,
+}
+
 struct HandleEnumeration {
     files: Vec<ProcessFileIo>,
-    complete: bool,
+    coverage: HandleCoverage,
 }
 
 pub(super) fn list_process_file_io(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
-) -> Result<ProcessFileIoSnapshot> {
+) -> Result<FileIoRead> {
     // The start tick brackets both procfs walks. A recycled PID must not let a
     // partially old handle list and a partially new counter read become one
     // coherent-looking answer. A sampled generation that is not known yet — a
@@ -67,7 +90,14 @@ pub(super) fn list_process_file_io(
     let counters = read_process_counters(pid);
     super::ensure_process_generation(pid, before)?;
 
-    Ok(snapshot(handles.files, counters, handles.complete))
+    Ok(FileIoRead {
+        coverage: handles.coverage,
+        snapshot: snapshot(
+            handles.files,
+            counters,
+            handles.coverage == HandleCoverage::Complete,
+        ),
+    })
 }
 
 fn snapshot(
@@ -112,10 +142,11 @@ fn enumerate_open_files(pid: u32) -> Result<HandleEnumeration> {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             // The process-wide counters can still be available even when this
-            // user may not inspect another user's descriptors.
+            // user may not inspect another user's descriptors. `Refused` says
+            // so, which is the one case another identity can fix.
             return Ok(HandleEnumeration {
                 files: Vec::new(),
-                complete: false,
+                coverage: HandleCoverage::Refused,
             });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -158,7 +189,13 @@ fn enumerate_open_files(pid: u32) -> Result<HandleEnumeration> {
 
     Ok(HandleEnumeration {
         files: files.into_values().collect(),
-        complete,
+        // "Incomplete" from here on means a cutoff, not a refusal: another
+        // identity would have seen exactly this much of the same table.
+        coverage: if complete {
+            HandleCoverage::Complete
+        } else {
+            HandleCoverage::Partial
+        },
     })
 }
 
@@ -462,6 +499,20 @@ mod tests {
         assert_eq!(snapshot.accounting.counter_write_bytes, Some(8192));
         assert_eq!(snapshot.accounting.read_bytes, 0);
         assert_eq!(snapshot.accounting.write_bytes, 0);
+    }
+
+    #[test]
+    fn the_coverage_of_our_own_handle_walk_is_never_refused() {
+        // This is the distinction the escalation gate reads: a partial walk is
+        // ours to keep (a racing exit, the budget), while only a refusal is
+        // something another identity could improve on.
+        let read = list_process_file_io(std::process::id(), None).expect("own process");
+        assert_ne!(read.coverage, HandleCoverage::Refused);
+        assert_eq!(
+            read.snapshot.accounting.handles_complete,
+            read.coverage == HandleCoverage::Complete,
+            "the snapshot's flag and the reported coverage must agree"
+        );
     }
 
     #[test]
