@@ -926,26 +926,31 @@ mod tests {
             Some(&r"C:\Tools\app.exe".to_string())
         );
 
-        // Also verify legacy DB without `icon_paths` field seeds from absolute path key
+        // Also verify legacy DB without `icon_paths` field seeds from absolute path key.
+        // `is_absolute` is the platform's rule, so the fixture key has to be
+        // one the host agrees is absolute: a `c:\...` key is a relative name on
+        // Unix, and seeding an icon from it there would be wrong.
+        let legacy_key: &str = if cfg!(windows) {
+            r"c:\program files\test.exe"
+        } else {
+            "/opt/program files/test.exe"
+        };
         let legacy_json = serde_json::json!({
             "since_epoch_s": 12345,
             "entries": {
-                r"c:\program files\test.exe": {
+                legacy_key: {
                     "cpu_seconds": 5.0,
                     "network_bytes": 100,
                     "network_available": true
                 }
             },
             "names": {
-                r"c:\program files\test.exe": "Test Application"
+                legacy_key: "Test Application"
             }
         });
         std::fs::write(&path, legacy_json.to_string()).unwrap();
         let db3 = AppHistoryDb::open(path);
-        assert_eq!(
-            db3.icon_path(r"c:\program files\test.exe"),
-            Some(r"c:\program files\test.exe")
-        );
+        assert_eq!(db3.icon_path(legacy_key), Some(legacy_key));
     }
 
     /// A blank executable path is no icon source: stored as-is it made the page

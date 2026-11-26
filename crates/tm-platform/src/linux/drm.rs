@@ -612,7 +612,14 @@ Bus Location    : 0000:01:00.0
     #[test]
     fn temperature_rejects_driver_sentinels() {
         assert_eq!(temperature_millidegrees_to_c(51_250), Some(51.25));
-        assert_eq!(temperature_millidegrees_to_c(-5_000), None);
+        // A measured sub-zero die is still a measurement: the range check
+        // exists to drop sentinels, not plausible readings (a machine in an
+        // unheated room really does report a few degrees below zero).
+        assert_eq!(temperature_millidegrees_to_c(-5_000), Some(-5.0));
+        // The sentinels a driver actually publishes for "no sample": the
+        // all-ones of an uninitialised counter and absolute zero.
         assert_eq!(temperature_millidegrees_to_c(i64::MAX), None);
+        assert_eq!(temperature_millidegrees_to_c(-273_150), None);
+        assert_eq!(temperature_millidegrees_to_c(500_000), None);
     }
 }
