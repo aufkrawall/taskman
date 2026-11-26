@@ -59,7 +59,14 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallFilter=@system-service
+# @system-service is the syscall group for a service and is expected to cover
+# every call below. They are named anyway because set-priority and set-affinity
+# are allowlisted actions: if the group ever drops one of them, those actions
+# fail with EPERM inside the broker even though CAP_SYS_NICE is granted — a
+# failure that looks like a permission bug in the action code instead of a unit
+# problem. `systemd-analyze syscall-filter @system-service` (and
+# `systemd-analyze verify taskman-core.service`) confirm the set on an Arch host.
+SystemCallFilter=@system-service setpriority sched_setaffinity sched_getaffinity prlimit64 sched_getscheduler sched_setscheduler
 # PrivateDevices= is deliberately NOT set: NVML reads /dev/nvidia* to serve the
 # GPU telemetry the unelevated GUI cannot read itself. RestrictRealtime= is not
 # set either — setting a realtime policy is one of the allowlisted actions.
