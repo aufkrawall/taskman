@@ -1,0 +1,63 @@
+# TaskMan protected core service.
+#
+# The GUI stays an ordinary user process. This unit owns the one socket the
+# product's privileged operations travel over (/run/taskman/core.sock), the
+# fixed action allowlist behind it and the root-only evidence an unelevated
+# sampler cannot read. See llm-wiki/linux-core-service.md for the boundary.
+#
+# packaging/linux/install-linux.sh installs this file and refuses to continue
+# when ExecStart no longer names the binary it just staged, so the unit and the
+# installer cannot drift apart.
+
+[Unit]
+Description=TaskMan protected core service
+Documentation=https://github.com/aufkrawall/taskman
+# The manifest is the authorization policy: the broker refuses to listen
+# without it. Starting the unit anyway would only produce a restart loop.
+ConditionPathExists=/etc/taskman/core-service.json
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/taskman/taskman-service --run
+Restart=on-failure
+# A crash loop after a bad upgrade must not spin; the broker re-reads the
+# manifest and install paths on every start.
+RestartSec=2s
+User=root
+Group=root
+
+# Root-owned 0755 socket directory, created and removed by systemd itself, so
+# the socket's parent never depends on the installer's tail end running.
+RuntimeDirectory=taskman
+RuntimeDirectoryMode=0755
+
+# --- Hardening --------------------------------------------------------------
+# The broker's entire job is acting on other users' processes and reading what
+# the kernel withholds from their own sessions, so the capability set is the
+# minimum that allowlist needs and nothing else:
+#   CAP_KILL             signal a process owned by another user
+#   CAP_SYS_NICE         nice value, scheduling policy, CPU affinity
+#   CAP_SYS_PTRACE       /proc/<pid>/{maps,fd,io,environ} of another user
+#   CAP_DAC_READ_SEARCH  read a file whose mode denies even root
+#   CAP_SYS_RESOURCE     oom_score_adj and resource-limit changes
+# Everything else is dropped; the protocol has no shell, no file write outside
+# /run/taskman and no generic "call this syscall" operation.
+CapabilityBoundingSet=CAP_KILL CAP_SYS_NICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+# Read-only system tree: the only writable path is the socket directory, which
+# is why the broker cannot be tricked into writing a file anywhere else.
+ProtectSystem=strict
+ReadWritePaths=/run/taskman
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+# PrivateDevices= is deliberately NOT set: NVML reads /dev/nvidia* to serve the
+# GPU telemetry the unelevated GUI cannot read itself. RestrictRealtime= is not
+# set either — setting a realtime policy is one of the allowlisted actions.
+
+[Install]
+WantedBy=multi-user.target
