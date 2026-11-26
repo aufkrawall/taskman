@@ -225,6 +225,12 @@ impl State {
         self.view_generation += 1;
     }
 
+    /// The current display-model generation, for pages outside this module that
+    /// must notice a structural change (`tabs::users` warms icons per rebuild).
+    pub fn view_generation(&self) -> u64 {
+        self.view_generation
+    }
+
     pub fn toggle_expanded(&mut self, pid: u32) {
         if !self.expanded.remove(&pid) {
             self.expanded.insert(pid);

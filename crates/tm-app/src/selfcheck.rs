@@ -720,7 +720,11 @@ pub fn run_icons() -> i32 {
             "{}",
             serde_json::json!({
                 "ok": false,
-                "error": "no distinct executable paths in the snapshot",
+                // The likely cause on Linux, stated so a plain-user run is not
+                // mistaken for a broken resolver: `/proc/<pid>/exe` of other
+                // users' processes is unreadable without the service.
+                "error": "no distinct executable paths in the snapshot \
+                          (on Linux, other users' /proc/<pid>/exe needs the service)",
             })
         );
         return 1;

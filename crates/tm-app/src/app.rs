@@ -540,11 +540,13 @@ struct InputStatsRecorder {
     /// two numbers. The remaining pages paint no row icon at all.
     icon_memo_hits: u64,
     icon_lookups: u64,
-    /// Icon prefetch calls the pages made their row model rebuild, and the
-    /// keys they handed the cache. On a cold cache a row paints an EMPTY icon
-    /// cell until its answer arrives, so a prefetch is what moves that work off
-    /// the paint path; the pair says how much of it left. Saturating like the
-    /// rebuild count: they are only reset while the probe is enabled.
+    /// How many prefetches the pages issued from their row model rebuild and had
+    /// at least one key for, and how many keys they handed over in total. On a
+    /// cold cache a row paints an EMPTY icon cell until its answer arrives, so a
+    /// prefetch is what moves that work off the paint path; the pair says how
+    /// much of it left. Counted before the cache's own dedup, so a rebuild whose
+    /// keys are all cached still counts here and is dropped there. Saturating
+    /// like the rebuild count: they are only reset while the probe is enabled.
     icon_prefetch_calls: u32,
     icon_prefetch_keys: u64,
     /// Clipped-text measurements spent only to answer "is this cell clipped?".
@@ -577,11 +579,12 @@ impl InputStatsRecorder {
 
 /// Most icon keys one prefetch call hands over.
 ///
-/// The cache keeps a bounded number of textures (`CACHE_CAP` in `icon_cache`)
-/// and every key costs a platform icon resolution, so warming more keys than it
-/// can hold would evict the icons this rebuild just resolved. The cap cuts in
-/// row order, which is the paint order: the rows the user sees first are the
-/// ones that get warmed.
+/// Deliberately a fraction of the texture cache's own cap (`CACHE_CAP` in
+/// `icon_cache`): warming more keys than the cache can hold would evict the
+/// icons this rebuild just resolved, and a rebuild is not a claim about rows the
+/// user is looking at. The cap cuts in row order, which is the *top* of the list,
+/// not the scrolled window — the visible rows resolve on the paint path when they
+/// are not in this set, and rows past the cap are never warmed at all.
 const ICON_PREFETCH_LIMIT: usize = 512;
 
 /// The icon cache keys a page's row model asks for: its distinct image paths,
@@ -624,8 +627,9 @@ pub struct IconPrefetch {
     /// Startup: the fetched list (its fetch timestamp, the list's only
     /// identity) and the search its rows were last warmed for.
     startup: Option<(std::time::Instant, String)>,
-    /// Users: the sample and the search its rows were last warmed for.
-    users: Option<(u64, String)>,
+    /// Users: the sample, the display-model generation (an expanded session adds
+    /// rows) and the search its rows were last warmed for.
+    users: Option<((u64, u64), String)>,
 }
 
 /// Does `slot` hold anything other than `(generation, search)`?
@@ -633,8 +637,9 @@ pub struct IconPrefetch {
 /// The page prefetches when it does, and the gate then remembers what it
 /// warmed. `generation` is whatever identifies the page's data: a sample
 /// timestamp for a page built from the live snapshot, the fetch timestamp for
-/// one built from a fetched list. Both comparisons are cheap enough to run on
-/// every frame; the string copy happens only on the rebuild.
+/// one built from a fetched list, and a tuple of that plus the display-model
+/// generation where an expansion changes the rows. Both comparisons are cheap
+/// enough to run on every frame; the string copy happens only on the rebuild.
 fn prefetch_due<G: PartialEq + Copy>(
     slot: &mut Option<(G, String)>,
     generation: G,
@@ -665,8 +670,15 @@ impl IconPrefetch {
 
     /// Whether the Users page's rows changed since the cache was warmed for
     /// them.
-    pub fn users_due(&mut self, sample_ms: u64, search: &str) -> bool {
-        prefetch_due(&mut self.users, sample_ms, search)
+    ///
+    /// Expansion is part of the identity here, unlike a page built purely from
+    /// the snapshot: a session's app rows only exist while it is expanded, so
+    /// clicking it creates icon-bearing rows without a new sample or a new
+    /// search — the gate would stay shut and those rows would stream in exactly
+    /// as before. `model_generation` is the display-model counter the Processes
+    /// state bumps on every structural change.
+    pub fn users_due(&mut self, sample_ms: u64, model_generation: u64, search: &str) -> bool {
+        prefetch_due(&mut self.users, (sample_ms, model_generation), search)
     }
 }
 
@@ -3302,7 +3314,8 @@ impl TaskManApp {
     /// answer per frame while the user watches. Handing the model's keys over
     /// here starts the extractions before those rows are first painted. Called
     /// from the rebuild, never from the paint path, and gated by
-    /// [`IconPrefetch`] on the pages that rebuild every frame.
+    /// [`IconPrefetch`] on the pages that rebuild every frame. A rebuild with no
+    /// icon keys at all prefetched nothing, so it is not counted.
     pub fn prefetch_icons(&mut self, keys: Vec<String>) {
         if keys.is_empty() {
             return;
@@ -3353,11 +3366,14 @@ impl TaskManApp {
         let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
         let painted_frames = sw.frames.saturating_sub(sw.skipped_damage).max(1) as f64;
         // The icon cache's own counters ride this window: `ready`, `failed`,
-        // `queued` and `in_flight` are what the cache holds right now, while
-        // `prefetched` and the per-window prefetch counts are this window's
-        // work. A window with icon lookups but no prefetch call, and a `queued`
-        // that keeps growing, is a page still resolving icons from the paint
-        // path.
+        // `queued` and `in_flight` are what the cache holds right now, and
+        // `prefetched` is its running total since the cache was created — not
+        // this window's, unlike `icon_prefetch_calls`/`icon_prefetch_keys`, which
+        // the summary resets. The two are not meant to match even over a window:
+        // the pages count the keys they hand over, the cache counts the ones it
+        // enqueued after dropping keys that were already cached or backing off. A
+        // window with icon lookups but no prefetch call, and a `queued` that keeps
+        // growing, is a page still resolving icons from the paint path.
         let icons = self.shared.icons.stats();
         tracing::info!(
             moves_s = format_args!("{:.0}", moves.total_moves as f64 / secs),
@@ -3471,18 +3487,33 @@ mod tests {
     #[test]
     fn the_frame_built_pages_prefetch_only_when_their_rows_changed() {
         let mut gates = IconPrefetch::default();
-        assert!(gates.users_due(10, ""), "the first frame prefetches");
-        assert!(!gates.users_due(10, ""));
-        assert!(gates.users_due(11, ""), "a new sample rebuilds the rows");
-        assert!(!gates.users_due(11, ""));
-        assert!(gates.users_due(11, "chr"), "a new search rebuilds them too");
-        assert!(!gates.users_due(11, "chr"));
+        assert!(gates.users_due(10, 0, ""), "the first frame prefetches");
+        assert!(!gates.users_due(10, 0, ""));
+        assert!(gates.users_due(11, 0, ""), "a new sample rebuilds the rows");
+        assert!(!gates.users_due(11, 0, ""));
+        assert!(
+            gates.users_due(11, 1, ""),
+            "expanding a session adds rows without a new sample"
+        );
+        assert!(!gates.users_due(11, 1, ""));
+        assert!(
+            gates.users_due(11, 1, "chr"),
+            "a new search rebuilds them too"
+        );
+        assert!(!gates.users_due(11, 1, "chr"));
+
+        // Startup is keyed on the fetched list, whose identity is its timestamp:
+        // the same list must not re-ask even though the page rebuilds every frame.
+        let fetched_at = std::time::Instant::now();
+        assert!(gates.startup_due(fetched_at, ""));
+        assert!(!gates.startup_due(fetched_at, ""));
+        assert!(gates.startup_due(fetched_at, "chr"));
 
         // Each page keeps its own gate: another page's prefetch must not spend
         // this one's.
         assert!(gates.app_history_due(11, "chr"));
-        assert!(gates.startup_due(std::time::Instant::now(), ""));
-        assert!(!gates.users_due(11, "chr"));
+        assert!(!gates.users_due(11, 1, "chr"));
+        assert!(!gates.startup_due(fetched_at, "chr"));
         assert!(!gates.app_history_due(11, "chr"));
     }
 

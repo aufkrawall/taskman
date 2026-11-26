@@ -34,6 +34,7 @@ Primary sources:
 | Full gate | fmt, clippy `-D warnings`, workspace tests | `python build.py --check` |
 | Release | refresh the user-launched host artifact | `python build.py --host-only` |
 | Self-check | headless collector JSON smoke test; starts the binary but not its GUI | `target/release/taskman.exe --selfcheck [--mock]` |
+| Icon-resolution check | headless per-key icon timings: cold and warm pass, p50/p95/max, `ok`/`resolved`/`missing`; never opens a window and needs no display, so it is the way to measure the icon path on a bare-metal Linux box | `target/release/taskman.exe --selfcheck-icons` |
 | Code-sample end-to-end check | installed GUI → LocalSystem broker → system-profile ETW → module attribution | `"C:\Program Files\TaskMan\taskman.exe" --selfcheck-code-samples` |
 | Service self-check | headless broker framing/ACL/path summary; does not install/start SCM service | `target/release/taskman-service.exe --selfcheck` |
 

@@ -189,6 +189,19 @@ enum URow {
     },
 }
 
+/// The icon keys these rows ask the cache for, in row order.
+///
+/// A user row has no image of its own, and a row without an executable paints the
+/// platform's default application icon, so it contributes no key. Split out from
+/// the paint loop so the page-to-cache wiring can be tested without a GUI: the
+/// callback that warms a rebuild is otherwise only reachable by painting.
+fn prefetch_keys(rows: &[URow]) -> Vec<String> {
+    crate::app::icon_prefetch_keys(rows.iter().map(|row| match row {
+        URow::App { exe, .. } => exe.as_deref(),
+        URow::User(_) => None,
+    }))
+}
+
 /// Fold one process into its session's rollup and into that session's entry
 /// for the app it belongs to.
 fn accumulate(a: &mut Agg, p: &tm_core::model::ProcessEntry) {
@@ -500,13 +513,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     // Warm the icons of the app rows this rebuild just produced. The page
     // re-derives its rows from the live snapshot every frame, so `IconPrefetch`
-    // — not the frame — decides when the cache is asked again: a new sample or
-    // a new search.
-    if app.icons_prefetch.users_due(snap.timestamp_ms, &app.search) {
-        let keys = crate::app::icon_prefetch_keys(rows.iter().map(|row| match row {
-            URow::App { exe, .. } => exe.as_deref(),
-            URow::User(_) => None,
-        }));
+    // — not the frame — decides when the cache is asked again: a new sample, a
+    // new search, or an expansion (a session's app rows only exist while it is
+    // expanded, so clicking one creates icon-bearing rows without a sample).
+    let generation = app.processes_state.view_generation();
+    if app
+        .icons_prefetch
+        .users_due(snap.timestamp_ms, generation, &app.search)
+    {
+        let keys = prefetch_keys(&rows);
         app.prefetch_icons(keys);
     }
 
@@ -831,6 +846,10 @@ fn user_row_ui(
     let toggled = table.chevron(ui, rect, expanded, true, pal, seed);
     if toggled && !app.processes_state.expanded_users.remove(&s.id) {
         app.processes_state.expanded_users.insert(s.id);
+        // An expanded session adds app rows, i.e. new icon keys, without a new
+        // sample: bump the display-model generation so the prefetch gate reopens
+        // instead of waiting a sample for icons the user is about to look at.
+        app.processes_state.invalidate();
     }
     let icon_rect = egui::Rect::from_center_size(
         egui::Pos2::new(rect.left() + 38.0, rect.center().y),
@@ -1094,6 +1113,36 @@ mod tests {
             roll: Roll::new(),
             apps: HashMap::new(),
         }
+    }
+
+    /// The page warms exactly the keys its app rows paint, in row order, and one
+    /// per distinct executable — the wiring a page-level test can reach without
+    /// a GUI (the paint loop itself is not testable headlessly).
+    #[test]
+    fn an_expanded_session_prefetches_its_app_rows_in_order() {
+        let row = |session: u32, name: &str, exe: Option<&str>| URow::App {
+            session,
+            name: name.to_string(),
+            exe: exe.map(str::to_string),
+            roll: Box::new(Roll::new()),
+        };
+        let rows = vec![
+            URow::User(0),
+            row(1, "editor", Some("/usr/bin/editor")),
+            row(1, "editor helper", Some("/usr/bin/editor")),
+            row(1, "kernel thread", None),
+            row(2, "terminal", Some("/usr/bin/terminal")),
+        ];
+        assert_eq!(
+            prefetch_keys(&rows),
+            [
+                "/usr/bin/editor".to_string(),
+                "/usr/bin/terminal".to_string()
+            ],
+            "a user row and a row without an image contribute no key, and a \
+             shared executable is one key"
+        );
+        assert!(prefetch_keys(&[]).is_empty());
     }
 
     fn with_net(name: &str, recv: Option<f64>, sent: Option<f64>) -> ProcessEntry {
