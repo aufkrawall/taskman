@@ -4,6 +4,10 @@
 //! creation ticks. A recorded PPID can outlive its parent and later name an
 //! unrelated process with the recycled PID; descendants are therefore accepted
 //! only when they are not older than the process currently reached by the walk.
+//!
+//! The walk also reports whether it actually delivered a signal, because a
+//! caller may retry the same kill through another identity: see
+//! [`kill_process_with_delivery`].
 
 use std::collections::{HashMap, VecDeque};
 
@@ -22,9 +26,38 @@ struct Descendant {
     parent_start_ticks: i64,
 }
 
-pub(super) fn kill_process(pid: u32, expected_start_ticks: Option<i64>, tree: bool) -> Result<()> {
+/// Terminate `pid`, and its descendants when `tree` is set, reporting whether
+/// any signal was actually delivered.
+///
+/// The flag exists for one decision: whether the caller may retry this kill
+/// under another identity. The walk signals child-first and can fail halfway —
+/// a descendant this user owns receives SIGTERM, a foreign one answers EPERM —
+/// so "the walk returned an error" does not mean "nothing happened". Repeating
+/// that as root would signal part of the tree twice and act on a tree that has
+/// changed since the first attempt, which is exactly the invariant the action
+/// surface must not break.
+pub(super) fn kill_process_with_delivery(
+    pid: u32,
+    expected_start_ticks: Option<i64>,
+    tree: bool,
+) -> (Result<()>, bool) {
+    let mut delivered = false;
+    let result = kill_process_tracked(pid, expected_start_ticks, tree, &mut delivered);
+    (result, delivered)
+}
+
+fn kill_process_tracked(
+    pid: u32,
+    expected_start_ticks: Option<i64>,
+    tree: bool,
+    delivered: &mut bool,
+) -> Result<()> {
     if !tree {
-        return super::send_signal_checked(pid, expected_start_ticks, libc::SIGTERM);
+        let result = super::send_signal_checked(pid, expected_start_ticks, libc::SIGTERM);
+        // A single signal either landed or was never sent: the two cannot be
+        // told apart any other way, and this is the honest pairing.
+        *delivered = result.is_ok();
+        return result;
     }
     if pid == 0 {
         return Err(tm_core::TmError::platform("kill", "system process"));
@@ -96,7 +129,10 @@ pub(super) fn kill_process(pid: u32, expected_start_ticks: Option<i64>, tree: bo
             Some(child.link.start_ticks),
             libc::SIGTERM,
         ) {
-            Ok(()) | Err(tm_core::TmError::ProcessNotFound { .. }) => {}
+            // The child received it: from here on this attempt is not a
+            // "nothing happened" failure.
+            Ok(()) => *delivered = true,
+            Err(tm_core::TmError::ProcessNotFound { .. }) => {}
             Err(error) => {
                 tracing::debug!(
                     child = child.link.pid,
@@ -109,6 +145,7 @@ pub(super) fn kill_process(pid: u32, expected_start_ticks: Option<i64>, tree: bo
     }
 
     let root_result = super::send_signal_checked(pid, Some(expected), libc::SIGTERM);
+    *delivered |= root_result.is_ok();
     root_result.and(child_error.map_or(Ok(()), Err))
 }
 
@@ -360,5 +397,29 @@ mod tests {
                 "child {child} must be signalled before parent {parent}"
             );
         }
+    }
+
+    #[test]
+    fn an_attempt_that_never_reached_a_signal_reports_nothing_delivered() {
+        // The escalation gate reads this flag: a refusal before the first
+        // signal must leave it false, whatever failed.
+        let (result, delivered) = kill_process_with_delivery(0, None, false);
+        assert!(result.is_err());
+        assert!(!delivered, "pid 0 never receives a signal");
+
+        let (result, delivered) = kill_process_with_delivery(0, None, true);
+        assert!(result.is_err());
+        assert!(!delivered);
+
+        // A vanished root is refused by the identity check, before any walk.
+        let (result, delivered) = kill_process_with_delivery(u32::MAX - 1, Some(1), true);
+        assert!(result.is_err());
+        assert!(!delivered);
+
+        // Without a sampled identity there is nothing to verify against, so the
+        // attempt stops before signalling either.
+        let (result, delivered) = kill_process_with_delivery(u32::MAX - 1, None, true);
+        assert!(result.is_err());
+        assert!(!delivered);
     }
 }

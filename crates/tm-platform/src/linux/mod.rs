@@ -26,8 +26,14 @@ mod shell;
 mod startup;
 mod x11_windows;
 
+use self::core_service::client::{self, ClientError};
 use crate::actions::*;
 use crate::linux_action_support::PrivilegedAction;
+use crate::linux_core_bridge::{
+    client_error, connections_from_wire, core_service_state, file_io_from_wire, module_from_wire,
+    response_label, service_verb, threads_from_wire,
+};
+use crate::linux_core_service::{ActionRequest, MANIFEST_PATH, Request, Response};
 use crate::linux_telemetry;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -838,6 +844,13 @@ pub struct LinuxActions;
 
 impl PlatformActions for LinuxActions {
     fn capabilities(&self) -> Capabilities {
+        // The process read/action flags describe surfaces this backend
+        // delivers with the user's own token through procfs and syscalls, and
+        // for other users' processes through the broker when it is installed.
+        // They stay independent of the broker's presence on purpose: a missing
+        // service must neither blank a tab nor disable an action the direct
+        // path still delivers, and no flag here promises something no path can
+        // carry (module unloading, a whole-machine network view).
         Capabilities {
             services_list: services::available(),
             services_control: services::available(),
@@ -872,13 +885,40 @@ impl PlatformActions for LinuxActions {
     }
     fn control_service(&self, name: &str, action: ServiceAction) -> Result<()> {
         let direct = services::control_unit_direct(name, action);
-        polkit::direct_or_elevated(
-            direct,
-            PrivilegedAction::Service {
+        if direct.is_ok() {
+            return direct;
+        }
+        // Only a real authorization failure is worth asking anyone else: a
+        // missing unit or a broken systemctl must not become a prompt.
+        if !direct
+            .as_ref()
+            .err()
+            .is_some_and(polkit::is_permission_denied)
+        {
+            return direct;
+        }
+        let request = Request::Action {
+            action: ActionRequest::Service {
                 unit: name.to_string(),
-                action,
+                verb: service_verb(action),
             },
-        )
+        };
+        match client::request(&request) {
+            // The broker runs as root, so its answer is the privileged one.
+            Ok(Response::Done) => Ok(()),
+            Ok(other) => Err(unexpected_response(request.label(), &other)),
+            // No broker installed or answering: today's Polkit path, unchanged.
+            Err(error) if error.may_fall_back() => polkit::direct_or_elevated(
+                direct,
+                PrivilegedAction::Service {
+                    unit: name.to_string(),
+                    action,
+                },
+            ),
+            // Root itself declined. A Polkit prompt would only ask the user to
+            // repeat what the privileged path already refused.
+            Err(error) => Err(client_error(request.label(), &error)),
+        }
     }
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
         Ok(startup::list_autostart())
@@ -925,7 +965,28 @@ impl PlatformActions for LinuxActions {
         tree: bool,
     ) -> Result<()> {
         validate_mutation_target(pid)?;
-        let direct = process_tree::kill_process(pid, expected_start_epoch_s, tree);
+        let (direct, delivered) =
+            process_tree::kill_process_with_delivery(pid, expected_start_epoch_s, tree);
+        // The broker is the only path that can signal another user's process,
+        // and it re-reads the creation ticks itself. The tree case is included:
+        // the service walks the descendants as root, which a portable,
+        // user-writable GUI image can never do safely.
+        //
+        // A walk that already signalled something is NOT retried: it exits part
+        // way through (`Ok` for one descendant, EPERM for the next), and asking
+        // the service to signal the whole tree again would deliver a second
+        // SIGTERM to the part that is left standing.
+        if !delivered
+            && let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+                ActionRequest::Kill {
+                    pid,
+                    start_ticks,
+                    tree,
+                }
+            })
+        {
+            return result;
+        }
         match (expected_start_epoch_s, tree) {
             (Some(start_ticks), false) => {
                 polkit::direct_or_elevated(direct, PrivilegedAction::Kill { pid, start_ticks })
@@ -949,6 +1010,15 @@ impl PlatformActions for LinuxActions {
             libc::SIGCONT
         };
         let direct = send_signal_checked(pid, expected_start_epoch_s, signal);
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            if suspend {
+                ActionRequest::Suspend { pid, start_ticks }
+            } else {
+                ActionRequest::Resume { pid, start_ticks }
+            }
+        }) {
+            return result;
+        }
         match (expected_start_epoch_s, suspend) {
             (Some(start_ticks), true) => {
                 polkit::direct_or_elevated(direct, PrivilegedAction::Suspend { pid, start_ticks })
@@ -967,6 +1037,15 @@ impl PlatformActions for LinuxActions {
     ) -> Result<()> {
         validate_mutation_target(pid)?;
         let direct = set_priority_direct(pid, expected_start_epoch_s, priority);
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            ActionRequest::SetPriority {
+                pid,
+                start_ticks,
+                priority,
+            }
+        }) {
+            return result;
+        }
         match expected_start_epoch_s {
             Some(start_ticks) => polkit::direct_or_elevated(
                 direct,
@@ -1015,6 +1094,15 @@ impl PlatformActions for LinuxActions {
     ) -> Result<()> {
         validate_mutation_target(pid)?;
         let direct = set_affinity_direct(pid, expected_start_epoch_s, mask);
+        if let Some(result) = brokered_action(&direct, expected_start_epoch_s, |start_ticks| {
+            ActionRequest::SetAffinity {
+                pid,
+                start_ticks,
+                mask,
+            }
+        }) {
+            return result;
+        }
         match expected_start_epoch_s {
             Some(start_ticks) => polkit::direct_or_elevated(
                 direct,
@@ -1042,6 +1130,23 @@ impl PlatformActions for LinuxActions {
         polkit::relaunch_elevated()
     }
 
+    fn core_service_state(&self) -> CoreServiceState {
+        // Both inputs are cheap: the manifest is one `stat`, and `status()` is a
+        // cache read that refreshes on its own thread, so this cannot block the
+        // render path it is called from.
+        let installed = manifest_installed();
+        // A manifest-less machine has nothing to ask, so the probe is skipped
+        // entirely and the reason travels with the state.
+        let status = if installed {
+            client::status()
+        } else {
+            Err(ClientError::Unavailable(
+                "the core service is not installed".into(),
+            ))
+        };
+        core_service_state(installed, status)
+    }
+
     fn open_file_location(&self, path: &str) -> Result<()> {
         shell::open_file_location(path)
     }
@@ -1060,9 +1165,30 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
         let before = process_start_for_read(pid, expected_start_epoch_s)?;
-        let modules = process_modules::list_process_modules(pid)?;
-        ensure_process_generation(pid, before)?;
-        Ok(modules)
+        match process_modules::list_process_modules(pid) {
+            Ok(modules) => {
+                ensure_process_generation(pid, before)?;
+                Ok(modules)
+            }
+            // `/proc/<pid>/maps` is readable only by the process' own user, so
+            // another user's process is exactly the case the broker answers.
+            Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
+                let request = Request::ProcessModules {
+                    pid,
+                    start_ticks: before,
+                };
+                let modules = brokered_read(&request, direct_error, |response| match response {
+                    Response::Modules(wire) => Ok(wire.into_iter().map(module_from_wire).collect()),
+                    other => Err(other),
+                })?;
+                // The service re-checked the generation inside the request; our
+                // own bracket then proves the answer still describes the process
+                // this read asked about.
+                ensure_process_generation(pid, before)?;
+                Ok(modules)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn list_process_threads(
@@ -1071,16 +1197,60 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<ProcessThreads> {
         let before = process_start_for_read(pid, expected_start_epoch_s)?;
-        let threads = process_threads::list_process_threads(pid, Some(before))?;
-        ensure_process_generation(pid, before)?;
-        Ok(threads)
+        match process_threads::list_process_threads(pid, Some(before)) {
+            Ok(threads) => {
+                ensure_process_generation(pid, before)?;
+                Ok(threads)
+            }
+            Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
+                let request = Request::ProcessThreads {
+                    pid,
+                    start_ticks: before,
+                };
+                let threads = brokered_read(&request, direct_error, |response| match response {
+                    Response::Threads(wire) => Ok(threads_from_wire(wire)),
+                    other => Err(other),
+                })?;
+                ensure_process_generation(pid, before)?;
+                Ok(threads)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn list_process_connections(&self, pid: u32) -> Result<Vec<ProcessConnection>> {
         let before = process_start_for_read(pid, None)?;
-        let connections = process_connections::list_process_connections(pid)?;
-        ensure_process_generation(pid, before)?;
-        Ok(connections)
+        match process_connections::list_process_connections(pid) {
+            Ok(connections) => {
+                ensure_process_generation(pid, before)?;
+                Ok(connections)
+            }
+            Err(direct_error) if polkit::is_permission_denied(&direct_error) => {
+                // The connection table carries no creation time, so the sampled
+                // generation travels with the request and is closed again below.
+                let request = Request::ProcessConnections {
+                    pid,
+                    start_ticks: before,
+                };
+                let mapping = brokered_read(&request, direct_error, |response| match response {
+                    Response::Connections(wire) => Ok(connections_from_wire(wire)),
+                    other => Err(other),
+                })?;
+                if !mapping.unparsable.is_empty() && broker_diagnostic_allowed() {
+                    // Dropping the row keeps the rest of the answer usable, but
+                    // a defect must not be invisible: name the endpoint.
+                    tracing::debug!(
+                        pid,
+                        dropped = mapping.unparsable.len(),
+                        first = mapping.unparsable.first().map(String::as_str),
+                        "core service answered endpoints this build cannot parse"
+                    );
+                }
+                ensure_process_generation(pid, before)?;
+                Ok(mapping.connections)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn backend_name(&self) -> &'static str {
@@ -1105,8 +1275,171 @@ impl PlatformActions for LinuxActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
-        process_io::list_process_file_io(pid, expected_start_epoch_s)
+        let before = process_start_for_read(pid, expected_start_epoch_s)?;
+        let direct = process_io::list_process_file_io(pid, Some(before));
+        // There are two ways the direct walk is useless for another user's
+        // process: `/proc/<pid>/fd` is owner-only and comes back as an empty,
+        // incomplete snapshot, or another step fails outright with EPERM. Both
+        // are the case the broker exists for; a snapshot that saw handles is a
+        // real answer and never pays a round trip.
+        let escalate = match &direct {
+            Ok(snapshot) => !snapshot.accounting.handles_complete && snapshot.files.is_empty(),
+            Err(error) => polkit::is_permission_denied(error),
+        };
+        if !escalate {
+            return direct;
+        }
+        let request = Request::ProcessFileIo {
+            pid,
+            start_ticks: before,
+        };
+        let brokered = match client::request(&request) {
+            Ok(Response::FileIo(wire)) => Some(file_io_from_wire(*wire)),
+            Ok(other) => return Err(unexpected_response(request.label(), &other)),
+            // No broker: the local answer, or its error, is the honest one.
+            Err(error) if error.may_fall_back() => None,
+            Err(error) => return Err(client_error(request.label(), &error)),
+        };
+        let Some(snapshot) = brokered else {
+            return direct;
+        };
+        // The request pins the sampled generation, and closing our own bracket
+        // as well proves the answer still describes the process asked about.
+        ensure_process_generation(pid, before)?;
+        Ok(snapshot)
     }
+}
+
+// -------------------------------------------------------- core service bridge
+//
+// The broker is the only path that can reach another user's or a protected
+// process: `/proc/<pid>/maps` is readable only by its owner, `/proc/<pid>/fd`
+// and `/proc/<pid>/task` need CAP_SYS_PTRACE for a foreign process, and
+// signalling one needs the same. Every call site above therefore keeps the
+// direct procfs/syscall attempt first — a direct attempt that worked never pays
+// a round trip — and asks the broker only where the kernel answered
+// EPERM/EACCES.
+//
+// Two rules hold everywhere:
+//
+// - Only a permission failure escalates. A vanished process, a malformed record
+//   or an exhausted budget is the same answer under either identity.
+// - The broker's answer ends the decision. A refusal is returned with the
+//   service's own reason; it never becomes a Polkit prompt or a local retry.
+
+/// Whether a failed direct attempt may be handed to the broker.
+///
+/// Both conditions are necessary: the kernel refused for lack of privilege, and
+/// the caller knows the creation identity the service has to re-check. An
+/// action without one could address a recycled pid, so it stays local.
+fn may_escalate(direct: &Result<()>, start_ticks: Option<i64>) -> bool {
+    start_ticks.is_some()
+        && direct
+            .as_ref()
+            .err()
+            .is_some_and(polkit::is_permission_denied)
+}
+
+/// Ask the broker for an action the direct attempt could not perform.
+///
+/// `None` means "continue with the pre-service path": no other identity would
+/// change the outcome, or no broker is installed and answering. `Some(result)`
+/// is final — the service either did it or gave its reason, and a reason must
+/// never degrade into a second privileged attempt.
+///
+/// The caller decides whether a *partial* attempt may be retried: suspend,
+/// resume, priority and affinity write absolute values, so re-applying one
+/// cannot be observed twice, while a kill is gated on
+/// [`process_tree::kill_process_with_delivery`] reporting that nothing was
+/// delivered.
+fn brokered_action(
+    direct: &Result<()>,
+    start_ticks: Option<i64>,
+    action: impl FnOnce(i64) -> ActionRequest,
+) -> Option<Result<()>> {
+    if !may_escalate(direct, start_ticks) {
+        return None;
+    }
+    // `start_ticks` is known here; `?` is the compiler's proof of it.
+    let start_ticks = start_ticks?;
+    let request = Request::Action {
+        action: action(start_ticks),
+    };
+    match client::request(&request) {
+        Ok(Response::Done) => Some(Ok(())),
+        Ok(other) => Some(Err(unexpected_response(request.label(), &other))),
+        // The broker never answered, so the caller's own path may still deliver
+        // the operation the way it did before this service existed.
+        Err(error) if error.may_fall_back() => None,
+        // The context is the verb that failed, not a generic label.
+        Err(error) => Some(Err(client_error(request.label(), &error))),
+    }
+}
+
+/// Ask the broker for a per-process read the kernel refused.
+///
+/// A broker that never answered leaves the direct reason in place: it is the
+/// honest one for this token, and the broker's absence is not a measurement. A
+/// broker answer ends the decision — a refusal names itself instead of looking
+/// like an empty result.
+fn brokered_read<T>(
+    request: &Request,
+    direct_error: tm_core::TmError,
+    decode: impl FnOnce(Response) -> std::result::Result<T, Response>,
+) -> Result<T> {
+    match client::request(request) {
+        Ok(response) => match decode(response) {
+            Ok(value) => Ok(value),
+            Err(unexpected) => Err(unexpected_response(request.label(), &unexpected)),
+        },
+        Err(ClientError::Unavailable(_)) => Err(direct_error),
+        Err(error) => Err(client_error(request.label(), &error)),
+    }
+}
+
+fn unexpected_response(context: &'static str, response: &Response) -> tm_core::TmError {
+    tm_core::TmError::platform(
+        context,
+        format!(
+            "the core service answered with an unexpected {} payload",
+            response_label(response)
+        ),
+    )
+}
+
+/// Whether a broker diagnostic may be logged now.
+///
+/// A per-process tab can ask several times per second and a defective answer
+/// repeats identically, so one line per window is enough to diagnose it without
+/// filling the log.
+fn broker_diagnostic_allowed() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const WINDOW_MS: u64 = 30_000;
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+    let now = START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX - 1)) as u64
+        + 1;
+    let mut previous = LAST_MS.load(Ordering::Relaxed);
+    loop {
+        if previous != 0 && now.saturating_sub(previous) < WINDOW_MS {
+            return false;
+        }
+        match LAST_MS.compare_exchange_weak(previous, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+/// Whether the installer wrote the protected manifest. Its absence is the only
+/// proof this machine has no core service; the socket alone could be stale.
+fn manifest_installed() -> bool {
+    std::fs::metadata(MANIFEST_PATH).is_ok()
 }
 
 fn set_priority_direct(
@@ -1721,5 +2054,31 @@ mod tests {
         assert_ne!(process.start_epoch_s, corrected_time);
         process.start_epoch_s = corrected_time;
         assert_eq!(process.creation_identity(), Some(ticks));
+    }
+
+    #[test]
+    fn only_a_permission_failure_with_a_known_identity_reaches_the_broker() {
+        let denied: Result<()> = Err(tm_core::TmError::platform(
+            "read /proc/pid/maps",
+            "/proc/4242/maps: Permission denied (os error 13)",
+        ));
+        assert!(may_escalate(&denied, Some(9)));
+        assert!(
+            !may_escalate(&denied, None),
+            "an action without a creation identity must stay local"
+        );
+        let io_denied: Result<()> = Err(tm_core::TmError::Io(std::io::Error::from_raw_os_error(
+            libc::EPERM,
+        )));
+        assert!(may_escalate(&io_denied, Some(9)));
+        assert!(
+            !may_escalate(&Ok(()), Some(9)),
+            "a direct success must never pay a round trip"
+        );
+        let vanished: Result<()> = Err(tm_core::TmError::ProcessNotFound { pid: 4242 });
+        assert!(
+            !may_escalate(&vanished, Some(9)),
+            "a vanished target answers the same under any identity"
+        );
     }
 }
