@@ -66,9 +66,9 @@ interchangeable: both end in the same `install-linux.sh` layout.
 The archives have no top-level directory, so extract into one:
 
 ```sh
-mkdir -p taskman-0.1.35
-tar xzf taskman-v0.1.35-linux-x86_64.tar.gz -C taskman-0.1.35
-sudo taskman-0.1.35/install-linux.sh
+mkdir -p taskman-0.1.36
+tar xzf taskman-v0.1.36-linux-x86_64.tar.gz -C taskman-0.1.36
+sudo taskman-0.1.36/install-linux.sh
 ```
 
 The tarball keeps the two binaries under `bin/` and this packaging's files next

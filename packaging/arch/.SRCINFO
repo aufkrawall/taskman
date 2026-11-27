@@ -1,6 +1,6 @@
 pkgbase = taskman
 	pkgdesc = Cross-platform task manager and system monitor
-	pkgver = 0.1.35
+	pkgver = 0.1.36
 	pkgrel = 1
 	url = https://github.com/aufkrawall/taskman
 	install = taskman.install
