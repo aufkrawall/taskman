@@ -44,9 +44,11 @@ readonly METAINFO_DIR=/usr/share/metainfo
 readonly RUNTIME_DIR=/run/taskman
 
 # Manifest constants mirrored from crates/tm-platform/src/linux_core_service.rs.
-# The service rejects a manifest that disagrees with these, so they are fixed
-# here rather than configurable.
-readonly PROTOCOL_VERSION=3
+# The service rejects a manifest that disagrees with these. PROTOCOL_VERSION is
+# also queried from `taskman-service --version` when runnable on the host so a
+# script and binary on the target system cannot drift, and a crate unit test
+# pins the fallback value below.
+PROTOCOL_VERSION=4
 readonly SOCKET_PATH=/run/taskman/core.sock
 readonly SENSOR_CACHE_MS=500
 
@@ -252,6 +254,24 @@ resolve_self() {
   fi
   UNIT_SOURCE=$SCRIPT_DIR/$UNIT_NAME
   TEMPLATE=$SCRIPT_DIR/$MANIFEST_NAME.in
+}
+
+# Query the protocol version from a runnable taskman-service binary so the
+# manifest written by install/upgrade cannot lag behind the binary's compiled
+# PROTOCOL_VERSION. When staging cross-architecture (--packaged) the binary may
+# not be executable on the build host, in which case the fallback stays in use.
+resolve_protocol_version() {
+  local service_bin=$1 out proto
+  if [ ! -x "$service_bin" ]; then
+    return 0
+  fi
+  out=$("$service_bin" --version 2>/dev/null || true)
+  if [[ $out =~ protocol[[:space:]]+([0-9]+) ]]; then
+    proto=${BASH_REMATCH[1]}
+    if [ "$proto" -gt 0 ] 2>/dev/null; then
+      PROTOCOL_VERSION=$proto
+    fi
+  fi
 }
 
 # Pick the directory the two binaries come from. --source-dir may point at the
@@ -863,6 +883,7 @@ do_install() {
   resolve_self
   resolve_source_dir "${SOURCE_DIR:-}"
   validate_sources
+  resolve_protocol_version "$SERVICE_SOURCE"
   validate_packaging_files
   validate_unit
   if [ -z "$ROOT" ]; then
@@ -911,6 +932,7 @@ do_post_install() {
   if [ ! -f "$LIB_DIR/$SERVICE_BINARY" ] || [ ! -f "$UNIT_DIR/$UNIT_NAME" ]; then
     die "$UNIT_DIR/$UNIT_NAME or $LIB_DIR/$SERVICE_BINARY is missing: the package payload is incomplete"
   fi
+  resolve_protocol_version "$LIB_DIR/$SERVICE_BINARY"
   if ! systemd_is_running; then
     # pacstrap, arch-chroot and container builds run scriptlets without systemd;
     # there is nothing to reload, enable or start, and the booted system re-runs

@@ -161,6 +161,37 @@ class LinuxBuildToolingTests(unittest.TestCase):
         ):
             self.assertFalse(build.check_fork())
 
+    def test_build_linux_uses_native_host_build_when_target_matches_host(self):
+        native_exe = Path("/tmp/target/release/taskman")
+        with (
+            patch.object(build, "linux_cross_command", return_value=None),
+            patch.object(build, "host_target", return_value=build.LINUX_TARGET),
+            patch.object(build, "build_host", return_value=native_exe) as mock_host,
+            patch.object(
+                build,
+                "build_linux_musl",
+                side_effect=AssertionError("must not fall back to musl on native gnu host"),
+            ),
+        ):
+            exe, attempted, flavor = build.build_linux("release")
+        self.assertEqual(exe, native_exe)
+        self.assertTrue(attempted)
+        self.assertEqual(flavor, "gnu")
+        mock_host.assert_called_once_with("release")
+
+    def test_build_linux_falls_back_to_musl_when_target_differs_from_host(self):
+        musl_exe = Path("/tmp/target/x86_64-unknown-linux-musl/release/taskman")
+        with (
+            patch.object(build, "linux_cross_command", return_value=None),
+            patch.object(build, "host_target", return_value="x86_64-pc-windows-msvc"),
+            patch.object(build, "build_linux_musl", return_value=(musl_exe, True)) as mock_musl,
+        ):
+            exe, attempted, flavor = build.build_linux("release")
+        self.assertEqual(exe, musl_exe)
+        self.assertTrue(attempted)
+        self.assertEqual(flavor, "musl")
+        mock_musl.assert_called_once_with("release")
+
 
 if __name__ == "__main__":
     unittest.main()

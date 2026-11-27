@@ -1490,4 +1490,23 @@ mod tests {
             "/home/user/target/release/taskman-service"
         )));
     }
+
+    #[test]
+    fn install_script_protocol_version_matches_crate() {
+        let script = include_str!("../../../packaging/linux/install-linux.sh");
+        let parsed = script
+            .lines()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                let rest = trimmed
+                    .strip_prefix("readonly PROTOCOL_VERSION=")
+                    .or_else(|| trimmed.strip_prefix("PROTOCOL_VERSION="))?;
+                rest.parse::<u32>().ok()
+            })
+            .expect("PROTOCOL_VERSION=<u32> line in packaging/linux/install-linux.sh");
+        assert_eq!(
+            parsed, PROTOCOL_VERSION,
+            "packaging/linux/install-linux.sh PROTOCOL_VERSION ({parsed}) must match linux_core_service::PROTOCOL_VERSION ({PROTOCOL_VERSION})"
+        );
+    }
 }

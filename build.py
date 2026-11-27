@@ -779,6 +779,12 @@ def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, 
             log(f"linux binary missing after build: {exe}")
             return None, True, "gnu"
         return exe, True, "gnu"
+    if target == host_target():
+        # Native Linux host matching the target (e.g. x86_64-unknown-linux-gnu
+        # without cross/zigbuild): build_host() produces the native glibc
+        # binaries directly so tarballs and .deb/.rpm packages still build.
+        exe = build_host(profile)
+        return exe, True, "gnu"
     if target != LINUX_TARGET:
         return None, False, "gnu"
     # No glibc cross toolchain: the rust-lld/musl path works with rustup alone.
@@ -1646,11 +1652,12 @@ def main() -> int:
                 else:
                     host_files.append((service_exe, "taskman-service.exe"))
                     windows_service_exe = service_exe
-            if platform.system() == "Linux" and LINUX_DESKTOP.exists():
-                host_files.append(
-                    (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
-                )
-            artifacts.append((f"taskman-v{version}-{host_tag()}", host_files))
+            if platform.system() != "Linux" or not linux_requested:
+                if platform.system() == "Linux" and LINUX_DESKTOP.exists():
+                    host_files.append(
+                        (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
+                    )
+                artifacts.append((f"taskman-v{version}-{host_tag()}", host_files))
             if windows_service_exe is not None and not args.no_package:
                 setup = package_setup(
                     profile, exe, windows_service_exe, host_tag(), version
