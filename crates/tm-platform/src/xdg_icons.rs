@@ -1095,16 +1095,12 @@ fn first_in_contexts(contexts: &[PathBuf], file_name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Scan `<data_dir>/applications` (recursively, one level of subdirs is
-/// enough for KDE's legacy layout) for `.desktop` files and index their
-/// `Icon=` by exe basename. Matching rules: the desktop file's own id, plus
-/// every executable name its entry declares ([`DesktopEntry::executable_names`]).
-/// Higher-precedence data dirs are scanned first and win.
-fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
+/// Scan `<data_dir>/applications` (recursively, two levels of subdirs are
+/// enough for KDE's legacy layout) for `.desktop` files.
+fn scan_desktop_applications(data_dirs: &[PathBuf], mut visit: impl FnMut(&str, &DesktopEntry)) {
     // `applications/` is depth 0; two levels below it cover legacy layouts
     // such as `applications/kde4/` or `applications/vendor/foo/`.
     const MAX_DEPTH: u8 = 2;
-    let mut index = HashMap::new();
     for data_dir in data_dirs {
         let apps = data_dir.join("applications");
         let mut stack = vec![(apps, 0u8)];
@@ -1126,14 +1122,7 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
                 let Some(entry) = desktop_file_entry(&p) else {
                     continue;
                 };
-                let Some(icon) = entry.icon.as_deref() else {
-                    continue;
-                };
-                let stem = file_name.trim_end_matches(".desktop").to_ascii_lowercase();
-                index.entry(stem).or_insert_with(|| icon.to_string());
-                for exe_base in entry.executable_names() {
-                    index.entry(exe_base).or_insert_with(|| icon.to_string());
-                }
+                visit(file_name, &entry);
             }
             // Reversed onto the LIFO stack, so the alphabetically first
             // subdirectory is scanned first — the same rule that decides a
@@ -1142,6 +1131,43 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
             stack.extend(subdirs.into_iter().rev());
         }
     }
+}
+
+/// Index `.desktop` `Icon=` by exe basename. Matching rules: the desktop file's
+/// own id, plus every executable name its entry declares
+/// ([`DesktopEntry::executable_names`]). Higher-precedence data dirs are
+/// scanned first and win.
+fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    scan_desktop_applications(data_dirs, |file_name, entry| {
+        let Some(icon) = entry.icon.as_deref() else {
+            return;
+        };
+        let stem = file_name.trim_end_matches(".desktop").to_ascii_lowercase();
+        index.entry(stem).or_insert_with(|| icon.to_string());
+        for exe_base in entry.executable_names() {
+            index.entry(exe_base).or_insert_with(|| icon.to_string());
+        }
+    });
+    index
+}
+
+/// Index user-visible GUI `.desktop` entries (`Type=Application`, not
+/// `NoDisplay=true`, not `Hidden=true`, not `Terminal=true`) by their declared
+/// non-wrapper executable basename → `.desktop` file name.
+#[cfg(any(target_os = "linux", test))]
+fn build_gui_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    scan_desktop_applications(data_dirs, |file_name, entry| {
+        if !entry.is_visible_gui_app() {
+            return;
+        }
+        for exe_base in entry.executable_names() {
+            index
+                .entry(exe_base)
+                .or_insert_with(|| file_name.to_string());
+        }
+    });
     index
 }
 
@@ -1176,12 +1202,23 @@ fn desktop_file_icon(path: &Path) -> Option<String> {
 
 /// The parts of a `.desktop` file's `[Desktop Entry]` the icon index needs.
 struct DesktopEntry {
+    entry_type: Option<String>,
     exec: Option<String>,
     try_exec: Option<String>,
     icon: Option<String>,
+    no_display: bool,
+    hidden: bool,
+    terminal: bool,
 }
 
 impl DesktopEntry {
+    #[cfg(any(target_os = "linux", test))]
+    fn is_visible_gui_app(&self) -> bool {
+        self.entry_type.as_deref() == Some("Application")
+            && !self.no_display
+            && !self.hidden
+            && !self.terminal
+    }
     /// Executable basenames (lowercase) this entry can appear as in a process
     /// list.
     ///
@@ -1236,9 +1273,13 @@ fn desktop_file_entry(path: &Path) -> Option<DesktopEntry> {
     let text = read_text_capped(path)?;
     let mut in_entry = false;
     let mut entry = DesktopEntry {
+        entry_type: None,
         exec: None,
         try_exec: None,
         icon: None,
+        no_display: false,
+        hidden: false,
+        terminal: false,
     };
     for raw in text.lines() {
         let line = raw.trim();
@@ -1249,7 +1290,9 @@ fn desktop_file_entry(path: &Path) -> Option<DesktopEntry> {
         if !in_entry || line.starts_with('#') {
             continue;
         }
-        if let Some(v) = line.strip_prefix("Exec=") {
+        if let Some(v) = line.strip_prefix("Type=") {
+            entry.entry_type.get_or_insert_with(|| v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Exec=") {
             entry.exec.get_or_insert_with(|| v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("TryExec=") {
             entry.try_exec.get_or_insert_with(|| v.trim().to_string());
@@ -1261,6 +1304,12 @@ fn desktop_file_entry(path: &Path) -> Option<DesktopEntry> {
             if !icon.is_empty() {
                 entry.icon.get_or_insert_with(|| icon.to_string());
             }
+        } else if let Some(v) = line.strip_prefix("NoDisplay=") {
+            entry.no_display |= v.trim().eq_ignore_ascii_case("true");
+        } else if let Some(v) = line.strip_prefix("Hidden=") {
+            entry.hidden |= v.trim().eq_ignore_ascii_case("true");
+        } else if let Some(v) = line.strip_prefix("Terminal=") {
+            entry.terminal |= v.trim().eq_ignore_ascii_case("true");
         }
     }
     Some(entry)
@@ -1871,6 +1920,17 @@ pub fn default_app_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
     IconResolver::shared().default_app_icon_rgba()
 }
 
+/// Match an executable path to a user-visible GUI `.desktop` entry id
+/// (`Type=Application`, not `NoDisplay=true`, `Hidden=true`, or
+/// `Terminal=true`), without initializing icon themes or `fc-match`.
+#[cfg(target_os = "linux")]
+pub(crate) fn visible_gui_desktop_id(exe_path: &Path) -> Option<&'static str> {
+    static INDEX: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| build_gui_desktop_index(&IconLookup::from_env().data_dirs));
+    let base = exe_path.file_name()?.to_str()?.to_ascii_lowercase();
+    index.get(&base).map(String::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2368,6 +2428,36 @@ mod tests {
             !index.contains_key("python3"),
             "python3 is a wrapper, not PyApp's image"
         );
+    }
+
+    #[test]
+    fn gui_desktop_index_excludes_hidden_nodisplay_and_terminal_entries() {
+        let sb = Sandbox::new("gui-desktop-index");
+        write_desktop(
+            &sb.root.join("share/applications/brave-browser.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Brave\nExec=/opt/brave-bin/brave %U\nTerminal=false\n",
+        );
+        write_desktop(
+            &sb.root
+                .join("share/applications/xdg-desktop-portal-gtk.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Portal\nExec=/usr/lib/xdg-desktop-portal-gtk\nNoDisplay=true\n",
+        );
+        write_desktop(
+            &sb.root.join("share/applications/htop.desktop"),
+            "[Desktop Entry]\nType=Application\nName=htop\nExec=htop\nTerminal=true\n",
+        );
+        write_desktop(
+            &sb.root.join("share/applications/hidden-app.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Hidden\nExec=/usr/bin/hidden-app\nHidden=true\n",
+        );
+        let index = build_gui_desktop_index(&[sb.root.join("share")]);
+        assert_eq!(
+            index.get("brave").map(String::as_str),
+            Some("brave-browser.desktop")
+        );
+        assert!(!index.contains_key("xdg-desktop-portal-gtk"));
+        assert!(!index.contains_key("htop"));
+        assert!(!index.contains_key("hidden-app"));
     }
 
     /// `read_dir` order is filesystem-defined; when two desktop files claim the

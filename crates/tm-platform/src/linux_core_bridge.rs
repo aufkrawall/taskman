@@ -88,6 +88,7 @@ pub(crate) fn response_label(response: &Response) -> &'static str {
         Response::Connections(_) => "connections",
         Response::FileIo(_) => "file-io",
         Response::Evidence(_) => "evidence",
+        Response::Telemetry(_) => "telemetry",
         Response::Done => "done",
         Response::Error(_) => "error",
     }

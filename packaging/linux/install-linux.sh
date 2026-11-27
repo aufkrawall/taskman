@@ -46,7 +46,7 @@ readonly RUNTIME_DIR=/run/taskman
 # Manifest constants mirrored from crates/tm-platform/src/linux_core_service.rs.
 # The service rejects a manifest that disagrees with these, so they are fixed
 # here rather than configurable.
-readonly PROTOCOL_VERSION=1
+readonly PROTOCOL_VERSION=2
 readonly SOCKET_PATH=/run/taskman/core.sock
 readonly SENSOR_CACHE_MS=500
 
@@ -858,11 +858,20 @@ do_post_install() {
     resolve_user
   elif read_manifest_uids "$CONF_DIR/$MANIFEST_NAME" && [ "${#AUTHORIZED_UIDS[@]}" -gt 0 ]; then
     # A root login ran pacman. The live manifest still holds the policy (it is in
-    # backup=), so regenerating it would only rewrite the same uids; keep it and
-    # drop the placeholder pacman left beside it.
-    keep_existing=1
-    warn "no invoking user to authorize; keeping the manifest's uid(s) ${AUTHORIZED_UIDS[*]} - run '$LIB_DIR/install-linux.sh --user <name>' to change them"
-    remove_superseded_placeholder "$CONF_DIR/$MANIFEST_NAME.pacnew"
+    # backup=), so regenerating it would only rewrite the same uids; keep it
+    # when the protocol version still matches, or rewrite it with the preserved
+    # uids when a package upgrade bumped the protocol version.
+    if grep -Eq "\"protocol\"[[:space:]]*:[[:space:]]*$PROTOCOL_VERSION([^0-9]|$)" "$CONF_DIR/$MANIFEST_NAME"; then
+      keep_existing=1
+      warn "no invoking user to authorize; keeping the manifest's uid(s) ${AUTHORIZED_UIDS[*]} - run '$LIB_DIR/install-linux.sh --user <name>' to change them"
+      remove_superseded_placeholder "$CONF_DIR/$MANIFEST_NAME.pacnew"
+    else
+      keep_existing=1
+      add_client "$BIN_DIR/$GUI_BINARY"
+      install_manifest
+      verify_protected "$CONF_DIR/$MANIFEST_NAME" "the manifest" 644
+      warn "updated manifest protocol to $PROTOCOL_VERSION while preserving uid(s) ${AUTHORIZED_UIDS[*]}"
+    fi
   else
     unconfigured=1
   fi

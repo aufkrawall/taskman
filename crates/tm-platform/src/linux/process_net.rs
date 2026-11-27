@@ -19,6 +19,14 @@ const RECV_TIMEOUT_MS: libc::suseconds_t = 500_000;
 /// Bytes each process received and sent in the last window.
 pub(super) type Window = HashMap<u32, (u64, u64)>;
 
+/// Unfinished per-process network sample waiting on optional privileged socket
+/// ownership for processes whose `/proc/<pid>/fd` the GUI cannot list.
+pub(super) struct PendingSample {
+    per_pid: Window,
+    unowned_deltas: Vec<accounting::SocketDelta>,
+    pub(super) unowned: Vec<u64>,
+}
+
 #[derive(Default)]
 pub(super) struct ProcessNet {
     accountant: TcpAccountant,
@@ -29,10 +37,10 @@ pub(super) struct ProcessNet {
 }
 
 impl ProcessNet {
-    /// The window's per-process TCP bytes, or `None` when the window cannot be
-    /// measured (first dump, or the dump failed) — every process is then
-    /// unmeasured, not idle.
-    pub(super) fn sample(&mut self, live_pids: &HashSet<u32>) -> Option<Window> {
+    /// Start a window by dumping TCP sockets and attributing against cached and
+    /// locally listable `/proc/<pid>/fd` entries. Returns `None` on the first
+    /// dump or when `sock_diag` failed.
+    pub(super) fn begin_sample(&mut self, live_pids: &HashSet<u32>) -> Option<PendingSample> {
         let sockets = match self.dump() {
             Ok(sockets) => sockets,
             Err(error) => {
@@ -45,21 +53,61 @@ impl ProcessNet {
         };
         let deltas = self.accountant.window(&sockets)?;
         let (mut per_pid, unowned) = accounting::attribute(&deltas, &self.owners);
-        if !unowned.is_empty() {
-            self.rescan_owners(live_pids, &sockets);
-            let late: Vec<_> = deltas
-                .iter()
-                .filter(|delta| unowned.contains(&delta.inode))
-                .copied()
-                .collect();
-            let (found, _) = accounting::attribute(&late, &self.owners);
-            for (pid, (received, sent)) in found {
-                let slot = per_pid.entry(pid).or_default();
-                slot.0 = slot.0.saturating_add(received);
-                slot.1 = slot.1.saturating_add(sent);
-            }
+        if unowned.is_empty() {
+            return Some(PendingSample {
+                per_pid,
+                unowned_deltas: Vec::new(),
+                unowned: Vec::new(),
+            });
         }
-        Some(per_pid)
+
+        self.rescan_local_owners(live_pids, &sockets);
+        let unowned_set: HashSet<u64> = unowned.into_iter().collect();
+        let late_deltas: Vec<_> = deltas
+            .iter()
+            .filter(|delta| unowned_set.contains(&delta.inode))
+            .copied()
+            .collect();
+        let (found, still_unowned) = accounting::attribute(&late_deltas, &self.owners);
+        for (pid, (received, sent)) in found {
+            let slot = per_pid.entry(pid).or_default();
+            slot.0 = slot.0.saturating_add(received);
+            slot.1 = slot.1.saturating_add(sent);
+        }
+        let still_set: HashSet<u64> = still_unowned.into_iter().collect();
+        let unowned_deltas: Vec<_> = late_deltas
+            .into_iter()
+            .filter(|delta| still_set.contains(&delta.inode))
+            .collect();
+        let mut remaining: Vec<u64> = still_set.into_iter().collect();
+        remaining.sort_unstable();
+        Some(PendingSample {
+            per_pid,
+            unowned_deltas,
+            unowned: remaining,
+        })
+    }
+
+    /// Incorporate privileged socket ownership resolved by the core service
+    /// and complete the window's attribution.
+    pub(super) fn finish_sample(
+        &mut self,
+        mut pending: PendingSample,
+        broker_owners: &[(u64, u32)],
+    ) -> Window {
+        if broker_owners.is_empty() || pending.unowned_deltas.is_empty() {
+            return pending.per_pid;
+        }
+        for &(inode, pid) in broker_owners {
+            self.owners.entry(inode).or_insert(pid);
+        }
+        let (found, _) = accounting::attribute(&pending.unowned_deltas, &self.owners);
+        for (pid, (received, sent)) in found {
+            let slot = pending.per_pid.entry(pid).or_default();
+            slot.0 = slot.0.saturating_add(received);
+            slot.1 = slot.1.saturating_add(sent);
+        }
+        pending.per_pid
     }
 
     /// Stop measuring: the next sample starts a fresh window.
@@ -68,13 +116,12 @@ impl ProcessNet {
         self.owners.clear();
     }
 
-    /// Re-learn which process holds each live TCP socket.
-    ///
-    /// Only descriptors this token may read are visible, so other users'
-    /// processes stay unattributed (unless TaskMan runs as root).
-    fn rescan_owners(&mut self, live_pids: &HashSet<u32>, sockets: &[TcpSocket]) {
+    /// Re-learn which locally readable process holds each live TCP socket,
+    /// while retaining still-live cached entries (including privileged owners).
+    fn rescan_local_owners(&mut self, live_pids: &HashSet<u32>, sockets: &[TcpSocket]) {
         let wanted: HashSet<u64> = sockets.iter().map(|socket| socket.inode).collect();
-        let mut owners = HashMap::with_capacity(wanted.len());
+        self.owners
+            .retain(|inode, pid| wanted.contains(inode) && live_pids.contains(pid));
         let mut pids: Vec<u32> = live_pids.iter().copied().collect();
         // Lowest pid first, so a socket inherited across fork is attributed
         // deterministically (to the parent that normally created it).
@@ -85,11 +132,10 @@ impl ProcessNet {
             };
             for inode in inodes {
                 if wanted.contains(&inode) {
-                    owners.entry(inode).or_insert(pid);
+                    self.owners.entry(inode).or_insert(pid);
                 }
             }
         }
-        self.owners = owners;
     }
 
     fn dump(&mut self) -> std::io::Result<Vec<TcpSocket>> {

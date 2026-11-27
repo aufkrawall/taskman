@@ -38,13 +38,11 @@ use serde::{Deserialize, Serialize};
 use crate::linux_sensors::SensorSnapshot;
 use tm_core::model::PriorityClass;
 
-/// Version of the request/response schema. This is the FIRST released schema,
-/// so it stays 1 while the feature is still being assembled: the GUI and the
-/// service always ship from one release. Every wire-shape change AFTER this
+/// Version of the request/response schema. Every wire-shape change after a
 /// release — a new variant, a field whose meaning shifts, a removed field —
-/// must bump it, because a GUI and a service from different releases then fail
-/// at the handshake instead of misreading each other.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// bumps it so a GUI and a service from different releases fail at the
+/// handshake instead of misreading each other.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Root-owned runtime directory that systemd creates for the service.
 pub const SOCKET_DIR: &str = "/run/taskman";
@@ -69,6 +67,11 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Largest manifest file. The manifest is a dozen short fields.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+/// Maximum targets in a single batched `ProcessTelemetry` request so one frame
+/// stays comfortably below [`MAX_REQUEST_BYTES`].
+pub const MAX_TELEMETRY_TARGETS: usize = 512;
+/// Maximum unowned socket inodes in a single `ProcessTelemetry` request.
+pub const MAX_WANTED_SOCKET_INODES: usize = 4_096;
 /// How long a client waits for one response. A read (status, sensors, process
 /// evidence) answers in milliseconds, and sampling must never park on a wedged
 /// broker, so this is deliberately short.
@@ -449,6 +452,13 @@ pub enum Request {
     ProcessFileIo { pid: u32, start_ticks: i64 },
     /// Container/hardening evidence the kernel withholds from other users.
     ProcessEvidence { pid: u32, start_ticks: i64 },
+    /// Batched `/proc/<pid>/io` and socket-ownership read for processes whose
+    /// `/proc` entries are withheld from an unprivileged GUI.
+    ProcessTelemetry {
+        targets: Vec<TelemetryTarget>,
+        #[serde(default)]
+        wanted_socket_inodes: Vec<u64>,
+    },
     /// One privileged mutation.
     Action { action: ActionRequest },
 }
@@ -464,6 +474,7 @@ impl Request {
             Self::ProcessConnections { .. } => "process-connections",
             Self::ProcessFileIo { .. } => "process-file-io",
             Self::ProcessEvidence { .. } => "process-evidence",
+            Self::ProcessTelemetry { .. } => "process-telemetry",
             Self::Action { action } => action.label(),
         }
     }
@@ -477,6 +488,27 @@ impl Request {
             | Self::ProcessConnections { pid, .. }
             | Self::ProcessFileIo { pid, .. }
             | Self::ProcessEvidence { pid, .. } => valid_pid(*pid),
+            Self::ProcessTelemetry {
+                targets,
+                wanted_socket_inodes,
+            } => {
+                if targets.len() > MAX_TELEMETRY_TARGETS {
+                    return Err(format!(
+                        "telemetry batch has {} targets, limit is {MAX_TELEMETRY_TARGETS}",
+                        targets.len()
+                    ));
+                }
+                if wanted_socket_inodes.len() > MAX_WANTED_SOCKET_INODES {
+                    return Err(format!(
+                        "telemetry batch asks for {} socket inodes, limit is {MAX_WANTED_SOCKET_INODES}",
+                        wanted_socket_inodes.len()
+                    ));
+                }
+                for target in targets {
+                    valid_pid(target.pid)?;
+                }
+                Ok(())
+            }
             Self::Action { action } => action.validate(),
         }
     }
@@ -591,6 +623,7 @@ pub enum Response {
     /// owner-only, so another user's process needs the broker).
     FileIo(Box<WireFileIo>),
     Evidence(Box<ProcessEvidence>),
+    Telemetry(Vec<ProcessTelemetryEntry>),
     /// An action completed.
     Done,
     /// The service refused or failed. `code` is the machine-readable part.
@@ -725,6 +758,34 @@ pub struct WireFileIoEntry {
     pub is_read: bool,
     pub is_write: bool,
     pub open_handles: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryTarget {
+    pub pid: u32,
+    pub start_ticks: i64,
+    pub need_io: bool,
+    pub check_fd: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireProcIo {
+    pub rchar: u64,
+    pub wchar: u64,
+    pub syscr: u64,
+    pub syscw: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessTelemetryEntry {
+    pub pid: u32,
+    pub start_ticks: i64,
+    pub io: Option<WireProcIo>,
+    pub fd_readable: Option<bool>,
+    #[serde(default)]
+    pub socket_inodes: Vec<u64>,
 }
 
 /// Root-only process evidence that `/proc` withholds from other users.
@@ -944,8 +1005,10 @@ mod tests {
 
     #[test]
     fn manifest_defaults_only_fill_optional_fields() {
-        let text = r#"{"protocol":1,"authorized_uids":[1000],"clients":["/usr/bin/taskman"]}"#;
-        let manifest = Manifest::parse(text).expect("parse");
+        let text = format!(
+            r#"{{"protocol":{PROTOCOL_VERSION},"authorized_uids":[1000],"clients":["/usr/bin/taskman"]}}"#
+        );
+        let manifest = Manifest::parse(&text).expect("parse");
         assert_eq!(manifest.socket, SOCKET_PATH);
         assert_eq!(manifest.sensor_cache_ms, 500);
         assert!(!manifest.allow_user_writable_client);
@@ -1266,6 +1329,20 @@ mod tests {
                     open_handles: 1,
                 }],
             })),
+            Response::Telemetry(vec![ProcessTelemetryEntry {
+                pid: 42,
+                start_ticks: 1234,
+                io: Some(WireProcIo {
+                    rchar: 10,
+                    wchar: 20,
+                    syscr: 1,
+                    syscw: 2,
+                    read_bytes: 4096,
+                    write_bytes: 8192,
+                }),
+                fd_readable: Some(true),
+                socket_inodes: vec![99_001],
+            }]),
         ];
         for response in responses {
             let encoded = encode_frame(&response, MAX_RESPONSE_BYTES).expect("encode");
@@ -1286,12 +1363,50 @@ mod tests {
                 pid: 42,
                 start_ticks: 1234,
             },
+            Request::ProcessTelemetry {
+                targets: vec![TelemetryTarget {
+                    pid: 42,
+                    start_ticks: 1234,
+                    need_io: true,
+                    check_fd: true,
+                }],
+                wanted_socket_inodes: vec![99_001],
+            },
         ] {
             let encoded = encode_frame(&request, MAX_REQUEST_BYTES).expect("encode");
             let body = &encoded[4..];
             let decoded: Request = decode_frame(body).expect("decode");
             assert_eq!(decoded, request);
         }
+
+        assert!(
+            Request::ProcessTelemetry {
+                targets: vec![TelemetryTarget {
+                    pid: 0,
+                    start_ticks: 1,
+                    need_io: true,
+                    check_fd: false,
+                }],
+                wanted_socket_inodes: Vec::new(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::ProcessTelemetry {
+                targets: (1..=MAX_TELEMETRY_TARGETS + 1)
+                    .map(|pid| TelemetryTarget {
+                        pid: pid as u32,
+                        start_ticks: 1,
+                        need_io: true,
+                        check_fd: false,
+                    })
+                    .collect(),
+                wanted_socket_inodes: Vec::new(),
+            }
+            .validate()
+            .is_err()
+        );
 
         // An unnamed kernel state keeps its raw byte, so the brokered answer
         // renders exactly what the direct reader would.

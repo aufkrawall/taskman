@@ -53,6 +53,8 @@ pub(super) struct DesktopEvidence {
     /// under `app.slice`.
     pub(super) app_group: Option<String>,
     pub(super) session_id: Option<u32>,
+    /// Numeric UID from `user-<uid>.slice`.
+    pub(super) uid: Option<u32>,
     /// UID whose `user@UID.service` manager this process runs under, when it
     /// is not inside a `session-N.scope`. Such a process belongs to that
     /// user's service manager rather than to one login, so the collector
@@ -61,15 +63,30 @@ pub(super) struct DesktopEvidence {
     pub(super) manager_uid: Option<u32>,
     /// Validated user `app.slice` family awaiting the graphical-environment
     /// gate. It becomes `app_group` only when that gate is positive.
-    app_unit_group: Option<String>,
-    user_session: bool,
+    pub(super) app_unit_group: Option<String>,
+    pub(super) user_session: bool,
     /// Canonical user session/user-manager prefix, always with exactly one
     /// leading slash. It keeps app families from colliding across users and
     /// provides one canonical prefix for every app-family key.
-    user_scope: Option<String>,
+    pub(super) user_scope: Option<String>,
     /// False for malformed standard units or authoritative closed roles whose
     /// environment must not be allowed to turn an Unknown into an App.
     environment_eligible: bool,
+    /// True when the process's own complete environment carried a non-empty
+    /// graphical display variable.
+    pub(super) graphical_env: bool,
+    /// True when `/proc/<pid>/environ` was unavailable, clobbered (e.g.
+    /// Chromium/Electron `setproctitle`), or oversized, rather than proving a
+    /// headless environment.
+    pub(super) environ_unreadable: bool,
+    /// True for a valid systemd unit under `app.slice` that is not a desktop
+    /// application unit (`dconf.service`, `gnome-keyring-daemon.service`,
+    /// `app-dbus\x2d:...`). Defaults to Background unless an explicit launcher
+    /// hint promotes it to App.
+    generic_app_slice_unit: bool,
+    /// True when the process sits directly in `session-N.scope` without a
+    /// child slice/unit (such as on non-systemd compositors/WMs).
+    pub(super) session_scope_root: bool,
 }
 
 impl DesktopEvidence {
@@ -214,12 +231,16 @@ fn inspect(pid: u32, expected_start_ticks: i64, system_manager: bool) -> Desktop
     // Environment reads are only useful for a weak user-session role, a
     // validated app.slice unit awaiting its graphical gate, or a fallback
     // launcher identity. Authoritative Background/System roles never read it.
-    if evidence.user_session
-        && evidence.environment_eligible
-        && evidence.role.is_none()
-        && let Some(hints) = read_environment_hints(pid)
-    {
-        apply_environment_hints(&mut evidence, hints);
+    if evidence.user_session && evidence.environment_eligible && evidence.role.is_none() {
+        match read_environment_hints(pid) {
+            Some(hints) => apply_environment_hints(&mut evidence, hints),
+            None => {
+                evidence.environ_unreadable = true;
+                if evidence.generic_app_slice_unit {
+                    evidence.role = Some(DesktopRoleEvidence::Background);
+                }
+            }
+        }
     }
 
     if super::linux_proc_start_ticks(pid) != Some(expected_start_ticks) {
@@ -384,6 +405,7 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
     let rest = &components[3..];
     let mut evidence = DesktopEvidence {
         session_id,
+        uid: Some(uid),
         manager_uid,
         user_session: true,
         user_scope,
@@ -395,6 +417,7 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
         if session_root {
             evidence.role = Some(DesktopRoleEvidence::Background);
             evidence.environment_eligible = false;
+            evidence.session_scope_root = true;
         }
         return Some(evidence);
     }
@@ -421,10 +444,14 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
                     let scope = evidence.user_scope.as_deref()?;
                     evidence.app_unit_group =
                         Some(format!("systemd:{scope}/{}", rest[..=1].join("/")));
+                } else {
+                    // Valid user units in app.slice that are neither `app-*`
+                    // launchers nor `snap.*` apps (e.g. `dconf.service`,
+                    // `gnome-keyring-daemon.service`, `app-dbus\x2d:...` D-Bus
+                    // daemons) default to Background unless a launcher hint
+                    // (Flatpak/Snap/GIO/BAMF) or a visible window promotes them.
+                    evidence.generic_app_slice_unit = true;
                 }
-                // A syntactically valid generic unit is weak context. It may
-                // be identified by a validated per-process launcher hint, but
-                // never by a merely inherited display variable.
             } else {
                 evidence.environment_eligible = false;
             }
@@ -530,8 +557,9 @@ fn valid_user_unit(component: &str) -> bool {
 }
 
 /// Only launcher-shaped units may identify an app family by cgroup alone.
-/// A generic but syntactically valid user unit (`sleep.service`,
-/// `run-u42.scope`) is not application evidence.
+/// A generic user unit (`sleep.service`, `dconf.service`, `run-u42.scope`) or
+/// a `dbus-broker` legacy activation slice (`app-dbus\x2d:...`) is a background
+/// service unless a launcher hint or window proves otherwise.
 fn valid_application_unit(component: &str) -> bool {
     if !valid_user_unit(component) {
         return false;
@@ -541,9 +569,12 @@ fn valid_application_unit(component: &str) -> bool {
         .or_else(|| component.strip_suffix(".service"))
         .or_else(|| component.strip_suffix(".slice"))
         .unwrap_or_default();
-    let standard_app = stem
-        .strip_prefix("app-")
-        .is_some_and(|identity| !identity.is_empty());
+    let dbus_activation_slice =
+        stem.starts_with("app-dbus\\x2d:") || stem.starts_with("app-dbus-:");
+    let standard_app = !dbus_activation_slice
+        && stem
+            .strip_prefix("app-")
+            .is_some_and(|identity| !identity.is_empty());
     let snap_app = {
         let mut parts = stem.split('.');
         parts.next() == Some("snap")
@@ -694,8 +725,13 @@ fn apply_environment_hints(evidence: &mut DesktopEvidence, hints: DesktopHints) 
         return;
     }
 
-    if !hints.graphical_session() {
-        if evidence.app_unit_group.is_some() {
+    let graphical = hints.graphical_session();
+    if graphical {
+        evidence.graphical_env = true;
+    }
+
+    if !graphical {
+        if evidence.app_unit_group.is_some() || evidence.generic_app_slice_unit {
             evidence.role = Some(DesktopRoleEvidence::Background);
         }
         return;
@@ -711,6 +747,11 @@ fn apply_environment_hints(evidence: &mut DesktopEvidence, hints: DesktopHints) 
     {
         evidence.role = Some(DesktopRoleEvidence::App);
         evidence.app_group = Some(format!("systemd:{user_scope}:{app_group}"));
+        return;
+    }
+
+    if evidence.generic_app_slice_unit {
+        evidence.role = Some(DesktopRoleEvidence::Background);
     }
 }
 
@@ -784,7 +825,13 @@ mod tests {
 
     #[test]
     fn arbitrary_app_slice_units_need_a_validated_launcher_identity() {
-        for unit in ["sleep.service", "run-u42.scope"] {
+        for unit in [
+            "sleep.service",
+            "run-u42.scope",
+            "dconf.service",
+            "gnome-keyring-daemon.service",
+            "xdg-desktop-portal-gtk.service",
+        ] {
             assert!(valid_user_unit(unit), "{unit} is syntactically valid");
             assert!(
                 !valid_application_unit(unit),
@@ -795,6 +842,7 @@ mod tests {
             assert_eq!(evidence.role, None);
             assert_eq!(evidence.app_unit_group, None);
             assert!(evidence.environment_eligible);
+            assert!(evidence.generic_app_slice_unit);
 
             apply_environment_hints(
                 &mut evidence,
@@ -802,8 +850,9 @@ mod tests {
                     .expect("inherited graphical environment"),
             );
             assert_eq!(
-                evidence.role, None,
-                "a display variable inherited from the session is not app identity"
+                evidence.role,
+                Some(DesktopRoleEvidence::Background),
+                "a generic app.slice service without an app launcher identity is Background"
             );
             assert_eq!(evidence.app_group, None);
         }
@@ -986,12 +1035,24 @@ mod tests {
         .expect("systemd hex-escaped unit");
         assert!(escaped.user_session);
         assert!(escaped.app_unit_group.is_some());
-        let nested_slice = parse_v2(
+        let nested_app_slice = parse_v2(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.kded-1.slice/nested.service",
+        )
+        .expect("nested app slice under app.slice");
+        assert!(nested_app_slice.user_session);
+        assert!(nested_app_slice.app_unit_group.is_some());
+        let mut dbus_slice = parse_v2(
             "/user.slice/user-1000.slice/user@1000.service/app.slice/app-dbus\\x2d:1.2\\x2dorg.kde.kwalletd6.slice/dbus-:1.2-org.kde.kwalletd6@0.service",
         )
-        .expect("nested systemd slice under app.slice");
-        assert!(nested_slice.user_session);
-        assert!(nested_slice.app_unit_group.is_some());
+        .expect("nested dbus activation slice under app.slice");
+        assert!(dbus_slice.user_session);
+        assert_eq!(dbus_slice.app_unit_group, None);
+        assert!(dbus_slice.generic_app_slice_unit);
+        apply_environment_hints(
+            &mut dbus_slice,
+            parse_environment(b"WAYLAND_DISPLAY=wayland-0\0").expect("env"),
+        );
+        assert_eq!(dbus_slice.role, Some(DesktopRoleEvidence::Background));
         let manager = parse_v2("/user.slice/user-1000.slice/user@1000.service/init.scope")
             .expect("user manager path");
         assert_eq!(manager.manager_uid, Some(1000));
@@ -1304,6 +1365,11 @@ mod tests {
         assert_eq!(app.role, None);
         assert_eq!(app.role_marker(), DesktopRoleEvidence::Unknown);
         assert!(app.app_unit_group.is_some());
+
+        // Chromium/Electron `setproctitle` zeroes `/proc/<pid>/environ` into NUL
+        // runs; `parse_environment` rejects it rather than treating it as
+        // headless, so the collector can propagate graphical session evidence.
+        assert_eq!(parse_environment(b"\0\0\0\0"), None);
     }
 
     #[test]

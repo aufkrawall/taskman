@@ -564,19 +564,20 @@ remain follow-up rather than being simulated in headless tests:
   avoids guessing from usernames, but some systemd user-manager application
   scopes under `user@UID.service` have no session component and therefore do
   not contribute to session rollups.
-- **Native-Wayland App/Background roles are launcher evidence, not compositor
-  facts.** Only a standard `app-*` unit or Snap launcher in user `app.slice`
-  supplies cgroup app-family identity. It can identify an App only when its
-  complete environment carries a non-whitespace Wayland/X11 display variable.
-  Arbitrary well-formed app.slice units remain Unknown unless the same
-  graphical gate and weak user-session evidence accompany a trusted
-  Flatpak/Snap/GIO/BAMF per-process hint; an inherited display variable alone
-  is not identity. A complete headless recognized app unit is Background and
-  unavailable/partial/oversized evidence stays Unknown. Native Wayland still
-  has no portable whole-window inventory, focus signal or exact compositor
-  mapping. Applications outside these conventions, malformed/ambiguous cgroups
-  and exact X11 no-window evidence can leave a process Unknown or Background
-  rather than recovered. GNOME Shell.Introspect (sender-allowlisted) and
+- **Native-Wayland App/Background roles are launcher and session evidence, not
+  compositor facts.** Standard `app-*` units (excluding `app-dbus\x2d:` D-Bus
+  daemon slices) and Snap launchers in user `app.slice` identify an App when
+  either their own environment or their unit/user graphical session is active;
+  readable headless environments stay Background. Clobbered/unreadable
+  environments (Chromium/Electron `setproctitle`, `PR_SET_DUMPABLE=0`) inherit
+  positive unit or user-session graphical status, and split child `app-*` units
+  with the same executable merge under their parent app root. Generic user
+  units in `app.slice` (`dconf.service`, `gnome-keyring-daemon.service`,
+  `app-dbus\x2d:...`) default to Background unless a launcher hint or window
+  promotes them, and visible GUI `.desktop` entries promote in graphical user
+  sessions outside `session.slice`/`background.slice`/`init.scope`. Native
+  Wayland still has no portable whole-window inventory, focus signal or exact
+  compositor mapping. GNOME Shell.Introspect (sender-allowlisted) and
   interactive KWin APIs are deliberately not used. WSL without real systemd
   PID 1 stays Unknown for its synthetic `/init.scope` evidence unless X11
   ownership supplies independent evidence.
@@ -620,10 +621,12 @@ remain follow-up rather than being simulated in headless tests:
 - **Per-process network is TCP only.** `sock_diag` exposes lifetime byte
   counters per TCP socket (`tcpi_bytes_acked`/`tcpi_bytes_received`); UDP
   sockets — QUIC/HTTP-3 included — carry none, so that traffic is not
-  attributed. Sockets are joined to processes through `/proc/<pid>/fd`, which
-  an unprivileged GUI can read only for its own user's processes: other users'
-  rows stay "—". A socket that opens and closes between two dumps is missed. A
-  full answer needs eBPF in the root service.
+  attributed. Sockets are joined to processes through `/proc/<pid>/fd`; an
+  unprivileged GUI reads its own dumpable processes directly and queries
+  `taskman-core.service` (`ProcessTelemetry`) for root and `PR_SET_DUMPABLE=0`
+  processes. When the service is absent or refuses, unreadable processes' rows
+  stay "—". A socket that opens and closes between two dumps is missed. A full
+  answer needs eBPF in the root service.
 - **Per-process disk active time is an attribution, not a measurement.**
   Linux keeps no per-process disk service time. The drive's measured busy time
   is shared out by each readable process' block-layer bytes over

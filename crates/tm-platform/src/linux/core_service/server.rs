@@ -61,21 +61,22 @@ use crate::actions::{ConnectionProtocol, ServiceAction, TcpState, ThreadState};
 use crate::linux_core_service::{
     ACTION_DEADLINE_MS, ActionRequest, ClientImage, INSTALL_ROOT, InstalledClient, MANIFEST_PATH,
     MAX_MANIFEST_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Manifest, NamespaceId,
-    PROTOCOL_VERSION, PeerCredentials, PeerVerdict, ProcessEvidence, Refusal, Request,
-    RequestEnvelope, ResourceLimit, Response, ResponseEnvelope, SERVICE_UNIT, SOCKET_DIR,
-    SOCKET_PATH, ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo, WireFileIoEntry,
-    WireModule, WireThread, WireThreadState, WireThreads, decode_frame, encode_frame,
-    evaluate_peer, is_inside_install_root, manifest_protection_problem, read_frame,
-    service_image_protection_problem,
+    PROTOCOL_VERSION, PeerCredentials, PeerVerdict, ProcessEvidence, ProcessTelemetryEntry,
+    Refusal, Request, RequestEnvelope, ResourceLimit, Response, ResponseEnvelope, SERVICE_UNIT,
+    SOCKET_DIR, SOCKET_PATH, ServiceStatusInfo, ServiceVerb, TelemetryTarget, WireConnection,
+    WireFileIo, WireFileIoEntry, WireModule, WireProcIo, WireThread, WireThreadState, WireThreads,
+    decode_frame, encode_frame, evaluate_peer, is_inside_install_root, manifest_protection_problem,
+    read_frame, service_image_protection_problem,
 };
 use crate::linux_sensors::SensorSnapshot;
+use crate::linux_telemetry;
 use tm_core::error::TmError;
 use tm_core::model::PriorityClass;
 
 use super::super::{
-    ensure_process_generation, process_connections, process_io, process_modules,
-    process_start_for_read, process_threads, process_tree, send_signal_checked, sensors, services,
-    set_affinity_direct, set_priority_direct,
+    descriptors_listable, ensure_process_generation, process_connections, process_io,
+    process_modules, process_start_for_read, process_threads, process_tree, send_signal_checked,
+    sensors, services, set_affinity_direct, set_priority_direct,
 };
 
 /// Version this build reports; the workspace version, so a status answer names
@@ -1589,6 +1590,10 @@ fn dispatch(state: &ServiceState, peer_pid: u32, request: Request) -> Response {
             Ok(evidence) => Response::Evidence(Box::new(evidence)),
             Err(error) => error_response(error),
         },
+        Request::ProcessTelemetry {
+            targets,
+            wanted_socket_inodes,
+        } => Response::Telemetry(collect_process_telemetry(&targets, &wanted_socket_inodes)),
         Request::Action { action } => run_action(state, peer_pid, action),
     }
 }
@@ -2031,6 +2036,70 @@ fn collect_evidence(pid: u32, start_ticks: i64) -> Result<ProcessEvidence, TmErr
     };
     ensure_process_generation(pid, before)?;
     Ok(evidence)
+}
+
+/// Batched `/proc/<pid>/io` and `/proc/<pid>/fd` socket-inode inspection for
+/// processes withheld from an unprivileged GUI.
+///
+/// Each target is bracketed individually by its `start_ticks`; a vanished or
+/// recycled target is simply omitted rather than failing the whole batch.
+fn collect_process_telemetry(
+    targets: &[TelemetryTarget],
+    wanted_socket_inodes: &[u64],
+) -> Vec<ProcessTelemetryEntry> {
+    let wanted: HashSet<u64> = wanted_socket_inodes.iter().copied().collect();
+    let mut entries = Vec::with_capacity(targets.len());
+    for target in targets {
+        let Ok(before) = process_start_for_read(target.pid, Some(target.start_ticks)) else {
+            continue;
+        };
+        let io = if target.need_io {
+            read_proc_text(target.pid, "io")
+                .as_deref()
+                .and_then(linux_telemetry::parse_proc_io)
+                .map(|parsed| WireProcIo {
+                    rchar: parsed.rchar,
+                    wchar: parsed.wchar,
+                    syscr: parsed.syscr,
+                    syscw: parsed.syscw,
+                    read_bytes: parsed.read_bytes,
+                    write_bytes: parsed.write_bytes,
+                })
+        } else {
+            None
+        };
+        let (fd_readable, socket_inodes) = if target.check_fd {
+            let readable = descriptors_listable(target.pid);
+            let matched = if readable && !wanted.is_empty() {
+                process_connections::process_socket_inodes(target.pid)
+                    .map(|inodes| {
+                        let mut matched: Vec<u64> = inodes
+                            .into_iter()
+                            .filter(|inode| wanted.contains(inode))
+                            .collect();
+                        matched.sort_unstable();
+                        matched
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (Some(readable), matched)
+        } else {
+            (None, Vec::new())
+        };
+        if ensure_process_generation(target.pid, before).is_err() {
+            continue;
+        }
+        entries.push(ProcessTelemetryEntry {
+            pid: target.pid,
+            start_ticks: target.start_ticks,
+            io,
+            fd_readable,
+            socket_inodes,
+        });
+    }
+    entries
 }
 
 fn read_link_text(path: impl AsRef<Path>) -> Option<String> {
@@ -2908,6 +2977,35 @@ Max realtime timeout      unlimited            unlimited            us        \n
             matches!(error, TmError::ProcessNotFound { .. }),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn process_telemetry_reads_verified_target_and_skips_identity_mismatch() {
+        let pid = std::process::id();
+        let start_ticks = crate::linux::read_proc_start_ticks(pid).expect("own start ticks");
+        let entries = collect_process_telemetry(
+            &[
+                TelemetryTarget {
+                    pid,
+                    start_ticks,
+                    need_io: true,
+                    check_fd: true,
+                },
+                TelemetryTarget {
+                    pid,
+                    start_ticks: start_ticks + 1,
+                    need_io: true,
+                    check_fd: true,
+                },
+            ],
+            &[],
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pid, pid);
+        assert_eq!(entries[0].start_ticks, start_ticks);
+        assert!(entries[0].io.is_some());
+        assert_eq!(entries[0].fd_readable, Some(true));
+        assert!(entries[0].socket_inodes.is_empty());
     }
 
     // ------------------------------------------------------------- tempdirs

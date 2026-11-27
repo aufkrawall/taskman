@@ -116,39 +116,37 @@ pub use crate::linux_core_bridge::ClientError;
 /// What a status read can answer: a completed outcome or a pending probe.
 pub use crate::linux_core_bridge::StatusProbe;
 
-/// The one connection, held across an exchange.
+/// Connection cooldown state across exchanges.
+///
+/// The broker serves one request per connection and closes the socket after
+/// answering (`server.rs`), so each request opens a fresh local socket instead
+/// of reusing a closed descriptor.
 struct Connection {
-    socket: Option<UnixStream>,
     /// Set after a transport failure; no request is attempted before it passes.
     retry_after: Option<Instant>,
 }
 
 impl Connection {
     const fn new() -> Self {
-        Self {
-            socket: None,
-            retry_after: None,
-        }
+        Self { retry_after: None }
     }
 
     fn in_cooldown(&self) -> bool {
         self.retry_after.is_some_and(|at| Instant::now() < at)
     }
 
-    /// Drop the socket after a transport failure and start the cooldown.
+    /// Start the cooldown after a transport failure.
     fn fail(&mut self, detail: String) -> ClientError {
-        self.socket = None;
         self.retry_after = Some(Instant::now() + UNAVAILABLE_COOLDOWN);
         ClientError::Unavailable(detail)
     }
 
-    /// Drop the socket after an ambiguous failure and start the cooldown.
+    /// Start the cooldown after an ambiguous failure.
     ///
     /// `Failed` is deliberate: the request reached the service, so its outcome
     /// is unknown rather than absent, and [`ClientError::Failed`] is the class
     /// that no caller may retry.
     fn abort(&mut self, detail: String) -> ClientError {
-        self.socket = None;
         self.retry_after = Some(Instant::now() + UNAVAILABLE_COOLDOWN);
         ClientError::Failed(detail)
     }
@@ -299,34 +297,22 @@ fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, 
         // Our own bug rather than the broker's decision: nothing was sent.
         return Err(ClientError::Failed(format!("invalid request: {problem}")));
     }
-    if connection.socket.is_none() {
-        // A connect has no server-side work behind it — it either completes or
-        // nobody is listening — so it keeps the short read budget even for an
-        // action. Nothing has been sent at this point, so a slow connect can
-        // never be mistaken for a mutation that started.
-        let connect_by = Instant::now() + CONNECT_DEADLINE;
-        let socket = match connect_bounded(connect_by) {
-            Ok(socket) => socket,
-            // Not installed, not running, or no search permission on the
-            // socket directory: in every case there is nobody to ask.
-            Err(error) => return Err(connection.fail(format!("connect {SOCKET_PATH}: {error}"))),
-        };
-        connection.socket = Some(socket);
-    }
-    // Take the socket out so a failure can drop it without borrowing the
-    // connection twice; it is handed back only once the exchange succeeded.
-    let socket = match connection.socket.take() {
-        Some(socket) => socket,
-        None => return Err(connection.fail("the connection lost its socket".into())),
+    // A connect has no server-side work behind it — it either completes or
+    // nobody is listening — so it keeps the short read budget even for an
+    // action. Nothing has been sent at this point, so a slow connect can
+    // never be mistaken for a mutation that started.
+    let connect_by = Instant::now() + CONNECT_DEADLINE;
+    let socket = match connect_bounded(connect_by) {
+        Ok(socket) => socket,
+        // Not installed, not running, or no search permission on the
+        // socket directory: in every case there is nobody to ask.
+        Err(error) => return Err(connection.fail(format!("connect {SOCKET_PATH}: {error}"))),
     };
     // The action budget starts here, where the service starts working: a
     // `systemctl restart` is allowed to outlive the read deadline.
     let deadline = Instant::now() + request_deadline(request);
     let body = match transact(&socket, request, deadline) {
-        Ok(body) => {
-            connection.socket = Some(socket);
-            body
-        }
+        Ok(body) => body,
         Err(attempt) => {
             return Err(transport_failure(
                 connection,
@@ -336,6 +322,7 @@ fn exchange(connection: &mut Connection, request: &Request) -> Result<Response, 
             ));
         }
     };
+    drop(socket);
     let envelope: ResponseEnvelope = match decode_frame(&body) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -581,7 +568,6 @@ mod tests {
         assert!(!connection.in_cooldown());
         let error = connection.fail("connect failed".into());
         assert!(connection.in_cooldown());
-        assert!(connection.socket.is_none());
         assert!(error.may_fall_back());
 
         // The cooldown answer names itself instead of paying another connect.

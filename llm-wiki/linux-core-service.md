@@ -1,6 +1,6 @@
 # Linux Elevated Core Service and Desktop Integration
 
-Last cross-checked: 2026-11-26
+Last cross-checked: 2026-11-27
 
 Primary sources:
 
@@ -60,9 +60,14 @@ authorization decisions are unit-tested there.
 - Frame: big-endian `u32` body length + JSON body. Requests are capped at
   64 KiB, responses at 2 MiB. `RequestEnvelope { protocol, request }` and
   `ResponseEnvelope { protocol, response }` make a version mismatch an explicit
-  error instead of a misread field.
+  error instead of a misread field (`PROTOCOL_VERSION = 2`).
+- One request per connection: the server drops the stream after writing the
+  response, and `client.rs` opens a fresh local socket per exchange rather than
+  reusing a closed descriptor.
 - Requests (`Request`): `Status`, `Sensors`, `ProcessModules`,
-  `ProcessThreads`, `ProcessConnections`, `ProcessEvidence`, `Action`.
+  `ProcessThreads`, `ProcessConnections`, `ProcessFileIo`, `ProcessEvidence`,
+  `ProcessTelemetry` (batched `/proc/<pid>/io` and `/proc/<pid>/fd` socket-inode
+  ownership for root and `PR_SET_DUMPABLE=0` processes), `Action`.
 - Actions (`ActionRequest`): `kill` (optionally the descendant tree),
   `suspend`, `resume`, `set-priority`, `set-affinity`, `service` (`start`,
   `stop`, `restart`). Every process action carries `start_ticks`, the kernel

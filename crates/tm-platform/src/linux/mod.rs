@@ -35,7 +35,10 @@ use crate::linux_core_bridge::{
     StatusProbe, client_error, connections_from_wire, core_service_state, file_io_from_wire,
     merge_file_io, module_from_wire, response_label, service_verb, threads_from_wire,
 };
-use crate::linux_core_service::{ActionRequest, MANIFEST_PATH, Request, Response};
+use crate::linux_core_service::{
+    ActionRequest, MANIFEST_PATH, MAX_TELEMETRY_TARGETS, MAX_WANTED_SOCKET_INODES,
+    ProcessTelemetryEntry, Request, Response, TelemetryTarget, WireProcIo,
+};
 use crate::linux_telemetry;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -85,7 +88,13 @@ pub struct LinuxCollector {
     /// Per-process TCP byte totals since TaskMan first measured the process,
     /// keyed by pid with the start ticks that identify its generation.
     net_totals: HashMap<u32, (Option<i64>, u64, u64)>,
+    /// Cooldown after a broker refusal/failure on sampler telemetry so an
+    /// unauthorized binary (e.g. dev build) does not probe every tick.
+    broker_refused_until: Option<std::time::Instant>,
 }
+
+/// How long the sampler pauses telemetry broker requests after a refusal/error.
+const BROKER_REFUSAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long the physical-drive list and the volume → drive resolution stay
 /// valid. A drive plugged in shows up within this long.
@@ -199,10 +208,15 @@ impl SystemCollector for LinuxCollector {
             .and_then(parse_proc_stat_btime)
             .zip(linux_clk_tck());
         let mut processes = Vec::with_capacity(n_procs);
+        let mut classification_ctx: Vec<(String, Option<bool>, desktop_session::DesktopEvidence)> =
+            Vec::with_capacity(n_procs);
         let mut live_pids = HashSet::with_capacity(n_procs);
         // Block-layer bytes each readable process caused this window, for the
         // disk-time attribution after the drives are read.
         let mut block_bytes: HashMap<u32, u64> = HashMap::new();
+        let mut attributable_net_pids: HashSet<u32> = HashSet::with_capacity(n_procs);
+        let mut deferred_io: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+        let mut need_broker_fd: HashSet<u32> = HashSet::new();
         // One logind record read per user per tick, not per process.
         let mut display_sessions: HashMap<u32, Option<u32>> = HashMap::new();
         let mut thread_total = 0usize;
@@ -285,13 +299,36 @@ impl SystemCollector for LinuxCollector {
                         linux_start_timestamp(btime_s, ticks, clk_tck)
                     });
             entry.cpu_time_s = proc_cpu.and_then(|cpu| cpu.cpu_time_s);
-            if let Some(bytes) = apply_activity(
-                &mut self.activity,
-                &mut entry,
-                stat_bytes.as_deref(),
-                interval_s,
-            ) {
-                block_bytes.insert(pid_u, bytes);
+            let proc_idx = processes.len();
+            match read_local_proc_io(pid_u) {
+                LocalProcIo::Measured(io) => {
+                    if let Some(bytes) = apply_activity(
+                        &mut self.activity,
+                        &mut entry,
+                        stat_bytes.as_deref(),
+                        Some(io),
+                        interval_s,
+                    ) {
+                        block_bytes.insert(pid_u, bytes);
+                    }
+                }
+                LocalProcIo::PermissionDenied if !is_kthread && boot_start_ticks.is_some() => {
+                    deferred_io.push((proc_idx, stat_bytes.clone()));
+                }
+                LocalProcIo::PermissionDenied | LocalProcIo::Unavailable => {
+                    apply_activity(
+                        &mut self.activity,
+                        &mut entry,
+                        stat_bytes.as_deref(),
+                        None,
+                        interval_s,
+                    );
+                }
+            }
+            if descriptors_listable(pid_u) {
+                attributable_net_pids.insert(pid_u);
+            } else if providers.process_net && !is_kthread && boot_start_ticks.is_some() {
+                need_broker_fd.insert(pid_u);
             }
             entry.has_window = has_window == Some(true);
             entry.app_group = if category == ProcCategory::App {
@@ -330,6 +367,7 @@ impl SystemCollector for LinuxCollector {
             entry.command_line = command_line;
             entry.priority = proc_priority(stat_bytes.as_deref());
             entry.elevated = entry.user.as_deref().map(|u| u == "root");
+            classification_ctx.push((name, has_window, desktop_evidence));
             processes.push(entry);
         }
         self.desktop_evidence.retain_live(&live_pids);
@@ -337,15 +375,85 @@ impl SystemCollector for LinuxCollector {
         self.cmdlines.retain(|pid, _| live_pids.contains(pid));
         self.activity.retain(|pid, _| live_pids.contains(pid));
         self.elf_classes.retain(|pid, _| live_pids.contains(pid));
-        mark_desktop_app_roots(&mut processes);
-        apply_process_net(
-            &mut self.process_net,
-            &mut self.net_totals,
+        let mut graphical_uids: HashSet<u32> = HashSet::new();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let current_uid = unsafe { libc::getuid() };
+        if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+        {
+            graphical_uids.insert(current_uid);
+        }
+        for (&uid, session) in &display_sessions {
+            if session.is_some() {
+                graphical_uids.insert(uid);
+            }
+        }
+        refine_linux_classification(
             &mut processes,
-            &live_pids,
-            interval_s,
-            providers.process_net,
+            &classification_ctx,
+            &graphical_uids,
+            crate::xdg_icons::visible_gui_desktop_id,
         );
+        merge_child_app_groups(&mut processes);
+        mark_desktop_app_roots(&mut processes);
+
+        let pending_net = if providers.process_net {
+            self.process_net.begin_sample(&live_pids)
+        } else {
+            self.process_net.forget();
+            self.net_totals.clear();
+            None
+        };
+        let wanted_socket_inodes = pending_net
+            .as_ref()
+            .map(|pending| pending.unowned.as_slice())
+            .unwrap_or(&[]);
+        let broker_entries = collect_broker_telemetry(
+            &mut self.broker_refused_until,
+            &processes,
+            &deferred_io,
+            &need_broker_fd,
+            wanted_socket_inodes,
+            started,
+        );
+        for (proc_idx, stat_bytes) in deferred_io {
+            let entry = &mut processes[proc_idx];
+            let broker_io = broker_entries
+                .get(&entry.pid)
+                .filter(|telem| Some(telem.start_ticks) == entry.boot_start_ticks)
+                .and_then(|telem| telem.io)
+                .map(proc_io_from_wire);
+            if let Some(bytes) = apply_activity(
+                &mut self.activity,
+                entry,
+                stat_bytes.as_deref(),
+                broker_io,
+                interval_s,
+            ) {
+                block_bytes.insert(entry.pid, bytes);
+            }
+        }
+        let mut broker_owners: Vec<(u64, u32)> = Vec::new();
+        for telem in broker_entries.values() {
+            if telem.fd_readable == Some(true) {
+                attributable_net_pids.insert(telem.pid);
+                for &inode in &telem.socket_inodes {
+                    broker_owners.push((inode, telem.pid));
+                }
+            }
+        }
+        broker_owners.sort_unstable_by_key(|&(_, pid)| pid);
+        if let Some(pending) = pending_net {
+            let window = self.process_net.finish_sample(pending, &broker_owners);
+            apply_process_net_window(
+                &mut self.net_totals,
+                &mut processes,
+                &live_pids,
+                &attributable_net_pids,
+                &window,
+                interval_s,
+            );
+        }
 
         // Disk rates and active time are a single `/proc/diskstats` read per
         // tick; keep them active even while hidden to tray (like CPU and
@@ -495,35 +603,23 @@ impl SystemCollector for LinuxCollector {
     }
 }
 
-/// Fill the per-process network columns from the TCP accountant.
+/// Fill the per-process network columns from a completed TCP window.
 ///
-/// A process whose descriptors this token can read (`handles` is known)
-/// is measured: no traffic is a real 0 B/s. One whose descriptors are
-/// hidden keeps `None` — its sockets cannot be joined to it, so a 0 would
-/// be invented.
-fn apply_process_net(
-    accountant: &mut process_net::ProcessNet,
+/// Only processes whose descriptors were listable (either by this token or by
+/// the root core service) are measured: no traffic is a real 0 B/s. One whose
+/// descriptors are hidden keeps `None` — its sockets cannot be joined to it, so
+/// a 0 would be invented.
+fn apply_process_net_window(
     net_totals: &mut HashMap<u32, (Option<i64>, u64, u64)>,
     processes: &mut [ProcessEntry],
     live_pids: &HashSet<u32>,
+    attributable_pids: &HashSet<u32>,
+    window: &process_net::Window,
     interval_s: f64,
-    wanted: bool,
 ) {
-    if !wanted {
-        accountant.forget();
-        net_totals.clear();
-        return;
-    }
-    let Some(window) = accountant.sample(live_pids) else {
-        return;
-    };
     net_totals.retain(|pid, _| live_pids.contains(pid));
     for process in processes.iter_mut() {
-        // Socket ownership comes from the descriptor walk, so only a process
-        // whose descriptors this token can list is measured; for any other the
-        // window's missing entry means unknown, not idle. (Its handle count may
-        // still be known: `stat` reports it where listing is refused.)
-        if !descriptors_listable(process.pid) {
+        if !attributable_pids.contains(&process.pid) {
             continue;
         }
         let (received, sent) = window.get(&process.pid).copied().unwrap_or((0, 0));
@@ -540,6 +636,119 @@ fn apply_process_net(
         process.net_recv_total = Some(totals.1);
         process.net_sent_total = Some(totals.2);
     }
+}
+
+enum LocalProcIo {
+    Measured(linux_telemetry::ProcIo),
+    PermissionDenied,
+    Unavailable,
+}
+
+fn read_local_proc_io(pid: u32) -> LocalProcIo {
+    match std::fs::read_to_string(format!("/proc/{pid}/io")) {
+        Ok(text) => match linux_telemetry::parse_proc_io(&text) {
+            Some(io) => LocalProcIo::Measured(io),
+            None => LocalProcIo::Unavailable,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            LocalProcIo::PermissionDenied
+        }
+        Err(_) => LocalProcIo::Unavailable,
+    }
+}
+
+fn proc_io_from_wire(wire: WireProcIo) -> linux_telemetry::ProcIo {
+    linux_telemetry::ProcIo {
+        rchar: wire.rchar,
+        wchar: wire.wchar,
+        syscr: wire.syscr,
+        syscw: wire.syscw,
+        read_bytes: wire.read_bytes,
+        write_bytes: wire.write_bytes,
+    }
+}
+
+fn collect_broker_telemetry(
+    refused_until: &mut Option<Instant>,
+    processes: &[ProcessEntry],
+    deferred_io: &[(usize, Option<Vec<u8>>)],
+    need_broker_fd: &HashSet<u32>,
+    wanted_socket_inodes: &[u64],
+    now: Instant,
+) -> HashMap<u32, ProcessTelemetryEntry> {
+    if polkit::is_elevated() || !manifest_installed() {
+        return HashMap::new();
+    }
+    if refused_until.is_some_and(|until| now < until) {
+        return HashMap::new();
+    }
+    let need_io_pids: HashSet<u32> = deferred_io
+        .iter()
+        .map(|&(idx, _)| processes[idx].pid)
+        .collect();
+    if need_io_pids.is_empty() && need_broker_fd.is_empty() {
+        return HashMap::new();
+    }
+    let mut targets = Vec::with_capacity(need_io_pids.len() + need_broker_fd.len());
+    for process in processes {
+        let need_io = need_io_pids.contains(&process.pid);
+        let check_fd = need_broker_fd.contains(&process.pid);
+        if (!need_io && !check_fd) || process.pid == 0 {
+            continue;
+        }
+        let Some(start_ticks) = process.boot_start_ticks else {
+            continue;
+        };
+        targets.push(TelemetryTarget {
+            pid: process.pid,
+            start_ticks,
+            need_io,
+            check_fd,
+        });
+    }
+    if targets.is_empty() {
+        return HashMap::new();
+    }
+
+    let wanted: Vec<u64> = wanted_socket_inodes
+        .iter()
+        .copied()
+        .take(MAX_WANTED_SOCKET_INODES)
+        .collect();
+    let mut results = HashMap::with_capacity(targets.len());
+    for chunk in targets.chunks(MAX_TELEMETRY_TARGETS) {
+        let request = Request::ProcessTelemetry {
+            targets: chunk.to_vec(),
+            wanted_socket_inodes: wanted.clone(),
+        };
+        match client::request(&request) {
+            Ok(Response::Telemetry(entries)) => {
+                *refused_until = None;
+                for entry in entries {
+                    results.insert(entry.pid, entry);
+                }
+            }
+            Ok(other) => {
+                *refused_until = Some(now + BROKER_REFUSAL_COOLDOWN);
+                if broker_diagnostic_allowed() {
+                    tracing::debug!(
+                        payload = response_label(&other),
+                        "core service answered process-telemetry with an unexpected payload"
+                    );
+                }
+                break;
+            }
+            Err(ClientError::Unavailable(_)) => break,
+            Err(error) => {
+                *refused_until = Some(now + BROKER_REFUSAL_COOLDOWN);
+                if broker_diagnostic_allowed() {
+                    tracing::debug!(%error, "core service declined process-telemetry");
+                }
+                break;
+            }
+        }
+    }
+    results
 }
 
 /// Whether a process image is 32-bit on this 64-bit host — Windows' WOW64
@@ -589,11 +798,9 @@ fn apply_activity(
     activity: &mut HashMap<u32, Activity>,
     entry: &mut ProcessEntry,
     stat: Option<&[u8]>,
+    io: Option<linux_telemetry::ProcIo>,
     interval_s: f64,
 ) -> Option<u64> {
-    let io = std::fs::read_to_string(format!("/proc/{}/io", entry.pid))
-        .ok()
-        .and_then(|text| linux_telemetry::parse_proc_io(&text));
     let faults = stat.and_then(linux_telemetry::parse_proc_stat_faults);
     let previous = activity
         .get(&entry.pid)
@@ -778,6 +985,172 @@ fn username_for_uid(users: &sysinfo::Users, uid: &sysinfo::Uid) -> Option<String
         .map(|u| u.name().to_string())
 }
 
+fn merge_child_app_groups(processes: &mut [ProcessEntry]) {
+    let mut by_pid: HashMap<u32, usize> = HashMap::with_capacity(processes.len());
+    let mut group_roots: HashMap<String, usize> = HashMap::new();
+    for (index, process) in processes.iter().enumerate() {
+        by_pid.insert(process.pid, index);
+        if process.category != ProcCategory::App {
+            continue;
+        }
+        let Some(group) = process
+            .app_group
+            .as_deref()
+            .filter(|group| !group.is_empty())
+        else {
+            continue;
+        };
+        let replace = match group_roots.get(group) {
+            Some(&existing) => app_root_key(process) < app_root_key(&processes[existing]),
+            None => true,
+        };
+        if replace {
+            group_roots.insert(group.to_owned(), index);
+        }
+    }
+
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (group, &root_idx) in &group_roots {
+        let mut cur_idx = root_idx;
+        let mut target: Option<&str> = None;
+        let mut seen = HashSet::new();
+        seen.insert(processes[cur_idx].pid);
+        while let Some(ppid) = processes[cur_idx].ppid {
+            if !seen.insert(ppid) {
+                break;
+            }
+            let Some(&parent_idx) = by_pid.get(&ppid) else {
+                break;
+            };
+            let child = &processes[cur_idx];
+            let parent = &processes[parent_idx];
+            if parent.category != ProcCategory::App
+                || parent.exe_path.is_none()
+                || parent.exe_path != child.exe_path
+            {
+                break;
+            }
+            let Some(parent_group) = parent.app_group.as_deref().filter(|g| !g.is_empty()) else {
+                break;
+            };
+            if parent_group != group {
+                target = Some(parent_group);
+            }
+            cur_idx = parent_idx;
+        }
+        if let Some(parent_group) = target
+            && parent_group != group
+        {
+            remap.insert(group.clone(), parent_group.to_owned());
+        }
+    }
+
+    if remap.is_empty() {
+        return;
+    }
+    for process in processes.iter_mut() {
+        if let Some(group) = process.app_group.as_deref()
+            && let Some(target) = remap.get(group)
+        {
+            process.app_group = Some(target.clone());
+        }
+    }
+}
+
+/// Promote desktop foreground applications whose own `/proc/<pid>/environ` was
+/// clobbered (e.g. Chromium/Electron `setproctitle`) or unreadable, as well as
+/// visible GUI `.desktop` applications running inside a graphical user session
+/// without a systemd `app-*` scope.
+fn refine_linux_classification<'a>(
+    processes: &mut [ProcessEntry],
+    ctx: &[(String, Option<bool>, desktop_session::DesktopEvidence)],
+    extra_graphical_uids: &HashSet<u32>,
+    gui_desktop_id: impl Fn(&Path) -> Option<&'a str>,
+) {
+    let mut graphical_unit_groups: HashSet<&str> = HashSet::new();
+    let mut headless_unit_groups: HashSet<&str> = HashSet::new();
+    let mut graphical_user_scopes: HashSet<&str> = HashSet::new();
+    let mut graphical_uids: HashSet<u32> = extra_graphical_uids.clone();
+
+    for (_, has_window, evidence) in ctx {
+        let positive_graphical = evidence.graphical_env || *has_window == Some(true);
+        if positive_graphical {
+            if let Some(group) = evidence.app_unit_group.as_deref() {
+                graphical_unit_groups.insert(group);
+            }
+            if let Some(scope) = evidence.user_scope.as_deref() {
+                graphical_user_scopes.insert(scope);
+            }
+            if let Some(uid) = evidence.uid {
+                graphical_uids.insert(uid);
+            }
+        } else if evidence.role == Some(classify::DesktopRoleEvidence::Background)
+            && !evidence.environ_unreadable
+            && let Some(group) = evidence.app_unit_group.as_deref()
+        {
+            headless_unit_groups.insert(group);
+        }
+    }
+
+    for (entry, (raw_name, has_window, evidence)) in processes.iter_mut().zip(ctx.iter()) {
+        if entry.category == ProcCategory::System {
+            continue;
+        }
+        let user_is_graphical = evidence
+            .user_scope
+            .as_deref()
+            .is_some_and(|scope| graphical_user_scopes.contains(scope))
+            || evidence
+                .uid
+                .is_some_and(|uid| graphical_uids.contains(&uid));
+
+        if evidence.role.is_none()
+            && evidence.environ_unreadable
+            && let Some(group) = evidence.app_unit_group.as_deref()
+        {
+            let unit_is_graphical = graphical_unit_groups.contains(group)
+                || (!headless_unit_groups.contains(group) && user_is_graphical);
+            if unit_is_graphical {
+                let role = Some(classify::DesktopRoleEvidence::App);
+                entry.desktop_role = role;
+                entry.category = classify_collected_process(entry.pid, raw_name, *has_window, role);
+                entry.app_group = (entry.category == ProcCategory::App).then(|| group.to_owned());
+                continue;
+            }
+        }
+
+        if entry.category != ProcCategory::App
+            && evidence.user_session
+            && evidence.app_unit_group.is_none()
+            && (evidence.role.is_none() || evidence.session_scope_root)
+        {
+            let graphical = evidence.graphical_env
+                || *has_window == Some(true)
+                || ((evidence.environ_unreadable || evidence.session_scope_root)
+                    && user_is_graphical);
+            if graphical
+                && let Some(user_scope) = evidence.user_scope.as_deref()
+                && let Some(exe_path) = entry.exe_path.as_deref()
+                && let Some(desktop_id) = gui_desktop_id(exe_path)
+            {
+                let role = Some(classify::DesktopRoleEvidence::App);
+                entry.desktop_role = role;
+                entry.category = classify_collected_process(entry.pid, raw_name, *has_window, role);
+                entry.app_group = (entry.category == ProcCategory::App)
+                    .then(|| format!("systemd:{user_scope}:desktop:{desktop_id}"));
+            }
+        }
+    }
+}
+
+fn app_root_key(process: &ProcessEntry) -> (bool, i64, u32) {
+    (
+        !process.has_window,
+        process.creation_identity().unwrap_or(i64::MAX),
+        process.pid,
+    )
+}
+
 fn mark_desktop_app_roots(processes: &mut [ProcessEntry]) {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, process) in processes.iter().enumerate() {
@@ -793,14 +1166,10 @@ fn mark_desktop_app_roots(processes: &mut [ProcessEntry]) {
         }
     }
     for members in groups.values() {
-        let Some(&root) = members.iter().min_by_key(|&&index| {
-            let process = &processes[index];
-            (
-                !process.has_window,
-                process.creation_identity().unwrap_or(i64::MAX),
-                process.pid,
-            )
-        }) else {
+        let Some(&root) = members
+            .iter()
+            .min_by_key(|&&index| app_root_key(&processes[index]))
+        else {
             continue;
         };
         processes[root].app_root = true;
@@ -822,7 +1191,7 @@ fn proc_status_kb(pid: u32, field: &str) -> Option<u64> {
 
 /// Whether this token may list `/proc/<pid>/fd` -- the access the socket and
 /// GPU descriptor walks need. One `access` call, no listing.
-fn descriptors_listable(pid: u32) -> bool {
+pub(super) fn descriptors_listable(pid: u32) -> bool {
     let Ok(path) = std::ffi::CString::new(format!("/proc/{pid}/fd")) else {
         return false;
     };
@@ -2156,6 +2525,7 @@ pub fn create_collector() -> LinuxCollector {
         activity: HashMap::new(),
         elf_classes: HashMap::new(),
         net_totals: HashMap::new(),
+        broker_refused_until: None,
     }
 }
 
@@ -2577,5 +2947,157 @@ mod tests {
         // Normal user process without PF_KTHREAD (even with spaces/parens in comm).
         let user = b"1234 (my (app)) S 1000 1234 1234 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99 0";
         assert!(!parse_proc_stat_is_kthread(user));
+    }
+
+    #[test]
+    fn clobbered_environ_app_units_promote_when_session_is_graphical_and_headless_stays_background()
+    {
+        let user_scope = "/user.slice/user-1000.slice/user@1000.service".to_string();
+        let brave_scope =
+            format!("systemd:{user_scope}/app.slice/app-org.chromium.Chromium-100.scope");
+        let brave_svc = format!("systemd:{user_scope}/app.slice/app-brave\\x2dbrowser@abc.service");
+        let headless_scope = format!("systemd:{user_scope}/app.slice/app-headless@1.service");
+
+        let mut brave_main = ProcessEntry::new(100, "brave");
+        brave_main.exe_path = Some(std::path::PathBuf::from("/opt/brave-bin/brave"));
+        brave_main.category = ProcCategory::Unknown;
+        brave_main.desktop_role = Some(classify::DesktopRoleEvidence::Unknown);
+
+        let mut brave_zygote = ProcessEntry::new(101, "brave");
+        brave_zygote.ppid = Some(100);
+        brave_zygote.exe_path = Some(std::path::PathBuf::from("/opt/brave-bin/brave"));
+        brave_zygote.category = ProcCategory::Unknown;
+        brave_zygote.desktop_role = Some(classify::DesktopRoleEvidence::Unknown);
+
+        let mut headless = ProcessEntry::new(102, "worker");
+        headless.category = ProcCategory::Background;
+        headless.desktop_role = Some(classify::DesktopRoleEvidence::Background);
+
+        let mut sway_app = ProcessEntry::new(103, "firefox");
+        sway_app.exe_path = Some(std::path::PathBuf::from("/usr/lib/firefox/firefox"));
+        sway_app.category = ProcCategory::Background;
+        sway_app.desktop_role = Some(classify::DesktopRoleEvidence::Background);
+
+        let mut sway_wm = ProcessEntry::new(104, "startplasma-wayland");
+        sway_wm.exe_path = Some(std::path::PathBuf::from("/usr/bin/startplasma-wayland"));
+        sway_wm.category = ProcCategory::Background;
+        sway_wm.desktop_role = Some(classify::DesktopRoleEvidence::Background);
+
+        let mut ev_main = desktop_session::DesktopEvidence::default();
+        ev_main.uid = Some(1000);
+        ev_main.user_session = true;
+        ev_main.user_scope = Some(user_scope.clone());
+        ev_main.app_unit_group = Some(brave_scope.clone());
+        ev_main.environ_unreadable = true;
+
+        let mut ev_zygote = desktop_session::DesktopEvidence::default();
+        ev_zygote.uid = Some(1000);
+        ev_zygote.user_session = true;
+        ev_zygote.user_scope = Some(user_scope.clone());
+        ev_zygote.app_unit_group = Some(brave_svc.clone());
+        ev_zygote.environ_unreadable = true;
+
+        let mut ev_headless = desktop_session::DesktopEvidence::default();
+        ev_headless.uid = Some(1000);
+        ev_headless.user_session = true;
+        ev_headless.user_scope = Some(user_scope.clone());
+        ev_headless.app_unit_group = Some(headless_scope);
+        ev_headless.role = Some(classify::DesktopRoleEvidence::Background);
+        ev_headless.environ_unreadable = false;
+
+        let mut ev_sway_app = desktop_session::DesktopEvidence::default();
+        ev_sway_app.uid = Some(1000);
+        ev_sway_app.user_session = true;
+        ev_sway_app.user_scope = Some("/user.slice/user-1000.slice/session-2.scope".into());
+        ev_sway_app.role = Some(classify::DesktopRoleEvidence::Background);
+        ev_sway_app.session_scope_root = true;
+
+        let ev_sway_wm = ev_sway_app.clone();
+
+        let mut processes = vec![brave_main, brave_zygote, headless, sway_app, sway_wm];
+        let ctx = vec![
+            ("brave".into(), None, ev_main),
+            ("brave".into(), None, ev_zygote),
+            ("worker".into(), None, ev_headless),
+            ("firefox".into(), None, ev_sway_app),
+            ("startplasma-way".into(), None, ev_sway_wm),
+        ];
+        let graphical_uids = HashSet::from([1000]);
+        refine_linux_classification(&mut processes, &ctx, &graphical_uids, |exe| {
+            (exe == Path::new("/usr/lib/firefox/firefox")).then_some("firefox.desktop")
+        });
+        merge_child_app_groups(&mut processes);
+        mark_desktop_app_roots(&mut processes);
+
+        assert_eq!(processes[0].category, ProcCategory::App);
+        assert_eq!(processes[1].category, ProcCategory::App);
+        assert_eq!(
+            processes[0].app_group, processes[1].app_group,
+            "split child app unit with matching executable must merge into parent app group"
+        );
+        assert!(processes[0].app_root);
+        assert!(!processes[1].app_root);
+        assert_eq!(processes[2].category, ProcCategory::Background);
+        assert_eq!(processes[3].category, ProcCategory::App);
+        assert_eq!(processes[4].category, ProcCategory::Background);
+    }
+
+    #[test]
+    fn independent_konsole_instances_separated_by_shell_do_not_merge() {
+        let mut k1 = ProcessEntry::new(10, "konsole");
+        k1.category = ProcCategory::App;
+        k1.exe_path = Some(std::path::PathBuf::from("/usr/bin/konsole"));
+        k1.app_group = Some("systemd:/user/app-org.kde.konsole-10.scope".into());
+
+        let mut shell = ProcessEntry::new(11, "bash");
+        shell.ppid = Some(10);
+        shell.category = ProcCategory::App;
+        shell.exe_path = Some(std::path::PathBuf::from("/usr/bin/bash"));
+        shell.app_group = k1.app_group.clone();
+
+        let mut k2 = ProcessEntry::new(12, "konsole");
+        k2.ppid = Some(11);
+        k2.category = ProcCategory::App;
+        k2.exe_path = Some(std::path::PathBuf::from("/usr/bin/konsole"));
+        k2.app_group = Some("systemd:/user/app-org.kde.konsole-12.scope".into());
+
+        let mut processes = vec![k1, shell, k2];
+        merge_child_app_groups(&mut processes);
+        mark_desktop_app_roots(&mut processes);
+        assert_ne!(processes[0].app_group, processes[2].app_group);
+        assert!(processes[0].app_root);
+        assert!(processes[2].app_root);
+    }
+
+    #[test]
+    fn network_attribution_keeps_unreadable_processes_unknown_until_broker_confirms_access() {
+        let mut root_idle = ProcessEntry::new(200, "systemd-journald");
+        root_idle.boot_start_ticks = Some(5);
+        let mut root_active = ProcessEntry::new(201, "NetworkManager");
+        root_active.boot_start_ticks = Some(6);
+        let mut opaque = ProcessEntry::new(202, "secret-daemon");
+        opaque.boot_start_ticks = Some(7);
+
+        let mut processes = vec![root_idle, root_active, opaque];
+        let live_pids = HashSet::from([200, 201, 202]);
+        let attributable_pids = HashSet::from([200, 201]);
+        let window = HashMap::from([(201, (1000, 500))]);
+        let mut totals = HashMap::new();
+
+        apply_process_net_window(
+            &mut totals,
+            &mut processes,
+            &live_pids,
+            &attributable_pids,
+            &window,
+            1.0,
+        );
+
+        assert_eq!(processes[0].net_recv_bps, Some(0.0));
+        assert_eq!(processes[0].net_sent_bps, Some(0.0));
+        assert_eq!(processes[1].net_recv_bps, Some(1000.0));
+        assert_eq!(processes[1].net_sent_bps, Some(500.0));
+        assert_eq!(processes[2].net_recv_bps, None);
+        assert_eq!(processes[2].net_sent_bps, None);
     }
 }
