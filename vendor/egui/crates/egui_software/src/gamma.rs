@@ -129,6 +129,37 @@ impl TextGamma {
         self.from_linear[(mixed >> 4) as usize]
     }
 
+    /// Blend one channel with pre-looked-up `s_linear`, scaling enhanced glyph coverage
+    /// by straight text opacity `alpha`.
+    ///
+    /// Applying contrast to glyph coverage *before* opacity keeps solid glyph interiors
+    /// (`cov == 255`) from being boosted above `alpha` when `contrast > 0`, and matches
+    /// `egui_lcd.wgsl`'s `enhance_lcd_contrast(rgb) * in.color.a`.
+    #[inline(always)]
+    pub fn blend_channel_alpha_fast(
+        &self,
+        s_linear: u32,
+        src: u8,
+        dst: u8,
+        cov: u8,
+        alpha: u8,
+    ) -> u8 {
+        if alpha == 255 {
+            return self.blend_channel_fast(s_linear, src, dst, cov);
+        }
+        let boosted = u32::from(self.contrast_lut[cov as usize]);
+        let a = (boosted * u32::from(alpha) + 127) / 255;
+        if a == 0 {
+            return dst;
+        }
+        if a >= 255 {
+            return src;
+        }
+        let d = u32::from(self.to_linear[dst as usize]);
+        let mixed = (s_linear * a + d * (255 - a)) / 255;
+        self.from_linear[(mixed >> 4) as usize]
+    }
+
     /// Blend one channel: `src` over `dst` at coverage `cov`, gamma-corrected.
     #[inline]
     pub fn blend_channel(&self, src: u8, dst: u8, cov: u8) -> u8 {
@@ -241,5 +272,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn translucent_solid_coverage_is_not_boosted_by_contrast() {
+        let plain = TextGamma::new(1.8, 0.0);
+        let boosted = TextGamma::new(1.8, 0.5);
+        let (src, dst, alpha) = (255u8, 0x2bu8, 128u8);
+        assert_eq!(
+            boosted.blend_channel_alpha_fast(boosted.linear_u16(src), src, dst, 255, alpha),
+            plain.blend_channel_alpha_fast(plain.linear_u16(src), src, dst, 255, alpha),
+            "solid glyph interior at partial opacity must not be boosted by contrast"
+        );
+        assert!(
+            boosted.blend_channel_alpha_fast(boosted.linear_u16(src), src, dst, 128, alpha)
+                > plain.blend_channel_alpha_fast(plain.linear_u16(src), src, dst, 128, alpha),
+            "partial edge coverage at partial opacity must still receive contrast boost"
+        );
     }
 }

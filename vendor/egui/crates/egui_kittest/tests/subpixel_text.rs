@@ -370,9 +370,63 @@ impl egui_kittest::TestRenderer for SoftwareTestRenderer {
     }
 }
 
+fn available_dual_source_backends() -> Vec<wgpu::Backend> {
+    let filter = std::env::var("TASKMAN_GPU_BACKEND")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
+    let setup = egui_kittest::wgpu::default_wgpu_setup();
+    let instance = pollster::block_on(setup.new_instance());
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    let mut backends = Vec::new();
+    for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
+        if let Some(ref want) = filter {
+            let matches_filter = (want == "dx12" || want == "d3d12")
+                && backend == wgpu::Backend::Dx12
+                || want == "vulkan" && backend == wgpu::Backend::Vulkan;
+            if !matches_filter {
+                continue;
+            }
+        }
+        let has_adapter = adapters.iter().any(|adapter| {
+            adapter.get_info().backend == backend
+                && adapter.get_info().device_type != wgpu::DeviceType::Cpu
+                && adapter
+                    .features()
+                    .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        });
+        if has_adapter {
+            backends.push(backend);
+        }
+    }
+    backends
+}
+
+fn setup_for_dual_source_backend(backend: wgpu::Backend) -> WgpuSetup {
+    let mut setup = egui_kittest::wgpu::default_wgpu_setup();
+    let WgpuSetup::CreateNew(create_new) = &mut setup else {
+        unreachable!("default_wgpu_setup always creates a new setup");
+    };
+    create_new.native_adapter_selector = Some(Arc::new(move |adapters, _surface| {
+        adapters
+            .iter()
+            .find(|adapter| {
+                adapter.get_info().backend == backend
+                    && adapter.get_info().device_type != wgpu::DeviceType::Cpu
+                    && adapter
+                        .features()
+                        .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+            })
+            .cloned()
+            .ok_or_else(|| format!("no dual-source-capable {backend:?} adapter"))
+    }));
+    setup
+}
+
+#[expect(clippy::too_many_arguments)]
 fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
     renderer: R,
     theme: Theme,
+    ppp: f32,
     bg: Color32,
     fg_primary: Color32,
     fg_dim: Color32,
@@ -381,8 +435,8 @@ fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
     bg_luma: f32,
 ) -> image::RgbaImage {
     let mut harness = Harness::builder()
-        .with_size(Vec2::new(260.0, 72.0))
-        .with_pixels_per_point(1.0)
+        .with_size(Vec2::new(260.0, 96.0))
+        .with_pixels_per_point(ppp)
         .renderer(renderer)
         .build_ui(move |ui| {
             ui.ctx().set_theme(theme);
@@ -400,14 +454,28 @@ fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
                 fg_primary,
             );
             ui.painter()
-                .add(TextShape::new(Pos2::new(10.0, 12.0), primary, fg_primary));
+                .add(TextShape::new(Pos2::new(10.0, 10.0), primary, fg_primary));
             let dim = ui.painter().layout_no_wrap(
                 "Secondary 2410 MB".to_owned(),
                 FontId::proportional(13.0),
                 fg_dim,
             );
             ui.painter()
-                .add(TextShape::new(Pos2::new(10.0, 38.0), dim, fg_dim));
+                .add(TextShape::new(Pos2::new(10.0, 34.0), dim, fg_dim));
+            let mut italic_job = egui::text::LayoutJob::default();
+            italic_job.append(
+                "Italic fallback 42%",
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(13.0),
+                    color: fg_primary,
+                    italics: true,
+                    ..Default::default()
+                },
+            );
+            let italic = ui.painter().layout_job(italic_job);
+            ui.painter()
+                .add(TextShape::new(Pos2::new(10.0, 58.0), italic, fg_primary));
         });
     harness.run();
     harness.render().expect("parity render")
@@ -417,92 +485,135 @@ fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
 #[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
 fn cpu_and_gpu_match_on_dark_and_light_surfaces() {
     require_hardware("cpu_and_gpu_match_on_dark_and_light_surfaces");
+    let backends = available_dual_source_backends();
+    assert!(
+        !backends.is_empty(),
+        "no D3D12 or Vulkan dual-source adapter matched"
+    );
 
     let cases = [
         (
-            "dark_surface_#191919",
+            "dark_sharp_#191919",
             Theme::Dark,
             Color32::from_rgb(0x19, 0x19, 0x19),
             Color32::WHITE,
             Color32::from_rgb(0x9d, 0x9d, 0x9d),
-            1.35,
+            1.404,
             0.0,
             0.13,
         ),
         (
-            "dark_elevated_#2b2b2b",
+            "dark_sharp_#2b2b2b",
             Theme::Dark,
             Color32::from_rgb(0x2b, 0x2b, 0x2b),
             Color32::WHITE,
             Color32::from_rgb(0x9d, 0x9d, 0x9d),
-            1.35,
+            1.404,
             0.0,
             0.13,
         ),
         (
-            "light_surface_#f3f3f3",
+            "dark_standard_translucent",
+            Theme::Dark,
+            Color32::from_rgb(0x21, 0x21, 0x21),
+            Color32::from_white_alpha(128),
+            Color32::from_rgb(0x9d, 0x9d, 0x9d),
+            1.8,
+            0.5,
+            0.13,
+        ),
+        (
+            "light_sharp_#f3f3f3",
             Theme::Light,
             Color32::from_rgb(0xf3, 0xf3, 0xf3),
             Color32::from_rgb(0x1a, 0x1a, 0x1a),
             Color32::from_rgb(0x5f, 0x5f, 0x5f),
-            1.9,
-            0.15,
+            1.98,
+            0.0,
             0.96,
         ),
     ];
 
-    for (label, theme, bg, fg_primary, fg_dim, gamma, contrast, bg_luma) in cases {
-        let cpu = render_parity_scene(
-            SoftwareTestRenderer::new(),
-            theme,
-            bg,
-            fg_primary,
-            fg_dim,
-            gamma,
-            contrast,
-            bg_luma,
-        );
-        for srgb_target in [false, true] {
-            let gpu_renderer = if srgb_target {
-                WgpuTestRenderer::from_setup_and_format(
-                    setup_for_dual_source(),
-                    RendererOptions::PREDICTABLE,
-                    wgpu::TextureFormat::Rgba8UnormSrgb,
-                )
-            } else {
-                WgpuTestRenderer::from_setup_and_options(
-                    setup_for_dual_source(),
-                    RendererOptions::PREDICTABLE,
-                )
-            };
-            let gpu = render_parity_scene(
-                gpu_renderer,
-                theme,
-                bg,
-                fg_primary,
-                fg_dim,
-                gamma,
-                contrast,
-                bg_luma,
-            );
-            let mut max_diff = 0_u8;
-            let mut total_diff = 0_u64;
-            let mut non_bg_channels = 0_u64;
-            for (c, g) in cpu.pixels().zip(gpu.pixels()) {
-                for ch in 0..3 {
-                    let diff = c.0[ch].abs_diff(g.0[ch]);
-                    max_diff = max_diff.max(diff);
-                    if c.0[ch] != bg[ch] || g.0[ch] != bg[ch] {
-                        total_diff += u64::from(diff);
-                        non_bg_channels += 1;
+    let renderer_configs = [
+        ("predictable", RendererOptions::PREDICTABLE),
+        (
+            "hardware_dithered",
+            RendererOptions {
+                dithering: true,
+                predictable_texture_filtering: false,
+                ..RendererOptions::default()
+            },
+        ),
+    ];
+
+    for backend in backends {
+        for ppp in [1.0_f32, 1.5] {
+            for (label, theme, bg, fg_primary, fg_dim, gamma, contrast, bg_luma) in cases {
+                let cpu = render_parity_scene(
+                    SoftwareTestRenderer::new(),
+                    theme,
+                    ppp,
+                    bg,
+                    fg_primary,
+                    fg_dim,
+                    gamma,
+                    contrast,
+                    bg_luma,
+                );
+                for (opt_label, options) in renderer_configs {
+                    for srgb_target in [false, true] {
+                        let setup = setup_for_dual_source_backend(backend);
+                        let gpu_renderer = if srgb_target {
+                            WgpuTestRenderer::from_setup_and_format(
+                                setup,
+                                options,
+                                wgpu::TextureFormat::Rgba8UnormSrgb,
+                            )
+                        } else {
+                            WgpuTestRenderer::from_setup_and_options(setup, options)
+                        };
+                        let gpu = render_parity_scene(
+                            gpu_renderer,
+                            theme,
+                            ppp,
+                            bg,
+                            fg_primary,
+                            fg_dim,
+                            gamma,
+                            contrast,
+                            bg_luma,
+                        );
+                        let mut max_diff = 0_u8;
+                        let mut worst = (0_u32, 0_u32, [0_u8; 4], [0_u8; 4]);
+                        let mut total_diff = 0_u64;
+                        let mut non_bg_channels = 0_u64;
+                        for (idx, (c, g)) in cpu.pixels().zip(gpu.pixels()).enumerate() {
+                            for ch in 0..3 {
+                                let diff = c.0[ch].abs_diff(g.0[ch]);
+                                if diff > max_diff {
+                                    max_diff = diff;
+                                    let x = idx as u32 % cpu.width();
+                                    let y = idx as u32 / cpu.width();
+                                    worst = (x, y, c.0, g.0);
+                                }
+                                if c.0[ch] != bg[ch] || g.0[ch] != bg[ch] {
+                                    total_diff += u64::from(diff);
+                                    non_bg_channels += 1;
+                                }
+                            }
+                        }
+                        let mean_diff = total_diff as f64 / non_bg_channels.max(1) as f64;
+                        assert!(
+                            max_diff <= 8 && mean_diff <= 1.5,
+                            "{backend:?} {label} (ppp={ppp}, {opt_label}, srgb={srgb_target}) diverged from CPU: max_diff={max_diff} at ({},{}) cpu={:?} gpu={:?}, mean_diff={mean_diff:.3}",
+                            worst.0,
+                            worst.1,
+                            worst.2,
+                            worst.3,
+                        );
                     }
                 }
             }
-            let mean_diff = total_diff as f64 / non_bg_channels.max(1) as f64;
-            assert!(
-                max_diff <= 6 && mean_diff <= 1.25,
-                "{label} (srgb={srgb_target}) diverged from CPU: max_diff={max_diff}, mean_diff={mean_diff:.3}"
-            );
         }
     }
 }

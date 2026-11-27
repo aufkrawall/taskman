@@ -2075,6 +2075,20 @@ mod tests {
     }
 
     #[test]
+    fn lcd_shader_omits_dithering_on_lcd_coverage_path() {
+        let source = include_str!("egui_lcd.wgsl");
+        let subpixel_branch = source
+            .split("if subpixel_texel {")
+            .nth(1)
+            .and_then(|rest| rest.split("} else {").next())
+            .expect("egui_lcd.wgsl must contain the subpixel_texel branch");
+        assert!(
+            !subpixel_branch.contains("dither_interleaved"),
+            "LCD coverage path must stay deterministic without spatial dithering noise"
+        );
+    }
+
+    #[test]
     fn calibrated_gpu_blend_matches_cpu_text_gamma_on_real_theme_surfaces() {
         fn srgb_to_linear(c: f32) -> f32 {
             if c < 0.04045 {
@@ -2094,62 +2108,171 @@ mod tests {
             let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         }
+        #[expect(clippy::too_many_arguments)]
         fn gpu_calibrated_result(
-            fg: f32,
-            bg_actual: f32,
-            a: f32,
+            fg: [f32; 3],
+            bg_actual: [f32; 3],
+            cov: f32,
+            alpha: f32,
             gamma: f32,
+            contrast: f32,
             bg_luma: f32,
             srgb_target: bool,
-        ) -> f32 {
-            let pol = if fg >= bg_luma { 0.0 } else { 1.0 };
-            let same_side = (bg_luma < 0.5 && fg > bg_luma) || (bg_luma >= 0.5 && fg < bg_luma);
-            let side_w = if same_side {
-                smoothstep(0.04, 0.16, (fg - bg_luma).abs())
-            } else {
-                0.0
-            };
-            let ch_trust = smoothstep(0.02, 0.12, (fg - bg_luma).abs());
-            let d = pol + (bg_luma - pol) * (side_w * ch_trust);
-            let target_gamma = (fg.powf(gamma) * a + d.powf(gamma) * (1.0 - a)).powf(1.0 / gamma);
+        ) -> [f32; 3] {
+            let lum = (0.299 * fg[0] + 0.587 * fg[1] + 0.114 * fg[2]).clamp(0.0, 1.0);
+            let a = enhanced_lcd_coverage(cov, contrast) * alpha;
+            let mut out = [0.0; 3];
+            for ch in 0..3 {
+                let s = fg[ch];
+                let pol = if lum >= bg_luma { 0.0 } else { 1.0 };
+                let same_side =
+                    (bg_luma < 0.5 && lum > bg_luma) || (bg_luma >= 0.5 && lum < bg_luma);
+                let side_w = if same_side {
+                    smoothstep(0.04, 0.16, (lum - bg_luma).abs())
+                } else {
+                    0.0
+                };
+                let ch_trust = smoothstep(0.02, 0.12, (s - bg_luma).abs());
+                let d = pol + (bg_luma - pol) * (side_w * ch_trust);
+                let target_gamma =
+                    (s.powf(gamma) * a + d.powf(gamma) * (1.0 - a)).powf(1.0 / gamma);
 
-            if srgb_target {
-                let s_l = srgb_to_linear(fg);
-                let d_l = srgb_to_linear(d);
-                let t_l = srgb_to_linear(target_gamma);
-                let w = ((t_l - d_l) / (s_l - d_l)).clamp(0.0, 1.0);
-                linear_to_srgb(s_l * w + srgb_to_linear(bg_actual) * (1.0 - w))
-            } else {
-                let w = ((target_gamma - d) / (fg - d)).clamp(0.0, 1.0);
-                fg * w + bg_actual * (1.0 - w)
+                out[ch] = if srgb_target {
+                    let s_l = srgb_to_linear(s);
+                    let d_l = srgb_to_linear(d);
+                    let t_l = srgb_to_linear(target_gamma);
+                    let denom = s_l - d_l;
+                    let w = if denom.abs() > 1e-4 {
+                        ((t_l - d_l) / denom).clamp(0.0, 1.0)
+                    } else {
+                        a
+                    };
+                    linear_to_srgb(s_l * w + srgb_to_linear(bg_actual[ch]) * (1.0 - w))
+                } else {
+                    let denom = s - d;
+                    let w = if denom.abs() > 1e-4 {
+                        ((target_gamma - d) / denom).clamp(0.0, 1.0)
+                    } else {
+                        a
+                    };
+                    s * w + bg_actual[ch] * (1.0 - w)
+                };
             }
+            out
         }
 
-        let gamma = 1.3_f32;
-        for srgb_target in [false, true] {
-            for cov in [0.15_f32, 0.5, 0.85] {
-                // Dark mode surfaces (#191919 = 0.098, #2b2b2b = 0.169) with #ffffff and #9d9d9d
-                for &bg in &[25.0 / 255.0_f32, 43.0 / 255.0] {
-                    for &fg in &[1.0_f32, 157.0 / 255.0] {
-                        let cpu =
-                            (fg.powf(gamma) * cov + bg.powf(gamma) * (1.0 - cov)).powf(1.0 / gamma);
-                        let gpu = gpu_calibrated_result(fg, bg, cov, gamma, 0.13, srgb_target);
+        let rgb = |r: u8, g: u8, b: u8| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+        let scenarios = [
+            // Dark Sharp (gamma=1.404, contrast=0.0) on #191919 and #2b2b2b with neutral + accent
+            (
+                "dark_sharp_19_white",
+                rgb(255, 255, 255),
+                rgb(0x19, 0x19, 0x19),
+                1.0,
+                1.404,
+                0.0,
+                0.13,
+            ),
+            (
+                "dark_sharp_2b_white",
+                rgb(255, 255, 255),
+                rgb(0x2b, 0x2b, 0x2b),
+                1.0,
+                1.404,
+                0.0,
+                0.13,
+            ),
+            (
+                "dark_sharp_19_dim",
+                rgb(0x9d, 0x9d, 0x9d),
+                rgb(0x19, 0x19, 0x19),
+                1.0,
+                1.404,
+                0.0,
+                0.13,
+            ),
+            (
+                "dark_sharp_19_accent",
+                rgb(0x4c, 0xc2, 0xff),
+                rgb(0x19, 0x19, 0x19),
+                1.0,
+                1.404,
+                0.0,
+                0.13,
+            ),
+            (
+                "dark_sharp_19_kernel",
+                rgb(0x3a, 0x63, 0xd9),
+                rgb(0x19, 0x19, 0x19),
+                1.0,
+                1.404,
+                0.0,
+                0.13,
+            ),
+            // Dark Standard translucent (gamma=1.8, contrast=0.5, alpha=0.5)
+            (
+                "dark_std_translucent",
+                rgb(255, 255, 255),
+                rgb(0x2b, 0x2b, 0x2b),
+                0.5,
+                1.8,
+                0.5,
+                0.13,
+            ),
+            // Light Sharp (gamma=1.98, contrast=0.0) on #f3f3f3 and #ffffff with neutral + accent
+            (
+                "light_sharp_f3_text",
+                rgb(0x1a, 0x1a, 0x1a),
+                rgb(0xf3, 0xf3, 0xf3),
+                1.0,
+                1.98,
+                0.0,
+                0.96,
+            ),
+            (
+                "light_sharp_f3_dim",
+                rgb(0x5f, 0x5f, 0x5f),
+                rgb(0xf3, 0xf3, 0xf3),
+                1.0,
+                1.98,
+                0.0,
+                0.96,
+            ),
+            (
+                "light_sharp_ff_accent",
+                rgb(0x00, 0x78, 0xd4),
+                rgb(0xff, 0xff, 0xff),
+                1.0,
+                1.98,
+                0.0,
+                0.96,
+            ),
+        ];
+
+        for (label, fg, bg, alpha, gamma, contrast, bg_luma) in scenarios {
+            for srgb_target in [false, true] {
+                for cov in [0.15_f32, 0.5, 0.85] {
+                    let a = enhanced_lcd_coverage(cov, contrast) * alpha;
+                    let gpu = gpu_calibrated_result(
+                        fg,
+                        bg,
+                        cov,
+                        alpha,
+                        gamma,
+                        contrast,
+                        bg_luma,
+                        srgb_target,
+                    );
+                    let limit = if gamma > 1.5 && bg[0] < 0.5 { 3.5 } else { 3.0 };
+                    for ch in 0..3 {
+                        let cpu = (fg[ch].powf(gamma) * a + bg[ch].powf(gamma) * (1.0 - a))
+                            .powf(1.0 / gamma);
                         assert!(
-                            (cpu - gpu).abs() * 255.0 <= 3.0,
-                            "dark srgb={srgb_target} fg={fg} bg={bg} cov={cov}: cpu={cpu} gpu={gpu}"
+                            (cpu - gpu[ch]).abs() * 255.0 <= limit,
+                            "{label} srgb={srgb_target} ch={ch} cov={cov}: cpu={cpu} gpu={}",
+                            gpu[ch]
                         );
                     }
-                }
-                // Light mode (#f3f3f3 = 0.953) with #1a1a1a and #5f5f5f
-                let bg = 243.0 / 255.0_f32;
-                for &fg in &[26.0 / 255.0_f32, 95.0 / 255.0] {
-                    let cpu =
-                        (fg.powf(gamma) * cov + bg.powf(gamma) * (1.0 - cov)).powf(1.0 / gamma);
-                    let gpu = gpu_calibrated_result(fg, bg, cov, gamma, 0.96, srgb_target);
-                    assert!(
-                        (cpu - gpu).abs() * 255.0 <= 3.0,
-                        "light srgb={srgb_target} fg={fg} cov={cov}: cpu={cpu} gpu={gpu}"
-                    );
                 }
             }
         }

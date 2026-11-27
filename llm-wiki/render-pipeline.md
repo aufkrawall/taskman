@@ -352,7 +352,8 @@ per-channel coverage at location 0 / source 1. The pipeline blends `ONE` against
 `ONE_MINUS_SRC1`, so RGB each use their own coverage. BGR is a blend-time channel swap;
 the atlas remains RGB-filtered. The 32-byte `Locals` uniform carries the active order,
 `TextOptions::text_contrast`, `TextOptions::text_gamma`, and `TextOptions::text_background_luma`.
-Dithering runs only on covered pixels (`coverage > 0` / `alpha > 0`), never into transparent glyph padding.
+LCD sub-pixel edges skip dithering so `Unorm`, `sRGB`, and CPU output stay deterministic without
+edge sparkle; ordinary non-LCD geometry in the same mesh keeps covered-only dithering.
 
 **GPU gamma handling:** fixed-function dual-source blending cannot read the destination pixel,
 so the shader solves for the fixed-function blend weight that lands on the software renderer's
@@ -361,30 +362,39 @@ so the shader solves for the fixed-function blend weight that lands on the softw
 that calibrated surface luminance instead of `0`/`1` endpoints, and on sRGB framebuffers
 (`fs_lcd_linear_framebuffer`) the target is converted to linear sRGB before solving linear
 blend weights (`subpixel_bg_luma < 0` falls back to foreground-luminance compensation). This
-brings CPU (`egui_software`), D3D12, and Vulkan (`egui-wgpu`) within ~1 LSB mean difference on
-both primary (`#ffffff`/`#1a1a1a`) and dim (`#9d9d9d`/`#5f5f5f`) text on `#191919`, `#2b2b2b`,
-and `#f3f3f3` surfaces. In `epaint`, `Font::glyph_info` upgrades `SmoothMode::Normal` to
-`SmoothMode::Lcd` whenever `subpixel != Off`.
+brings CPU (`egui_software`), D3D12, and Vulkan (`egui-wgpu`) within ~1–2 LSB on primary and dim
+text across `#191919`, `#2b2b2b`, `#f3f3f3`, and `#ffffff` surfaces (high-contrast colored
+backgrounds like `heat_high` cells or Light accent buttons still diverge slightly because
+fixed-function blending cannot read `dst`). Both CPU (`egui_software`) and GPU (`egui_lcd.wgsl`)
+apply enhanced contrast to glyph coverage *before* scaling by straight text opacity `alpha`, and
+both apply `TextGamma` to transformed/italic/off-grid LCD grayscale fallbacks. In `epaint`,
+`FontFace::allocate_glyph` upgrades `SmoothMode::Normal` to `SmoothMode::Lcd` whenever
+`subpixel != Off` (leaving `SmoothMode::Light` untouched).
 
 ## Text weight, and what `TextSmoothing` now means
 
 `DirectWrite`'s gamma and contrast describe *DirectWrite's* curve. Fed unchanged into this
 one they lift a half-covered pixel from 128 to 178 on a dark UI, which reads as fat and
 glowing next to native Windows text -- Windows errs thin. Under sub-pixel rendering, `Sharp`
-pairs `LcdFilter::LIGHT` (`[0, 85, 86, 85, 0]`, avoiding `FREETYPE_DEFAULT`'s `8/255` outer
-neighbor bleed around 1 px stems at 100% scaling) when the platform filter is `Default`, while
-tuning blend weight for both 100% and 150% displays:
+pairs `LcdFilter::LIGHT` (`[0, 85, 86, 85, 0]`, omitting `FREETYPE_DEFAULT`'s `±2` outer
+sub-pixel taps when the platform did not specify a filter, e.g. Windows; explicit Linux
+Fontconfig `lcdfilter: default` stays `FREETYPE_DEFAULT`) with `contrast = 0.0` and tuned blend
+weight for both 100% and 150% displays. When sub-pixel rendering is unavailable (`SubpixelMode::Off`
+— Linux `rgba=none`, RDP, portrait displays, or non-dual-source GPUs), `theme::grayscale_transfer`
+applies polarity-calibrated gamma curves instead of raw linear sRGB coverage (`Off`), preventing
+thin/stepped dark-mode text and fat light-mode text:
 
-| profile | grid-fit | binning | default LCD filter | blend (Dark) | blend (Light) |
+| profile | grid-fit | binning | platform-default LCD filter | LCD blend (Dark / Light) | grayscale transfer (Dark / Light) |
 | --- | --- | --- | --- | --- | --- |
-| `Sharp` | yes | no | `LIGHT` | `gamma * 0.78`, `contrast = 0.0` | `gamma * 1.10`, `contrast = 0.0` |
-| `Standard` | no (follows Linux Fontconfig `hintstyle`) | no | `FREETYPE_DEFAULT` | the display's own parameters | the display's own parameters |
-| `Smooth` | no | yes | `FREETYPE_DEFAULT` | the display's own parameters | the display's own parameters |
+| `Sharp` | full on Windows/default; respects Linux Fontconfig `hintslight`/`hintmedium`/`hintnone` | no | `LIGHT` (explicit Fontconfig `default` stays `FREETYPE_DEFAULT`) | `gamma * 0.78`, `0.0` / `gamma * 1.10`, `0.0` | `Gamma(0.80)` / `Gamma(1.50)` |
+| `Standard` | follows Linux Fontconfig `hintstyle` | no | `FREETYPE_DEFAULT` | display params | `Gamma(0.65)` / `Gamma(1.30)` |
+| `Smooth` | default (`preserve_linear_metrics`) | yes | `FREETYPE_DEFAULT` | display params | `Gamma(0.65)` / `Gamma(1.30)` |
 
-`theme::cleartype_weight` and `theme::lcd_filter` are the single definitions, shared with the
-comparison harness (which pins thinner `Sharp` ink in both Dark and Light modes at both `1.0`
-and `1.5` `ppp`). Both the software renderer and the WGPU LCD shader consume gamma, contrast,
-and `text_background_luma` from `TextOptions`.
+`theme::cleartype_weight`, `theme::lcd_filter`, and `theme::grayscale_transfer` are the single
+definitions, shared with the comparison harness (which pins thinner `Sharp` ink in both Dark and
+Light modes at both `1.0` and `1.5` `ppp` under both LCD and grayscale). Both the software
+renderer and the WGPU LCD shader consume gamma, contrast, and `text_background_luma` from
+`TextOptions`.
 
 `100%` (`ppp = 1.0`, 13 px) is especially sensitive to outer neighbor taps (`8/255` boosted by
 non-linear gamma to `~45-70/255`) and non-zero `contrast`, which previously left `Sharp` ~11.6%

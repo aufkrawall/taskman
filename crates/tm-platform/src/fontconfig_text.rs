@@ -161,10 +161,11 @@ fn params_from_output(text: &str) -> Params {
 
     params.lcd_filter = match properties.lcdfilter {
         Some(0) => LcdFilterChoice::None,
+        Some(1) => LcdFilterChoice::Default,
         Some(2) => LcdFilterChoice::Light,
         Some(3) => LcdFilterChoice::Legacy,
-        // Fontconfig's default and unknown future values use FreeType's default filter.
-        _ => LcdFilterChoice::Default,
+        // Omitted or unknown values leave the choice to the smoothing profile.
+        _ => LcdFilterChoice::PlatformDefault,
     };
     params
 }
@@ -598,7 +599,13 @@ mod tests {
         assert_eq!(filter("1"), LcdFilterChoice::Default);
         assert_eq!(filter("2"), LcdFilterChoice::Light);
         assert_eq!(filter("3"), LcdFilterChoice::Legacy);
-        assert_eq!(filter("future"), LcdFilterChoice::Default);
+        assert_eq!(filter("future"), LcdFilterChoice::PlatformDefault);
+        let omitted = params_from_output(
+            "\tantialias: True(w)\n\
+             \trgba: 1(i)(w)\n",
+        )
+        .lcd_filter;
+        assert_eq!(omitted, LcdFilterChoice::PlatformDefault);
     }
 
     #[test]

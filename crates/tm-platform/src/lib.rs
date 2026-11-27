@@ -388,8 +388,12 @@ pub mod text_rendering {
     /// depend on epaint. `tm-ui` maps it to the fork's concrete filter tables.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub enum LcdFilterChoice {
-        /// FreeType's default LCD filter.
+        /// Platform did not specify an explicit LCD filter (Windows, macOS, or Linux
+        /// Fontconfig without an explicit `lcdfilter` setting). Allows smoothing profiles
+        /// like `Sharp` to choose the best filter table for the profile.
         #[default]
+        PlatformDefault,
+        /// Explicit Fontconfig `lcdfilter: default` (FreeType's 5-tap default filter).
         Default,
         /// FreeType's light LCD filter.
         Light,
@@ -434,7 +438,7 @@ pub mod text_rendering {
                 gamma: 1.8,
                 contrast: 0.5,
                 cleartype_level: 1.0,
-                lcd_filter: LcdFilterChoice::Default,
+                lcd_filter: LcdFilterChoice::PlatformDefault,
                 hint_style: HintStyleChoice::Default,
             }
         }
@@ -494,7 +498,7 @@ pub mod text_rendering {
             gamma: p.gamma,
             contrast: p.contrast,
             cleartype_level: p.cleartype_level,
-            lcd_filter: LcdFilterChoice::Default,
+            lcd_filter: LcdFilterChoice::PlatformDefault,
             hint_style: HintStyleChoice::Default,
         }
     }

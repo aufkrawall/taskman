@@ -255,8 +255,9 @@ fn blit_rect(
                 }
             }
         } else {
-            // Translucent sub-pixel text.
-            let scale = |cov: u8| ((u32::from(cov) * u32::from(ca) + 127) / 255) as u8;
+            // Translucent sub-pixel text: apply enhanced contrast to glyph coverage first,
+            // then scale by straight text opacity `ca` so solid interiors stay at `ca` and
+            // CPU matches `egui_lcd.wgsl`.
             for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
                 if !epaint::text::subpixel::is_lcd_texel(texel) {
                     if let Some(pixel) = ordinary_texel(texel, *dst) {
@@ -272,11 +273,13 @@ fn blit_rect(
                 let db = (d & 0xff) as u8;
                 let r = blend
                     .gamma
-                    .blend_channel_fast(s_lin_r, sr, dr, scale(cov_r));
-                let g = blend.gamma.blend_channel_fast(s_lin_g, sg, dg, scale(tg));
+                    .blend_channel_alpha_fast(s_lin_r, sr, dr, cov_r, ca);
+                let g = blend
+                    .gamma
+                    .blend_channel_alpha_fast(s_lin_g, sg, dg, tg, ca);
                 let b = blend
                     .gamma
-                    .blend_channel_fast(s_lin_b, sb, db, scale(cov_b));
+                    .blend_channel_alpha_fast(s_lin_b, sb, db, cov_b, ca);
                 *dst = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
             }
         }
@@ -574,6 +577,38 @@ mod tests {
         let (r, g, b) = ((half >> 16) & 0xff, (half >> 8) & 0xff, half & 0xff);
         assert_eq!(r, g, "fading must not tint");
         assert_eq!(g, b, "fading must not tint");
+
+        // Solid coverage at half opacity must not be boosted by enhanced contrast.
+        let render_with_contrast = |contrast| {
+            let gamma = TextGamma::new(1.8, contrast);
+            let mut buf = vec![0x002b2b2b; 4];
+            let mut target = Target::new(&mut buf, 2, 2).unwrap();
+            let q = quad(
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                0.0,
+                0.0,
+                Color32::from_rgba_premultiplied(128, 128, 128, 128),
+            );
+            blit_quad(
+                &mut target,
+                full_clip(2, 2),
+                &q,
+                &atlas,
+                TextBlend {
+                    subpixel: SubpixelMode::Rgb,
+                    gamma: &gamma,
+                },
+            );
+            buf[0]
+        };
+        assert_eq!(
+            render_with_contrast(0.5),
+            render_with_contrast(0.0),
+            "solid interior of translucent LCD text must not change with contrast"
+        );
     }
 
     #[test]

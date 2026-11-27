@@ -12,6 +12,16 @@ pub struct Texture {
     pub options: TextureOptions,
 }
 
+/// Sample result from a managed font atlas when LCD sub-pixel mode is active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LcdAtlasSample {
+    /// Bilinearly filtered mean coverage from zero-alpha LCD texels (`0..=255`).
+    /// Blended through `TextGamma` to match upright LCD text and `egui_lcd.wgsl`.
+    LcdCoverage(u8),
+    /// Ordinary premultiplied texel (color glyph, grayscale glyph, `WHITE_UV`, or empty).
+    Ordinary(Color32),
+}
+
 impl Texture {
     /// Sample with the semantics of an OpenGL sampler configured the way `egui_glow`
     /// configures it.
@@ -30,8 +40,55 @@ impl Texture {
     /// Its triangles still sample the font atlas, so converting the LCD texels before
     /// filtering prevents tinted fringes while preserving a premultiplied grayscale blend.
     /// Non-LCD texels (including premultiplied colour glyphs) pass through unchanged.
+    #[cfg(test)]
     pub(crate) fn sample_gray_lcd(&self, u: f32, v: f32) -> Color32 {
         self.sample_impl(u, v, true)
+    }
+
+    /// Sample a font atlas for transformed/fallback LCD text, preserving whether the
+    /// sample came purely from LCD coverage texels so the rasterizer can apply `TextGamma`
+    /// and contrast (matching `egui_lcd.wgsl`'s off-grid fallback) without affecting
+    /// premultiplied color glyphs or `WHITE_UV` geometry in the same atlas.
+    pub(crate) fn sample_lcd_or_ordinary(&self, u: f32, v: f32) -> LcdAtlasSample {
+        if self.width == 0 || self.height == 0 {
+            return LcdAtlasSample::Ordinary(Color32::TRANSPARENT);
+        }
+        if self.options.magnification == TextureFilter::Linear {
+            let x = u * self.width as f32 - 0.5;
+            let y = v * self.height as f32 - 0.5;
+            let x0 = floor_exact(x);
+            let y0 = floor_exact(y);
+            let fx = x - x0;
+            let fy = y - y0;
+            let (x0, y0) = (x0 as i64, y0 as i64);
+
+            let raw = self.fetch_2x2_raw(x0, y0);
+            let any_lcd = raw
+                .iter()
+                .any(|&texel| epaint::text::subpixel::is_lcd_texel(texel));
+            if !any_lcd {
+                return LcdAtlasSample::Ordinary(bilerp_rgba(raw, fx, fy));
+            }
+            let any_non_lcd = raw.iter().any(|&texel| texel.a() != 0);
+            if !any_non_lcd {
+                let gray = raw.map(lcd_mean_coverage);
+                let top = gray[0] as f32 + (gray[1] as f32 - gray[0] as f32) * fx;
+                let bottom = gray[2] as f32 + (gray[3] as f32 - gray[2] as f32) * fx;
+                let cov = crate::raster::round_to_u8(top + (bottom - top) * fy) as u8;
+                return LcdAtlasSample::LcdCoverage(cov);
+            }
+            let converted = raw.map(gray_lcd_texel);
+            LcdAtlasSample::Ordinary(bilerp_rgba(converted, fx, fy))
+        } else {
+            let x = (u * self.width as f32).floor();
+            let y = (v * self.height as f32).floor();
+            let raw = self.texel_wrapped(x as i64, y as i64, false);
+            if epaint::text::subpixel::is_lcd_texel(raw) {
+                LcdAtlasSample::LcdCoverage(lcd_mean_coverage(raw))
+            } else {
+                LcdAtlasSample::Ordinary(raw)
+            }
+        }
     }
 
     fn sample_impl(&self, u: f32, v: f32, gray_lcd: bool) -> Color32 {
@@ -48,6 +105,23 @@ impl Texture {
         }
     }
 
+    fn fetch_2x2_raw(&self, x0: i64, y0: i64) -> [Color32; 4] {
+        let (w, h) = (self.width as i64, self.height as i64);
+        if x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h {
+            let top = (y0 * w + x0) as usize;
+            let bottom = top + self.width;
+            let fetch = |i: usize| self.pixels.get(i).copied().unwrap_or(Color32::TRANSPARENT);
+            [fetch(top), fetch(top + 1), fetch(bottom), fetch(bottom + 1)]
+        } else {
+            [
+                self.texel_wrapped(x0, y0, false),
+                self.texel_wrapped(x0 + 1, y0, false),
+                self.texel_wrapped(x0, y0 + 1, false),
+                self.texel_wrapped(x0 + 1, y0 + 1, false),
+            ]
+        }
+    }
+
     fn bilinear(&self, u: f32, v: f32, gray_lcd: bool) -> Color32 {
         // Texel centres sit at (i + 0.5) / size, so the continuous coordinate of texel i
         // is `uv * size - 0.5`. Getting this half-texel shift wrong is the classic cause
@@ -60,40 +134,13 @@ impl Texture {
         let fy = y - y0;
         let (x0, y0) = (x0 as i64, y0 as i64);
 
-        let (w, h) = (self.width as i64, self.height as i64);
-        let [c00, c10, c01, c11] = if x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h {
-            // The whole 2x2 footprint is inside the texture, where every wrap mode is
-            // the identity: read the four texels directly instead of wrapping each
-            // coordinate of each one. That is every sample of an image drawn inside its
-            // own bounds -- the row icons, scaled down from 48 px, on every frame.
-            let top = (y0 * w + x0) as usize;
-            let bottom = top + self.width;
-            let fetch = |i: usize| {
-                let texel = self.pixels.get(i).copied().unwrap_or(Color32::TRANSPARENT);
-                if gray_lcd {
-                    gray_lcd_texel(texel)
-                } else {
-                    texel
-                }
-            };
-            [fetch(top), fetch(top + 1), fetch(bottom), fetch(bottom + 1)]
+        let raw = self.fetch_2x2_raw(x0, y0);
+        let samples = if gray_lcd {
+            raw.map(gray_lcd_texel)
         } else {
-            [
-                self.texel_wrapped(x0, y0, gray_lcd),
-                self.texel_wrapped(x0 + 1, y0, gray_lcd),
-                self.texel_wrapped(x0, y0 + 1, gray_lcd),
-                self.texel_wrapped(x0 + 1, y0 + 1, gray_lcd),
-            ]
+            raw
         };
-
-        let lerp = |a: u8, b: u8, t: f32| a as f32 + (b as f32 - a as f32) * t;
-        let mut out = [0u8; 4];
-        for (i, o) in out.iter_mut().enumerate() {
-            let top = lerp(c00[i], c10[i], fx);
-            let bottom = lerp(c01[i], c11[i], fx);
-            *o = crate::raster::round_to_u8(top + (bottom - top) * fy) as u8;
-        }
-        Color32::from_rgba_premultiplied(out[0], out[1], out[2], out[3])
+        bilerp_rgba(samples, fx, fy)
     }
 
     /// Fetch a texel, applying the texture's wrap mode to out-of-range coordinates.
@@ -130,12 +177,29 @@ fn floor_exact(x: f32) -> f32 {
     }
 }
 
+#[inline]
+fn bilerp_rgba([c00, c10, c01, c11]: [Color32; 4], fx: f32, fy: f32) -> Color32 {
+    let lerp = |a: u8, b: u8, t: f32| a as f32 + (b as f32 - a as f32) * t;
+    let mut out = [0u8; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        let top = lerp(c00[i], c10[i], fx);
+        let bottom = lerp(c01[i], c11[i], fx);
+        *o = crate::raster::round_to_u8(top + (bottom - top) * fy) as u8;
+    }
+    Color32::from_rgba_premultiplied(out[0], out[1], out[2], out[3])
+}
+
+#[inline]
+fn lcd_mean_coverage(texel: Color32) -> u8 {
+    let [r, g, b, _] = texel.to_array();
+    ((u32::from(r) + u32::from(g) + u32::from(b) + 1) / 3) as u8
+}
+
 fn gray_lcd_texel(texel: Color32) -> Color32 {
     if !epaint::text::subpixel::is_lcd_texel(texel) {
         return texel;
     }
-    let [r, g, b, _] = texel.to_array();
-    let gray = ((u32::from(r) + u32::from(g) + u32::from(b) + 1) / 3) as u8;
+    let gray = lcd_mean_coverage(texel);
     Color32::from_rgba_premultiplied(gray, gray, gray, gray)
 }
 

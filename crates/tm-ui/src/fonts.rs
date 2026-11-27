@@ -91,11 +91,25 @@ pub fn reapply(ctx: &egui::Context) {
 /// this changes sharpness, not layout.
 fn hinting_target(smoothing: TextSmoothing, hint_style: HintStyleChoice) -> HintingTarget {
     match smoothing {
-        TextSmoothing::Sharp => HintingTarget::Smooth(SmoothHinting {
-            light: false,
-            symmetric_rendering: false,
-            preserve_linear_metrics: false,
-        }),
+        TextSmoothing::Sharp => match hint_style {
+            // Respect Linux Fontconfig `hintslight` / `hintmedium` so modern Linux UI faces
+            // (Noto Sans, Inter, Cantarell, Adwaita Sans) keep clean horizontal proportions
+            // and spacing while still using Sharp's lean blend weights. Windows/macOS report
+            // `Default` and keep full horizontal+vertical grid-fitting.
+            HintStyleChoice::Slight => HintingTarget::Smooth(SmoothHinting {
+                light: true,
+                symmetric_rendering: true,
+                preserve_linear_metrics: true,
+            }),
+            HintStyleChoice::Medium => HintingTarget::default(),
+            HintStyleChoice::Default | HintStyleChoice::Full | HintStyleChoice::None => {
+                HintingTarget::Smooth(SmoothHinting {
+                    light: false,
+                    symmetric_rendering: false,
+                    preserve_linear_metrics: false,
+                })
+            }
+        },
         TextSmoothing::Standard => match hint_style {
             HintStyleChoice::Slight => HintingTarget::Smooth(SmoothHinting {
                 light: true,
@@ -722,30 +736,42 @@ mod tests {
     }
 
     #[test]
-    fn fontconfig_hintstyle_maps_cleanly_under_standard_smoothing() {
+    fn fontconfig_hintstyle_maps_cleanly_across_profiles() {
+        let light = HintingTarget::Smooth(SmoothHinting {
+            light: true,
+            symmetric_rendering: true,
+            preserve_linear_metrics: true,
+        });
+        let full = HintingTarget::Smooth(SmoothHinting {
+            light: false,
+            symmetric_rendering: false,
+            preserve_linear_metrics: false,
+        });
         assert_eq!(
             hinting_target(TextSmoothing::Standard, HintStyleChoice::Slight),
-            HintingTarget::Smooth(SmoothHinting {
-                light: true,
-                symmetric_rendering: true,
-                preserve_linear_metrics: true,
-            })
+            light
         );
         assert_eq!(
             hinting_target(TextSmoothing::Standard, HintStyleChoice::Full),
-            HintingTarget::Smooth(SmoothHinting {
-                light: false,
-                symmetric_rendering: false,
-                preserve_linear_metrics: false,
-            })
+            full
+        );
+        // Windows / platform-unspecified `Sharp` keeps full horizontal+vertical grid-fitting.
+        assert_eq!(
+            hinting_target(TextSmoothing::Sharp, HintStyleChoice::Default),
+            full
         );
         assert_eq!(
+            hinting_target(TextSmoothing::Sharp, HintStyleChoice::Full),
+            full
+        );
+        // Linux Fontconfig `hintslight` / `hintmedium` are respected under `Sharp` too.
+        assert_eq!(
             hinting_target(TextSmoothing::Sharp, HintStyleChoice::Slight),
-            HintingTarget::Smooth(SmoothHinting {
-                light: false,
-                symmetric_rendering: false,
-                preserve_linear_metrics: false,
-            })
+            light
+        );
+        assert_eq!(
+            hinting_target(TextSmoothing::Sharp, HintStyleChoice::Medium),
+            HintingTarget::default()
         );
     }
 }

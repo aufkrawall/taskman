@@ -422,31 +422,22 @@ pub fn install_visuals(ctx: &egui::Context) {
 /// byte-identical grayscale path, so the renderer interlock above still decides whether
 /// LCD rasterization is valid at all.
 ///
-/// For grayscale text:
-/// * `font_hinting` stays on: stems snap toward the pixel grid, like
-///   ClearType's hinted rendering.
+/// For grayscale text (`SubpixelMode::Off`, e.g. RDP, portrait monitors, mixed-monitor
+/// straddle, non-dual-source GPUs, or Linux desktops with `rgba=none`):
+/// * `font_hinting` stays on unless Linux Fontconfig explicitly disables hinting.
 /// * Glyph positions snap to physical pixels (`TessellationOptions`
 ///   `round_text_to_pixels`, default-on).
-/// * `subpixel_binning` caches each glyph at four fractional x-offsets which
-///   are then bilinearly sampled — more even spacing, softer stems. Only
+/// * `subpixel_binning` caches each glyph at four fractional x-offsets rasterized from
+///   shifted vector outlines and blitted 1:1 — more even spacing, softer stems. Only
 ///   [`TextSmoothing::Smooth`] asks for it.
-/// * The coverage→alpha ramp decides stroke WEIGHT. egui's dark-mode default
-///   `2c − c²` lifts every partially covered pixel (0.5 → 0.75), which reads
-///   as fat and blurry next to native Windows text;
-///   [`TextSmoothing::Sharp`] uses raw coverage instead.
+/// * The coverage→alpha gamma curve (`grayscale_transfer`) matches our calibrated ClearType
+///   polarity: Dark uses `< 1.0` (`0.80` Sharp / `0.65` Standard, avoiding both thin/stepped
+///   linear coverage and `2c - c²` bloat) while Light uses `> 1.0` (`1.50` Sharp / `1.30`
+///   Standard, preventing fat linear dark-on-light stems).
 fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
-    use egui::epaint::FontColorTransferFunction as Ramp;
     let smoothing = env_smoothing().unwrap_or_else(text_smoothing);
-    let per_theme = match theme {
-        egui::Theme::Dark => Ramp::DARK_MODE_DEFAULT,
-        egui::Theme::Light => Ramp::LIGHT_MODE_DEFAULT,
-    };
-    let (ramp, binning) = match smoothing {
-        TextSmoothing::Sharp => (Ramp::Off, false),
-        TextSmoothing::Standard => (per_theme, false),
-        TextSmoothing::Smooth => (per_theme, true),
-    };
-    opts.color_transfer_function = ramp;
+    let binning = matches!(smoothing, TextSmoothing::Smooth);
+    opts.color_transfer_function = grayscale_transfer(smoothing, theme);
     opts.subpixel_binning = binning;
 
     // Sub-pixel (ClearType) coverage. Orthogonal to the grayscale weight above: it
@@ -460,9 +451,10 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
         opts.lcd_filter = lcd_filter(smoothing, params.lcd_filter);
 
         // Under sub-pixel rendering the smoothing profile becomes a WEIGHT and filter
-        // control: `Sharp` pairs `LcdFilter::LIGHT` (no outer-pixel bleed around 1px stems
-        // at 100% scaling) with `contrast = 0.0` and polarity-appropriate gamma tuning so
-        // 13 px rows stay crisp and lean alongside native Windows 11 ClearType.
+        // control: `Sharp` pairs `LcdFilter::LIGHT` (omitting `FREETYPE_DEFAULT`'s `±2`
+        // outer taps when the platform did not specify a filter) with `contrast = 0.0`
+        // and polarity-appropriate gamma tuning so 13 px rows stay crisp and lean
+        // alongside native Windows 11 ClearType.
         let (gamma, contrast) = cleartype_weight(smoothing, theme, &params);
         opts.text_gamma = gamma;
         opts.text_contrast = contrast;
@@ -473,13 +465,30 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     // pass before the `Fonts` object is built, so a value written into this
     // style would be discarded; the renderer's own integration supplies it (16 K
     // for the software renderer this app defaults to).
-    // Respect Linux Fontconfig `hinting: false` / `hintstyle: hintnone` under Standard;
+    // Respect an explicit Linux Fontconfig `hinting: false` / `hintstyle: hintnone`;
     // otherwise keep hinting on so stems stay crisp.
-    opts.font_hinting = !(smoothing == TextSmoothing::Standard
-        && params.hint_style == tm_platform::text_rendering::HintStyleChoice::None);
+    opts.font_hinting = params.hint_style != tm_platform::text_rendering::HintStyleChoice::None;
 }
 
-/// Map the platform-neutral fontconfig choice onto the fork's filter tables.
+/// Calibrated grayscale coverage-to-alpha transfer curve for `SubpixelMode::Off`.
+///
+/// Shared with `text_compare` so grayscale comparisons mirror app rendering.
+/// Dark exponents (`< 1.0`) lift partial coverage toward our ClearType Dark curve without
+/// `TwoCoverageMinusCoverageSq`'s bloat; Light exponents (`> 1.0`) thin partial coverage
+/// so dark-on-light text does not render fat in sRGB blending.
+pub const fn grayscale_transfer(
+    smoothing: TextSmoothing,
+    theme: egui::Theme,
+) -> egui::epaint::FontColorTransferFunction {
+    use egui::epaint::FontColorTransferFunction::Gamma;
+    match (smoothing, theme) {
+        (TextSmoothing::Sharp, egui::Theme::Dark) => Gamma(0.80),
+        (TextSmoothing::Standard | TextSmoothing::Smooth, egui::Theme::Dark) => Gamma(0.65),
+        (TextSmoothing::Sharp, egui::Theme::Light) => Gamma(1.50),
+        (TextSmoothing::Standard | TextSmoothing::Smooth, egui::Theme::Light) => Gamma(1.30),
+    }
+}
+
 /// Map platform LCD filter preference and smoothing profile to epaint's 5-tap filter.
 ///
 /// Shared with `text_compare` so the comparison harness mirrors app rendering.
@@ -489,10 +498,14 @@ pub fn lcd_filter(
 ) -> egui::epaint::LcdFilter {
     use tm_platform::text_rendering::LcdFilterChoice;
     match (smoothing, choice) {
-        // `Sharp` omits outer neighbor taps when using the platform default so thin
-        // 1px stems at 100% scaling do not gain gamma-boosted fringe halos.
-        (TextSmoothing::Sharp, LcdFilterChoice::Default) => egui::epaint::LcdFilter::LIGHT,
-        (_, LcdFilterChoice::Default) => egui::epaint::LcdFilter::FREETYPE_DEFAULT,
+        // When the platform did not specify an explicit filter (e.g. Windows), `Sharp`
+        // uses `LIGHT` to omit `FREETYPE_DEFAULT`'s `±2` sub-pixel taps that otherwise
+        // fatten 1px stems at 100% scaling. An explicit Linux Fontconfig `lcdfilter: default`
+        // is respected as `FREETYPE_DEFAULT`.
+        (TextSmoothing::Sharp, LcdFilterChoice::PlatformDefault) => egui::epaint::LcdFilter::LIGHT,
+        (_, LcdFilterChoice::PlatformDefault | LcdFilterChoice::Default) => {
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
+        }
         (_, LcdFilterChoice::Light) => egui::epaint::LcdFilter::LIGHT,
         // fontconfig's legacy filter and epaint's classic ClearType filter have the same
         // role; use the normalized five-tap approximation rather than inventing an
@@ -511,9 +524,6 @@ pub const fn text_background_luma(theme: egui::Theme) -> f32 {
     }
 }
 
-/// Blend gamma and contrast for a smoothing profile under sub-pixel rendering.
-///
-/// Shared with `text_compare` so the comparison harness renders what the app renders.
 /// Weight tuning for [`TextSmoothing::Sharp`] under sub-pixel rendering.
 ///
 /// Dropping `contrast` to `0.0` avoids lifting 1px stem edges at 100% scaling while
@@ -523,14 +533,17 @@ const SHARP_DARK_GAMMA_SCALE: f32 = 0.78;
 const SHARP_LIGHT_GAMMA_SCALE: f32 = 1.10;
 const SHARP_CONTRAST: f32 = 0.0;
 
+/// Blend gamma and contrast for a smoothing profile under sub-pixel rendering.
+///
+/// Shared with `text_compare` so the comparison harness renders what the app renders.
 pub fn cleartype_weight(
     smoothing: TextSmoothing,
     theme: egui::Theme,
     params: &tm_platform::text_rendering::Params,
 ) -> (f32, f32) {
     match (smoothing, theme) {
-        // Thin and crisp: closest to native Windows on a dark UI. Measured at 150%
-        // scaling this removes ~14% of the ink and sharpens the stems.
+        // Thin and crisp: closest to native Windows on a dark UI, trimming 100% ink by
+        // ~10.4% and 150% ink by ~8.0% relative to the prior 0.88/0.25 + FREETYPE_DEFAULT.
         (TextSmoothing::Sharp, egui::Theme::Dark) => (
             (params.gamma * SHARP_DARK_GAMMA_SCALE).clamp(1.0, 3.0),
             params.contrast.min(SHARP_CONTRAST),
@@ -696,9 +709,23 @@ mod tests {
     #[test]
     fn fontconfig_lcdfilter_choices_map_to_filter_tables() {
         use tm_platform::text_rendering::LcdFilterChoice;
+        // Platform-unspecified (`PlatformDefault`, e.g. Windows): `Sharp` uses `LIGHT`.
+        assert_eq!(
+            lcd_filter(TextSmoothing::Sharp, LcdFilterChoice::PlatformDefault),
+            egui::epaint::LcdFilter::LIGHT
+        );
+        assert_eq!(
+            lcd_filter(TextSmoothing::Standard, LcdFilterChoice::PlatformDefault),
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
+        );
+        assert_eq!(
+            lcd_filter(TextSmoothing::Smooth, LcdFilterChoice::PlatformDefault),
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
+        );
+        // Explicit Linux Fontconfig `lcdfilter: default` is respected even under `Sharp`.
         assert_eq!(
             lcd_filter(TextSmoothing::Sharp, LcdFilterChoice::Default),
-            egui::epaint::LcdFilter::LIGHT
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
         );
         assert_eq!(
             lcd_filter(TextSmoothing::Standard, LcdFilterChoice::Default),
@@ -719,6 +746,32 @@ mod tests {
         assert_eq!(
             lcd_filter(TextSmoothing::Sharp, LcdFilterChoice::None),
             egui::epaint::LcdFilter::NONE
+        );
+    }
+
+    #[test]
+    fn grayscale_transfer_calibrates_dark_and_light_polarity() {
+        let dark_sharp = grayscale_transfer(TextSmoothing::Sharp, egui::Theme::Dark);
+        let dark_std = grayscale_transfer(TextSmoothing::Standard, egui::Theme::Dark);
+        let light_sharp = grayscale_transfer(TextSmoothing::Sharp, egui::Theme::Light);
+        let light_std = grayscale_transfer(TextSmoothing::Standard, egui::Theme::Light);
+
+        // Dark lifts partial coverage above raw linear (0.5) without `2c - c^2` bloat (0.75),
+        // with Sharp staying leaner than Standard.
+        let ds = dark_sharp.alpha_from_coverage(0.5);
+        let dt = dark_std.alpha_from_coverage(0.5);
+        assert!(
+            ds > 0.5 && ds < dt && dt < 0.70,
+            "dark: sharp={ds} std={dt}"
+        );
+
+        // Light thins partial coverage below raw linear (0.5) so dark-on-light text is not fat,
+        // with Sharp staying leaner than Standard.
+        let ls = light_sharp.alpha_from_coverage(0.5);
+        let lt = light_std.alpha_from_coverage(0.5);
+        assert!(
+            ls < lt && lt < 0.5 && ls > 0.25,
+            "light: sharp={ls} std={lt}"
         );
     }
 

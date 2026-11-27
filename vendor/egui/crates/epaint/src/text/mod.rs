@@ -88,10 +88,11 @@ pub struct TextOptions {
     /// ever changed when the user picks a different smoothing profile, which rebuilds the
     /// atlas regardless.
     ///
-    /// Windows' default is 1.8. Lower renders thinner. The software renderer applies the
-    /// full nonlinear destination-gamma model. The WGPU dual-source path can apply
-    /// [`Self::text_contrast`] but not destination gamma: fixed-function blending cannot
-    /// read the framebuffer. This limitation is deliberate and documented in the renderer.
+    /// Windows' default is 1.8. Lower renders thinner on dark surfaces and heavier on light
+    /// surfaces. The software renderer applies the full nonlinear destination-gamma model;
+    /// the WGPU dual-source path calibrates both `Unorm` and `sRGB` blend weights against
+    /// [`Self::text_background_luma`] (or foreground polarity when negative) to match it
+    /// without framebuffer reads.
     pub text_gamma: f32,
 
     /// TASKMAN-FORK: enhanced-contrast boost applied to coverage before blending.

@@ -25,8 +25,9 @@
 //! | `Standard` | no | no | the display's own DirectWrite parameters |
 //! | `Smooth` | no | yes | the display's parameters, softest |
 //!
-//! Measure at **150% scaling**, not 100%: at 100% the profiles look alike, and the
-//! weight question only becomes visible where stems are ~2 px.
+//! Measure at both **100%** and **150% scaling**: at 100% the LCD filter's outer taps
+//! and contrast dominate 1 px stem weight, while at 150% stems are ~2 px and gamma drives
+//! perceived thickness.
 
 use eframe::egui::epaint::text::{
     FontData, FontDefinitions, FontFamily, FontTweak, HintingTarget, LcdFilter, SmoothHinting,
@@ -202,6 +203,7 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
     for t in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.style_mut_of(t, |style| {
             let o = &mut style.visuals.text_options;
+            o.color_transfer_function = crate::theme::grayscale_transfer(smoothing, t);
             o.subpixel = subpixel;
             o.lcd_filter = filter.unwrap_or_else(|| {
                 crate::theme::lcd_filter(smoothing, crate::theme::subpixel_params().lcd_filter)
@@ -477,19 +479,16 @@ mod tests {
         write_zoomed(&base.join(format!("{prefix}-sharp-gray.png")), &buf);
     }
 
-    /// The coverage ramp is not consulted on the sub-pixel path, so `Sharp` and
-    /// `Standard` can only differ through grid-fitting. If a future change starts
-    /// applying the ramp there too, the gamma model would be applied twice and text would
-    /// come out visibly wrong -- this pins the current behaviour down.
+    /// Under sub-pixel rendering, `Sharp` and `Standard` must produce distinct output
+    /// (grid-fitting, LCD filter, and blend weight).
     #[test]
-    fn the_profiles_differ_only_by_hinting_and_binning_under_subpixel() {
+    fn the_profiles_differ_under_subpixel() {
         let Some(bytes) = font_or_skip() else { return };
         let sharp = render(&bytes, TextSmoothing::Sharp, SubpixelMode::Rgb);
         let standard = render(&bytes, TextSmoothing::Standard, SubpixelMode::Rgb);
         assert_ne!(
             sharp, standard,
-            "Sharp and Standard rendered identically -- the hinting profile is not \
-             reaching the rasterizer"
+            "Sharp and Standard rendered identically -- profile settings are not reaching the renderer"
         );
     }
 
@@ -573,6 +572,45 @@ mod tests {
             assert!(
                 sharp > standard * 0.6,
                 "Light Mode at ppp={ppp}, Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0})"
+            );
+        }
+    }
+
+    /// Under grayscale fallback (`SubpixelMode::Off` — Linux `rgba=none`, RDP, portrait
+    /// monitors, or unsupported GPUs), `Sharp` must stay thinner than `Standard` in both
+    /// Dark and Light modes without dropping stems.
+    #[test]
+    fn sharp_renders_thinner_than_standard_under_grayscale() {
+        let Some(bytes) = font_or_skip() else { return };
+        for ppp in [1.0_f32, 1.5] {
+            let dark_sharp = ink(&render_cfg(
+                &bytes,
+                Cfg::new(TextSmoothing::Sharp, SubpixelMode::Off).ppp(ppp),
+            ));
+            let dark_std = ink(&render_cfg(
+                &bytes,
+                Cfg::new(TextSmoothing::Standard, SubpixelMode::Off).ppp(ppp),
+            ));
+            assert!(
+                dark_sharp < dark_std * 0.98 && dark_sharp > dark_std * 0.65,
+                "Grayscale Dark ppp={ppp}: sharp={dark_sharp:.0}, standard={dark_std:.0}"
+            );
+
+            let light_sharp = dark_ink(&render_cfg(
+                &bytes,
+                Cfg::new(TextSmoothing::Sharp, SubpixelMode::Off)
+                    .theme(egui::Theme::Light)
+                    .ppp(ppp),
+            ));
+            let light_std = dark_ink(&render_cfg(
+                &bytes,
+                Cfg::new(TextSmoothing::Standard, SubpixelMode::Off)
+                    .theme(egui::Theme::Light)
+                    .ppp(ppp),
+            ));
+            assert!(
+                light_sharp < light_std * 0.98 && light_sharp > light_std * 0.65,
+                "Grayscale Light ppp={ppp}: sharp={light_sharp:.0}, standard={light_std:.0}"
             );
         }
     }

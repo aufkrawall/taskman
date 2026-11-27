@@ -591,7 +591,7 @@ impl Painter {
                     resolve(idx[2], true),
                 ];
                 if !self.subpixel.is_off() && idx.iter().all(|i| glyphs.contains(i)) {
-                    raster::triangle_gray_lcd(target, clip, vertices, Some(atlas));
+                    raster::triangle_gray_lcd(target, clip, vertices, Some(atlas), &self.gamma);
                 } else {
                     raster::triangle(target, clip, vertices, Some(atlas));
                 }
@@ -677,7 +677,7 @@ impl Painter {
             let sampler = if white { None } else { sampler };
             if !white && !self.subpixel.is_off() && mesh.texture_id == epaint::TextureId::default()
             {
-                raster::triangle_gray_lcd(target, clip, vertices, sampler);
+                raster::triangle_gray_lcd(target, clip, vertices, sampler, &self.gamma);
             } else {
                 raster::triangle(target, clip, vertices, sampler);
             }

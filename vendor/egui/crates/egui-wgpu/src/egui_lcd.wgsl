@@ -12,14 +12,15 @@
 //
 // independently for R, G and B.
 //
-// * On linear (sRGB-converting) framebuffers, hardware already converts `dst` to linear
-//   and encodes the blended output back to sRGB, so the shader converts the straight text
-//   color to linear *before* multiplying by per-channel coverage (conserving energy).
-// * On gamma (non-sRGB `Unorm`) framebuffers, fixed-function blending cannot read `dst`,
-//   so the shader applies a foreground-luminance gamma compensation curve to coverage:
-//   exact `a'^(1/g)` for white-on-dark, exact `1 - (1 - a')^(1/g)` for black-on-light,
-//   interpolated by text luminance in between. This matches the CPU renderer's `TextGamma`
-//   weight closely in both dark and light themes without framebuffer reads.
+// * On both gamma (`Unorm`) and linear (sRGB-converting) framebuffers, fixed-function
+//   dual-source blending cannot read `dst`, so `calibrated_lcd_blend_weights` solves for
+//   the per-channel blend weight that lands on the software renderer's `TextGamma` result
+//   `(s^g * a + d^g * (1 - a))^(1/g)` against `r_locals.subpixel_bg_luma` (falling back
+//   to foreground-luminance polarity compensation when `subpixel_bg_luma < 0` or when
+//   foreground polarity opposes the theme background). On sRGB targets, the target color
+//   and endpoints are converted to linear sRGB before solving linear blend weights.
+// * LCD sub-pixel edges intentionally skip dithering so `Unorm`, `sRGB`, and CPU output
+//   stay sharp and deterministic without spatial edge sparkle.
 
 fn is_lcd_texel(tex: vec4<f32>) -> bool {
     return tex.a <= 0.5 / 255.0
@@ -175,10 +176,7 @@ fn lcd_output(in: VertexOutput, linear_framebuffer: bool) -> LcdOutput {
             color = vec4<f32>(linear_rgb * channel_coverage, mean_alpha);
             coverage = vec4<f32>(channel_coverage, mean_alpha);
         } else {
-            var gamma_rgb = straight_rgb * channel_coverage;
-            if r_locals.dithering == 1 && max(channel_coverage.r, max(channel_coverage.g, channel_coverage.b)) > 0.0 {
-                gamma_rgb = dither_interleaved(gamma_rgb, 256.0, in.position);
-            }
+            let gamma_rgb = straight_rgb * channel_coverage;
             color = vec4<f32>(gamma_rgb, mean_alpha);
             coverage = vec4<f32>(channel_coverage, mean_alpha);
         }

@@ -20,8 +20,9 @@
 //!   gamma-corrected space with a contrast boost; [`crate::text::TextOptions`] carries
 //!   those parameters and the *renderer* applies them where its blend model can. The
 //!   software renderer implements the nonlinear destination-gamma curve; fixed-function
-//!   dual-source WGPU blending can apply contrast but cannot read the framebuffer for the
-//!   destination-gamma term.
+//!   dual-source WGPU blending calibrates per-channel blend weights against
+//!   [`crate::text::TextOptions::text_background_luma`] to match it on both `Unorm` and
+//!   `sRGB` targets without framebuffer reads.
 //!
 //! # Why the atlas needs no new format
 //!
@@ -114,10 +115,11 @@ impl LcdFilter {
     /// default because the reference we are matching -- Windows 11 -- reads sharp.
     pub const FREETYPE_DEFAULT: Self = Self([8, 77, 86, 77, 8]);
 
-    /// `FreeType`'s `FT_LCD_FILTER_LIGHT`: a gentler, narrower filter than the default.
+    /// `FreeType`'s `FT_LCD_FILTER_LIGHT`: a narrower 3-tap box filter (`[1/3, 1/3, 1/3]`).
     ///
-    /// fontconfig exposes this as `lcdfilter: light`; desktops use it when the user asks
-    /// for less colour fringing at the cost of a little sharpness.
+    /// Drops the `±2` outer sub-pixel taps of [`Self::FREETYPE_DEFAULT`], producing leaner,
+    /// sharper stems at 100% scaling at the cost of slightly more adjacent-pixel colour
+    /// fringing. Fontconfig exposes this as `lcdfilter: light`.
     pub const LIGHT: Self = Self([0, 85, 86, 85, 0]);
 
     /// No filtering: raw 3x samples. Maximum sharpness, heavy fringing.

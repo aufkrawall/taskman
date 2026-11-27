@@ -32,8 +32,9 @@
 
 use ecolor::Color32;
 
+use crate::gamma::TextGamma;
 use crate::target::{PixelRect, Target};
-use crate::texture::Texture;
+use crate::texture::{LcdAtlasSample, Texture};
 
 /// Sub-pixel precision of the edge functions: 1/16 px.
 const SUB_BITS: u32 = 4;
@@ -92,21 +93,22 @@ pub fn triangle(
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
 ) {
-    triangle_impl(target, clip, v, texture, false);
+    triangle_impl(target, clip, v, texture, None);
 }
 
 /// Rasterize transformed text whose font-atlas mesh contains LCD coverage.
 ///
-/// LCD texels are reduced to their mean coverage before sampling. That is the correct
-/// grayscale fallback for rotated, scaled and fractional glyph quads; color glyphs in the
-/// same atlas pass through unchanged.
+/// LCD texels are reduced to their mean coverage before filtering and blended through
+/// `gamma` (matching upright LCD text weight and `egui_lcd.wgsl`'s off-grid fallback);
+/// color glyphs and ordinary texels in the same atlas pass through unchanged.
 pub(crate) fn triangle_gray_lcd(
     target: &mut Target<'_>,
     clip: PixelRect,
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
+    gamma: &TextGamma,
 ) {
-    triangle_impl(target, clip, v, texture, true);
+    triangle_impl(target, clip, v, texture, Some(gamma));
 }
 
 fn triangle_impl(
@@ -114,7 +116,7 @@ fn triangle_impl(
     clip: PixelRect,
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
-    gray_lcd: bool,
+    lcd_gamma: Option<&TextGamma>,
 ) {
     let mut v = v;
 
@@ -220,6 +222,100 @@ fn triangle_impl(
     }
 
     // General path: textured and/or gouraud-interpolated triangles.
+    if let (Some(tex), Some(gamma)) = (texture, lcd_gamma) {
+        let uniform_color = v[0].color == v[1].color && v[1].color == v[2].color;
+        let [u_sr, u_sg, u_sb, u_ca] = v[0].color.to_srgba_unmultiplied();
+        let u_s_lin_r = gamma.linear_u16(u_sr);
+        let u_s_lin_g = gamma.linear_u16(u_sg);
+        let u_s_lin_b = gamma.linear_u16(u_sb);
+
+        for y in bounds.min_y..bounds.max_y {
+            let span = row_span(row_w, step_x, bounds);
+            let (Some((xs, xe)), Some(row)) = (span, target.row_mut(y as u32)) else {
+                for k in 0..3 {
+                    row_w[k] += step_y[k];
+                }
+                continue;
+            };
+            let lead = (xs as i64) - bounds.min_x as i64;
+            let mut w = [
+                row_w[0] + step_x[0] * lead,
+                row_w[1] + step_x[1] * lead,
+                row_w[2] + step_x[2] * lead,
+            ];
+
+            for x in xs..xe {
+                let l0 = w[0] as f32 * inv_area;
+                let l1 = w[1] as f32 * inv_area;
+                let l2 = 1.0 - l0 - l1;
+                let u = v[0].u * l0 + v[1].u * l1 + v[2].u * l2;
+                let vv = v[0].v * l0 + v[1].v * l1 + v[2].v * l2;
+
+                match tex.sample_lcd_or_ordinary(u, vv) {
+                    LcdAtlasSample::LcdCoverage(cov) => {
+                        if cov > 0
+                            && let Some(dst) = row.get_mut(x)
+                        {
+                            let (sr, sg, sb, ca, s_lin_r, s_lin_g, s_lin_b) = if uniform_color {
+                                (u_sr, u_sg, u_sb, u_ca, u_s_lin_r, u_s_lin_g, u_s_lin_b)
+                            } else {
+                                let premul = interpolated_vertex_color(&v, l0, l1, l2);
+                                let c = Color32::from_rgba_premultiplied(
+                                    round_to_u8(premul[0]) as u8,
+                                    round_to_u8(premul[1]) as u8,
+                                    round_to_u8(premul[2]) as u8,
+                                    round_to_u8(premul[3]) as u8,
+                                );
+                                let [sr, sg, sb, ca] = c.to_srgba_unmultiplied();
+                                (
+                                    sr,
+                                    sg,
+                                    sb,
+                                    ca,
+                                    gamma.linear_u16(sr),
+                                    gamma.linear_u16(sg),
+                                    gamma.linear_u16(sb),
+                                )
+                            };
+                            if ca > 0 {
+                                let d = *dst;
+                                let dr = ((d >> 16) & 0xff) as u8;
+                                let dg = ((d >> 8) & 0xff) as u8;
+                                let db = (d & 0xff) as u8;
+                                let r = gamma.blend_channel_alpha_fast(s_lin_r, sr, dr, cov, ca);
+                                let g = gamma.blend_channel_alpha_fast(s_lin_g, sg, dg, cov, ca);
+                                let b = gamma.blend_channel_alpha_fast(s_lin_b, sb, db, cov, ca);
+                                *dst = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                            }
+                        }
+                    }
+                    LcdAtlasSample::Ordinary(texel) => {
+                        let t = texel.to_array();
+                        if t[3] > 0
+                            && let Some(dst) = row.get_mut(x)
+                        {
+                            let mut src = interpolated_vertex_color(&v, l0, l1, l2);
+                            for i in 0..4 {
+                                src[i] = src[i] * t[i] as f32 * (1.0 / 255.0);
+                            }
+                            if src[3] > 0.0 {
+                                *dst = blend_over(src, *dst);
+                            }
+                        }
+                    }
+                }
+                for k in 0..3 {
+                    w[k] += step_x[k];
+                }
+            }
+
+            for k in 0..3 {
+                row_w[k] += step_y[k];
+            }
+        }
+        return;
+    }
+
     for y in bounds.min_y..bounds.max_y {
         let span = row_span(row_w, step_x, bounds);
         let (Some((xs, xe)), Some(row)) = (span, target.row_mut(y as u32)) else {
@@ -246,7 +342,7 @@ fn triangle_impl(
             let l1 = w[1] as f32 * inv_area;
             let l2 = 1.0 - l0 - l1;
 
-            let src = shade(&v, l0, l1, l2, texture, gray_lcd);
+            let src = shade(&v, l0, l1, l2, texture);
             if src[3] > 0.0
                 && let Some(dst) = row.get_mut(x)
             {
@@ -263,25 +359,9 @@ fn triangle_impl(
     }
 }
 
-/// The fragment shader: interpolate the vertex colour, fetch the texel, multiply in
-/// gamma space. Returns premultiplied RGBA in `0..=255` as floats.
-///
-/// Phase 1 deliberately works in `f32` end to end and rounds exactly once, in
-/// [`blend_over`]. A GPU computes in float too, so this is the shortest path to matching
-/// it bit-for-bit; the integer and SIMD fast paths come later, guarded by the parity test
-/// this enables.
 #[inline]
-fn shade(
-    v: &[ScreenVertex; 3],
-    l0: f32,
-    l1: f32,
-    l2: f32,
-    texture: Option<&Texture>,
-    gray_lcd: bool,
-) -> [f32; 4] {
+fn interpolated_vertex_color(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32) -> [f32; 4] {
     let c0 = v[0].color.to_array();
-    let c1 = v[1].color.to_array();
-    let c2 = v[2].color.to_array();
     let mut out = [0.0f32; 4];
     if v[0].color == v[1].color && v[1].color == v[2].color {
         // Uniform colour, which is most of what egui emits -- solid fills, and every
@@ -293,20 +373,30 @@ fn shade(
             out[i] = c0[i] as f32;
         }
     } else {
+        let c1 = v[1].color.to_array();
+        let c2 = v[2].color.to_array();
         for i in 0..4 {
             out[i] = c0[i] as f32 * l0 + c1[i] as f32 * l1 + c2[i] as f32 * l2;
         }
     }
+    out
+}
+
+/// The fragment shader: interpolate the vertex colour, fetch the texel, multiply in
+/// gamma space. Returns premultiplied RGBA in `0..=255` as floats.
+///
+/// Phase 1 deliberately works in `f32` end to end and rounds exactly once, in
+/// [`blend_over`]. A GPU computes in float too, so this is the shortest path to matching
+/// it bit-for-bit; the integer and SIMD fast paths come later, guarded by the parity test
+/// this enables.
+#[inline]
+fn shade(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32, texture: Option<&Texture>) -> [f32; 4] {
+    let mut out = interpolated_vertex_color(v, l0, l1, l2);
 
     if let Some(tex) = texture {
         let u = v[0].u * l0 + v[1].u * l1 + v[2].u * l2;
         let vv = v[0].v * l0 + v[1].v * l1 + v[2].v * l2;
-        let texel = if gray_lcd {
-            tex.sample_gray_lcd(u, vv)
-        } else {
-            tex.sample(u, vv)
-        }
-        .to_array();
+        let texel = tex.sample(u, vv).to_array();
         for i in 0..4 {
             out[i] = out[i] * texel[i] as f32 * (1.0 / 255.0);
         }
@@ -731,5 +821,78 @@ mod tests {
         assert!(is_top_left(0, -10), "upward => left edge");
         assert!(!is_top_left(-10, 10), "the hypotenuse is neither");
         assert!(!is_top_left(0, 10), "downward => right edge");
+    }
+
+    #[test]
+    fn triangle_gray_lcd_applies_text_gamma_to_lcd_texels_and_leaves_color_glyphs_ordinary() {
+        use epaint::textures::TextureOptions;
+
+        let lcd_tex = Texture {
+            pixels: vec![Color32::from_rgba_premultiplied(128, 128, 128, 0)],
+            width: 1,
+            height: 1,
+            options: TextureOptions::NEAREST,
+        };
+        let color_tex = Texture {
+            pixels: vec![Color32::from_rgba_premultiplied(200, 40, 10, 220)],
+            width: 1,
+            height: 1,
+            options: TextureOptions::NEAREST,
+        };
+        let tri = [
+            ScreenVertex {
+                x: 0.0,
+                y: 0.0,
+                u: 0.5,
+                v: 0.5,
+                color: Color32::WHITE,
+            },
+            ScreenVertex {
+                x: 4.0,
+                y: 0.0,
+                u: 0.5,
+                v: 0.5,
+                color: Color32::WHITE,
+            },
+            ScreenVertex {
+                x: 0.0,
+                y: 4.0,
+                u: 0.5,
+                v: 0.5,
+                color: Color32::WHITE,
+            },
+        ];
+
+        let gamma = TextGamma::new(1.8, 0.5);
+        let mut lcd_buf = vec![pack_rgb(0x19, 0x19, 0x19); 16];
+        let mut lcd_target = Target::new(&mut lcd_buf, 4, 4).unwrap();
+        triangle_gray_lcd(
+            &mut lcd_target,
+            full_clip(4, 4),
+            tri,
+            Some(&lcd_tex),
+            &gamma,
+        );
+        let expected_channel = gamma.blend_channel(255, 0x19, 128);
+        assert_eq!(
+            lcd_buf[0],
+            pack_rgb(expected_channel, expected_channel, expected_channel),
+            "transformed LCD triangle must blend mean coverage through TextGamma"
+        );
+
+        let mut color_buf = vec![pack_rgb(0x19, 0x19, 0x19); 16];
+        let mut color_target = Target::new(&mut color_buf, 4, 4).unwrap();
+        triangle_gray_lcd(
+            &mut color_target,
+            full_clip(4, 4),
+            tri,
+            Some(&color_tex),
+            &gamma,
+        );
+        assert_eq!(
+            color_buf[0],
+            blend_over([200.0, 40.0, 10.0, 220.0], pack_rgb(0x19, 0x19, 0x19)),
+            "premultiplied color glyphs must stay on ordinary blend_over"
+        );
     }
 }
