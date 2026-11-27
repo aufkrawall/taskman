@@ -387,7 +387,7 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::Memory,
         col: || {
-            let (label, tip) = if cfg!(target_os = "windows") {
+            let (label, tip) = if cfg!(any(target_os = "windows", target_os = "linux")) {
                 (K::ColMemoryPrivateWs, K::TipMemoryWsPrivate)
             } else {
                 (K::ColMemoryRss, K::TipMemoryRss)
@@ -4280,7 +4280,9 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
                     .unwrap_or_else(|| "—".into()),
                 false,
             );
-            if cfg!(target_os = "windows") || process.private_working_set_bytes.is_some() {
+            if cfg!(any(target_os = "windows", target_os = "linux"))
+                || process.private_working_set_bytes.is_some()
+            {
                 property_row(
                     ui,
                     i18n::tr(K::PropPrivateWorkingSet),

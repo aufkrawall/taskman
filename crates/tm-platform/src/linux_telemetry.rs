@@ -266,6 +266,40 @@ pub fn virtualization_from_cpuinfo(cpuinfo: &str) -> &'static str {
     if enabled { "Enabled" } else { "Unknown" }
 }
 
+/// Parse `Private_Clean + Private_Dirty` (in bytes) from `/proc/<pid>/smaps_rollup`.
+///
+/// This is the Linux kernel equivalent of Windows Private Working Set:
+/// resident physical pages mapped exclusively by this process. Returns `None`
+/// if neither field is present.
+pub fn parse_smaps_rollup_private_bytes(text: &str) -> Option<u64> {
+    let mut clean: Option<u64> = None;
+    let mut dirty: Option<u64> = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let mut parts = value.split_whitespace();
+        let Some(kib_str) = parts.next() else {
+            continue;
+        };
+        let bytes = kib_str
+            .parse::<u64>()
+            .ok()
+            .and_then(|k| k.checked_mul(1024));
+        match key {
+            "Private_Clean" => clean = bytes,
+            "Private_Dirty" => dirty = bytes,
+            _ => {}
+        }
+    }
+    match (clean, dirty) {
+        (Some(c), Some(d)) => c.checked_add(d),
+        (Some(c), None) => Some(c),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    }
+}
+
 /// `TASK_COMM_LEN - 1`: the longest name `/proc/<pid>/stat` can carry.
 const COMM_MAX: usize = 15;
 
@@ -876,5 +910,22 @@ Committed_AS:   12345 kB
         let bare = [(PathBuf::from("/sys/class/drm/card0"), None)];
         assert!(card_identities_hold(&bare, &bare));
         assert!(!card_identities_hold(&cached, &bare));
+    }
+
+    #[test]
+    fn smaps_rollup_private_bytes_sums_clean_and_dirty_kib() {
+        let sample = "\
+Rss:               32768 kB
+Pss:               20480 kB
+Shared_Clean:      12288 kB
+Shared_Dirty:          0 kB
+Private_Clean:      4096 kB
+Private_Dirty:     16384 kB
+";
+        assert_eq!(
+            parse_smaps_rollup_private_bytes(sample),
+            Some((4096 + 16384) * 1024)
+        );
+        assert_eq!(parse_smaps_rollup_private_bytes("Rss: 12 kB\n"), None);
     }
 }

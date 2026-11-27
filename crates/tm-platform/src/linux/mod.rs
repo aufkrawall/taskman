@@ -219,6 +219,7 @@ impl SystemCollector for LinuxCollector {
         let mut attributable_net_pids: HashSet<u32> = HashSet::with_capacity(n_procs);
         let mut deferred_io: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
         let mut need_broker_fd: HashSet<u32> = HashSet::new();
+        let mut need_broker_private_ws: HashSet<u32> = HashSet::new();
         // One logind record read per user per tick, not per process.
         let mut display_sessions: HashMap<u32, Option<u32>> = HashMap::new();
         let mut thread_total = 0usize;
@@ -288,8 +289,21 @@ impl SystemCollector for LinuxCollector {
             entry.category = category;
             entry.desktop_role = desktop_role;
             entry.cpu_pct = proc_cpu.and_then(|cpu| cpu.pct);
-            entry.mem_bytes = p.memory();
-            entry.working_set_bytes = Some(p.memory());
+            let rss = p.memory();
+            entry.working_set_bytes = Some(rss);
+            if !is_kthread && rss > 0 {
+                if let Some(pws) = read_local_private_working_set(pid_u) {
+                    entry.private_working_set_bytes = Some(pws);
+                    entry.mem_bytes = pws;
+                } else {
+                    entry.mem_bytes = rss;
+                    if boot_start_ticks.is_some() {
+                        need_broker_private_ws.insert(pid_u);
+                    }
+                }
+            } else {
+                entry.mem_bytes = rss;
+            }
             entry.commit_bytes = Some(p.virtual_memory());
             entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
             entry.boot_start_ticks = boot_start_ticks;
@@ -415,9 +429,22 @@ impl SystemCollector for LinuxCollector {
             &processes,
             &deferred_io,
             &need_broker_fd,
+            &need_broker_private_ws,
             wanted_socket_inodes,
             started,
         );
+        if !need_broker_private_ws.is_empty() && !broker_entries.is_empty() {
+            for entry in &mut processes {
+                if let Some(pws) = broker_entries
+                    .get(&entry.pid)
+                    .filter(|telem| Some(telem.start_ticks) == entry.boot_start_ticks)
+                    .and_then(|telem| telem.private_working_set_bytes)
+                {
+                    entry.private_working_set_bytes = Some(pws);
+                    entry.mem_bytes = pws;
+                }
+            }
+        }
         for (proc_idx, stat_bytes) in deferred_io {
             let entry = &mut processes[proc_idx];
             let broker_io = broker_entries
@@ -646,6 +673,11 @@ enum LocalProcIo {
     Unavailable,
 }
 
+fn read_local_private_working_set(pid: u32) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    linux_telemetry::parse_smaps_rollup_private_bytes(&text)
+}
+
 fn read_local_proc_io(pid: u32) -> LocalProcIo {
     match std::fs::read_to_string(format!("/proc/{pid}/io")) {
         Ok(text) => match linux_telemetry::parse_proc_io(&text) {
@@ -675,6 +707,7 @@ fn collect_broker_telemetry(
     processes: &[ProcessEntry],
     deferred_io: &[(usize, Option<Vec<u8>>)],
     need_broker_fd: &HashSet<u32>,
+    need_broker_private_ws: &HashSet<u32>,
     wanted_socket_inodes: &[u64],
     now: Instant,
 ) -> HashMap<u32, ProcessTelemetryEntry> {
@@ -688,14 +721,17 @@ fn collect_broker_telemetry(
         .iter()
         .map(|&(idx, _)| processes[idx].pid)
         .collect();
-    if need_io_pids.is_empty() && need_broker_fd.is_empty() {
+    if need_io_pids.is_empty() && need_broker_fd.is_empty() && need_broker_private_ws.is_empty() {
         return HashMap::new();
     }
-    let mut targets = Vec::with_capacity(need_io_pids.len() + need_broker_fd.len());
+    let mut targets = Vec::with_capacity(
+        need_io_pids.len() + need_broker_fd.len() + need_broker_private_ws.len(),
+    );
     for process in processes {
         let need_io = need_io_pids.contains(&process.pid);
         let check_fd = need_broker_fd.contains(&process.pid);
-        if (!need_io && !check_fd) || process.pid == 0 {
+        let need_private_ws = need_broker_private_ws.contains(&process.pid);
+        if (!need_io && !check_fd && !need_private_ws) || process.pid == 0 {
             continue;
         }
         let Some(start_ticks) = process.boot_start_ticks else {
@@ -706,6 +742,7 @@ fn collect_broker_telemetry(
             start_ticks,
             need_io,
             check_fd,
+            need_private_ws,
         });
     }
     if targets.is_empty() {

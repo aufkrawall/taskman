@@ -42,7 +42,7 @@ use tm_core::model::PriorityClass;
 /// release — a new variant, a field whose meaning shifts, a removed field —
 /// bumps it so a GUI and a service from different releases fail at the
 /// handshake instead of misreading each other.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Root-owned runtime directory that systemd creates for the service.
 pub const SOCKET_DIR: &str = "/run/taskman";
@@ -803,6 +803,8 @@ pub struct TelemetryTarget {
     pub start_ticks: i64,
     pub need_io: bool,
     pub check_fd: bool,
+    #[serde(default)]
+    pub need_private_ws: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -823,6 +825,8 @@ pub struct ProcessTelemetryEntry {
     pub fd_readable: Option<bool>,
     #[serde(default)]
     pub socket_inodes: Vec<u64>,
+    #[serde(default)]
+    pub private_working_set_bytes: Option<u64>,
 }
 
 /// Root-only process evidence that `/proc` withholds from other users.
@@ -1401,6 +1405,7 @@ mod tests {
                 }),
                 fd_readable: Some(true),
                 socket_inodes: vec![99_001],
+                private_working_set_bytes: Some(12_345_678),
             }]),
         ];
         for response in responses {
@@ -1428,6 +1433,7 @@ mod tests {
                     start_ticks: 1234,
                     need_io: true,
                     check_fd: true,
+                    need_private_ws: true,
                 }],
                 wanted_socket_inodes: vec![99_001],
             },
@@ -1445,6 +1451,7 @@ mod tests {
                     start_ticks: 1,
                     need_io: true,
                     check_fd: false,
+                    need_private_ws: false,
                 }],
                 wanted_socket_inodes: Vec::new(),
             }
@@ -1459,6 +1466,7 @@ mod tests {
                         start_ticks: 1,
                         need_io: true,
                         check_fd: false,
+                        need_private_ws: false,
                     })
                     .collect(),
                 wanted_socket_inodes: Vec::new(),

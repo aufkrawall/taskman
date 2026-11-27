@@ -55,7 +55,7 @@ pub const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
         id: "mem",
         label: || i18n::tr(K::ColMemory),
         tooltip: Some(|| {
-            if cfg!(target_os = "windows") {
+            if cfg!(any(target_os = "windows", target_os = "linux")) {
                 i18n::tr(K::TipProcessesMemory)
             } else {
                 i18n::tr(K::TipProcessesMemoryRss)

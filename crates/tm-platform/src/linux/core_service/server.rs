@@ -2174,6 +2174,13 @@ fn collect_process_telemetry(
         } else {
             (None, Vec::new())
         };
+        let private_working_set_bytes = if target.need_private_ws {
+            read_proc_text(target.pid, "smaps_rollup")
+                .as_deref()
+                .and_then(linux_telemetry::parse_smaps_rollup_private_bytes)
+        } else {
+            None
+        };
         if ensure_process_generation(target.pid, before).is_err() {
             continue;
         }
@@ -2183,6 +2190,7 @@ fn collect_process_telemetry(
             io,
             fd_readable,
             socket_inodes,
+            private_working_set_bytes,
         });
     }
     entries
@@ -3076,12 +3084,14 @@ Max realtime timeout      unlimited            unlimited            us        \n
                     start_ticks,
                     need_io: true,
                     check_fd: true,
+                    need_private_ws: true,
                 },
                 TelemetryTarget {
                     pid,
                     start_ticks: start_ticks + 1,
                     need_io: true,
                     check_fd: true,
+                    need_private_ws: true,
                 },
             ],
             &[],
@@ -3092,6 +3102,7 @@ Max realtime timeout      unlimited            unlimited            us        \n
         assert!(entries[0].io.is_some());
         assert_eq!(entries[0].fd_readable, Some(true));
         assert!(entries[0].socket_inodes.is_empty());
+        assert!(entries[0].private_working_set_bytes.is_some());
     }
 
     // ------------------------------------------------------------- tempdirs
