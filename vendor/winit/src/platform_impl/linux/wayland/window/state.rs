@@ -29,6 +29,7 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::Shm;
 use sctk::subcompositor::SubcompositorState;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
+use wayland_protocols_plasma::plasma_shell::client::org_kde_plasma_surface::OrgKdePlasmaSurface;
 
 use crate::cursor::CustomCursor as RootCustomCursor;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Size};
@@ -36,6 +37,7 @@ use crate::error::{ExternalError, NotSupportedError};
 use crate::platform_impl::wayland::logical_to_physical_rounded;
 use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
+use crate::platform_impl::wayland::types::plasma_shell::PlasmaShell;
 use crate::platform_impl::{PlatformCustomCursor, WindowId};
 use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
 
@@ -168,6 +170,8 @@ pub struct WindowState {
     fractional_scale: Option<WpFractionalScaleV1>,
     blur: Option<OrgKdeKwinBlur>,
     blur_manager: Option<KWinBlurManager>,
+    plasma_surface: Option<OrgKdePlasmaSurface>,
+    plasma_shell: Option<PlasmaShell>,
 
     /// Whether the client side decorations have pending move operations.
     ///
@@ -278,6 +282,8 @@ impl WindowState {
         Self {
             blur: None,
             blur_manager: winit_state.kwin_blur_manager.clone(),
+            plasma_surface: None,
+            plasma_shell: winit_state.plasma_shell.clone(),
             compositor,
             connection,
             csd_fails: false,
@@ -361,7 +367,35 @@ impl WindowState {
         self.frame_callback_state = FrameCallbackState::None;
         let change = visibility_change(hidden, &mut self.presented, &mut self.needs_initial_commit);
         self.awaiting_remap_configure = change == VisibilityChange::Remap;
+        if change != VisibilityChange::None {
+            self.set_plasma_hidden(hidden);
+        }
         change
+    }
+
+    /// TaskMan fork: tell KWin (`org_kde_plasma_surface`) to omit a hidden
+    /// toplevel from the taskbar and switcher, so a surface hidden before its
+    /// first present does not leave a ghost taskbar entry.
+    fn set_plasma_hidden(&mut self, hidden: bool) {
+        let surface = if hidden {
+            if self.plasma_surface.is_none() {
+                if let Some(shell) = &self.plasma_shell {
+                    self.plasma_surface =
+                        Some(shell.get_surface(self.window.wl_surface(), &self.queue_handle));
+                }
+            }
+            self.plasma_surface.as_ref()
+        } else {
+            self.plasma_surface.as_ref()
+        };
+        let Some(plasma_surface) = surface else {
+            return;
+        };
+        let skip = u32::from(hidden);
+        plasma_surface.set_skip_taskbar(skip);
+        if plasma_surface.version() >= 5 {
+            plasma_surface.set_skip_switcher(skip);
+        }
     }
 
     /// TaskMan fork: a present is about to attach a buffer.
@@ -1326,6 +1360,9 @@ impl Drop for WindowState {
     fn drop(&mut self) {
         if let Some(blur) = self.blur.take() {
             blur.release();
+        }
+        if let Some(plasma_surface) = self.plasma_surface.take() {
+            plasma_surface.destroy();
         }
 
         if let Some(fs) = self.fractional_scale.take() {
