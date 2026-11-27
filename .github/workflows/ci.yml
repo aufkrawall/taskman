@@ -86,8 +86,14 @@ jobs:
         working-directory: packaging/arch
         # Process substitution, so this step needs bash rather than the
         # container's /bin/sh. makepkg is the authority on the field set.
+        # A container job runs as root and makepkg refuses to run as root, so
+        # the query runs as an unprivileged user whose home exists; as root it
+        # printed nothing and the diff reported every line as added.
         shell: bash
-        run: diff <(makepkg --printsrcinfo) .SRCINFO
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$PWD"
+          diff <(runuser -u builder -- makepkg --printsrcinfo) .SRCINFO
       - name: PKGBUILD and scriptlets
         run: |
           bash -n packaging/arch/PKGBUILD
