@@ -925,4 +925,7 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   `CAP_PERFMON` + `bpf` syscall). Open limits: requires Linux 5.5+ with
   `/sys/kernel/btf/vmlinux` (5.10+ for `filp_close` `bpf_d_path`); `io_uring`
   and memory-mapped I/O are not traced; without `taskman-core.service` active,
-  per-file byte counts remain `Unavailable` (`—`).
+  per-file byte counts remain `Unavailable` (`—`). The eBPF map carries no
+  per-entry timestamp, so the I/O page's "Last I/O" column is "—" on Linux;
+  filling it needs a `bpf_ktime_get_boot_ns` store in the `fexit` programs
+  (an `IoVal` layout change) that could not be tested from the Windows host.

@@ -428,6 +428,7 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
                 is_read: false,
                 is_write: false,
                 open_handles: 0,
+                idle_ms: None,
             });
 
         file_entry.open_handles = file_entry.open_handles.saturating_add(1);

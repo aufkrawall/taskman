@@ -432,6 +432,12 @@ pub struct FileIoSample {
     /// the traced window: zero for a process traced since its start, the
     /// pre-session snapshot for an older one, `None` when unknown.
     pub counter_baseline: Option<FileBytes>,
+    /// Per path in [`Self::files`]: how long before this sample the process's
+    /// last transfer on it was consumed. Absent for a path with no transfer
+    /// (an open file the trace knows idle). The stamp is taken when the
+    /// consumer accounts the record, so it trails the transfer by at most the
+    /// session's flush interval (one second), never more.
+    pub idle: HashMap<String, Duration>,
 }
 
 impl FileIoSample {
@@ -566,6 +572,11 @@ pub(super) fn attach_file_io(
                     .unwrap_or(0)
                     .saturating_add(bytes.write_bytes),
             );
+            // Several buckets for one row: the most recent transfer wins.
+            if let Some(idle) = sample.idle.get(path) {
+                let idle_ms = idle.as_millis().min(u128::from(u64::MAX)) as u64;
+                file.idle_ms = Some(file.idle_ms.map_or(idle_ms, |known| known.min(idle_ms)));
+            }
         }
     }
     let accounting = &mut snapshot.accounting;
@@ -608,6 +619,7 @@ fn closed_file_row(path: &str) -> crate::actions::ProcessFileIo {
         is_read: false,
         is_write: false,
         open_handles: 0,
+        idle_ms: None,
     }
 }
 
@@ -838,6 +850,9 @@ struct Pending {
 struct Unresolved {
     pid: u32,
     bytes: FileBytes,
+    /// When the latest of those bytes completed, so naming them later does
+    /// not make an old transfer look recent.
+    last_transfer: Instant,
     /// Whether the handle table was already asked about this object, so a
     /// name it could not give is not asked for again on every poll.
     asked: bool,
@@ -849,6 +864,9 @@ struct Tracked {
     bytes: FileBytes,
     /// [`State::clock`] at the last transfer.
     touched: u64,
+    /// When the consumer accounted the last transfer; see
+    /// [`FileIoSample::idle`].
+    last_transfer: Option<Instant>,
 }
 
 /// Per-process accumulators.
@@ -1024,7 +1042,7 @@ impl State {
     /// paths (this process's, or the largest process's for the session-wide
     /// budget); only when nothing can be evicted are the bytes refused into
     /// the omitted remainder. Either way the drop is counted.
-    fn charge_path(&mut self, pid: u32, path: Arc<str>, bytes: FileBytes) {
+    fn charge_path(&mut self, pid: u32, path: Arc<str>, bytes: FileBytes, at: Instant) {
         let new_path = !self
             .pids
             .get(&pid)
@@ -1069,6 +1087,7 @@ impl State {
             .or_default();
         tracked.bytes.merge(bytes);
         tracked.touched = clock;
+        tracked.last_transfer = Some(tracked.last_transfer.map_or(at, |last| last.max(at)));
         if new_path {
             self.tracked_paths = self.tracked_paths.saturating_add(1);
         }
@@ -1208,7 +1227,7 @@ impl State {
     }
 
     /// A completed logical transfer of `bytes` by `pid` on `object`.
-    fn complete(&mut self, pid: u32, object: u64, write: bool, bytes: u64) {
+    fn complete(&mut self, pid: u32, object: u64, write: bool, bytes: u64, at: Instant) {
         self.session_transfers = self.session_transfers.saturating_add(1);
         {
             let files = self.pids.entry(pid).or_default();
@@ -1224,7 +1243,7 @@ impl State {
             && open.held_by(pid)
         {
             let path = Arc::clone(&open.path);
-            self.charge_path(pid, path, amount);
+            self.charge_path(pid, path, amount, at);
             return;
         }
         // Nameless for THIS process — never seen, or named for another process
@@ -1235,6 +1254,7 @@ impl State {
         let waiting = self.unresolved.entry(object).or_default();
         if let Some(entry) = waiting.iter_mut().find(|entry| entry.pid == pid) {
             entry.bytes.add(write, bytes);
+            entry.last_transfer = entry.last_transfer.max(at);
             return;
         }
         if self.unresolved_count >= MAX_UNRESOLVED_OBJECTS {
@@ -1247,6 +1267,7 @@ impl State {
         waiting.push(Unresolved {
             pid,
             bytes: amount,
+            last_transfer: at,
             asked: false,
         });
         self.unresolved_count = self.unresolved_count.saturating_add(1);
@@ -1289,7 +1310,7 @@ impl State {
             }
             if let Some(entry) = waited {
                 self.unresolved_count = self.unresolved_count.saturating_sub(1);
-                self.charge_path(pid, name, entry.bytes);
+                self.charge_path(pid, name, entry.bytes, entry.last_transfer);
             }
         }
     }
@@ -1427,7 +1448,13 @@ impl Shared {
                 // A completion cannot move more than was asked for; a larger
                 // number is a misread, and the request size bounds it.
                 let moved = bytes.min(u64::from(request.requested));
-                state.complete(request.pid, request.object, request.write, moved);
+                state.complete(
+                    request.pid,
+                    request.object,
+                    request.write,
+                    moved,
+                    Instant::now(),
+                );
             }
         }
     }
@@ -1732,7 +1759,13 @@ impl FileEtw {
         let (mut sample, diagnostics) = {
             let state = shared.lock();
             let since_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let sample = sample_from(&state, pid, self.session.is_running(), since_ms);
+            let sample = sample_from(
+                &state,
+                pid,
+                self.session.is_running(),
+                since_ms,
+                Instant::now(),
+            );
             let diagnostics = (
                 state.rejected_opcode,
                 state.rejected_version,
@@ -1812,8 +1845,28 @@ fn coverage_of(
 
 /// One process's view of the accumulators: its rows, its remainders and the
 /// session-wide counters that qualify them.
-fn sample_from(state: &State, pid: u32, running: bool, since_ms: u64) -> FileIoSample {
+///
+/// `now` is the instant the per-path idle times are measured against.
+fn sample_from(
+    state: &State,
+    pid: u32,
+    running: bool,
+    since_ms: u64,
+    now: Instant,
+) -> FileIoSample {
     let files = state.pids.get(&pid);
+    let idle_since_transfer = files
+        .map(|files| {
+            files
+                .files
+                .iter()
+                .filter_map(|(path, tracked)| {
+                    let last = tracked.last_transfer?;
+                    Some((path.to_string(), now.saturating_duration_since(last)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut paths: Vec<(String, FileBytes)> = files
         .map(|files| {
             files
@@ -1858,6 +1911,7 @@ fn sample_from(state: &State, pid: u32, running: bool, since_ms: u64) -> FileIoS
         events_lost: None,
         traced_since_process_start: false,
         counter_baseline: None,
+        idle: idle_since_transfer,
     }
 }
 
@@ -2169,7 +2223,7 @@ mod tests {
     }
 
     fn sample_of(shared: &Shared, pid: u32) -> FileIoSample {
-        sample_from(&shared.lock(), pid, true, 0)
+        sample_from(&shared.lock(), pid, true, 0, Instant::now())
     }
 
     fn bytes(sample: &FileIoSample, path: &str) -> Option<FileBytes> {
@@ -2679,7 +2733,7 @@ mod tests {
             "the first sample names every handle"
         );
         assert_eq!(naming_request(&mut state, 30, &mut last, start), None);
-        state.complete(30, 0x4000, false, 10);
+        state.complete(30, 0x4000, false, 10, Instant::now());
         assert_eq!(
             naming_request(&mut state, 30, &mut last, start + SEED_INTERVAL / 2),
             None,
@@ -3486,6 +3540,7 @@ mod tests {
                 read_bytes: 0,
                 write_bytes: 10,
             },
+            Instant::now(),
         );
         // Two files the process opened and closed, the oldest first.
         state.charge_path(
@@ -3495,6 +3550,7 @@ mod tests {
                 read_bytes: 0,
                 write_bytes: 2,
             },
+            Instant::now(),
         );
         state.charge_path(
             44,
@@ -3503,6 +3559,7 @@ mod tests {
                 read_bytes: 0,
                 write_bytes: 3,
             },
+            Instant::now(),
         );
         state.evict(44);
         let files = &state.pids.get(&44).expect("a bucket").files;
@@ -3734,6 +3791,7 @@ mod tests {
             is_read: true,
             is_write: false,
             open_handles: 1,
+            idle_ms: None,
         }
     }
 
@@ -3781,6 +3839,16 @@ mod tests {
             events_lost: Some(1),
             traced_since_process_start: false,
             counter_baseline: None,
+            idle: HashMap::from([
+                (
+                    r"c:\windows\system32\A.dll".to_string(),
+                    Duration::from_millis(3_000),
+                ),
+                (
+                    r"C:\temp\gone.tmp".to_string(),
+                    Duration::from_millis(90_000),
+                ),
+            ]),
         }
     }
 
@@ -3896,6 +3964,91 @@ mod tests {
         assert_eq!(accounting.write_bytes, sample.attributed().write_bytes);
         assert_eq!(accounting.read_bytes, 4_096 + 96_167 + 512);
         assert_eq!(accounting.write_bytes, 1_024 + 2_048);
+    }
+
+    /// A path's idle time runs from its LAST transfer, bytes that waited for a
+    /// name keep the time they completed, and a file with no transfer has no
+    /// idle time at all rather than a made-up one.
+    #[test]
+    fn idle_time_runs_from_the_last_transfer() {
+        let mut state = State::default();
+        let t0 = Instant::now();
+        // Named at Create, written at t0 and again at t0 + 2 s.
+        state
+            .open
+            .insert(0x1000, OpenFile::new(50, Arc::from(r"C:\logs\app.log")));
+        state.complete(50, 0x1000, true, 10, t0);
+        state.complete(50, 0x1000, true, 10, t0 + Duration::from_secs(2));
+        // Read at t0 on an object with no name yet, named 30 s later.
+        state.complete(50, 0x2000, false, 7, t0);
+        state.apply_names(50, vec![(0x2000, r"C:\data\late.bin".to_string())]);
+        // Open, but nothing moved.
+        state
+            .open
+            .insert(0x3000, OpenFile::new(50, Arc::from(r"C:\data\idle.db")));
+        // Accounted after the later write must not move the stamp backwards.
+        state.complete(50, 0x1000, true, 1, t0 + Duration::from_secs(1));
+
+        let sample = sample_from(&state, 50, true, 0, t0 + Duration::from_secs(30));
+        assert_eq!(
+            sample.idle.get(r"C:\logs\app.log"),
+            Some(&Duration::from_secs(28)),
+            "the latest transfer wins"
+        );
+        assert_eq!(
+            sample.idle.get(r"C:\data\late.bin"),
+            Some(&Duration::from_secs(30)),
+            "naming the bytes later does not make them recent"
+        );
+        assert_eq!(sample.idle.get(r"C:\data\idle.db"), None);
+        assert!(
+            sample
+                .files
+                .iter()
+                .any(|(path, _)| path == r"C:\data\idle.db"),
+            "the idle file is still a measured-zero row"
+        );
+        // A clock read before the stamp saturates instead of wrapping.
+        let early = sample_from(&state, 50, true, 0, t0);
+        assert_eq!(early.idle.get(r"C:\logs\app.log"), Some(&Duration::ZERO));
+    }
+
+    /// Every bucket of a row lends it its idle time, the most recent one wins,
+    /// a closed row keeps its own, and a row the trace never saw move stays
+    /// unknown.
+    #[test]
+    fn attached_rows_carry_their_idle_time() {
+        let mut snapshot = crate::actions::ProcessFileIoSnapshot {
+            files: vec![
+                file_row(r"C:\Windows\System32\a.dll"),
+                file_row(r"C:\data\untouched.bin"),
+            ],
+            accounting: crate::actions::FileIoAccounting::default(),
+        };
+        let mut sample = measured_sample();
+        // A second casing of the same row, older than the first.
+        sample.files.push((
+            r"C:\WINDOWS\System32\a.dll".to_string(),
+            FileBytes {
+                read_bytes: 1,
+                write_bytes: 0,
+            },
+        ));
+        sample.idle.insert(
+            r"C:\WINDOWS\System32\a.dll".to_string(),
+            Duration::from_secs(600),
+        );
+        attach_file_io(&mut snapshot, &sample);
+        let row = |path: &str| {
+            snapshot
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("a row for {path}"))
+        };
+        assert_eq!(row(r"C:\Windows\System32\a.dll").idle_ms, Some(3_000));
+        assert_eq!(row(r"C:\temp\gone.tmp").idle_ms, Some(90_000));
+        assert_eq!(row(r"C:\data\untouched.bin").idle_ms, None);
     }
 
     /// The whole point of the wiring: bytes reach exactly the rows they name,

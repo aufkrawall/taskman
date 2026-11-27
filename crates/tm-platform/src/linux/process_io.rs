@@ -387,6 +387,7 @@ fn merge_handle_fact(files: &mut HashMap<String, OpenHandleRow>, fact: HandleFac
             is_read: false,
             is_write: false,
             open_handles: 0,
+            idle_ms: None,
         },
         dev,
         ino,

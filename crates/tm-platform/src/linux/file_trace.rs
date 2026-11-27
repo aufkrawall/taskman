@@ -1316,6 +1316,7 @@ fn build_measured_snapshot(
                     is_read: false,
                     is_write: false,
                     open_handles: 0,
+                    idle_ms: None,
                 });
             } else {
                 omitted_read_bytes = omitted_read_bytes.saturating_add(val.read_bytes);
@@ -1479,6 +1480,7 @@ mod tests {
                     is_read: false,
                     is_write: true,
                     open_handles: 1,
+                    idle_ms: None,
                 },
                 dev: libc::makedev(259, 5),
                 ino: 42,
@@ -1496,6 +1498,7 @@ mod tests {
                     is_read: true,
                     is_write: false,
                     open_handles: 1,
+                    idle_ms: None,
                 },
                 dev: libc::makedev(0, 38),
                 ino: 777,
@@ -1513,6 +1516,7 @@ mod tests {
                     is_read: true,
                     is_write: false,
                     open_handles: 1,
+                    idle_ms: None,
                 },
                 dev: libc::makedev(259, 5),
                 ino: 99,

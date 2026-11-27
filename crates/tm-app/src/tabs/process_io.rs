@@ -39,6 +39,7 @@ pub enum FileSortColumn {
     Written,
     Total,
     Size,
+    LastIo,
 }
 
 /// One tracked file for the inspected process.
@@ -55,6 +56,9 @@ pub struct TrackedFileIo {
     pub is_read: bool,
     pub is_write: bool,
     pub open_handles: u32,
+    /// When the process last read or wrote the file, as measured by the
+    /// per-file trace; `None` when no transfer was measured.
+    pub last_io_at: Option<Instant>,
 }
 
 /// State of the I/O page within the Process Properties dialog.
@@ -79,6 +83,10 @@ pub struct State {
     /// empty spot in the list cannot be filled in again later.
     retention_truncated: bool,
     pub file_filter: String,
+    /// Show only files the process still holds open. A view filter: the
+    /// closed rows stay retained, and the totals above the table keep
+    /// counting them.
+    pub hide_closed: bool,
     pub file_sort_column: FileSortColumn,
     pub file_sort_ascending: bool,
     pub selected_path: Option<String>,
@@ -99,6 +107,7 @@ impl Default for State {
             accounting: None,
             retention_truncated: false,
             file_filter: String::new(),
+            hide_closed: false,
             file_sort_column: FileSortColumn::Written,
             file_sort_ascending: false,
             selected_path: None,
@@ -204,6 +213,12 @@ impl State {
     }
 
     pub fn merge_files(&mut self, snapshot: ProcessFileIoSnapshot) {
+        self.merge_files_at(snapshot, Instant::now());
+    }
+
+    /// [`Self::merge_files`] with the arrival instant the rows' idle times
+    /// are anchored to.
+    fn merge_files_at(&mut self, snapshot: ProcessFileIoSnapshot, received: Instant) {
         let handles_complete = snapshot.accounting.handles_complete;
         self.accounting = Some(snapshot.accounting);
         let mut seen = HashSet::new();
@@ -215,6 +230,9 @@ impl State {
             .collect();
         for file in snapshot.files {
             seen.insert(file.path.clone());
+            let last_io_at = file
+                .idle_ms
+                .and_then(|idle_ms| received.checked_sub(Duration::from_millis(idle_ms)));
             if let Some(&index) = index_by_path.get(&file.path) {
                 let existing = &mut self.files[index];
                 if handles_complete {
@@ -251,6 +269,9 @@ impl State {
                     (None, None) => None,
                 };
                 existing.total_bytes = measured_total(existing.read_bytes, existing.write_bytes);
+                // Like the byte counts, a snapshot without the fact does not
+                // erase a known one, and a later transfer always wins.
+                existing.last_io_at = existing.last_io_at.max(last_io_at);
                 if handles_complete {
                     existing.file_size = file.file_size;
                 } else if let Some(size) = file.file_size {
@@ -276,6 +297,7 @@ impl State {
                     is_read: file.is_read,
                     is_write: file.is_write,
                     open_handles: file.open_handles,
+                    last_io_at,
                 });
             }
         }
@@ -333,6 +355,7 @@ impl State {
         let mut result: Vec<&TrackedFileIo> = self
             .files
             .iter()
+            .filter(|f| !self.hide_closed || f.open_handles > 0)
             .filter(|f| {
                 if filter.is_empty() {
                     true
@@ -357,6 +380,10 @@ impl State {
             }
             FileSortColumn::Size => {
                 cmp_known_last(a.file_size, b.file_size, asc).then_with(|| a.name.cmp(&b.name))
+            }
+            // Descending — the numeric default — puts the most recent first.
+            FileSortColumn::LastIo => {
+                cmp_known_last(a.last_io_at, b.last_io_at, asc).then_with(|| a.name.cmp(&b.name))
             }
             FileSortColumn::Path => {
                 let ord = a
@@ -611,6 +638,25 @@ fn fmt_io_rate(v: f64) -> String {
 
 fn fmt_io_bytes(v: f64) -> String {
     format::format_bytes_loc(v.max(0.0) as u64)
+}
+
+/// Time since a file's last measured transfer, compact: "4 s", "12 min",
+/// "3 h", "2 d". `None` (no transfer measured) reads as unavailable.
+fn fmt_last_io(last_io_at: Option<Instant>, now: Instant, lang: i18n::Lang) -> String {
+    let Some(last) = last_io_at else {
+        return "\u{2014}".to_string();
+    };
+    let secs = now.saturating_duration_since(last).as_secs();
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3_600 => format!("{} min", secs / 60),
+        3_600..172_800 => format!("{} h", secs / 3_600),
+        _ => format!(
+            "{} {}",
+            secs / 86_400,
+            i18n::tr_in(lang, K::PropIoDaysShort)
+        ),
+    }
 }
 
 fn fmt_optional_count(value: Option<u64>) -> String {
@@ -964,6 +1010,9 @@ pub fn show(
         if !state.file_filter.is_empty() && ui.small_button("×").clicked() {
             state.file_filter.clear();
         }
+        ui.add_space(8.0);
+        ui.checkbox(&mut state.hide_closed, i18n::tr(K::PropIoHideClosed))
+            .on_hover_text(i18n::tr(K::PropIoHideClosedTooltip));
     });
 
     if let Some(stale) = state.file_stale.as_deref() {
@@ -1015,8 +1064,9 @@ pub fn show(
             state.accounting.as_ref(),
             !handles_incomplete,
             // "No matches" only over a list that HAD candidates: with nothing
-            // to filter, the search box is not why the table is empty.
-            !state.file_filter.trim().is_empty() && !state.files.is_empty(),
+            // to filter, the search box (or the closed-file toggle) is not why
+            // the table is empty.
+            (!state.file_filter.trim().is_empty() || state.hide_closed) && !state.files.is_empty(),
             ELEVATION_IS_A_REMEDY,
             i18n::lang(),
         ) {
@@ -1069,9 +1119,11 @@ pub fn show(
     let mut sort_change = None;
     let mut selected_clicked = None;
     let selected_path = state.selected_path.clone();
+    let now = Instant::now();
+    let lang = i18n::lang();
 
     egui::Grid::new("process-io-files-grid")
-        .num_columns(6)
+        .num_columns(7)
         .spacing(Vec2::new(16.0, 6.0))
         .striped(true)
         .show(ui, |ui| {
@@ -1265,6 +1317,10 @@ pub fn show(
                     .map_or_else(|| "—".to_string(), format::format_bytes_loc);
                 show_num_cell(ui, egui::RichText::new(&s), &s, COL_SIZE_W);
 
+                // Time since the last transfer
+                let s = fmt_last_io(file.last_io_at, now, lang);
+                show_num_cell(ui, egui::RichText::new(&s), &s, COL_LAST_IO_W);
+
                 ui.end_row();
             }
         });
@@ -1288,8 +1344,9 @@ const COL_READ_W: f32 = 85.0;
 const COL_WRITE_W: f32 = 95.0;
 const COL_TOTAL_W: f32 = 105.0;
 const COL_SIZE_W: f32 = 90.0;
+const COL_LAST_IO_W: f32 = 80.0;
 
-/// Paint all six column headers of the file table.
+/// Paint all seven column headers of the file table.
 fn show_file_header_row(
     ui: &mut egui::Ui,
     pal: &theme::Palette,
@@ -1297,7 +1354,7 @@ fn show_file_header_row(
     ascending: bool,
     sort_change: &mut Option<FileSortColumn>,
 ) {
-    const COLUMNS: [(K, FileSortColumn, f32, bool); 6] = [
+    const COLUMNS: [(K, FileSortColumn, f32, bool); 7] = [
         (
             K::PropIoColFile,
             FileSortColumn::File,
@@ -1314,6 +1371,12 @@ fn show_file_header_row(
         ),
         (K::PropIoColTotal, FileSortColumn::Total, COL_TOTAL_W, true),
         (K::PropIoColSize, FileSortColumn::Size, COL_SIZE_W, true),
+        (
+            K::PropIoColLastIo,
+            FileSortColumn::LastIo,
+            COL_LAST_IO_W,
+            true,
+        ),
     ];
     for (key, col, width, numeric) in COLUMNS {
         show_file_header_cell(
@@ -1889,6 +1952,7 @@ mod tests {
                 is_read: true,
                 is_write: false,
                 open_handles: 1,
+                idle_ms: None,
             },
             ProcessFileIo {
                 path: r"C:\data\output.log".to_string(),
@@ -1902,6 +1966,7 @@ mod tests {
                 is_read: false,
                 is_write: true,
                 open_handles: 1,
+                idle_ms: None,
             },
         ];
         state.merge_files(ProcessFileIoSnapshot {
@@ -1931,6 +1996,7 @@ mod tests {
                 is_read: false,
                 is_write: true,
                 open_handles: 1,
+                idle_ms: None,
             },
             ProcessFileIo {
                 path: r"C:\data\config.json".to_string(),
@@ -1944,6 +2010,7 @@ mod tests {
                 is_read: true,
                 is_write: false,
                 open_handles: 1,
+                idle_ms: None,
             },
         ];
         state.merge_files(ProcessFileIoSnapshot {
@@ -1976,6 +2043,154 @@ mod tests {
         assert_eq!(output.open_handles, 1);
     }
 
+    fn idle_row(path: &str, open_handles: u32, idle_ms: Option<u64>) -> ProcessFileIo {
+        ProcessFileIo {
+            path: path.to_string(),
+            read_bytes: Some(10),
+            write_bytes: Some(0),
+            read_ops: None,
+            write_ops: None,
+            offset: None,
+            file_size: None,
+            access_known: true,
+            is_read: open_handles > 0,
+            is_write: false,
+            open_handles,
+            idle_ms,
+        }
+    }
+
+    fn measured_files(files: Vec<ProcessFileIo>) -> ProcessFileIoSnapshot {
+        ProcessFileIoSnapshot {
+            files,
+            accounting: FileIoAccounting {
+                state: FileIoAccountingState::Measured,
+                handles_complete: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A row's idle time is anchored to the snapshot's arrival, a later
+    /// snapshot that does not carry it keeps the known one, and an older
+    /// transfer never replaces a newer one.
+    #[test]
+    fn last_io_is_anchored_to_arrival_and_never_regresses() {
+        let mut state = State::default();
+        let t0 = Instant::now() + Duration::from_secs(3_600);
+        state.merge_files_at(
+            measured_files(vec![
+                idle_row(r"C:\a.log", 1, Some(4_000)),
+                idle_row(r"C:\b.db", 1, None),
+            ]),
+            t0,
+        );
+        let row = |state: &State, path: &str| {
+            state
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.last_io_at)
+                .expect("a row")
+        };
+        assert_eq!(row(&state, r"C:\a.log"), Some(t0 - Duration::from_secs(4)));
+        assert_eq!(row(&state, r"C:\b.db"), None, "no transfer, no time");
+
+        // 10 s later: a.log without the fact, b.db moved 1 s ago.
+        let t1 = t0 + Duration::from_secs(10);
+        state.merge_files_at(
+            measured_files(vec![
+                idle_row(r"C:\a.log", 1, None),
+                idle_row(r"C:\b.db", 1, Some(1_000)),
+            ]),
+            t1,
+        );
+        assert_eq!(row(&state, r"C:\a.log"), Some(t0 - Duration::from_secs(4)));
+        assert_eq!(row(&state, r"C:\b.db"), Some(t1 - Duration::from_secs(1)));
+
+        // A stale answer (an older transfer) arriving late changes nothing.
+        state.merge_files_at(
+            measured_files(vec![idle_row(r"C:\b.db", 1, Some(60_000))]),
+            t1,
+        );
+        assert_eq!(row(&state, r"C:\b.db"), Some(t1 - Duration::from_secs(1)));
+    }
+
+    /// "Hide closed" filters the view only; Last I/O sorts the most recent
+    /// first by default and keeps unmeasured rows last in both directions.
+    #[test]
+    fn hide_closed_and_last_io_sort() {
+        let mut state = State::default();
+        let t0 = Instant::now() + Duration::from_secs(3_600);
+        state.merge_files_at(
+            measured_files(vec![
+                idle_row(r"C:\open-old.log", 1, Some(300_000)),
+                idle_row(r"C:\closed-recent.tmp", 0, Some(2_000)),
+                idle_row(r"C:\open-idle.db", 1, None),
+                idle_row(r"C:\open-recent.log", 1, Some(1_000)),
+            ]),
+            t0,
+        );
+        let names = |state: &State| -> Vec<String> {
+            state
+                .sorted_and_filtered_files()
+                .iter()
+                .map(|file| file.name.clone())
+                .collect()
+        };
+        state.file_sort_column = FileSortColumn::LastIo;
+        state.file_sort_ascending = false;
+        assert_eq!(
+            names(&state),
+            [
+                "open-recent.log",
+                "closed-recent.tmp",
+                "open-old.log",
+                "open-idle.db"
+            ]
+        );
+        state.file_sort_ascending = true;
+        assert_eq!(
+            names(&state),
+            [
+                "open-old.log",
+                "closed-recent.tmp",
+                "open-recent.log",
+                "open-idle.db"
+            ]
+        );
+
+        state.hide_closed = true;
+        assert!(!names(&state).contains(&"closed-recent.tmp".to_string()));
+        assert_eq!(state.files.len(), 4, "hidden, not dropped");
+        assert_eq!(
+            measured_sum(state.files.iter().map(|file| file.read_bytes)),
+            Some(40),
+            "the totals still count the hidden row"
+        );
+    }
+
+    #[test]
+    fn last_io_formats_compactly_and_unknown_as_a_dash() {
+        use tm_core::i18n::Lang;
+        let now = Instant::now() + Duration::from_secs(10 * 86_400);
+        let ago = |secs: u64| Some(now - Duration::from_secs(secs));
+        assert_eq!(fmt_last_io(None, now, Lang::En), "\u{2014}");
+        assert_eq!(fmt_last_io(ago(0), now, Lang::En), "0 s");
+        assert_eq!(fmt_last_io(ago(59), now, Lang::En), "59 s");
+        assert_eq!(fmt_last_io(ago(60), now, Lang::En), "1 min");
+        assert_eq!(fmt_last_io(ago(3_599), now, Lang::En), "59 min");
+        assert_eq!(fmt_last_io(ago(3_600), now, Lang::En), "1 h");
+        assert_eq!(fmt_last_io(ago(47 * 3_600), now, Lang::En), "47 h");
+        assert_eq!(fmt_last_io(ago(3 * 86_400), now, Lang::En), "3 d");
+        assert_eq!(fmt_last_io(ago(3 * 86_400), now, Lang::De), "3 T");
+        // A stamp after `now` (a frame drawn before the merge) is not negative.
+        assert_eq!(
+            fmt_last_io(Some(now + Duration::from_secs(5)), now, Lang::En),
+            "0 s"
+        );
+    }
+
     #[test]
     fn file_sorting_and_filtering() {
         let mut state = State {
@@ -1992,6 +2207,7 @@ mod tests {
                     is_read: true,
                     is_write: false,
                     open_handles: 1,
+                    last_io_at: None,
                 },
                 TrackedFileIo {
                     path: r"C:\beta\heavy_write.dat".to_string(),
@@ -2005,6 +2221,7 @@ mod tests {
                     is_read: false,
                     is_write: true,
                     open_handles: 1,
+                    last_io_at: None,
                 },
                 TrackedFileIo {
                     path: r"C:\gamma\notes.txt".to_string(),
@@ -2018,6 +2235,7 @@ mod tests {
                     is_read: true,
                     is_write: true,
                     open_handles: 1,
+                    last_io_at: None,
                 },
             ],
             ..Default::default()
@@ -2097,6 +2315,7 @@ mod tests {
             is_read: true,
             is_write: false,
             open_handles: 1,
+            last_io_at: None,
         });
         state.merge_files(ProcessFileIoSnapshot {
             files: Vec::new(),
@@ -2336,6 +2555,7 @@ mod tests {
                     is_read: true,
                     is_write: false,
                     open_handles: 1,
+                    last_io_at: None,
                 },
                 TrackedFileIo {
                     path: r"C:\beta\heavy_write.dat".to_string(),
@@ -2349,6 +2569,7 @@ mod tests {
                     is_read: false,
                     is_write: true,
                     open_handles: 2,
+                    last_io_at: None,
                 },
             ],
             ..Default::default()
@@ -2423,6 +2644,7 @@ mod tests {
                 is_read: false,
                 is_write: false,
                 open_handles: 1,
+                idle_ms: None,
             })
             .collect();
         let mut state = State::default();

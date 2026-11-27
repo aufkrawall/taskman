@@ -238,6 +238,8 @@ fn file_io_entry_from_wire(wire: WireFileIoEntry) -> ProcessFileIo {
         is_read: wire.is_read,
         is_write: wire.is_write,
         open_handles: wire.open_handles,
+        // The eBPF map carries no transfer timestamp; unknown, not "never".
+        idle_ms: None,
     }
 }
 

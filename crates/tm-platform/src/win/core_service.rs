@@ -75,8 +75,9 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // enumeration (ProcessFileIo). v11 adds identity-bound parent process
 // evidence (ProcessParentInfo) in ProcessSecurityInfo. v13 adds the per-file
 // trace's coverage to `FileIoAccounting`: whether it saw the process's whole
-// life, and the process counters over the same window.
-pub const PROTOCOL_VERSION: u16 = 13;
+// life, and the process counters over the same window. v14 adds each file
+// row's idle time since its last measured transfer (`ProcessFileIo::idle_ms`).
+pub const PROTOCOL_VERSION: u16 = 14;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -5538,6 +5539,7 @@ mod tests {
                         is_read: true,
                         is_write: false,
                         open_handles: 1,
+                        idle_ms: Some(250),
                     }],
                     accounting: crate::actions::FileIoAccounting {
                         state: crate::actions::FileIoAccountingState::Unavailable,
@@ -5595,6 +5597,8 @@ mod tests {
                 is_read: true,
                 is_write: false,
                 open_handles: 1,
+                // The widest value a row can carry, so the frame bound holds.
+                idle_ms: Some(u64::MAX),
             })
             .collect();
         let response = BrokerResponse {
@@ -5891,6 +5895,7 @@ mod tests {
             is_read: true,
             is_write: false,
             open_handles: 1,
+            idle_ms: None,
         }
     }
 

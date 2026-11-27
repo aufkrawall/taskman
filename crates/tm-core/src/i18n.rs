@@ -473,6 +473,13 @@ keys! {
     PropIoColWritten => ["Geschrieben", "Written"],
     PropIoColTotal => ["Gesamt", "Total"],
     PropIoColSize => ["Größe", "Size"],
+    PropIoColLastIo => ["Letzte E/A", "Last I/O"],
+    PropIoDaysShort => ["T", "d"],
+    PropIoHideClosed => ["Geschlossene ausblenden", "Hide closed"],
+    PropIoHideClosedTooltip => [
+        "Nur Dateien anzeigen, die der Prozess noch geöffnet hat. Die Summen zählen geschlossene Dateien weiterhin mit.",
+        "Show only files the process still has open. The totals still include closed files."
+    ],
     PropIoSearchPlaceholder => ["Dateien filtern...", "Filter files..."],
     PropIoNoFiles => ["Keine Datei-Aktivität für diesen Prozess erkannt", "No file activity detected for this process"],
     PropIoFilesUnavailable => ["Datei-Informationen nicht verfügbar", "File information unavailable"],

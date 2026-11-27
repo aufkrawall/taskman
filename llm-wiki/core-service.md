@@ -38,7 +38,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v13 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v14 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected. v12 makes the creation-time identity token explicit
   100-ns ticks; a GUI and service from different versions fail at the
@@ -212,7 +212,9 @@ version so a new GUI against an older running service fails at the handshake
 with "unsupported broker protocol version" instead of reporting every
 protected target as exited. Protocol v13 adds the per-file trace's coverage
 to `FileIoAccounting` (`traced_since_process_start`,
-`counter_window_read_bytes`/`counter_window_write_bytes`). The per-file trace
+`counter_window_read_bytes`/`counter_window_write_bytes`). Protocol v14 adds
+`ProcessFileIo::idle_ms`, the time from a row's last measured transfer to the
+answer. The per-file trace
 itself is NOT idle-stopped any more: the service starts it right after
 `on_ready` (thread `tm-file-start`) and keeps it for its whole life, with a
 60 s maintenance thread (`tm-file-maint`) that restarts a session stopped

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Process Properties → I/O: a "Last I/O" column and a "Hide closed" toggle for the file list (Windows).** The file list keeps every file the process read or wrote since tracing began, including files it closed or deleted, so its totals stay the process's real file I/O. A list that had grown over hours gave no hint which rows were still active. "Last I/O" now shows how long ago the process last read or wrote each file ("4 s", "12 min", "3 h", "2 d"), and sorting by it puts the most recent first. "Hide closed" shows only files that are still open, without dropping the closed rows from the totals. The time comes from the per-file trace and can trail the real transfer by up to its one-second flush interval. Files with no measured transfer, and every row on Linux (whose eBPF counters carry no timestamp yet), show "—". The core service protocol is now version 14, so a GUI and a service from different builds report the broker as unavailable until both are updated.
+
 ### Fixed
 
 - **GUI and Windows taskbar monitor keep refreshing under heavy RAM and CPU stress (Windows, Linux; D3D12, Vulkan, and CPU renderers):** fixed sampling, scheduling, and swapchain-timeout stalls that could leave the main window and Windows taskbar stats frozen until memory-stress workloads exited.

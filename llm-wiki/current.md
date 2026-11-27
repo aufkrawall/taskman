@@ -1124,6 +1124,19 @@ rebase runbook.
   (96 KB) every ~3 s through open-read-close — showed "0 B" on every row while
   its read graph spiked. Zero-byte entries (known open, nothing moved) add no
   row.
+  Each tracked path also carries the `Instant` the consumer accounted its
+  last transfer (`Tracked::last_transfer`; bytes waiting for a name keep the
+  time they completed, `Unresolved::last_transfer`), sampled as
+  `FileIoSample::idle` and attached as `ProcessFileIo::idle_ms` (most recent
+  bucket wins for a row). The stamp is taken at consumption, NOT from the
+  record's `TimeStamp`: the consumer opens the trace without
+  `PROCESS_TRACE_MODE_RAW_TIMESTAMP`, so that field is a converted wall-clock
+  value whose conversion was not verified live, while consumption trails the
+  transfer by at most the 1 s `FlushTimer`. The page anchors it to the
+  snapshot's arrival (`TrackedFileIo::last_io_at`, never moved backwards by a
+  merge) and shows a "Last I/O" age column (sortable, most recent first) plus
+  a "Hide closed" view filter that leaves the totals counting closed rows.
+  Linux rows carry `idle_ms: None` ("—").
   States: `Undelivered` until the session has decoded one completed transfer
   anywhere; from then on the session is proven, and a process with no transfer
   is `Measured` at zero. Rows the trace knows to be open read "0 B"; rows it

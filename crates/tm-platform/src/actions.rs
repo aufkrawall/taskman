@@ -380,6 +380,11 @@ pub struct ProcessFileIo {
     pub is_read: bool,
     pub is_write: bool,
     pub open_handles: u32,
+    /// Milliseconds from this process's last measured transfer on the file to
+    /// the moment the answer was taken. `None` when no transfer was measured
+    /// (or the platform's trace does not timestamp them), never a guess.
+    #[cfg_attr(target_os = "windows", serde(default))]
+    pub idle_ms: Option<u64>,
 }
 
 /// Whether, and how far, per-file byte accounting could be trusted for one

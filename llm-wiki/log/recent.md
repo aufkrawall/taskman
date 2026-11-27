@@ -1,3 +1,16 @@
+## 2026-11-27 - I/O page: Last I/O column and Hide closed toggle
+
+- Question: the per-file list keeps every file a process ever read or wrote,
+  including deleted ones. Kept on purpose (rows + unnamed + omitted = the
+  process's traced file I/O; closed rows fixed the "0 B on every row" bug), so
+  the change is presentation, not retention.
+- Added `ProcessFileIo::idle_ms` (broker protocol v14), stamped per path in
+  `file_etw.rs` at consumption time (see `current.md`), a sortable "Last I/O"
+  age column and a "Hide closed" view filter in `tabs/process_io.rs`. Linux
+  reports `None` (known-debt). Rejected: evicting closed rows by age (throws
+  away measured bytes) and a "(deleted)" marker (not requested; would need
+  existence checks).
+
 ## 2026-11-27 - Hardening refresh reliability under heavy RAM/CPU testers (Windows, Linux, D3D12/Vulkan/CPU)
 
 - Symptom: when a RAM tester heavily saturated memory and CPU while the desktop stayed partially usable, both TaskMan's GUI and Windows taskbar monitor stopped refreshing until the tester closed.
