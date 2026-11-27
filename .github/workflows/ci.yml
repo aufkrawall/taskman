@@ -100,7 +100,11 @@ jobs:
           shellcheck -s bash -S warning packaging/arch/taskman.install
       - name: Unit and desktop entry
         run: |
-          # No `|| true`: a directive typo is exactly what this must catch. The
-          # missing ExecStart binary is a warning, not an error.
+          # The unit's ExecStart names the installed broker, which this job never
+          # installs. systemd-analyze verify reports a missing ExecStart binary as
+          # an error (exit 1) on current systemd rather than the warning older
+          # versions printed, so stage a throwaway executable: this step is about
+          # the directive set, and a real hardening typo still fails it.
+          install -Dm755 /dev/null /usr/lib/taskman/taskman-service
           systemd-analyze verify packaging/linux/taskman-core.service
           desktop-file-validate packaging/linux/io.github.aufkrawall.Taskman.desktop
