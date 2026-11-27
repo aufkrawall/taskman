@@ -397,11 +397,24 @@ cost while it is there. Treat every line as a rule, not a description.
   (`widgets::chart::x_on_axis`), so a sparser series plots where it belongs
   instead of being stretched, and `AppHistoryDb::observe` already scales by the
   engine's current interval. Restoring the window forces one immediate sample.
-- **The sampler yields while hidden.** `SystemCollector::set_background` →
-  `win::set_sampler_background` puts the engine thread into
-  `THREAD_MODE_BACKGROUND_BEGIN` (priority 4, very low I/O and memory
-  priority). The process priority CLASS stays `ABOVE_NORMAL` on purpose: the
-  one moment this program has to work is when the machine is saturated.
+- **The sampler yields while hidden without risking memory-eviction traps.**
+  `surface_visibility_transition` only enters background mode when BOTH the main
+  window AND the Windows taskbar monitor are hidden (`!(main || taskbar)`). On
+  Windows, `prioritize_control_plane` raises the process to
+  `ABOVE_NORMAL_PRIORITY_CLASS`, disables Windows 11 Power Throttling (EcoQoS)
+  on the process and control threads (`UI`, `tm-engine`, `tm-taskbar`,
+  `tm-service` broker workers), and keeps active threads at
+  `THREAD_PRIORITY_ABOVE_NORMAL`. When truly hidden, `win::set_sampler_background`
+  lowers `tm-engine` to `THREAD_PRIORITY_LOWEST` (base priority 8, equal to
+  normal workloads) with normal memory priority instead of
+  `THREAD_MODE_BACKGROUND_BEGIN` (which forced `MEMORY_PRIORITY_VERY_LOW` and
+  trapped in-flight ticks under RAM testers), and `wake_sampler_priority`
+  restores active priority out-of-band on reveal. Linux calls best-effort
+  `setpriority(PRIO_PROCESS, 0, -5)` when permitted by root or `RLIMIT_NICE`.
+  Windows slow/cross-process telemetry providers (`AsyncPdhCollector` with 15 s
+  freshness expiry, `service_catalog_cached`, and `windows_enum`'s async
+  UWP AUMID + `SendMessageTimeoutW` prober) run off `tm-engine` so stalled
+  kernel/shell/service subsystems never freeze CPU/RAM/process/taskbar updates.
 - **Linux honours the same mask** (2026-11-25). `LinuxCollector::set_demand` →
   `linux_telemetry::providers` selects GPU counters (`any_gpu`), the
   `/proc/diskstats` read (`DISK_RATE`, with a `forget()` so the resumed window
@@ -1606,7 +1619,7 @@ rebase runbook.
   unchanged completed results still wake the window to restore hit testing.
   Failed/empty rechecks of an unchanged target keep the last confirmed rects as
   `UiaCache::stale` (never `current`, so the widget stays put click-through) for up
-  to `UIA_STALE_LAYOUT_MAX_FAILURES` = 3 consecutive failures (≈ 3.5 s) and only
+  to `UIA_STALE_LAYOUT_MAX_FAILURES` = 8 consecutive failures (≈ 28 s) and only
   then clear them and hide; failed scans without prior rects clear as before.
   All failures record progressive failure backoff
   (`500` ms -> `1` s -> `2` s -> `5` s), and re-queue the failed target inside

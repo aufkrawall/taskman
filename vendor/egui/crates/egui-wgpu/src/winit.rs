@@ -1053,7 +1053,20 @@ impl Painter {
                         surface_state.needs_recreate = true;
                         self.context.request_repaint_of(viewport_id);
                     }
-                    SurfaceErrorAction::SkipFrame => {}
+                    SurfaceErrorAction::SkipFrame => {
+                        // On D3D12 and Vulkan under heavy memory or GPU contention,
+                        // acquiring the next swapchain texture can transiently time
+                        // out. Schedule a bounded retry repaint so the window
+                        // recovers on its own instead of staying frozen on the old
+                        // frame until unrelated input arrives; never wake on
+                        // `Occluded` (minimized / hidden windows must stay idle).
+                        if matches!(other, wgpu::CurrentSurfaceTexture::Timeout) {
+                            self.context.request_repaint_after_for(
+                                std::time::Duration::from_millis(50),
+                                viewport_id,
+                            );
+                        }
+                    }
                 }
                 // No frame was acquired, so nothing was cleared: the surface keeps its
                 // undefined pixels and the viewport still owes a primer.
@@ -1441,7 +1454,20 @@ impl Painter {
                         surface_state.needs_recreate = true;
                         self.context.request_repaint_of(viewport_id);
                     }
-                    SurfaceErrorAction::SkipFrame => {}
+                    SurfaceErrorAction::SkipFrame => {
+                        // On D3D12 and Vulkan under heavy memory or GPU contention,
+                        // acquiring the next swapchain texture can transiently time
+                        // out. Schedule a bounded retry repaint so the window
+                        // recovers on its own instead of staying frozen on the old
+                        // frame until unrelated input arrives; never wake on
+                        // `Occluded` (minimized / hidden windows must stay idle).
+                        if matches!(other, wgpu::CurrentSurfaceTexture::Timeout) {
+                            self.context.request_repaint_after_for(
+                                std::time::Duration::from_millis(50),
+                                viewport_id,
+                            );
+                        }
+                    }
                 }
                 return vsync_sec;
             }

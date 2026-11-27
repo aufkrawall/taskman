@@ -76,6 +76,10 @@ pub const MAX_WANTED_SOCKET_INODES: usize = 4_096;
 /// evidence) answers in milliseconds, and sampling must never park on a wedged
 /// broker, so this is deliberately short.
 pub const CLIENT_DEADLINE_MS: u64 = 3_000;
+/// Tighter deadline for sampler-tick batched [`Request::ProcessTelemetry`]
+/// calls so a stalled `/proc/<pid>/smaps_rollup` walk on a huge memory-tester
+/// process or a heavily loaded broker cannot freeze the sampling cadence.
+pub const TELEMETRY_DEADLINE_MS: u64 = 400;
 
 /// How long a client waits for a privileged ACTION.
 ///

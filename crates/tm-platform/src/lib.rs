@@ -401,6 +401,28 @@ pub fn create_mock_actions() -> Box<dyn actions::PlatformActions> {
     Box::new(actions::MockActions)
 }
 
+/// Keep the UI/service control plane responsive when heavy CPU or memory
+/// workloads saturate the machine.
+///
+/// Windows raises the process to `ABOVE_NORMAL_PRIORITY_CLASS`, disables
+/// Windows 11 EcoQoS/power throttling for the process and control thread, and
+/// raises the calling thread to `THREAD_PRIORITY_ABOVE_NORMAL`.
+/// Linux performs a best-effort `setpriority(PRIO_PROCESS, 0, -5)` when
+/// permitted by `RLIMIT_NICE` or root privileges and ignores permission errors.
+pub fn prioritize_control_plane() {
+    #[cfg(target_os = "windows")]
+    win::prioritize_control_plane();
+    #[cfg(target_os = "linux")]
+    linux::prioritize_control_plane();
+}
+
+/// Immediately restore the sampling thread's active priority without waiting
+/// for an in-flight sampling tick to return.
+pub fn wake_sampler_priority() {
+    #[cfg(target_os = "windows")]
+    win::wake_sampler_priority();
+}
+
 /// Build only the system collector.
 pub fn create_collector() -> Box<dyn tm_core::engine::SystemCollector> {
     #[cfg(target_os = "windows")]

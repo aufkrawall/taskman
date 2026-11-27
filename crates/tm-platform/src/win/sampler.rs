@@ -15,8 +15,8 @@ use crate::win::{
     perfcounters, process_ops, version, windows_enum,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
     UpdateKind, Users,
@@ -28,10 +28,27 @@ use tm_core::error::Result;
 use tm_core::i18n::{self, K};
 use tm_core::model::*;
 
-/// Refresh cadence for slow-changing per-process attributes. Time-based
-/// (not tick-count based) so behavior stays identical at High/Normal/Low
-/// update speeds; entries also invalidate when the process identity changes.
-const ATTR_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Base refresh cadence for slow-changing per-process attributes. Staggered
+/// per PID (`ATTR_REFRESH_BASE_SECS..+6s`) so all processes do not expire on
+/// the same tick and trigger a synchronized burst of handle opens.
+const ATTR_REFRESH_BASE_SECS: u64 = 10;
+const ATTR_REFRESH_SPREAD_SECS: u64 = 6;
+
+fn attr_refresh_ttl(pid: u32) -> Duration {
+    Duration::from_secs(ATTR_REFRESH_BASE_SECS + u64::from(pid) % ATTR_REFRESH_SPREAD_SECS)
+}
+
+/// How often mounted volume metadata (`GetVolumeInformationW`,
+/// `GetDiskFreeSpaceExW`, `DeviceIoControl`) is refreshed. Live disk activity
+/// and throughput come from PDH, so volume capacity does not need per-second
+/// kernel/storage device queries (matching Linux's `DISK_TOPOLOGY_TTL`).
+const DISK_REFRESH_TTL: Duration = Duration::from_secs(5);
+
+/// Per-tick cap on synchronous LocalSystem broker identity calls so a cold
+/// start or slow broker under heavy memory pressure can never stall a tick;
+/// remaining processes are queried on subsequent ticks.
+const IDENTITY_BROKER_MAX_PER_TICK: usize = 8;
+const IDENTITY_BROKER_BUDGET_PER_TICK: Duration = Duration::from_millis(40);
 
 /// Retry horizon for a broker identity read that produced no answer. See
 /// [`PidAttrs::identity_retry_at`].
@@ -82,6 +99,10 @@ struct PidAttrs {
     power_throttled: Option<bool>,
     /// Full command line (Details page); immutable after process start.
     command_line: Option<String>,
+    /// Whether `command_line_from_handle` was already attempted for this
+    /// `(pid, start_epoch_s)` generation, so unreadable SYSTEM/PPL processes do
+    /// not retry PEB reads every attribute-TTL cycle forever.
+    cmd_queried: bool,
     /// Owning account ("DOMAIN\\user" / "SYSTEM"); immutable after process
     /// start. sysinfo leaves this unset for every process it cannot open,
     /// which is most of session 0 — see [`process_ops::token_identity`].
@@ -203,7 +224,15 @@ pub struct Sampler {
     gpu_probed_at: Option<Instant>,
     /// Static RAM hardware facts (SMBIOS), probed once.
     ram_static: Option<memory_info::RamStatic>,
-    pdh: Mutex<perfcounters::PdhCounters>,
+    /// Static host/OS strings cached once in `lazy_init` instead of reading
+    /// HKLM Registry keys on every sampling tick.
+    static_hostname: String,
+    static_os_name: String,
+    static_os_version: String,
+    static_kernel_version: String,
+    /// When `self.disks.refresh(true)` last ran (see [`DISK_REFRESH_TTL`]).
+    disks_refreshed_at: Option<Instant>,
+    pdh: perfcounters::AsyncPdhCollector,
     /// Current telemetry demand from the UI (drives expensive providers).
     demand: TelemetryDemand,
     /// Cached native network adapter metadata with a wall-clock TTL so the
@@ -509,7 +538,12 @@ impl Sampler {
             gpu_adapters: None,
             gpu_probed_at: None,
             ram_static: None,
-            pdh: Mutex::new(perfcounters::PdhCounters::new()),
+            static_hostname: String::new(),
+            static_os_name: "Windows".into(),
+            static_os_version: String::new(),
+            static_kernel_version: String::new(),
+            disks_refreshed_at: None,
+            pdh: perfcounters::AsyncPdhCollector::new(),
             demand: TelemetryDemand::core(),
             net_meta_cache: None,
             wifi_cache: None,
@@ -537,20 +571,28 @@ impl Sampler {
         // Static hardware facts: SMBIOS parsing + CPUID topology probing.
         self.cpu_static = Some(cpu_info::CpuStatic::probe());
         self.ram_static = Some(memory_info::probe());
+        self.static_hostname = hostname();
+        self.static_os_name = System::name().unwrap_or_else(|| "Windows".into());
+        self.static_os_version = System::long_os_version().unwrap_or_default();
+        self.static_kernel_version = System::kernel_version().unwrap_or_default();
         process_ops::enable_debug_privilege();
         // `new_with_refreshed_list` already performs the first enumeration.
         let users = Users::new_with_refreshed_list();
         self.user_names = build_user_map(&users);
         self.disks = Disks::new_with_refreshed_list();
+        self.disks_refreshed_at = Some(Instant::now());
         self.networks = Networks::new_with_refreshed_list();
         self.initialized = true;
     }
 
-    fn refresh_raw(&mut self) {
-        // NOTE: no `.with_cpu_usage()` / `.with_cpu()` here — all CPU load
-        // values come from `cpu_load` (NtQuerySystemInformation deltas).
-        // Besides correctness this saves sysinfo's per-process
-        // GetProcessTimes/GetSystemTimes storm every tick.
+    fn refresh_raw(&mut self, started: Instant) {
+        // NOTE: no `.with_cpu_usage()` / `.with_cpu()` / `.with_memory()` /
+        // `.with_disk_usage()` here — CPU, Working Set, Private Working Set,
+        // Commit, Peak Working Set, and process I/O counters all come from
+        // `cpu_load` (one handle-free NtQuerySystemInformation call). Dropping
+        // sysinfo's redundant per-process GetProcessMemoryInfo and
+        // GetProcessIoCounters calls saves hundreds of handle-bound syscalls
+        // per tick and avoids VM-lock contention under heavy RAM testers.
         self.sys.refresh_specifics(
             RefreshKind::nothing()
                 .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency())
@@ -560,21 +602,31 @@ impl Sampler {
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
-                .with_memory()
-                .with_disk_usage()
                 .with_user(UpdateKind::OnlyIfNotSet)
                 .with_exe(UpdateKind::OnlyIfNotSet),
         );
-        self.disks.refresh(true);
+        if self
+            .disks_refreshed_at
+            .is_none_or(|at| started.saturating_duration_since(at) >= DISK_REFRESH_TTL)
+        {
+            self.disks.refresh(true);
+            self.disks_refreshed_at = Some(started);
+        }
         self.networks.refresh(true);
     }
 
     /// Cached slow-changing attributes for one pid; refreshes them natively
-    /// at most every [`ATTR_REFRESH_TICKS`] ticks (4 native calls instead of
-    /// ~4 × processes per tick).
-    fn attrs_for(&mut self, pid: u32, start_epoch_s: Option<i64>) -> PidAttrs {
+    /// on a staggered TTL (`attr_refresh_ttl(pid)`).
+    fn attrs_for(
+        &mut self,
+        pid: u32,
+        start_epoch_s: Option<i64>,
+        broker_calls_used: &mut usize,
+        broker_time_used: &mut Duration,
+    ) -> PidAttrs {
+        let ttl = attr_refresh_ttl(pid);
         if let Some(a) = self.attrs.get_mut(&pid)
-            && a.refreshed_at.elapsed() < ATTR_REFRESH_TTL
+            && a.refreshed_at.elapsed() < ttl
             && a.start_epoch_s == start_epoch_s
         {
             if a.power_refreshed_at.elapsed() >= POWER_THROTTLE_REFRESH_TTL {
@@ -583,23 +635,25 @@ impl Sampler {
             }
             return a.clone();
         }
-        // The owning account and command line cannot change while a process
-        // lives, so a TTL refresh of the mutable attributes must not pay for
-        // the token + account lookup or PEB query again. Only a different
+        // The owning account, WOW64 bitness, and command line cannot change
+        // while a process lives, so a TTL refresh of the mutable attributes
+        // must not pay for token/PEB/PE-header queries again. Only a different
         // identity forces a re-read.
-        let (known_user, known_sid, known_cmd, known_retry_at) = self
-            .attrs
-            .get(&pid)
-            .filter(|a| a.start_epoch_s == start_epoch_s)
-            .map(|a| {
-                (
-                    a.user.clone(),
-                    a.user_sid.clone(),
-                    a.command_line.clone(),
-                    a.identity_retry_at,
-                )
-            })
-            .unwrap_or((None, None, None, None));
+        let (known_user, known_sid, known_cmd, known_cmd_queried, known_wow64, known_retry_at) =
+            self.attrs
+                .get(&pid)
+                .filter(|a| a.start_epoch_s == start_epoch_s)
+                .map(|a| {
+                    (
+                        a.user.clone(),
+                        a.user_sid.clone(),
+                        a.command_line.clone(),
+                        a.cmd_queried,
+                        a.wow64,
+                        a.identity_retry_at,
+                    )
+                })
+                .unwrap_or((None, None, None, false, None, None));
         let identity_missing = known_user.is_none() || known_sid.is_none();
         let mut identity = identity_missing
             .then(|| process_ops::token_identity(pid))
@@ -616,16 +670,22 @@ impl Sampler {
         // most: processes and tokens owned by SYSTEM or a service account
         // deny an interactive user everything. The LocalSystem broker opens
         // the unprotected ones, so it is asked instead — bounded per process
-        // by the retry horizon and routed through the shared telemetry lane.
+        // by the retry horizon and per tick by a count/time budget so a slow
+        // broker can never stall a sampling tick.
         let wants_identity = identity_missing && identity.is_none();
         let wants_security = self.demand.wants(TelemetryDemand::TOKEN_SECURITY)
             && security.elevated.is_none()
             && security.virtualization.is_none();
         let mut identity_retry_at = known_retry_at;
+        let broker_budget_available = *broker_calls_used < IDENTITY_BROKER_MAX_PER_TICK
+            && *broker_time_used < IDENTITY_BROKER_BUDGET_PER_TICK;
         if (wants_identity || wants_security)
             && start_epoch_s.is_some()
             && identity_retry_at.is_none_or(|at| at.elapsed() >= IDENTITY_BROKER_RETRY)
+            && broker_budget_available
         {
+            *broker_calls_used += 1;
+            let broker_started = Instant::now();
             match core_service::brokered_process_identity(pid, start_epoch_s) {
                 core_service::BrokeredIdentity::Token(token) => {
                     identity_retry_at = None;
@@ -642,11 +702,6 @@ impl Sampler {
                         security.virtualization = token.virtualization;
                     }
                 }
-                // No service, a foreign client, a busy telemetry lane, a policy
-                // refusal or an answer that was lost in transport: the account
-                // stays unknown ("—", never a guess), and the ask is retried
-                // after the horizon. Only the first refusal is worth a line —
-                // it is a state explanation, not per-process news.
                 core_service::BrokeredIdentity::Unavailable => {
                     identity_retry_at = Some(Instant::now());
                 }
@@ -658,19 +713,37 @@ impl Sampler {
                     identity_retry_at = Some(Instant::now());
                 }
             }
+            *broker_time_used = broker_time_used.saturating_add(broker_started.elapsed());
         }
+        // Prefer the handle-free kernel table for session_id and handle count
+        // when available, avoiding redundant OpenProcess calls per PID.
+        let session_id = self
+            .cpu_load
+            .session_id_of(pid, start_epoch_s)
+            .or_else(|| process_ops::session_id_of(pid));
+        let handles = self
+            .cpu_load
+            .handle_count_of(pid, start_epoch_s)
+            .or_else(|| process_ops::handle_count(pid));
+        let wow64 = known_wow64.or_else(|| process_ops::is_wow64(pid));
+        let command_line = if known_cmd.is_some() || known_cmd_queried {
+            known_cmd
+        } else {
+            process_ops::command_line_from_handle(pid)
+        };
         let fresh = PidAttrs {
-            session_id: process_ops::session_id_of(pid),
+            session_id,
             user: known_user.or_else(|| identity.as_ref().map(|i| i.name.clone())),
             user_sid: known_sid.or_else(|| identity.as_ref().and_then(|i| i.sid.clone())),
             critical: process_ops::is_critical(pid),
-            wow64: process_ops::is_wow64(pid),
+            wow64,
             priority: process_ops::priority_class_of(pid),
-            handles: process_ops::handle_count(pid),
+            handles,
             elevated: security.elevated,
             uac_virtualization: security.virtualization,
             power_throttled: process_ops::efficiency_mode_state(pid),
-            command_line: known_cmd.or_else(|| process_ops::command_line_from_handle(pid)),
+            command_line,
+            cmd_queried: true,
             start_epoch_s,
             refreshed_at: Instant::now(),
             power_refreshed_at: Instant::now(),
@@ -1409,7 +1482,7 @@ impl Sampler {
         let load = self.last_load.clone();
 
         // ---- refresh raw data --------------------------------------------------
-        self.refresh_raw();
+        self.refresh_raw(started);
 
         let window_owners = windows_enum::window_owners();
         self.not_responding_hold
@@ -1451,14 +1524,12 @@ impl Sampler {
         // and constant-size, unlike the grow-and-retry process table.
         let page_lists = perfcounters::query_windows_memory_lists();
 
-        // ---- PDH: demand-gated groups, one collection per tick -----------------
-        // The UI's TelemetryDemand decides which expensive providers stay
-        // warm; each group keeps its own query and two-sample warm-up.
-        {
-            let demand = self.demand;
-            let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
-            guard.tick(demand);
-        }
+        // ---- PDH: asynchronous demand-gated collection ------------------------
+        // Collecting wildcard GPU/Disk/Perflib PDH queries on a dedicated
+        // worker keeps `tm-engine` publishing live CPU, RAM, process, and
+        // taskbar updates even when PDH stalls under extreme memory pressure.
+        // Snapshots older than `PDH_STALE_AFTER` expire cleanly to unavailable.
+        let pdh_snap = self.pdh.request_and_read(self.demand, started);
         let (
             gpu_engine_records,
             gpu_adapter_mem_records,
@@ -1466,22 +1537,18 @@ impl Sampler {
             disk_perf,
             cpu_perf_pct,
             cpu_pdh_failed,
-        ) = {
-            let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
-            (
-                guard.read_gpu_engines().unwrap_or_default(),
-                guard.read_gpu_adapter_memory().unwrap_or_default(),
-                guard.read_gpu_memory().unwrap_or_default(),
-                guard.read_disks(),
-                guard.read_cpu_perf_pct(),
-                guard.cpu_counter_failed(),
-            )
-        };
-        // Unknown interrupt time must never be treated as zero; the pseudo-
-        // row split below handles `None` by skipping the subtraction.
-        let interrupt_pct = {
-            let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
-            guard.read_interrupt_pct()
+            interrupt_pct,
+        ) = match pdh_snap.as_deref() {
+            Some(s) => (
+                s.gpu_engines.as_slice(),
+                s.gpu_adapter_memory.as_slice(),
+                s.gpu_memory.as_slice(),
+                s.disks.as_slice(),
+                s.cpu_perf_pct,
+                s.cpu_counter_failed,
+                s.interrupt_pct,
+            ),
+            None => (&[][..], &[][..], &[][..], &[][..], None, false, None),
         };
 
         // Current speed, Task-Manager style: base clock × average
@@ -1519,7 +1586,7 @@ impl Sampler {
         }
 
         let mut processes: Vec<ProcessEntry> = Vec::with_capacity(n_procs);
-        let service_catalog = process_ops::service_catalog();
+        let service_catalog = process_ops::service_catalog_cached();
 
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1644,13 +1711,15 @@ impl Sampler {
             entry.private_working_set_bytes = ws_private;
             entry.mem_bytes = ws_private.or(ws_total).unwrap_or(0);
             // Neither source answering means unknown: "0 K" would claim a
-            // measurement nobody made.
-            let virt = p.virtual_memory();
-            entry.commit_bytes = if virt > 0 {
-                Some(virt)
-            } else {
-                self.cpu_load.commit_of(pid_u, entry.start_epoch_s)
-            };
+            // measurement nobody made. Prefer the handle-free kernel process
+            // table (which covers protected/SYSTEM processes too).
+            entry.commit_bytes =
+                self.cpu_load
+                    .commit_of(pid_u, entry.start_epoch_s)
+                    .or_else(|| {
+                        let virt = p.virtual_memory();
+                        (virt > 0).then_some(virt)
+                    });
             entry.peak_mem_bytes = self
                 .cpu_load
                 .peak_working_set_of(pid_u, entry.start_epoch_s);
@@ -1722,11 +1791,18 @@ impl Sampler {
             self.last_sys_reset = Some(Instant::now());
         }
 
-        // ---- slow-changing native attributes (cached, TTL-based) --------------
+        // ---- slow-changing native attributes (cached, staggered TTL) ----------
         // Applied in a separate pass so the &mut self cache never overlaps
         // the immutable sysinfo iteration above.
+        let mut broker_calls_used = 0usize;
+        let mut broker_time_used = Duration::ZERO;
         for p in processes.iter_mut() {
-            let a = self.attrs_for(p.pid, p.start_epoch_s);
+            let a = self.attrs_for(
+                p.pid,
+                p.start_epoch_s,
+                &mut broker_calls_used,
+                &mut broker_time_used,
+            );
             // Same story as the image path: `session_id_of` needs a handle, so
             // every process this token cannot open reported "—" even though
             // the kernel process table carries a session for ALL of them. The
@@ -1791,6 +1867,11 @@ impl Sampler {
                     p.wow64 = process_ops::pe_is_wow64(exe_path);
                 } else if is_kernel_or_system {
                     p.wow64 = Some(false);
+                }
+                if p.wow64.is_some()
+                    && let Some(entry) = self.attrs.get_mut(&p.pid)
+                {
+                    entry.wow64 = p.wow64;
                 }
             }
             p.elevated = a.elevated;
@@ -1901,7 +1982,7 @@ impl Sampler {
         // from the same perf records `collect_disks` turns into `snap.disks`
         // (one per physical disk), so no row can exceed its disk's active
         // time, nor the header — the busiest disk.
-        let disk_active = physical_disk_active(&disk_perf);
+        let disk_active = physical_disk_active(disk_perf);
         self.apply_process_disk(&mut processes, &disk_active);
 
         // ---- CPU attribution pseudo-rows ------------------------------------------
@@ -1920,15 +2001,11 @@ impl Sampler {
         );
 
         // ---- GPU ---------------------------------------------------------------
-        let gpus = self.collect_gpus(
-            &gpu_engine_records,
-            &gpu_adapter_mem_records,
-            &gpu_mem_records,
-        );
-        apply_process_gpu(&mut processes, &gpus, &gpu_engine_records, &gpu_mem_records);
+        let gpus = self.collect_gpus(gpu_engine_records, gpu_adapter_mem_records, gpu_mem_records);
+        apply_process_gpu(&mut processes, &gpus, gpu_engine_records, gpu_mem_records);
 
         // ---- disks -----------------------------------------------------------------
-        let disks = self.collect_disks(&disk_perf);
+        let disks = self.collect_disks(disk_perf);
 
         // ---- networks -----------------------------------------------------------------
         let nets = self.collect_networks(interval_s);
@@ -2006,10 +2083,10 @@ impl Sampler {
             gpus,
             processes,
             system: SystemMisc {
-                hostname: hostname(),
-                os_name: System::name().unwrap_or_else(|| "Windows".into()),
-                os_version: System::long_os_version().unwrap_or_default(),
-                kernel_version: System::kernel_version().unwrap_or_default(),
+                hostname: self.static_hostname.clone(),
+                os_name: self.static_os_name.clone(),
+                os_version: self.static_os_version.clone(),
+                kernel_version: self.static_kernel_version.clone(),
                 uptime_s: System::uptime(),
                 boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
@@ -3572,5 +3649,17 @@ mod tests {
             p.uac_virtualization,
             Some(tm_core::model::UacVirtualization::NotAllowed)
         );
+    }
+
+    #[test]
+    fn attr_refresh_ttl_staggers_by_pid() {
+        let ttls: HashSet<Duration> = (0..ATTR_REFRESH_SPREAD_SECS as u32)
+            .map(attr_refresh_ttl)
+            .collect();
+        assert_eq!(ttls.len(), ATTR_REFRESH_SPREAD_SECS as usize);
+        for ttl in ttls {
+            assert!(ttl >= Duration::from_secs(ATTR_REFRESH_BASE_SECS));
+            assert!(ttl < Duration::from_secs(ATTR_REFRESH_BASE_SECS + ATTR_REFRESH_SPREAD_SECS));
+        }
     }
 }

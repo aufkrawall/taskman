@@ -1613,9 +1613,15 @@ impl TaskManApp {
         ) else {
             return;
         };
+        let prev_main = self.surface_visible;
         self.surface_visible = visible;
         self.last_taskbar_interval_active = taskbar_active;
         if let Some(bg) = transition.background {
+            if !bg {
+                // Boost the engine thread out-of-band before queueing the
+                // command so an in-flight tick does not stay lowered.
+                tm_platform::wake_sampler_priority();
+            }
             self.engine.set_background(bg);
         }
         // A paused engine is the user's explicit choice and outranks this:
@@ -1630,11 +1636,9 @@ impl TaskManApp {
             self.engine
                 .request_refresh_if_stale(std::time::Duration::from_millis(250));
         }
-        if transition.background.is_some() {
-            tracing::debug!(visible, "surface visibility changed");
-        }
-        match transition.background {
-            Some(true) => {
+        if visible != prev_main {
+            tracing::debug!(visible, taskbar_active, "surface visibility changed");
+            if !visible {
                 // Release transient icon RGBA caches and return freed heap pages
                 // to the OS immediately, then trim again once eframe's 15 s
                 // hidden-residency grace drops GPU/SHM surfaces.
@@ -1642,11 +1646,9 @@ impl TaskManApp {
                 tm_platform::trim_process_memory();
                 self.pending_hidden_trim_at =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(16));
-            }
-            Some(false) => {
+            } else {
                 self.pending_hidden_trim_at = None;
             }
-            None => {}
         }
     }
 
@@ -2682,10 +2684,15 @@ fn surface_visibility_transition(
     let next_interval = surface_sampling_interval(main, taskbar, speed);
     let was_any_visible = prev_main || prev_taskbar;
     let is_any_visible = main || taskbar;
+    let any_vis_changed = is_any_visible != was_any_visible;
     let request_refresh = (vis_changed && main)
         || (!was_any_visible && is_any_visible && speed != tm_core::settings::UpdateSpeed::Paused);
     Some(SurfaceVisibilityTransition {
-        background: vis_changed.then_some(!main),
+        // Keep the sampling thread at active priority whenever EITHER the main
+        // window OR the taskbar monitor is visible. Dropping it into background
+        // mode while the taskbar monitor is live starved taskbar refreshes
+        // under heavy CPU/memory pressure.
+        background: any_vis_changed.then_some(!is_any_visible),
         set_interval: next_interval.filter(|_| next_interval != prev_interval),
         request_refresh,
     })
@@ -3916,11 +3923,12 @@ mod tests {
         );
 
         // Taskbar appearing when both surfaces were hidden wakes the sampler
-        // from HIDDEN_INTERVAL and requests a fresh sample (unless paused).
+        // from HIDDEN_INTERVAL, leaves background mode, and requests a fresh
+        // sample (unless paused).
         assert_eq!(
             surface_visibility_transition(false, false, false, true, UpdateSpeed::Normal),
             Some(SurfaceVisibilityTransition {
-                background: None,
+                background: Some(false),
                 set_interval: Some(UpdateSpeed::Normal.interval()),
                 request_refresh: true,
             })
@@ -3928,18 +3936,40 @@ mod tests {
         assert_eq!(
             surface_visibility_transition(false, false, false, true, UpdateSpeed::Paused),
             Some(SurfaceVisibilityTransition {
+                background: Some(false),
+                set_interval: None,
+                request_refresh: false,
+            })
+        );
+
+        // Hiding the main window while the taskbar monitor stays visible must
+        // keep background mode OFF so taskbar metrics keep refreshing under load.
+        assert_eq!(
+            surface_visibility_transition(true, true, false, true, UpdateSpeed::Normal),
+            Some(SurfaceVisibilityTransition {
                 background: None,
                 set_interval: None,
                 request_refresh: false,
             })
         );
 
-        // Restoring main window while taskbar was active restores providers
-        // and refreshes without altering an already-active sampling interval.
+        // Hiding the last visible surface (taskbar) enters background mode and
+        // stretches the interval to HIDDEN_INTERVAL.
+        assert_eq!(
+            surface_visibility_transition(false, true, false, false, UpdateSpeed::Normal),
+            Some(SurfaceVisibilityTransition {
+                background: Some(true),
+                set_interval: Some(HIDDEN_INTERVAL),
+                request_refresh: false,
+            })
+        );
+
+        // Restoring main window while taskbar was active keeps the engine out
+        // of background mode and refreshes without altering the active interval.
         assert_eq!(
             surface_visibility_transition(false, true, true, true, UpdateSpeed::Normal),
             Some(SurfaceVisibilityTransition {
-                background: Some(false),
+                background: None,
                 set_interval: None,
                 request_refresh: true,
             })

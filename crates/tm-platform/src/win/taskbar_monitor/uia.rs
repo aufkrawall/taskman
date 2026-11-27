@@ -33,8 +33,10 @@ pub(super) const UIA_RECHECK_SETTLE: Duration = Duration::from_millis(UIA_SETTLE
 pub(super) const UIA_RECHECK_MAX_DELAY: Duration = Duration::from_secs(1);
 /// Consecutive failed rechecks of an unchanged taskbar that keep the last
 /// confirmed layout (click-through, never current) before it is discarded and
-/// the widget hides. With the backoff steps below this is roughly 3.5 s.
-pub(super) const UIA_STALE_LAYOUT_MAX_FAILURES: u32 = 3;
+/// the widget hides. With the backoff steps below this is roughly 28 s so
+/// transient Explorer stalls under heavy RAM/CPU pressure keep updating
+/// metrics click-through instead of blinking the taskbar monitor away.
+pub(super) const UIA_STALE_LAYOUT_MAX_FAILURES: u32 = 8;
 pub(super) const UIA_FAILURE_BACKOFF_STEPS: [Duration; 4] = [
     Duration::from_millis(500),
     Duration::from_secs(1),

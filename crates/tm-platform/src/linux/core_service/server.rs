@@ -2124,6 +2124,14 @@ fn collect_evidence(pid: u32, start_ticks: i64) -> Result<ProcessEvidence, TmErr
     Ok(evidence)
 }
 
+/// Total time budget for `/proc/<pid>/smaps_rollup` PTE walks inside a single
+/// batched `ProcessTelemetry` request. Under a multi-GB root-owned RAM tester
+/// (`sudo memtester`), a single `smaps_rollup` walk can take hundreds of
+/// milliseconds while contending on `mmap_lock`; capping the rollup budget
+/// keeps cheap `/proc/<pid>/io` and `/proc/<pid>/fd` data flowing without
+/// tripping the GUI's telemetry deadline.
+const TELEMETRY_SMAPS_BUDGET: Duration = Duration::from_millis(120);
+
 /// Batched `/proc/<pid>/io` and `/proc/<pid>/fd` socket-inode inspection for
 /// processes withheld from an unprivileged GUI.
 ///
@@ -2135,6 +2143,7 @@ fn collect_process_telemetry(
 ) -> Vec<ProcessTelemetryEntry> {
     let wanted: HashSet<u64> = wanted_socket_inodes.iter().copied().collect();
     let mut entries = Vec::with_capacity(targets.len());
+    let mut smaps_elapsed = Duration::ZERO;
     for target in targets {
         let Ok(before) = process_start_for_read(target.pid, Some(target.start_ticks)) else {
             continue;
@@ -2174,13 +2183,17 @@ fn collect_process_telemetry(
         } else {
             (None, Vec::new())
         };
-        let private_working_set_bytes = if target.need_private_ws {
-            read_proc_text(target.pid, "smaps_rollup")
-                .as_deref()
-                .and_then(linux_telemetry::parse_smaps_rollup_private_bytes)
-        } else {
-            None
-        };
+        let private_working_set_bytes =
+            if target.need_private_ws && smaps_elapsed < TELEMETRY_SMAPS_BUDGET {
+                let smaps_started = Instant::now();
+                let value = read_proc_text(target.pid, "smaps_rollup")
+                    .as_deref()
+                    .and_then(linux_telemetry::parse_smaps_rollup_private_bytes);
+                smaps_elapsed = smaps_elapsed.saturating_add(smaps_started.elapsed());
+                value
+            } else {
+                None
+            };
         if ensure_process_generation(target.pid, before).is_err() {
             continue;
         }

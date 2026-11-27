@@ -261,7 +261,7 @@ fn spawn_inner(
 fn sample_and_publish(
     collector: &mut Box<dyn SystemCollector>,
     shared: &Shared,
-) -> Result<Arc<Snapshot>> {
+) -> Result<(Arc<Snapshot>, Duration)> {
     let started = Instant::now();
     let snap = collector.sample(started)?;
     let dur = started.elapsed();
@@ -271,19 +271,16 @@ fn sample_and_publish(
         .tick_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     shared.notify();
-    if dur > Duration::from_millis(250) {
-        tracing::warn!(dur_ms = dur.as_millis() as u64, "slow sampling tick");
-    } else {
-        tracing::trace!(dur_ms = dur.as_millis() as u64, "tick done");
-    }
-    Ok(arc)
+    Ok((arc, dur))
 }
 
-/// Failure bookkeeping shared by cadence ticks, refreshes and `SampleNow`.
+/// Failure and slow-tick bookkeeping shared by cadence ticks, refreshes and `SampleNow`.
 #[derive(Default)]
 struct TickHealth {
     failures: u64,
     last_report: Option<Instant>,
+    slow_ticks: u64,
+    last_slow_report: Option<Instant>,
 }
 
 impl TickHealth {
@@ -300,9 +297,26 @@ impl TickHealth {
         shared: &Shared,
     ) -> Option<Arc<Snapshot>> {
         match sample_and_publish(collector, shared) {
-            Ok(arc) => {
+            Ok((arc, dur)) => {
                 self.failures = 0;
                 self.last_report = None;
+                if dur > Duration::from_millis(250) {
+                    self.slow_ticks += 1;
+                    let due = self
+                        .last_slow_report
+                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(10));
+                    if due {
+                        let count = std::mem::take(&mut self.slow_ticks);
+                        self.last_slow_report = Some(Instant::now());
+                        tracing::warn!(
+                            dur_ms = dur.as_millis() as u64,
+                            slow_ticks = count,
+                            "slow sampling tick"
+                        );
+                    }
+                } else {
+                    tracing::trace!(dur_ms = dur.as_millis() as u64, "tick done");
+                }
                 Some(arc)
             }
             Err(e @ TmError::Unsupported(_)) => {

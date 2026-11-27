@@ -677,6 +677,7 @@ pub(super) fn taskbar_thread_main(
     visibility: Arc<MonitorVisibility>,
     callback: Arc<dyn Fn(Action) + Send + Sync>,
 ) {
+    crate::win::prioritize_current_thread();
     unsafe {
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);

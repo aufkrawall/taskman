@@ -1,9 +1,9 @@
 //! Enumerate pids owning visible top-level windows (used for App detection,
 //! mirroring Task Manager's "Apps" grouping).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -40,7 +40,160 @@ static CACHE: Mutex<Option<WindowOwners>> = Mutex::new(None);
 /// [`resolve_hung_candidates`].
 static SCAN_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+/// How long asynchronous `SendMessageTimeoutW` hung-probe results stay valid
+/// while the probe worker is busy with stalled windows.
+const HUNG_PROBE_RESULT_TTL: Duration = Duration::from_secs(5);
+
+struct ProbeJob {
+    hung_candidates: Vec<(u32, u32, isize)>,
+    uncached_frames: Vec<isize>,
+    sequence: usize,
+}
+
+struct AsyncWinProbeState {
+    pending: Option<ProbeJob>,
+    not_responding: HashSet<u32>,
+    probed_at: Option<Instant>,
+    frame_aumids: HashMap<isize, Option<String>>,
+}
+
+struct AsyncWinProbe {
+    state: Arc<(Mutex<AsyncWinProbeState>, Condvar)>,
+}
+
+impl AsyncWinProbe {
+    fn start() -> Self {
+        let state = Arc::new((
+            Mutex::new(AsyncWinProbeState {
+                pending: None,
+                not_responding: HashSet::new(),
+                probed_at: None,
+                frame_aumids: HashMap::new(),
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        if let Err(error) = std::thread::Builder::new()
+            .name("tm-win-probe".into())
+            .spawn(move || win_probe_worker(worker_state))
+        {
+            tracing::warn!(%error, "could not start async window-probe thread");
+        }
+        Self { state }
+    }
+
+    fn exchange(
+        &self,
+        hung_candidates: Vec<(u32, u32, HWND)>,
+        detached_frames: &[HWND],
+        sequence: usize,
+    ) -> (HashSet<u32>, HashMap<isize, Option<String>>) {
+        let live_frames: HashSet<isize> = detached_frames.iter().map(|h| h.0 as isize).collect();
+        let (lock, condvar) = &*self.state;
+        let mut guard = tm_core::sync::lock(lock);
+        guard
+            .frame_aumids
+            .retain(|hwnd, _| live_frames.contains(hwnd));
+        let uncached_frames: Vec<isize> = detached_frames
+            .iter()
+            .map(|h| h.0 as isize)
+            .filter(|raw| !guard.frame_aumids.contains_key(raw))
+            .collect();
+        let cached_aumids = guard.frame_aumids.clone();
+        let not_responding = if hung_candidates.is_empty() {
+            guard.not_responding.clear();
+            guard.probed_at = Some(Instant::now());
+            HashSet::new()
+        } else if guard
+            .probed_at
+            .is_some_and(|at| at.elapsed() <= HUNG_PROBE_RESULT_TTL)
+        {
+            let candidate_pids: HashSet<u32> =
+                hung_candidates.iter().map(|&(pid, _, _)| pid).collect();
+            guard
+                .not_responding
+                .iter()
+                .copied()
+                .filter(|pid| candidate_pids.contains(pid))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let need_worker = !hung_candidates.is_empty() || !uncached_frames.is_empty();
+        if need_worker {
+            guard.pending = Some(ProbeJob {
+                hung_candidates: hung_candidates
+                    .into_iter()
+                    .map(|(pid, tid, hwnd)| (pid, tid, hwnd.0 as isize))
+                    .collect(),
+                uncached_frames,
+                sequence,
+            });
+        }
+        drop(guard);
+        if need_worker {
+            condvar.notify_one();
+        }
+        (not_responding, cached_aumids)
+    }
+}
+
+fn win_probe_worker(shared: Arc<(Mutex<AsyncWinProbeState>, Condvar)>) {
+    ensure_com();
+    let (lock, condvar) = &*shared;
+    loop {
+        let job = {
+            let mut guard = tm_core::sync::lock(lock);
+            while guard.pending.is_none() {
+                guard = condvar
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            match guard.pending.take() {
+                Some(job) => job,
+                None => continue,
+            }
+        };
+
+        let mut resolved_aumids: Vec<(isize, Option<String>)> =
+            Vec::with_capacity(job.uncached_frames.len());
+        for raw in job.uncached_frames {
+            let hwnd = HWND(raw as *mut std::ffi::c_void);
+            // Skip frames that are already hung so cross-process COM does not
+            // stall behind a wedged ApplicationFrameHost.
+            let hung =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow(hwnd).as_bool() };
+            let aumid = if hung {
+                None
+            } else {
+                unsafe { window_app_id(hwnd) }
+            };
+            resolved_aumids.push((raw, aumid));
+        }
+
+        let candidates: Vec<(u32, u32, HWND)> = job
+            .hung_candidates
+            .into_iter()
+            .map(|(pid, tid, raw)| (pid, tid, HWND(raw as *mut std::ffi::c_void)))
+            .collect();
+        let not_responding = resolve_hung_candidates(
+            &candidates,
+            MAX_PROBE_BUDGET_PER_SCAN,
+            job.sequence,
+            probe_window_responds,
+        );
+
+        let mut guard = tm_core::sync::lock(lock);
+        for (raw, aumid) in resolved_aumids {
+            guard.frame_aumids.insert(raw, aumid);
+        }
+        guard.not_responding = not_responding;
+        guard.probed_at = Some(Instant::now());
+    }
+}
+
 pub fn window_owners() -> WindowOwners {
+    static ASYNC_PROBE: OnceLock<AsyncWinProbe> = OnceLock::new();
     let mut scan = Scan::default();
     scan.owners.complete = unsafe {
         windows::Win32::UI::WindowsAndMessaging::EnumWindows(
@@ -49,13 +202,14 @@ pub fn window_owners() -> WindowOwners {
         )
         .is_ok()
     };
-    pair_minimized_views(&mut scan);
-    scan.owners.not_responding = resolve_hung_candidates(
-        &scan.hung_candidates,
-        MAX_PROBE_BUDGET_PER_SCAN,
-        SCAN_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        probe_window_responds,
+    let sequence = SCAN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let (not_responding, cached_aumids) = ASYNC_PROBE.get_or_init(AsyncWinProbe::start).exchange(
+        std::mem::take(&mut scan.hung_candidates),
+        &scan.detached_frames,
+        sequence,
     );
+    pair_minimized_views(&mut scan, &cached_aumids);
+    scan.owners.not_responding = not_responding;
     let out = scan.owners;
     *tm_core::sync::lock(&CACHE) = Some(out.clone());
     out
@@ -495,15 +649,19 @@ unsafe extern "system" fn enum_cb(
 /// windowless host such as `TextInputHost.exe`) keeps alive. Both halves do
 /// carry the same application user model id, so pair them through that: a
 /// cloaked `CoreWindow` counts only once a frame still on screen claims it.
-fn pair_minimized_views(scan: &mut Scan) {
+fn pair_minimized_views(scan: &mut Scan, cached_aumids: &HashMap<isize, Option<String>>) {
     if scan.detached_frames.is_empty() || scan.hidden_cores.is_empty() {
         return;
     }
-    ensure_com();
     let frame_ids: HashSet<String> = scan
         .detached_frames
         .iter()
-        .filter_map(|frame| unsafe { window_app_id(*frame) })
+        .filter_map(|frame| {
+            cached_aumids
+                .get(&(frame.0 as isize))
+                .and_then(|id| id.as_ref())
+                .cloned()
+        })
         .collect();
     if frame_ids.is_empty() {
         return;

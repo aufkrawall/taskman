@@ -262,27 +262,97 @@ pub fn restart_explorer(pid: u32, expected_start_epoch_s: Option<i64>) -> Result
 /// input and disk-flush threads and would make a Task Manager replacement less
 /// reliable rather than more reliable.
 ///
-/// The priority CLASS covers every thread in the process, sampler included,
-/// which is right while the user is looking at the window and wrong the rest
-/// of the time: a copy parked in the notification area would otherwise outrank
-/// the work the user is actually doing, forever. Rather than give up the
-/// class — the whole point of which is that this program still responds when
-/// the machine is saturated — the sampling thread drops into Windows'
-/// background processing mode whenever no surface is on screen; see
-/// [`set_sampler_background`].
+/// We also explicitly opt the process and its control/sampling/taskbar threads
+/// out of Windows 11 Power Throttling (EcoQoS): Windows throttles tray and
+/// background-hosted utilities even when they run in `ABOVE_NORMAL_PRIORITY_CLASS`,
+/// which starves the UI and taskbar monitor under heavy memory/CPU saturation.
+///
+/// When NO surface (neither main window nor taskbar monitor) is visible, the
+/// sampling thread lowers its own CPU priority to `THREAD_PRIORITY_LOWEST`
+/// (base priority 8, equal to ordinary `NORMAL_PRIORITY_CLASS` workloads)
+/// instead of using `THREAD_MODE_BACKGROUND_BEGIN`: background mode forces
+/// `MEMORY_PRIORITY_VERY_LOW`, which causes Windows to aggressively evict the
+/// sampler's pages under RAM testers and traps an in-flight tick on restore.
 pub fn prioritize_control_plane() {
     use windows::Win32::System::Threading::{
-        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetCurrentThread, SetPriorityClass,
-        SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
     };
     unsafe {
         if let Err(error) = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) {
             tracing::debug!(%error, "could not raise TaskMan process priority");
         }
-        if let Err(error) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) {
-            tracing::debug!(%error, "could not raise TaskMan control-thread priority");
-        }
     }
+    opt_out_of_process_power_throttling();
+    prioritize_current_thread();
+}
+
+/// Disable Windows 11 EcoQoS / execution-speed power throttling for the
+/// current process so background/tray hosting never pins TaskMan to E-cores or
+/// throttled clock states under heavy system load.
+fn opt_out_of_process_power_throttling() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetProcessInformation,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: `state` is a valid `PROCESS_POWER_THROTTLING_STATE` with exact size.
+    if let Err(error) = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    } {
+        tracing::debug!(%error, "could not disable process power throttling");
+    }
+}
+
+/// Set Windows 11 thread-level EcoQoS / execution-speed power throttling on
+/// `thread`. `enable == false` explicitly opts the thread out of EcoQoS.
+fn set_thread_power_throttling(thread: windows::Win32::Foundation::HANDLE, enable: bool) {
+    use windows::Win32::System::Threading::{
+        SetThreadInformation, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+        ThreadPowerThrottling,
+    };
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: if enable {
+            THREAD_POWER_THROTTLING_EXECUTION_SPEED
+        } else {
+            0
+        },
+    };
+    // SAFETY: `state` is a valid `THREAD_POWER_THROTTLING_STATE` with exact size.
+    let _ = unsafe {
+        SetThreadInformation(
+            thread,
+            ThreadPowerThrottling,
+            (&state as *const THREAD_POWER_THROTTLING_STATE).cast(),
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+}
+
+/// Raise the calling thread to `THREAD_PRIORITY_ABOVE_NORMAL` and opt it out
+/// of Windows 11 EcoQoS. Used for the UI thread, sampling engine thread,
+/// taskbar monitor thread, and core-service broker workers.
+pub(crate) fn prioritize_current_thread() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    let thread = unsafe { GetCurrentThread() };
+    if let Err(error) = unsafe { SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) } {
+        tracing::debug!(%error, "could not raise TaskMan control-thread priority");
+    }
+    set_thread_power_throttling(thread, false);
 }
 
 /// Spawn a new elevated instance of the current exe (runas verb → UAC
@@ -346,10 +416,26 @@ pub fn relaunch_elevated_with_args(args: &[String]) -> Result<()> {
 
 pub struct WinCollector {
     inner: sampler::Sampler,
+    thread_registered: bool,
+}
+
+impl Drop for WinCollector {
+    fn drop(&mut self) {
+        if self.thread_registered {
+            clear_sampler_thread_handle();
+        }
+    }
 }
 
 impl SystemCollector for WinCollector {
     fn sample(&mut self, now: std::time::Instant) -> Result<Snapshot> {
+        if !self.thread_registered {
+            register_sampler_thread_handle();
+            self.thread_registered = true;
+            if !SAMPLER_IN_BACKGROUND.load(std::sync::atomic::Ordering::Acquire) {
+                prioritize_current_thread();
+            }
+        }
         self.inner.sample(now)
     }
 
@@ -362,51 +448,107 @@ impl SystemCollector for WinCollector {
     }
 
     fn set_background(&mut self, background: bool) {
+        if !self.thread_registered {
+            register_sampler_thread_handle();
+            self.thread_registered = true;
+        }
         set_sampler_background(background);
     }
 }
 
-/// Whether this thread is currently in Windows' background processing mode.
-/// The API is a toggle, not a level: `BEGIN` on a thread already in the mode
-/// fails, and so does `END` on one that is not.
+/// Whether the sampling thread is currently lowered for hidden-surface mode.
 static SAMPLER_IN_BACKGROUND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Put the sampling thread into (or out of) background processing mode.
-///
-/// Called on the engine thread, which is the thread that does the sampling.
-/// `THREAD_MODE_BACKGROUND_BEGIN` drops it to scheduling priority 4 *and*
-/// gives it very low I/O and memory priority, which is exactly the contract
-/// wanted while nobody is looking at the window: the work still happens, but
-/// it can no longer take a time slice, a disk queue slot or a page away from
-/// whatever the user is actually doing.
-///
-/// This is deliberately NOT done by lowering the process priority class: the
-/// GUI stays above-normal so it can still be driven when the machine is
-/// saturated, which is the one moment a task manager has to work.
-fn set_sampler_background(background: bool) {
-    use std::sync::atomic::Ordering;
+/// Duplicated `THREAD_SET_LIMITED_INFORMATION` handle of the live sampling
+/// engine thread, allowing the UI thread to restore the engine's priority
+/// immediately on window/taskbar reveal even while a sampling tick is in flight.
+static SAMPLER_THREAD_HANDLE: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
+fn register_sampler_thread_handle() {
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, HANDLE};
     use windows::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
-        THREAD_MODE_BACKGROUND_END,
+        GetCurrentProcess, GetCurrentThread, THREAD_SET_LIMITED_INFORMATION,
     };
 
-    if SAMPLER_IN_BACKGROUND.load(Ordering::Relaxed) == background {
+    let mut dup = HANDLE::default();
+    let ok = unsafe {
+        let proc = GetCurrentProcess();
+        DuplicateHandle(
+            proc,
+            GetCurrentThread(),
+            proc,
+            &mut dup,
+            THREAD_SET_LIMITED_INFORMATION.0,
+            false,
+            Default::default(),
+        )
+        .is_ok()
+    };
+    if !ok || dup.0.is_null() {
         return;
     }
-    let mode = if background {
-        THREAD_MODE_BACKGROUND_BEGIN
-    } else {
-        THREAD_MODE_BACKGROUND_END
-    };
-    match unsafe { SetThreadPriority(GetCurrentThread(), mode) } {
-        Ok(()) => {
-            SAMPLER_IN_BACKGROUND.store(background, Ordering::Relaxed);
-            tracing::debug!(background, "sampler thread background mode");
+    let mut slot = tm_core::sync::lock(&SAMPLER_THREAD_HANDLE);
+    if let Some(old) = slot.replace(dup.0 as isize) {
+        unsafe {
+            let _ = CloseHandle(HANDLE(old as *mut std::ffi::c_void));
         }
-        // Not fatal: the sampler keeps running at its normal priority, which
-        // is what it did before this existed.
-        Err(error) => tracing::debug!(%error, background, "sampler background mode refused"),
+    }
+}
+
+fn clear_sampler_thread_handle() {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    let old = tm_core::sync::lock(&SAMPLER_THREAD_HANDLE).take();
+    if let Some(raw) = old {
+        unsafe {
+            let _ = CloseHandle(HANDLE(raw as *mut std::ffi::c_void));
+        }
+    }
+}
+
+fn apply_sampler_priority(thread: windows::Win32::Foundation::HANDLE, background: bool) {
+    use windows::Win32::System::Threading::{
+        SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_LOWEST,
+    };
+    // Avoid `THREAD_MODE_BACKGROUND_BEGIN`: it drops the thread to
+    // `MEMORY_PRIORITY_VERY_LOW` and `IoPriorityVeryLow`, which causes Windows
+    // to evict the sampler's pages under heavy RAM testing and can trap an
+    // in-flight tick until the workload exits. `THREAD_PRIORITY_LOWEST` in
+    // `ABOVE_NORMAL_PRIORITY_CLASS` has base priority 8 (equal to ordinary
+    // normal-priority workloads) while keeping normal memory priority.
+    let priority = if background {
+        THREAD_PRIORITY_LOWEST
+    } else {
+        THREAD_PRIORITY_ABOVE_NORMAL
+    };
+    if let Err(error) = unsafe { SetThreadPriority(thread, priority) } {
+        tracing::debug!(%error, background, "sampler thread priority change refused");
+    }
+    set_thread_power_throttling(thread, background);
+}
+
+/// Immediately restore the sampling thread's active priority from the UI
+/// thread without waiting for an in-flight `sample()` tick to return.
+pub fn wake_sampler_priority() {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::HANDLE;
+
+    SAMPLER_IN_BACKGROUND.store(false, Ordering::Release);
+    let slot = tm_core::sync::lock(&SAMPLER_THREAD_HANDLE);
+    if let Some(raw) = *slot {
+        apply_sampler_priority(HANDLE(raw as *mut std::ffi::c_void), false);
+    }
+}
+
+/// Lower or raise the sampling thread's scheduling priority on the engine thread.
+fn set_sampler_background(background: bool) {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::System::Threading::GetCurrentThread;
+
+    let prev = SAMPLER_IN_BACKGROUND.swap(background, Ordering::AcqRel);
+    apply_sampler_priority(unsafe { GetCurrentThread() }, background);
+    if prev != background {
+        tracing::debug!(background, "sampler thread background mode");
     }
 }
 
@@ -756,6 +898,7 @@ impl PlatformActions for WinActions {
 pub fn create_collector() -> WinCollector {
     WinCollector {
         inner: sampler::Sampler::new(),
+        thread_registered: false,
     }
 }
 

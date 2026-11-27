@@ -56,6 +56,22 @@ use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
 
+/// Best-effort scheduling priority bump for the GUI and root core service on
+/// Linux. Succeeds when running as root (`taskman-service`) or when the user
+/// session grants `RLIMIT_NICE` headroom, and fails silently otherwise.
+///
+/// Deliberately never lowers priority (raises nice) when hidden, because an
+/// unprivileged Linux process cannot lower its nice value back on restore.
+pub fn prioritize_control_plane() {
+    // SAFETY: `setpriority` for the current process (`who = 0`) has no memory
+    // safety preconditions; EACCES/EPERM are expected for unprivileged sessions.
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -5) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::debug!(%error, "could not adjust Linux control-plane nice value");
+    }
+}
+
 pub struct LinuxCollector {
     sys: System,
     disks: Disks,
@@ -103,15 +119,34 @@ pub struct LinuxCollector {
     /// Cooldown after a broker refusal/failure on sampler telemetry so an
     /// unauthorized binary (e.g. dev build) does not probe every tick.
     broker_refused_until: Option<std::time::Instant>,
+    /// Static host/OS identity strings cached once at collector construction
+    /// instead of re-reading `/etc/os-release` and `uname` on every tick.
+    static_hostname: String,
+    static_os_name: String,
+    static_os_version: String,
+    static_kernel_version: String,
 }
 
 /// How long the sampler pauses telemetry broker requests after a refusal/error.
 const BROKER_REFUSAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Minimum RSS movement (bytes) that triggers an immediate `smaps_rollup`
-/// rescan before the staggered TTL expires.
+/// rescan before the staggered TTL expires for ordinary processes.
 const PRIVATE_WS_RSS_DELTA_BYTES: u64 = 64 * 1024;
+/// Above this RSS (256 MiB), scale the immediate-rescan delta to 5% of RSS so
+/// a growing multi-GB memory tester (`memtester`, `stress-ng`, etc.) does not
+/// force a full multi-million-PTE kernel `smaps_rollup` walk on every tick.
+const PRIVATE_WS_LARGE_PROCESS_BYTES: u64 = 256 * 1024 * 1024;
 const PRIVATE_WS_BASE_TTL_SECS: u64 = 8;
+/// Backed-off TTL for a PID whose last `smaps_rollup` read was slow
+/// (`>= PRIVATE_WS_SLOW_READ_THRESHOLD`), keeping the sampler responsive under
+/// heavy `mmap_lock` / memory-bandwidth contention.
+const PRIVATE_WS_SLOW_TTL_SECS: u64 = 60;
+const PRIVATE_WS_SLOW_READ_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(15);
+/// Per-tick time budget for local `/proc/<pid>/smaps_rollup` reads. Remaining
+/// stale PIDs keep their clamped cached PWS (or live RSS) and refresh on
+/// subsequent ticks instead of stalling the sampling engine.
+const PRIVATE_WS_TICK_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
 const PEAK_MEM_BASE_TTL_SECS: u64 = 5;
 const CMDLINE_NONE_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -128,6 +163,7 @@ struct PrivateWsEntry {
     last_rss: u64,
     pws_bytes: Option<u64>,
     sampled_at: Instant,
+    slow_read: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -257,7 +293,13 @@ impl SystemCollector for LinuxCollector {
             .disk_topology
             .as_ref()
             .is_none_or(|topology| started.duration_since(topology.read_at) >= DISK_TOPOLOGY_TTL);
-        self.disks.refresh(refresh_disk_list);
+        // Live disk throughput and active% come from `/proc/diskstats` every
+        // tick; `statvfs` capacity refreshes only need to run on
+        // `DISK_TOPOLOGY_TTL`, avoiding per-second VFS/mount stalls under
+        // memory/swap pressure.
+        if refresh_disk_list {
+            self.disks.refresh(true);
+        }
         self.networks.refresh(true);
 
         let cpus = self.sys.cpus();
@@ -326,6 +368,7 @@ impl SystemCollector for LinuxCollector {
         // One logind record read per user per tick, not per process.
         let mut display_sessions: HashMap<u32, Option<u32>> = HashMap::new();
         let mut thread_total = 0usize;
+        let mut smaps_budget_used = std::time::Duration::ZERO;
         for (pid, p) in self.sys.processes() {
             // sysinfo inserts every Linux task (thread) into the process map as
             // its own entry whenever tasks are refreshed (its default, even in
@@ -422,8 +465,21 @@ impl SystemCollector for LinuxCollector {
                         } else {
                             entry.mem_bytes = rss;
                         }
+                    } else if smaps_budget_used >= PRIVATE_WS_TICK_BUDGET {
+                        if let Some(pws) = cached.and_then(|c| c.pws_bytes) {
+                            let clamped = pws.min(rss);
+                            entry.private_working_set_bytes = Some(clamped);
+                            entry.mem_bytes = clamped;
+                        } else {
+                            entry.mem_bytes = rss;
+                        }
                     } else {
-                        match read_local_private_working_set_into(pid_u, &mut text_buf) {
+                        let smaps_started = Instant::now();
+                        let read_res = read_local_private_working_set_into(pid_u, &mut text_buf);
+                        let smaps_dur = smaps_started.elapsed();
+                        smaps_budget_used = smaps_budget_used.saturating_add(smaps_dur);
+                        let slow_read = smaps_dur >= PRIVATE_WS_SLOW_READ_THRESHOLD;
+                        match read_res {
                             LocalPrivateWs::Measured(pws) => {
                                 self.private_ws.insert(
                                     pid_u,
@@ -432,6 +488,7 @@ impl SystemCollector for LinuxCollector {
                                         last_rss: rss,
                                         pws_bytes: Some(pws),
                                         sampled_at: started,
+                                        slow_read,
                                     },
                                 );
                                 entry.private_working_set_bytes = Some(pws);
@@ -445,6 +502,7 @@ impl SystemCollector for LinuxCollector {
                                         last_rss: rss,
                                         pws_bytes: cached.and_then(|c| c.pws_bytes),
                                         sampled_at: started,
+                                        slow_read: cached.is_some_and(|c| c.slow_read),
                                     },
                                 );
                                 if let Some(pws) = cached.and_then(|c| c.pws_bytes) {
@@ -461,8 +519,11 @@ impl SystemCollector for LinuxCollector {
                             }
                         }
                     }
-                } else if !self.background {
-                    match read_local_private_working_set_into(pid_u, &mut text_buf) {
+                } else if !self.background && smaps_budget_used < PRIVATE_WS_TICK_BUDGET {
+                    let smaps_started = Instant::now();
+                    let read_res = read_local_private_working_set_into(pid_u, &mut text_buf);
+                    smaps_budget_used = smaps_budget_used.saturating_add(smaps_started.elapsed());
+                    match read_res {
                         LocalPrivateWs::Measured(pws) => {
                             entry.private_working_set_bytes = Some(pws);
                             entry.mem_bytes = pws;
@@ -634,6 +695,10 @@ impl SystemCollector for LinuxCollector {
                     .and_then(|telem| telem.private_working_set_bytes)
                 {
                     if let Some(ticks) = entry.boot_start_ticks {
+                        let slow_read = self
+                            .private_ws
+                            .get(&entry.pid)
+                            .is_some_and(|prev| prev.start_ticks == ticks && prev.slow_read);
                         self.private_ws.insert(
                             entry.pid,
                             PrivateWsEntry {
@@ -641,6 +706,7 @@ impl SystemCollector for LinuxCollector {
                                 last_rss: entry.working_set_bytes.unwrap_or(pws),
                                 pws_bytes: Some(pws),
                                 sampled_at: started,
+                                slow_read,
                             },
                         );
                     }
@@ -816,10 +882,10 @@ impl SystemCollector for LinuxCollector {
             gpus,
             processes,
             system: SystemMisc {
-                hostname: hostname(),
-                os_name: System::name().unwrap_or_else(|| "Linux".into()),
-                os_version: System::os_version().unwrap_or_default(),
-                kernel_version: System::kernel_version().unwrap_or_default(),
+                hostname: self.static_hostname.clone(),
+                os_name: self.static_os_name.clone(),
+                os_version: self.static_os_version.clone(),
+                kernel_version: self.static_kernel_version.clone(),
                 uptime_s: System::uptime(),
                 boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
@@ -879,6 +945,14 @@ enum LocalPrivateWs {
     Unavailable,
 }
 
+fn private_ws_rss_delta_threshold(rss: u64) -> u64 {
+    if rss > PRIVATE_WS_LARGE_PROCESS_BYTES {
+        (rss / 20).max(PRIVATE_WS_RSS_DELTA_BYTES)
+    } else {
+        PRIVATE_WS_RSS_DELTA_BYTES
+    }
+}
+
 fn private_ws_refresh_needed(
     entry: &PrivateWsEntry,
     pid: u32,
@@ -886,9 +960,22 @@ fn private_ws_refresh_needed(
     rss: u64,
     now: Instant,
 ) -> bool {
-    entry.start_ticks != start_ticks
-        || rss.abs_diff(entry.last_rss) >= PRIVATE_WS_RSS_DELTA_BYTES
-        || now.duration_since(entry.sampled_at) >= staggered_ttl(PRIVATE_WS_BASE_TTL_SECS, pid, 5)
+    if entry.start_ticks != start_ticks {
+        return true;
+    }
+    let ttl = if entry.slow_read {
+        staggered_ttl(PRIVATE_WS_SLOW_TTL_SECS, pid, 10)
+    } else {
+        staggered_ttl(PRIVATE_WS_BASE_TTL_SECS, pid, 5)
+    };
+    if now.duration_since(entry.sampled_at) >= ttl {
+        return true;
+    }
+    // A PID whose previous `smaps_rollup` walk was slow (e.g. a multi-GB
+    // memory tester holding `mmap_lock`) stays on its backed-off TTL instead
+    // of re-walking every time RSS shifts; its displayed memory still tracks
+    // live RSS via clamping every tick.
+    !entry.slow_read && rss.abs_diff(entry.last_rss) >= private_ws_rss_delta_threshold(rss)
 }
 
 fn read_local_private_working_set_into(pid: u32, buf: &mut String) -> LocalPrivateWs {
@@ -1028,7 +1115,6 @@ fn cached_elf_32bit(
 ) -> Option<bool> {
     if let Some((ticks, value)) = cache.get(&pid)
         && *ticks == start_ticks
-        && value.is_some()
     {
         return *value;
     }
@@ -2871,6 +2957,10 @@ pub fn create_collector() -> LinuxCollector {
         elf_classes: HashMap::new(),
         net_totals: HashMap::new(),
         broker_refused_until: None,
+        static_hostname: hostname(),
+        static_os_name: System::name().unwrap_or_else(|| "Linux".into()),
+        static_os_version: System::os_version().unwrap_or_default(),
+        static_kernel_version: System::kernel_version().unwrap_or_default(),
     }
 }
 
@@ -3506,6 +3596,7 @@ mod tests {
             last_rss: 10 * 1024 * 1024,
             pws_bytes: Some(8 * 1024 * 1024),
             sampled_at: base,
+            slow_read: false,
         };
         assert!(!private_ws_refresh_needed(
             &entry,
@@ -3550,6 +3641,54 @@ mod tests {
             10 * 1024 * 1024,
             base + pid_ttl,
         ));
+
+        // Large processes (>256 MiB, e.g. a 16 GiB RAM tester) scale the
+        // delta threshold to 5% of RSS so tiny allocation steps do not force
+        // per-tick kernel PTE walks.
+        let large_rss = 16 * 1024 * 1024 * 1024u64;
+        let large_entry = PrivateWsEntry {
+            start_ticks: 200,
+            last_rss: large_rss,
+            pws_bytes: Some(large_rss),
+            sampled_at: base,
+            slow_read: false,
+        };
+        assert!(!private_ws_refresh_needed(
+            &large_entry,
+            7,
+            200,
+            large_rss + 100 * 1024 * 1024,
+            base + std::time::Duration::from_secs(1),
+        ));
+        assert!(private_ws_refresh_needed(
+            &large_entry,
+            7,
+            200,
+            large_rss + large_rss / 20 + 4096,
+            base + std::time::Duration::from_secs(1),
+        ));
+
+        // A PID whose previous smaps_rollup walk was slow stays on the
+        // backed-off TTL even when RSS changes.
+        let slow_entry = PrivateWsEntry {
+            slow_read: true,
+            ..large_entry
+        };
+        let slow_ttl = staggered_ttl(PRIVATE_WS_SLOW_TTL_SECS, 7, 10);
+        assert!(!private_ws_refresh_needed(
+            &slow_entry,
+            7,
+            200,
+            large_rss + large_rss / 2,
+            base + slow_ttl - std::time::Duration::from_millis(1),
+        ));
+        assert!(private_ws_refresh_needed(
+            &slow_entry,
+            7,
+            200,
+            large_rss,
+            base + slow_ttl,
+        ));
     }
 
     #[test]
@@ -3586,5 +3725,36 @@ mod tests {
             path.as_cstr().to_str().unwrap(),
             "/proc/4294967295/smaps_rollup"
         );
+    }
+
+    #[test]
+    fn cached_elf_32bit_negative_caches_unreadable_paths_per_generation() {
+        let dir =
+            std::env::temp_dir().join(format!("tm_elf_neg_cache_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let bin = dir.join("probe.bin");
+        let _ = std::fs::remove_file(&bin);
+
+        let mut cache = HashMap::new();
+        assert_eq!(
+            cached_elf_32bit(&mut cache, 77, Some(100), Some(&bin)),
+            None
+        );
+
+        // Even if the file appears later, the same (pid, start_ticks) must
+        // serve the negative cache instead of reopening on every tick.
+        std::fs::write(&bin, [0x7F, b'E', b'L', b'F', 1]).expect("write fake ELF32");
+        assert_eq!(
+            cached_elf_32bit(&mut cache, 77, Some(100), Some(&bin)),
+            None
+        );
+
+        // A recycled PID (new start_ticks) invalidates the cache and reads fresh.
+        assert_eq!(
+            cached_elf_32bit(&mut cache, 77, Some(101), Some(&bin)),
+            Some(true)
+        );
+        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

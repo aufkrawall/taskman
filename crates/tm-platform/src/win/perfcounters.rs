@@ -734,6 +734,160 @@ impl Drop for QueryGroup {
     }
 }
 
+/// How long an asynchronously collected PDH snapshot remains usable before the
+/// sampler treats it as unavailable ("—") instead of presenting frozen rates.
+pub const PDH_STALE_AFTER: Duration = Duration::from_secs(15);
+
+/// Immutable snapshot of all PDH-derived metrics from one collection cycle.
+#[derive(Debug, Clone)]
+pub struct PdhSnapshot {
+    pub collected_at: Instant,
+    pub gpu_engines: Vec<GpuEngineRecord>,
+    pub gpu_adapter_memory: Vec<GpuAdapterMemRecord>,
+    pub gpu_memory: Vec<GpuMemRecord>,
+    pub disks: Vec<DiskPerf>,
+    pub cpu_perf_pct: Option<f32>,
+    pub cpu_counter_failed: bool,
+    pub interrupt_pct: Option<f32>,
+}
+
+impl PdhSnapshot {
+    pub fn is_fresh_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.collected_at) <= PDH_STALE_AFTER
+    }
+}
+
+struct AsyncPdhState {
+    pending_demand: Option<TelemetryDemand>,
+    latest: Option<std::sync::Arc<PdhSnapshot>>,
+    shutdown: bool,
+}
+
+/// Non-blocking wrapper around [`PdhCounters`].
+///
+/// `PdhCollectQueryData` on wildcard GPU/Disk/Perflib counters can block for
+/// multiple seconds when the machine is under extreme memory pressure or
+/// DxgKrnl/Perflib lock contention. Running PDH collection on its own
+/// event-driven worker thread guarantees `tm-engine` keeps publishing live
+/// CPU, RAM, network, and process snapshots even if PDH stalls; stale PDH
+/// readings expire cleanly to unavailable rather than freezing the app or
+/// fabricating zeros.
+pub struct AsyncPdhCollector {
+    state: std::sync::Arc<(std::sync::Mutex<AsyncPdhState>, std::sync::Condvar)>,
+    worker_started: std::sync::atomic::AtomicBool,
+}
+
+impl Default for AsyncPdhCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncPdhCollector {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new((
+                std::sync::Mutex::new(AsyncPdhState {
+                    pending_demand: None,
+                    latest: None,
+                    shutdown: false,
+                }),
+                std::sync::Condvar::new(),
+            )),
+            worker_started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn ensure_worker(&self) {
+        use std::sync::atomic::Ordering;
+        if self.worker_started.load(Ordering::Acquire) {
+            return;
+        }
+        if self.worker_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let shared = std::sync::Arc::clone(&self.state);
+        if let Err(error) = std::thread::Builder::new()
+            .name("tm-pdh".into())
+            .spawn(move || pdh_worker_main(shared))
+        {
+            self.worker_started.store(false, Ordering::Release);
+            tracing::warn!(%error, "could not start async PDH collector thread");
+        }
+    }
+
+    /// Trigger a PDH collection for `demand` (coalesced if one is already
+    /// pending or in flight) and immediately return the newest fresh snapshot
+    /// without blocking the caller.
+    pub fn request_and_read(
+        &self,
+        demand: TelemetryDemand,
+        now: Instant,
+    ) -> Option<std::sync::Arc<PdhSnapshot>> {
+        self.ensure_worker();
+        let (lock, condvar) = &*self.state;
+        let mut guard = tm_core::sync::lock(lock);
+        guard.pending_demand = Some(demand);
+        let latest = guard
+            .latest
+            .as_ref()
+            .filter(|snap| snap.is_fresh_at(now))
+            .cloned();
+        drop(guard);
+        condvar.notify_one();
+        latest
+    }
+}
+
+impl Drop for AsyncPdhCollector {
+    fn drop(&mut self) {
+        let (lock, condvar) = &*self.state;
+        tm_core::sync::lock(lock).shutdown = true;
+        condvar.notify_all();
+    }
+}
+
+fn pdh_worker_main(shared: std::sync::Arc<(std::sync::Mutex<AsyncPdhState>, std::sync::Condvar)>) {
+    super::prioritize_current_thread();
+    let mut pdh = PdhCounters::new();
+    let (lock, condvar) = &*shared;
+    loop {
+        let demand = {
+            let mut guard = tm_core::sync::lock(lock);
+            while !guard.shutdown && guard.pending_demand.is_none() {
+                guard = condvar
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if guard.shutdown {
+                break;
+            }
+            match guard.pending_demand.take() {
+                Some(demand) => demand,
+                None => continue,
+            }
+        };
+
+        pdh.tick(demand);
+        let snapshot = std::sync::Arc::new(PdhSnapshot {
+            collected_at: Instant::now(),
+            gpu_engines: pdh.read_gpu_engines().unwrap_or_default(),
+            gpu_adapter_memory: pdh.read_gpu_adapter_memory().unwrap_or_default(),
+            gpu_memory: pdh.read_gpu_memory().unwrap_or_default(),
+            disks: pdh.read_disks(),
+            cpu_perf_pct: pdh.read_cpu_perf_pct(),
+            cpu_counter_failed: pdh.cpu_counter_failed(),
+            interrupt_pct: pdh.read_interrupt_pct(),
+        });
+
+        let mut guard = tm_core::sync::lock(lock);
+        if guard.shutdown {
+            break;
+        }
+        guard.latest = Some(snapshot);
+    }
+}
+
 // ------------------------------------------------------------------ misc
 
 /// Memory details via GlobalMemoryStatusEx + GetPerformanceInfo.
@@ -1078,5 +1232,26 @@ mod tests {
         for m in mems {
             assert!(m.dedicated_bytes < 1024 * 1024 * 1024 * 1024);
         }
+    }
+
+    #[test]
+    fn pdh_snapshot_expires_after_staleness_window() {
+        let t0 = Instant::now();
+        let snap = PdhSnapshot {
+            collected_at: t0,
+            gpu_engines: Vec::new(),
+            gpu_adapter_memory: Vec::new(),
+            gpu_memory: Vec::new(),
+            disks: Vec::new(),
+            cpu_perf_pct: Some(100.0),
+            cpu_counter_failed: false,
+            interrupt_pct: Some(1.0),
+        };
+        assert!(snap.is_fresh_at(t0));
+        assert!(snap.is_fresh_at(t0 + PDH_STALE_AFTER));
+        assert!(
+            !snap.is_fresh_at(t0 + PDH_STALE_AFTER + Duration::from_millis(1)),
+            "stale PDH snapshots must expire to unavailable instead of serving frozen values"
+        );
     }
 }

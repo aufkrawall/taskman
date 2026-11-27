@@ -445,8 +445,7 @@ fn run_gui(mock: bool, args: &[String]) {
             None
         }
     };
-    #[cfg(target_os = "windows")]
-    tm_platform::win::prioritize_control_plane();
+    tm_platform::prioritize_control_plane();
 
     if let Some(sz) = args
         .iter()

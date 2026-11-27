@@ -17,8 +17,9 @@ use crate::actions::{
 };
 use crate::linux_core_service::{
     ACTION_DEADLINE_MS, CLIENT_DEADLINE_MS, Refusal, Request, Response, ServiceFailure,
-    ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo, WireFileIoAccounting,
-    WireFileIoEntry, WireFileIoState, WireModule, WireThread, WireThreadState, WireThreads,
+    ServiceStatusInfo, ServiceVerb, TELEMETRY_DEADLINE_MS, WireConnection, WireFileIo,
+    WireFileIoAccounting, WireFileIoEntry, WireFileIoState, WireModule, WireThread,
+    WireThreadState, WireThreads,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -251,6 +252,7 @@ fn file_io_entry_from_wire(wire: WireFileIoEntry) -> ProcessFileIo {
 pub(crate) fn request_deadline(request: &Request) -> Duration {
     let millis = match request {
         Request::Action { .. } => ACTION_DEADLINE_MS,
+        Request::ProcessTelemetry { .. } => TELEMETRY_DEADLINE_MS,
         _ => CLIENT_DEADLINE_MS,
     };
     Duration::from_millis(millis)
@@ -854,6 +856,7 @@ mod tests {
         // two must never be conflated: giving up on a running action is what
         // turns it into a retryable "unavailable".
         const { assert!(ACTION_DEADLINE_MS > CLIENT_DEADLINE_MS) };
+        const { assert!(CLIENT_DEADLINE_MS > TELEMETRY_DEADLINE_MS) };
         for request in every_action() {
             assert_eq!(
                 request_deadline(&request),
@@ -868,6 +871,13 @@ mod tests {
                 "{request:?}"
             );
         }
+        assert_eq!(
+            request_deadline(&Request::ProcessTelemetry {
+                targets: Vec::new(),
+                wanted_socket_inodes: Vec::new(),
+            }),
+            Duration::from_millis(TELEMETRY_DEADLINE_MS),
+        );
     }
 
     #[test]

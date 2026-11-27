@@ -233,6 +233,7 @@ The environment is not read: every path comes from the build or the manifest.";
     }
 
     fn run_broker(dev: bool) {
+        tm_platform::prioritize_control_plane();
         // File logging is best effort and never gates the broker: a log
         // directory that cannot be proven root-owned disables the appender
         // only, because an unusable directory must not take the privileged

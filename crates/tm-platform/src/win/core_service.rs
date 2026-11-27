@@ -849,6 +849,12 @@ impl TelemetryBroker {
     }
 }
 
+/// Bounded deadline for sampler-tick telemetry calls to the LocalSystem broker.
+/// Local named-pipe round-trips finish in <2 ms when healthy; keeping this
+/// tight ensures a starved broker under heavy memory/CPU load cannot stall the
+/// sampling engine for seconds at a time.
+const TELEMETRY_BROKER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn telemetry_broker_call(
     request: BrokerRequest,
 ) -> std::result::Result<BrokerValue, BrokerCallError> {
@@ -860,7 +866,7 @@ fn telemetry_broker_call(
             "telemetry worker could not start".into(),
         ));
     };
-    worker.call_with_timeout(request, std::time::Duration::from_secs(2))
+    worker.call_with_timeout(request, TELEMETRY_BROKER_TIMEOUT)
 }
 
 /// Outcome of asking the broker for per-process network counters.
@@ -3393,6 +3399,7 @@ pub fn run_broker(
         std::thread::Builder::new()
             .name(format!("tm-broker-{index}"))
             .spawn(move || {
+                super::prioritize_current_thread();
                 let actions = super::WinActions;
                 loop {
                     let next = tm_core::sync::lock(&receiver).recv();

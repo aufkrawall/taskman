@@ -958,9 +958,18 @@ pub fn is_wow64(pid: u32) -> Option<bool> {
     }
 }
 
-/// Determine whether an executable on disk is a 32-bit (WOW64) binary
-/// by inspecting its PE Machine header without launching or attaching to it.
-pub fn pe_is_wow64(path: &std::path::Path) -> Option<bool> {
+/// Bounded process-wide cache for [`pe_is_wow64`]. An executable's PE Machine
+/// header (`x86` vs `x64`/`ARM64`) does not change while a process runs, so
+/// caching by path avoids ~100+ synchronous disk opens per sampler tick for
+/// protected/SYSTEM processes whose handle cannot be opened — critical when
+/// RAM testers evict the Windows standby file cache.
+const PE_WOW64_CACHE_CAP: usize = 2048;
+
+static PE_WOW64_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, Option<bool>>>,
+> = std::sync::Mutex::new(None);
+
+fn pe_is_wow64_uncached(path: &std::path::Path) -> Option<bool> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
     let mut dos = [0u8; 64];
@@ -981,6 +990,28 @@ pub fn pe_is_wow64(path: &std::path::Path) -> Option<bool> {
         0x8664 | 0xaa64 => Some(false),         // 64-bit (x64, ARM64)
         _ => None,
     }
+}
+
+/// Determine whether an executable on disk is a 32-bit (WOW64) binary
+/// by inspecting its PE Machine header without launching or attaching to it.
+/// Results (including unreadable misses) are cached by path.
+pub fn pe_is_wow64(path: &std::path::Path) -> Option<bool> {
+    {
+        let guard = tm_core::sync::lock(&PE_WOW64_CACHE);
+        if let Some(map) = guard.as_ref()
+            && let Some(&cached) = map.get(path)
+        {
+            return cached;
+        }
+    }
+    let answer = pe_is_wow64_uncached(path);
+    let mut guard = tm_core::sync::lock(&PE_WOW64_CACHE);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() >= PE_WOW64_CACHE_CAP {
+        map.clear();
+    }
+    map.insert(path.to_path_buf(), answer);
+    answer
 }
 
 /// Helper to extract executable path from service binary command line
@@ -1076,19 +1107,140 @@ fn normalize_service_command_line(raw: &str) -> Option<String> {
 /// service (new binary path or account) is picked up within this window.
 const SERVICE_CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Service name -> configuration, with the instant the cache was started.
-///
-/// The catalog runs on every sampler tick. Querying each running service's
-/// configuration means an `OpenServiceW` and two `QueryServiceConfigW` round
-/// trips to services.exe per service — about 36 ms per tick for ~100 service
-/// hosts — to re-read values that practically never change. Only the
-/// enumeration (which carries the PIDs) has to be fresh.
+/// Minimum interval between asynchronous SCM service-catalog refreshes for
+/// the hot sampling loop.
+const SERVICE_CATALOG_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// One-time bounded wait on the very first catalog read so startup snapshots
+/// carry complete service names and `svchost` command lines on a healthy
+/// machine (~35 ms) without stalling if `services.exe` is wedged under load.
+const SERVICE_CATALOG_INITIAL_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Staggered per-service TTL around [`SERVICE_CONFIG_TTL`] so ~100 service
+/// configs never expire on the exact same refresh and trigger a synchronized
+/// RPC storm against `services.exe`.
+fn staggered_service_config_ttl(name: &str) -> std::time::Duration {
+    let hash = name.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    });
+    SERVICE_CONFIG_TTL + std::time::Duration::from_secs(hash % 30)
+}
+
+#[derive(Clone)]
+struct CachedServiceConfig {
+    config: ServiceConfig,
+    fetched_at: std::time::Instant,
+}
+
 static SERVICE_CONFIGS: std::sync::Mutex<
-    Option<(
-        std::time::Instant,
-        std::collections::HashMap<String, ServiceConfig>,
-    )>,
+    Option<std::collections::HashMap<String, CachedServiceConfig>>,
 > = std::sync::Mutex::new(None);
+
+struct AsyncServiceCatalogState {
+    latest: std::sync::Arc<ServiceCatalog>,
+    refreshed_at: Option<std::time::Instant>,
+    initial_deadline: Option<std::time::Instant>,
+    refresh_requested: bool,
+    refresh_in_flight: bool,
+}
+
+struct AsyncServiceCatalog {
+    state: std::sync::Arc<(
+        std::sync::Mutex<AsyncServiceCatalogState>,
+        std::sync::Condvar,
+    )>,
+}
+
+impl AsyncServiceCatalog {
+    fn start() -> Self {
+        let state = std::sync::Arc::new((
+            std::sync::Mutex::new(AsyncServiceCatalogState {
+                latest: std::sync::Arc::new(ServiceCatalog::default()),
+                refreshed_at: None,
+                initial_deadline: None,
+                refresh_requested: false,
+                refresh_in_flight: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let worker_state = std::sync::Arc::clone(&state);
+        if let Err(error) = std::thread::Builder::new()
+            .name("tm-scm".into())
+            .spawn(move || {
+                let (lock, condvar) = &*worker_state;
+                loop {
+                    {
+                        let mut guard = tm_core::sync::lock(lock);
+                        while !guard.refresh_requested {
+                            guard = condvar
+                                .wait(guard)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        guard.refresh_requested = false;
+                        guard.refresh_in_flight = true;
+                    }
+                    let fresh = std::sync::Arc::new(service_catalog());
+                    let mut guard = tm_core::sync::lock(lock);
+                    guard.latest = fresh;
+                    guard.refreshed_at = Some(std::time::Instant::now());
+                    guard.refresh_in_flight = false;
+                    drop(guard);
+                    condvar.notify_all();
+                }
+            })
+        {
+            tracing::warn!(%error, "could not start async SCM service-catalog thread");
+        }
+        Self { state }
+    }
+
+    fn get_or_trigger_refresh(&self) -> std::sync::Arc<ServiceCatalog> {
+        let (lock, condvar) = &*self.state;
+        let mut guard = tm_core::sync::lock(lock);
+        let due = guard
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() >= SERVICE_CATALOG_REFRESH_TTL);
+        let wake = due && !guard.refresh_in_flight && !guard.refresh_requested;
+        if wake {
+            guard.refresh_requested = true;
+        }
+        let initial_deadline =
+            if guard.refreshed_at.is_none() {
+                Some(*guard.initial_deadline.get_or_insert_with(|| {
+                    std::time::Instant::now() + SERVICE_CATALOG_INITIAL_WAIT
+                }))
+            } else {
+                None
+            };
+        if wake {
+            condvar.notify_all();
+        }
+        if let Some(deadline) = initial_deadline {
+            while guard.refreshed_at.is_none() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, _) = condvar
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard = next;
+            }
+        }
+        std::sync::Arc::clone(&guard.latest)
+    }
+}
+
+/// Non-blocking cached service catalog for the sampling engine.
+///
+/// Triggers an asynchronous refresh on a dedicated worker thread whenever the
+/// snapshot is older than [`SERVICE_CATALOG_REFRESH_TTL`], so a stalled
+/// `services.exe` RPC under heavy RAM pressure can never block `tm-engine`.
+pub fn service_catalog_cached() -> std::sync::Arc<ServiceCatalog> {
+    static ASYNC_CATALOG: std::sync::OnceLock<AsyncServiceCatalog> = std::sync::OnceLock::new();
+    ASYNC_CATALOG
+        .get_or_init(AsyncServiceCatalog::start)
+        .get_or_trigger_refresh()
+}
 
 /// Read one service's configuration through an open SCM handle. Failures
 /// leave the fields `None` (and are cached as such until the TTL expires).
@@ -1138,14 +1290,9 @@ pub fn service_catalog() -> ServiceCatalog {
     use windows::Win32::System::Services as scm;
     use windows::core::PCWSTR;
     let mut catalog = ServiceCatalog::default();
+    let now = std::time::Instant::now();
     let mut cache = tm_core::sync::lock(&SERVICE_CONFIGS);
-    if cache
-        .as_ref()
-        .is_none_or(|(since, _)| since.elapsed() > SERVICE_CONFIG_TTL)
-    {
-        *cache = Some((std::time::Instant::now(), std::collections::HashMap::new()));
-    }
-    let configs = &mut cache.as_mut().expect("initialized above").1;
+    let configs = cache.get_or_insert_with(std::collections::HashMap::new);
     unsafe {
         let Ok(mgr) = scm::OpenSCManagerW(
             PCWSTR::null(),
@@ -1170,7 +1317,11 @@ pub fn service_catalog() -> ServiceCatalog {
                 // service hosts apart in the Processes list.
                 let display = pwstr_to_string(it.lpDisplayName);
                 let short = pwstr_to_string(it.lpServiceName);
-                let label = if display.is_empty() { short } else { display };
+                let label = if display.is_empty() {
+                    short.clone()
+                } else {
+                    display
+                };
                 if pid != 0 && !label.is_empty() {
                     let names = catalog.names_by_pid.entry(pid).or_default();
                     if !names.iter().any(|name| name.eq_ignore_ascii_case(&label)) {
@@ -1180,11 +1331,23 @@ pub fn service_catalog() -> ServiceCatalog {
                 if pid == 0 {
                     continue;
                 }
-                let config = configs
-                    .entry(pwstr_to_string(it.lpServiceName))
-                    .or_insert_with(|| {
-                        query_service_config(mgr, PCWSTR::from_raw(it.lpServiceName.0))
-                    });
+                let ttl = staggered_service_config_ttl(&short);
+                let needs_query = configs
+                    .get(&short)
+                    .is_none_or(|entry| now.saturating_duration_since(entry.fetched_at) >= ttl);
+                if needs_query {
+                    let config = query_service_config(mgr, PCWSTR::from_raw(it.lpServiceName.0));
+                    configs.insert(
+                        short.clone(),
+                        CachedServiceConfig {
+                            config,
+                            fetched_at: now,
+                        },
+                    );
+                }
+                let Some(config) = configs.get(&short).map(|entry| &entry.config) else {
+                    continue;
+                };
                 if let Some(account) = &config.account {
                     catalog
                         .accounts_by_pid
@@ -3482,5 +3645,59 @@ mod tests {
             !super::creation_matches(ts_a, Some(ts_b)),
             "same-second 100-ns timestamps 1 ms apart must not match"
         );
+    }
+
+    #[test]
+    fn pe_is_wow64_caches_disk_reads_and_misses() {
+        let dir =
+            std::env::temp_dir().join(format!("tm_pe_wow64_cache_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("probe_x64.exe");
+        let mut bytes = vec![0u8; 0x80];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        bytes[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        std::fs::write(&exe, &bytes).expect("write fake PE");
+
+        assert_eq!(pe_is_wow64(&exe), Some(false));
+        // Removing the file must still hit the in-memory cache rather than
+        // reopening the image on disk every sampler tick.
+        std::fs::remove_file(&exe).expect("remove fake PE");
+        assert_eq!(pe_is_wow64(&exe), Some(false));
+
+        let missing = dir.join("does_not_exist.exe");
+        assert_eq!(pe_is_wow64(&missing), None);
+        // Writing a valid PE afterwards still returns the cached miss for that path.
+        std::fs::write(&missing, &bytes).expect("write late PE");
+        assert_eq!(pe_is_wow64(&missing), None);
+        let _ = std::fs::remove_file(&missing);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn service_config_ttl_staggers_across_services() {
+        let ttls: std::collections::HashSet<std::time::Duration> = [
+            "EventLog",
+            "Dnscache",
+            "Dhcp",
+            "W32Time",
+            "Spooler",
+            "Winmgmt",
+            "Schedule",
+            "LanmanWorkstation",
+        ]
+        .into_iter()
+        .map(staggered_service_config_ttl)
+        .collect();
+        assert!(
+            ttls.len() > 1,
+            "service config TTLs must stagger to avoid synchronized SCM storms"
+        );
+        for ttl in ttls {
+            assert!(ttl >= SERVICE_CONFIG_TTL);
+            assert!(ttl < SERVICE_CONFIG_TTL + std::time::Duration::from_secs(30));
+        }
     }
 }
