@@ -917,6 +917,12 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   a machine that fills them); not measured over days of uptime. Per-file
   history before the session started does not exist anywhere in Windows, so
   processes older than the service are counted from its start (stated on the
-  page). Linux has no per-file source at all (would need
-  eBPF on `vfs_read`/`vfs_write` with root) and keeps the columns
-  `Unavailable`.
+  page).
+- Linux per-file accounting (`linux/btf.rs` + `linux/file_trace.rs`, added
+  2026-11-27) uses pure-Rust eBPF `fexit` trampolines on `vfs_read`,
+  `vfs_write`, `vfs_readv`, and `vfs_writev` plus a best-effort `fentry` probe
+  on `filp_close` (`bpf_d_path`) inside `taskman-service` (`CAP_BPF` +
+  `CAP_PERFMON` + `bpf` syscall). Open limits: requires Linux 5.5+ with
+  `/sys/kernel/btf/vmlinux` (5.10+ for `filp_close` `bpf_d_path`); `io_uring`
+  and memory-mapped I/O are not traced; without `taskman-core.service` active,
+  per-file byte counts remain `Unavailable` (`—`).

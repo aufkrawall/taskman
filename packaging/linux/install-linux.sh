@@ -46,7 +46,7 @@ readonly RUNTIME_DIR=/run/taskman
 # Manifest constants mirrored from crates/tm-platform/src/linux_core_service.rs.
 # The service rejects a manifest that disagrees with these, so they are fixed
 # here rather than configurable.
-readonly PROTOCOL_VERSION=2
+readonly PROTOCOL_VERSION=3
 readonly SOCKET_PATH=/run/taskman/core.sock
 readonly SENSOR_CACHE_MS=500
 

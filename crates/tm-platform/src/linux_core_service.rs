@@ -42,7 +42,7 @@ use tm_core::model::PriorityClass;
 /// release — a new variant, a field whose meaning shifts, a removed field —
 /// bumps it so a GUI and a service from different releases fail at the
 /// handshake instead of misreading each other.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Root-owned runtime directory that systemd creates for the service.
 pub const SOCKET_DIR: &str = "/run/taskman";
@@ -738,11 +738,48 @@ pub struct WireConnection {
     pub state: Option<String>,
 }
 
+/// Per-file accounting state reported by the privileged Linux eBPF tracer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WireFileIoState {
+    Unavailable,
+    Undelivered,
+    Undecodable,
+    Measured,
+}
+
+/// Accounting scope and reconciliation counters carried alongside [`WireFileIo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFileIoAccounting {
+    pub state: WireFileIoState,
+    pub since_ms: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+    pub unnamed_read_bytes: u64,
+    pub unnamed_write_bytes: u64,
+    pub omitted_read_bytes: u64,
+    pub omitted_write_bytes: u64,
+    pub counter_read_bytes: Option<u64>,
+    pub counter_write_bytes: Option<u64>,
+    pub events_lost: Option<u64>,
+    pub cleared_file_objects: u64,
+    pub unnamed_creates: u64,
+    pub dropped_paths: u64,
+    pub handles_complete: bool,
+    pub traced_since_process_start: bool,
+    pub counter_window_read_bytes: Option<u64>,
+    pub counter_window_write_bytes: Option<u64>,
+}
+
 /// Per-file I/O accounting of one process (`/proc/<pid>/io` is owner-only, so
-/// another user's process needs the broker).
+/// another user's process needs the broker, and the eBPF tracer runs there).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireFileIo {
     pub files: Vec<WireFileIoEntry>,
+    #[serde(default)]
+    pub accounting: Option<WireFileIoAccounting>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1328,6 +1365,28 @@ mod tests {
                     is_write: false,
                     open_handles: 1,
                 }],
+                accounting: Some(WireFileIoAccounting {
+                    state: WireFileIoState::Measured,
+                    since_ms: 1_200,
+                    read_bytes: 4096,
+                    write_bytes: 0,
+                    read_ops: 2,
+                    write_ops: 0,
+                    unnamed_read_bytes: 0,
+                    unnamed_write_bytes: 0,
+                    omitted_read_bytes: 0,
+                    omitted_write_bytes: 0,
+                    counter_read_bytes: Some(4096),
+                    counter_write_bytes: Some(0),
+                    events_lost: Some(0),
+                    cleared_file_objects: 0,
+                    unnamed_creates: 0,
+                    dropped_paths: 0,
+                    handles_complete: true,
+                    traced_since_process_start: true,
+                    counter_window_read_bytes: Some(4096),
+                    counter_window_write_bytes: Some(0),
+                }),
             })),
             Response::Telemetry(vec![ProcessTelemetryEntry {
                 pid: 42,

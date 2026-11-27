@@ -17,8 +17,8 @@ use crate::actions::{
 };
 use crate::linux_core_service::{
     ACTION_DEADLINE_MS, CLIENT_DEADLINE_MS, Refusal, Request, Response, ServiceFailure,
-    ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo, WireFileIoEntry, WireModule,
-    WireThread, WireThreadState, WireThreads,
+    ServiceStatusInfo, ServiceVerb, WireConnection, WireFileIo, WireFileIoAccounting,
+    WireFileIoEntry, WireFileIoState, WireModule, WireThread, WireThreadState, WireThreads,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -174,20 +174,53 @@ pub(crate) fn service_verb(action: ServiceAction) -> ServiceVerb {
 ///   weaker fact is stated — the enumeration's coverage is not part of the
 ///   answer — instead of claiming a complete handle table.
 pub(crate) fn file_io_from_wire(wire: WireFileIo) -> ProcessFileIoSnapshot {
+    let accounting = wire.accounting.map_or_else(
+        || FileIoAccounting {
+            state: FileIoAccountingState::Unavailable,
+            counter_read_bytes: None,
+            counter_write_bytes: None,
+            handles_complete: false,
+            ..FileIoAccounting::default()
+        },
+        file_io_accounting_from_wire,
+    );
     ProcessFileIoSnapshot {
         files: wire
             .files
             .into_iter()
             .map(file_io_entry_from_wire)
             .collect(),
-        accounting: FileIoAccounting {
-            state: FileIoAccountingState::Unavailable,
-            counter_read_bytes: None,
-            counter_write_bytes: None,
-            handles_complete: false,
-            // Every other counter belongs to a trace that does not exist here.
-            ..FileIoAccounting::default()
+        accounting,
+    }
+}
+
+fn file_io_accounting_from_wire(wire: WireFileIoAccounting) -> FileIoAccounting {
+    FileIoAccounting {
+        state: match wire.state {
+            WireFileIoState::Unavailable => FileIoAccountingState::Unavailable,
+            WireFileIoState::Undelivered => FileIoAccountingState::Undelivered,
+            WireFileIoState::Undecodable => FileIoAccountingState::Undecodable,
+            WireFileIoState::Measured => FileIoAccountingState::Measured,
         },
+        since_ms: wire.since_ms,
+        read_bytes: wire.read_bytes,
+        write_bytes: wire.write_bytes,
+        read_ops: wire.read_ops,
+        write_ops: wire.write_ops,
+        unnamed_read_bytes: wire.unnamed_read_bytes,
+        unnamed_write_bytes: wire.unnamed_write_bytes,
+        omitted_read_bytes: wire.omitted_read_bytes,
+        omitted_write_bytes: wire.omitted_write_bytes,
+        counter_read_bytes: wire.counter_read_bytes,
+        counter_write_bytes: wire.counter_write_bytes,
+        events_lost: wire.events_lost,
+        cleared_file_objects: wire.cleared_file_objects,
+        unnamed_creates: wire.unnamed_creates,
+        dropped_paths: wire.dropped_paths,
+        handles_complete: wire.handles_complete,
+        traced_since_process_start: wire.traced_since_process_start,
+        counter_window_read_bytes: wire.counter_window_read_bytes,
+        counter_window_write_bytes: wire.counter_window_write_bytes,
     }
 }
 
@@ -612,6 +645,7 @@ mod tests {
             response_label(&Response::Connections(Vec::<WireConnection>::new())),
             response_label(&Response::FileIo(Box::new(WireFileIo {
                 files: Vec::new(),
+                accounting: None,
             }))),
             response_label(&Response::Evidence(Box::new(ProcessEvidence {
                 pid: 1,
@@ -908,7 +942,10 @@ mod tests {
                 ..FileIoAccounting::default()
             },
         };
-        let brokered = file_io_from_wire(WireFileIo { files: Vec::new() });
+        let brokered = file_io_from_wire(WireFileIo {
+            files: Vec::new(),
+            accounting: None,
+        });
         let merged = merge_file_io(brokered, &direct);
         assert_eq!(merged.accounting.counter_read_bytes, Some(4096));
         assert_eq!(merged.accounting.counter_write_bytes, Some(512));
@@ -919,7 +956,13 @@ mod tests {
 
         // A direct read that could not measure them leaves them unknown.
         let empty = ProcessFileIoSnapshot::default();
-        let merged = merge_file_io(file_io_from_wire(WireFileIo { files: Vec::new() }), &empty);
+        let merged = merge_file_io(
+            file_io_from_wire(WireFileIo {
+                files: Vec::new(),
+                accounting: None,
+            }),
+            &empty,
+        );
         assert_eq!(merged.accounting.counter_read_bytes, None);
         assert_eq!(merged.accounting.counter_write_bytes, None);
     }
@@ -1068,6 +1111,7 @@ mod tests {
                     open_handles: 2,
                 },
             ],
+            accounting: None,
         });
         assert_eq!(snapshot.files.len(), 2);
         assert_eq!(snapshot.files[0].path, "/var/log/syslog");
@@ -1078,7 +1122,7 @@ mod tests {
         );
         assert_eq!(snapshot.files[1].write_bytes, Some(512));
         assert_eq!(snapshot.files[1].open_handles, 2);
-        // The wire carries files, not a trace and not process totals.
+        // Without a wire accounting block, state stays conservative.
         assert_eq!(
             snapshot.accounting.state,
             FileIoAccountingState::Unavailable
@@ -1087,6 +1131,38 @@ mod tests {
         assert_eq!(snapshot.accounting.counter_write_bytes, None);
         assert!(!snapshot.accounting.handles_complete);
         assert_eq!(snapshot.accounting.events_lost, None);
+
+        // When the service carries measured eBPF accounting, preserve it verbatim.
+        let measured = file_io_from_wire(WireFileIo {
+            files: Vec::new(),
+            accounting: Some(crate::linux_core_service::WireFileIoAccounting {
+                state: crate::linux_core_service::WireFileIoState::Measured,
+                since_ms: 500,
+                read_bytes: 128,
+                write_bytes: 256,
+                read_ops: 1,
+                write_ops: 2,
+                unnamed_read_bytes: 0,
+                unnamed_write_bytes: 0,
+                omitted_read_bytes: 0,
+                omitted_write_bytes: 0,
+                counter_read_bytes: Some(4096),
+                counter_write_bytes: Some(8192),
+                events_lost: Some(0),
+                cleared_file_objects: 0,
+                unnamed_creates: 0,
+                dropped_paths: 0,
+                handles_complete: true,
+                traced_since_process_start: true,
+                counter_window_read_bytes: Some(500),
+                counter_window_write_bytes: Some(900),
+            }),
+        });
+        assert_eq!(measured.accounting.state, FileIoAccountingState::Measured);
+        assert!(measured.accounting.handles_complete);
+        assert!(measured.accounting.traced_since_process_start);
+        assert_eq!(measured.accounting.counter_window_read_bytes, Some(500));
+        assert_eq!(measured.accounting.counter_window_write_bytes, Some(900));
     }
 
     fn wire_thread(tid: u32, state: WireThreadState) -> crate::linux_core_service::WireThread {

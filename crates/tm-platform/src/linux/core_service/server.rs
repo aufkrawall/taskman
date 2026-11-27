@@ -54,19 +54,22 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::actions::{ConnectionProtocol, ServiceAction, TcpState, ThreadState};
+use crate::actions::{
+    ConnectionProtocol, FileIoAccountingState, ServiceAction, TcpState, ThreadState,
+};
 use crate::linux_core_service::{
     ACTION_DEADLINE_MS, ActionRequest, ClientImage, INSTALL_ROOT, InstalledClient, MANIFEST_PATH,
     MAX_MANIFEST_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Manifest, NamespaceId,
     PROTOCOL_VERSION, PeerCredentials, PeerVerdict, ProcessEvidence, ProcessTelemetryEntry,
     Refusal, Request, RequestEnvelope, ResourceLimit, Response, ResponseEnvelope, SERVICE_UNIT,
     SOCKET_DIR, SOCKET_PATH, ServiceStatusInfo, ServiceVerb, TelemetryTarget, WireConnection,
-    WireFileIo, WireFileIoEntry, WireModule, WireProcIo, WireThread, WireThreadState, WireThreads,
-    decode_frame, encode_frame, evaluate_peer, is_inside_install_root, manifest_protection_problem,
-    read_frame, service_image_protection_problem,
+    WireFileIo, WireFileIoAccounting, WireFileIoEntry, WireFileIoState, WireModule, WireProcIo,
+    WireThread, WireThreadState, WireThreads, decode_frame, encode_frame, evaluate_peer,
+    is_inside_install_root, manifest_protection_problem, read_frame,
+    service_image_protection_problem,
 };
 use crate::linux_sensors::SensorSnapshot;
 use crate::linux_telemetry;
@@ -74,9 +77,9 @@ use tm_core::error::TmError;
 use tm_core::model::PriorityClass;
 
 use super::super::{
-    descriptors_listable, ensure_process_generation, process_connections, process_io,
-    process_modules, process_start_for_read, process_threads, process_tree, send_signal_checked,
-    sensors, services, set_affinity_direct, set_priority_direct,
+    descriptors_listable, ensure_process_generation, file_trace::LinuxFileTrace,
+    process_connections, process_modules, process_start_for_read, process_threads, process_tree,
+    send_signal_checked, sensors, services, set_affinity_direct, set_priority_direct,
 };
 
 /// Version this build reports; the workspace version, so a status answer names
@@ -219,6 +222,19 @@ pub fn run_service(dev: bool) -> Result<(), String> {
     };
     let (service_image, install_verified) = verify_service_image(dev)?;
     let listener = prepare_listener()?;
+    let file_trace = match LinuxFileTrace::start() {
+        Ok(trace) => {
+            tracing::info!("linux per-file eBPF tracer started");
+            Arc::new(trace)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "linux per-file eBPF tracer unavailable; per-file byte counts will remain unavailable"
+            );
+            Arc::new(LinuxFileTrace::disabled())
+        }
+    };
 
     let state = Arc::new(ServiceState {
         manifest,
@@ -232,10 +248,27 @@ pub fn run_service(dev: bool) -> Result<(), String> {
         sensor_poll: Mutex::new(SensorCache::default()),
         sensor_sample_unix_ms: AtomicI64::new(0),
         sensor_available: AtomicBool::new(false),
+        file_trace: Arc::clone(&file_trace),
         units_in_flight: Mutex::new(HashSet::new()),
         requests_served: AtomicU64::new(0),
         refusals: AtomicU64::new(0),
     });
+
+    let trace_stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let trace_worker = if file_trace.is_active() {
+        let trace = Arc::clone(&file_trace);
+        let stop = Arc::clone(&trace_stop);
+        Some(
+            std::thread::Builder::new()
+                .name("tm-file-trace".into())
+                .spawn(move || run_file_trace_maintenance(&trace, &stop))
+                .map_err(|error| {
+                    format!("could not start file trace maintenance thread: {error}")
+                })?,
+        )
+    } else {
+        None
+    };
 
     let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<ClientWork>(WORK_QUEUE_CAP);
     let work_rx = Arc::new(Mutex::new(work_rx));
@@ -268,6 +301,11 @@ pub fn run_service(dev: bool) -> Result<(), String> {
     // not abandon a privileged thread mid-flight.
     drop(work_tx);
     for worker in workers {
+        let _ = worker.join();
+    }
+    if let Some(worker) = trace_worker {
+        *tm_core::sync::lock(&trace_stop.0) = true;
+        trace_stop.1.notify_all();
         let _ = worker.join();
     }
     if result.is_ok() {
@@ -397,6 +435,8 @@ struct ServiceState {
     /// Published after every poll so `Status` cannot block behind sysfs + NVML.
     sensor_sample_unix_ms: AtomicI64,
     sensor_available: AtomicBool,
+    /// System-wide eBPF per-file I/O tracer (disabled gracefully when kernel/caps disallow).
+    file_trace: Arc<LinuxFileTrace>,
     /// Unit names with a verb in flight, so one unit's action can never be
     /// started twice by two clients.
     units_in_flight: Mutex<HashSet<String>>,
@@ -1585,7 +1625,7 @@ fn dispatch(state: &ServiceState, peer_pid: u32, request: Request) -> Response {
         Request::ProcessModules { pid, start_ticks } => modules_response(pid, start_ticks),
         Request::ProcessThreads { pid, start_ticks } => threads_response(pid, start_ticks),
         Request::ProcessConnections { pid, start_ticks } => connections_response(pid, start_ticks),
-        Request::ProcessFileIo { pid, start_ticks } => file_io_response(pid, start_ticks),
+        Request::ProcessFileIo { pid, start_ticks } => file_io_response(state, pid, start_ticks),
         Request::ProcessEvidence { pid, start_ticks } => match collect_evidence(pid, start_ticks) {
             Ok(evidence) => Response::Evidence(Box::new(evidence)),
             Err(error) => error_response(error),
@@ -1687,33 +1727,79 @@ fn connections_response(pid: u32, start_ticks: i64) -> Response {
     )
 }
 
+fn run_file_trace_maintenance(trace: &LinuxFileTrace, stop: &(Mutex<bool>, Condvar)) {
+    let mut guard = tm_core::sync::lock(&stop.0);
+    while !*guard {
+        drop(guard);
+        trace.maintain();
+        guard = tm_core::sync::lock(&stop.0);
+        if *guard {
+            break;
+        }
+        let (next, _) = stop
+            .1
+            .wait_timeout(guard, Duration::from_secs(2))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard = next;
+    }
+}
+
 /// Per-file I/O of one exact process.
 ///
-/// The reader brackets the two procfs walks with the same creation identity, so
-/// a partially old handle list and a partially new counter read can never be
-/// presented as one coherent answer.
-fn file_io_response(pid: u32, start_ticks: i64) -> Response {
-    match process_io::list_process_file_io(pid, Some(start_ticks)) {
-        Ok(read) => Response::FileIo(Box::new(WireFileIo {
-            files: read
-                .snapshot
-                .files
-                .into_iter()
-                .map(|file| WireFileIoEntry {
-                    path: file.path,
-                    read_bytes: file.read_bytes,
-                    write_bytes: file.write_bytes,
-                    read_ops: file.read_ops,
-                    write_ops: file.write_ops,
-                    file_size: file.file_size,
-                    offset: file.offset,
-                    access_known: file.access_known,
-                    is_read: file.is_read,
-                    is_write: file.is_write,
-                    open_handles: file.open_handles,
-                })
-                .collect(),
-        })),
+/// Combines generation-bracketed procfs open handles and counters with the
+/// root eBPF per-file byte trace when active.
+fn file_io_response(state: &ServiceState, pid: u32, start_ticks: i64) -> Response {
+    match state.file_trace.snapshot_process(pid, start_ticks) {
+        Ok(snapshot) => {
+            let acc = snapshot.accounting;
+            Response::FileIo(Box::new(WireFileIo {
+                files: snapshot
+                    .files
+                    .into_iter()
+                    .map(|file| WireFileIoEntry {
+                        path: file.path,
+                        read_bytes: file.read_bytes,
+                        write_bytes: file.write_bytes,
+                        read_ops: file.read_ops,
+                        write_ops: file.write_ops,
+                        file_size: file.file_size,
+                        offset: file.offset,
+                        access_known: file.access_known,
+                        is_read: file.is_read,
+                        is_write: file.is_write,
+                        open_handles: file.open_handles,
+                    })
+                    .collect(),
+                accounting: Some(WireFileIoAccounting {
+                    state: match acc.state {
+                        FileIoAccountingState::Unavailable
+                        | FileIoAccountingState::KernelLoggerInUse => WireFileIoState::Unavailable,
+                        FileIoAccountingState::Undelivered => WireFileIoState::Undelivered,
+                        FileIoAccountingState::Undecodable => WireFileIoState::Undecodable,
+                        FileIoAccountingState::Measured => WireFileIoState::Measured,
+                    },
+                    since_ms: acc.since_ms,
+                    read_bytes: acc.read_bytes,
+                    write_bytes: acc.write_bytes,
+                    read_ops: acc.read_ops,
+                    write_ops: acc.write_ops,
+                    unnamed_read_bytes: acc.unnamed_read_bytes,
+                    unnamed_write_bytes: acc.unnamed_write_bytes,
+                    omitted_read_bytes: acc.omitted_read_bytes,
+                    omitted_write_bytes: acc.omitted_write_bytes,
+                    counter_read_bytes: acc.counter_read_bytes,
+                    counter_write_bytes: acc.counter_write_bytes,
+                    events_lost: acc.events_lost,
+                    cleared_file_objects: acc.cleared_file_objects,
+                    unnamed_creates: acc.unnamed_creates,
+                    dropped_paths: acc.dropped_paths,
+                    handles_complete: acc.handles_complete,
+                    traced_since_process_start: acc.traced_since_process_start,
+                    counter_window_read_bytes: acc.counter_window_read_bytes,
+                    counter_window_write_bytes: acc.counter_window_write_bytes,
+                }),
+            }))
+        }
         Err(error) => error_response(error),
     }
 }

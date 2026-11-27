@@ -60,12 +60,14 @@ authorization decisions are unit-tested there.
 - Frame: big-endian `u32` body length + JSON body. Requests are capped at
   64 KiB, responses at 2 MiB. `RequestEnvelope { protocol, request }` and
   `ResponseEnvelope { protocol, response }` make a version mismatch an explicit
-  error instead of a misread field (`PROTOCOL_VERSION = 2`).
+  error instead of a misread field (`PROTOCOL_VERSION = 3`).
 - One request per connection: the server drops the stream after writing the
   response, and `client.rs` opens a fresh local socket per exchange rather than
   reusing a closed descriptor.
 - Requests (`Request`): `Status`, `Sensors`, `ProcessModules`,
-  `ProcessThreads`, `ProcessConnections`, `ProcessFileIo`, `ProcessEvidence`,
+  `ProcessThreads`, `ProcessConnections`, `ProcessFileIo` (combines `/proc/<pid>/fd`
+  open handles with the root eBPF VFS tracer in `linux/file_trace.rs` using
+  `CAP_BPF` + `CAP_PERFMON` + `bpf` syscall), `ProcessEvidence`,
   `ProcessTelemetry` (batched `/proc/<pid>/io` and `/proc/<pid>/fd` socket-inode
   ownership for root and `PR_SET_DUMPABLE=0` processes), `Action`.
 - Actions (`ActionRequest`): `kill` (optionally the descendant tree),

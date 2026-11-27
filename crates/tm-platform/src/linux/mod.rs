@@ -3,11 +3,13 @@
 
 pub mod activation;
 mod autostart;
+mod btf;
 pub mod core_service;
 mod cpu_stat;
 mod desktop_session;
 mod diskstats;
 mod drm;
+mod file_trace;
 mod hwmon;
 mod launch;
 mod net_meta;
@@ -2029,18 +2031,9 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
         let before = process_start_for_read(pid, expected_start_epoch_s)?;
-        let direct = process_io::list_process_file_io(pid, Some(before));
-        // Only a REFUSED descriptor table is the broker's case. A partial walk —
-        // one uninspectable entry, or the budget running out — is a cutoff no
-        // other identity would improve on, so asking would cost a round trip per
-        // poll and could only replace counters we already have with unknown.
-        let refused = match &direct {
-            Ok(read) => read.coverage == process_io::HandleCoverage::Refused,
-            Err(error) => polkit::is_permission_denied(error),
-        };
-        if !refused {
-            return direct.map(|read| read.snapshot);
-        }
+        // Ask the broker first whenever it is running: it hosts the root eBPF
+        // per-file tracer, so even processes whose `/proc/<pid>/fd` is readable
+        // under the GUI's own token get measured per-file read/write totals.
         let request = Request::ProcessFileIo {
             pid,
             start_ticks: before,
@@ -2048,22 +2041,24 @@ impl PlatformActions for LinuxActions {
         let brokered = match client::request(&request) {
             Ok(Response::FileIo(wire)) => Some(file_io_from_wire(*wire)),
             Ok(other) => return Err(unexpected_response(request.label(), &other)),
-            // No broker: the local answer, or its error, is the honest one.
             Err(error) if error.may_fall_back() => None,
             Err(error) => return Err(client_error(request.label(), &error)),
         };
-        let Some(snapshot) = brokered else {
-            return direct.map(|read| read.snapshot);
-        };
-        // The request pins the sampled generation, and closing our own bracket
-        // as well proves the answer still describes the process asked about.
-        ensure_process_generation(pid, before)?;
-        // The wire carries files but not `/proc/<pid>/io` totals, so the numbers
-        // the direct read already had are kept instead of blanked.
-        Ok(match direct {
-            Ok(read) => merge_file_io(snapshot, &read.snapshot),
-            Err(_) => snapshot,
-        })
+        if let Some(snapshot) = brokered {
+            // The request pins the sampled generation, and closing our own
+            // bracket proves the answer still describes the target process.
+            ensure_process_generation(pid, before)?;
+            if snapshot.accounting.counter_read_bytes.is_some()
+                && snapshot.accounting.counter_write_bytes.is_some()
+            {
+                return Ok(snapshot);
+            }
+            return Ok(match process_io::list_process_file_io(pid, Some(before)) {
+                Ok(read) => merge_file_io(snapshot, &read.snapshot),
+                Err(_) => snapshot,
+            });
+        }
+        process_io::list_process_file_io(pid, Some(before)).map(|read| read.snapshot)
     }
 }
 
@@ -2501,6 +2496,12 @@ fn ensure_process_generation(pid: u32, before: i64) -> Result<()> {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     }
     Ok(())
+}
+
+pub(super) fn process_start_ticks_optional(pid: u32) -> Option<u64> {
+    read_proc_start_ticks(pid)
+        .ok()
+        .and_then(|ticks| u64::try_from(ticks).ok())
 }
 
 /// What each tick asks sysinfo for per process. Everything else (CPU, command

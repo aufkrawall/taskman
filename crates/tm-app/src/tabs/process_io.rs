@@ -961,7 +961,7 @@ pub fn show(
                 .hint_text(i18n::tr(K::PropIoSearchPlaceholder))
                 .desired_width(160.0),
         );
-        if !state.file_filter.is_empty() && ui.small_button("✖").clicked() {
+        if !state.file_filter.is_empty() && ui.small_button("×").clicked() {
             state.file_filter.clear();
         }
     });
@@ -1066,13 +1066,6 @@ pub fn show(
 
     ui.add_space(4.0);
 
-    const COL_FILE_MIN_W: f32 = 160.0;
-    const COL_PATH_MIN_W: f32 = 260.0;
-    const COL_READ_W: f32 = 85.0;
-    const COL_WRITE_W: f32 = 95.0;
-    const COL_TOTAL_W: f32 = 105.0;
-    const COL_SIZE_W: f32 = 90.0;
-
     let mut sort_change = None;
     let mut selected_clicked = None;
     let selected_path = state.selected_path.clone();
@@ -1083,139 +1076,13 @@ pub fn show(
         .striped(true)
         .show(ui, |ui| {
             // Header Row
-            let file_arrow = if state.file_sort_column == FileSortColumn::File {
-                if state.file_sort_ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
-            let file_btn = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(COL_FILE_MIN_W, 18.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_min_size(egui::vec2(COL_FILE_MIN_W, 18.0));
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!(
-                                    "{}{}",
-                                    i18n::tr(K::PropIoColFile),
-                                    file_arrow
-                                ))
-                                .font(crate::theme::font_semibold_in(ui, 13.0)),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                    },
-                )
-                .inner;
-            if file_btn
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                sort_change = Some(FileSortColumn::File);
-            }
-
-            let path_arrow = if state.file_sort_column == FileSortColumn::Path {
-                if state.file_sort_ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
-            let path_btn = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(COL_PATH_MIN_W, 18.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.set_min_size(egui::vec2(COL_PATH_MIN_W, 18.0));
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!(
-                                    "{}{}",
-                                    i18n::tr(K::ColPath),
-                                    path_arrow
-                                ))
-                                .font(crate::theme::font_semibold_in(ui, 13.0)),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                    },
-                )
-                .inner;
-            if path_btn
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                sort_change = Some(FileSortColumn::Path);
-            }
-
-            let mut show_num_header =
-                |ui: &mut egui::Ui, label: &str, col: FileSortColumn, width: f32| {
-                    let arrow = if state.file_sort_column == col {
-                        if state.file_sort_ascending {
-                            " ▲"
-                        } else {
-                            " ▼"
-                        }
-                    } else {
-                        ""
-                    };
-                    let text = format!("{label}{arrow}");
-                    let resp = ui
-                        .allocate_ui_with_layout(
-                            egui::vec2(width, 18.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.set_min_size(egui::vec2(width, 18.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(text)
-                                            .font(crate::theme::font_semibold_in(ui, 13.0)),
-                                    )
-                                    .sense(egui::Sense::click()),
-                                )
-                            },
-                        )
-                        .inner;
-                    if resp
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        sort_change = Some(col);
-                    }
-                };
-
-            show_num_header(
+            show_file_header_row(
                 ui,
-                i18n::tr(K::PropIoColRead),
-                FileSortColumn::Read,
-                COL_READ_W,
+                pal,
+                state.file_sort_column,
+                state.file_sort_ascending,
+                &mut sort_change,
             );
-            show_num_header(
-                ui,
-                i18n::tr(K::PropIoColWritten),
-                FileSortColumn::Written,
-                COL_WRITE_W,
-            );
-            show_num_header(
-                ui,
-                i18n::tr(K::PropIoColTotal),
-                FileSortColumn::Total,
-                COL_TOTAL_W,
-            );
-            show_num_header(
-                ui,
-                i18n::tr(K::PropIoColSize),
-                FileSortColumn::Size,
-                COL_SIZE_W,
-            );
-
             ui.end_row();
 
             // Rows
@@ -1412,6 +1279,125 @@ pub fn show(
     }
     if let Some(path) = selected_clicked {
         state.selected_path = Some(path);
+    }
+}
+
+const COL_FILE_MIN_W: f32 = 160.0;
+const COL_PATH_MIN_W: f32 = 260.0;
+const COL_READ_W: f32 = 85.0;
+const COL_WRITE_W: f32 = 95.0;
+const COL_TOTAL_W: f32 = 105.0;
+const COL_SIZE_W: f32 = 90.0;
+
+/// Paint all six column headers of the file table.
+fn show_file_header_row(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    active_col: FileSortColumn,
+    ascending: bool,
+    sort_change: &mut Option<FileSortColumn>,
+) {
+    const COLUMNS: [(K, FileSortColumn, f32, bool); 6] = [
+        (
+            K::PropIoColFile,
+            FileSortColumn::File,
+            COL_FILE_MIN_W,
+            false,
+        ),
+        (K::ColPath, FileSortColumn::Path, COL_PATH_MIN_W, false),
+        (K::PropIoColRead, FileSortColumn::Read, COL_READ_W, true),
+        (
+            K::PropIoColWritten,
+            FileSortColumn::Written,
+            COL_WRITE_W,
+            true,
+        ),
+        (K::PropIoColTotal, FileSortColumn::Total, COL_TOTAL_W, true),
+        (K::PropIoColSize, FileSortColumn::Size, COL_SIZE_W, true),
+    ];
+    for (key, col, width, numeric) in COLUMNS {
+        show_file_header_cell(
+            ui,
+            pal,
+            i18n::tr(key),
+            col,
+            width,
+            numeric,
+            active_col,
+            ascending,
+            sort_change,
+        );
+    }
+}
+
+/// Paint one clickable file-table header cell with a vector sort caret instead
+/// of Unicode triangle glyphs (which render as tofu boxes on fonts lacking U+25B2/U+25BC).
+#[allow(clippy::too_many_arguments)]
+fn show_file_header_cell(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    label: &str,
+    col: FileSortColumn,
+    width: f32,
+    numeric: bool,
+    active_col: FileSortColumn,
+    ascending: bool,
+    sort_change: &mut Option<FileSortColumn>,
+) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let is_sorted = active_col == col;
+    let text_color = if resp.hovered() {
+        pal.text
+    } else {
+        ui.visuals().text_color()
+    };
+    let painter = ui.painter_at(rect);
+    let galley = painter.layout_no_wrap(
+        label.to_owned(),
+        crate::theme::font_semibold_in(ui, 13.0),
+        text_color,
+    );
+    let center_y = rect.center().y;
+    const CARET_SPACE: f32 = 14.0;
+    if numeric {
+        let label_right = if is_sorted {
+            rect.right() - CARET_SPACE
+        } else {
+            rect.right()
+        };
+        let label_pos = egui::Align2::RIGHT_CENTER
+            .anchor_size(Pos2::new(label_right, center_y), galley.size())
+            .min;
+        painter.galley(label_pos, galley, text_color);
+        if is_sorted {
+            crate::widgets::tablekit::caret(
+                painter,
+                Pos2::new(rect.right() - 5.0, center_y),
+                ascending,
+                pal.text_dim,
+            );
+        }
+    } else {
+        let label_w = galley.size().x;
+        let label_pos = egui::Align2::LEFT_CENTER
+            .anchor_size(Pos2::new(rect.left(), center_y), galley.size())
+            .min;
+        painter.galley(label_pos, galley, text_color);
+        if is_sorted {
+            crate::widgets::tablekit::caret(
+                painter,
+                Pos2::new(rect.left() + label_w + 9.0, center_y),
+                ascending,
+                pal.text_dim,
+            );
+        }
+    }
+    if resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        *sort_change = Some(col);
     }
 }
 
@@ -2551,6 +2537,103 @@ mod tests {
         assert!(
             ctx.any_popup_open(),
             "right clicking file entry opens context menu"
+        );
+    }
+
+    #[test]
+    fn file_header_draws_sort_caret_polygon_without_unicode_triangles() {
+        let pal = theme::DARK;
+        let render_header = |active_col: FileSortColumn, ascending: bool| {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 100.0));
+            let mut sort_change = None;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::Grid::new("test-file-header-grid")
+                        .num_columns(6)
+                        .spacing(Vec2::new(16.0, 6.0))
+                        .show(ui, |ui| {
+                            show_file_header_row(ui, &pal, active_col, ascending, &mut sort_change);
+                            ui.end_row();
+                        });
+                },
+            );
+            let mut text_has_triangle = false;
+            let mut triangles: Vec<Vec<Pos2>> = Vec::new();
+            for clipped in &output.shapes {
+                match &clipped.shape {
+                    egui::Shape::Text(text) => {
+                        let s = text.galley.job.text.as_str();
+                        if s.contains('▲') || s.contains('▼') || s.contains('▴') || s.contains('▾')
+                        {
+                            text_has_triangle = true;
+                        }
+                    }
+                    egui::Shape::Path(path)
+                        if path.fill != Color32::TRANSPARENT && path.points.len() == 3 =>
+                    {
+                        triangles.push(path.points.clone());
+                    }
+                    _ => {}
+                }
+            }
+            output.drop_without_applying_deltas();
+            (text_has_triangle, triangles)
+        };
+
+        let (text_tri_desc, tris_desc) = render_header(FileSortColumn::Written, false);
+        assert!(
+            !text_tri_desc,
+            "header must not rely on Unicode triangle glyphs that render as tofu boxes"
+        );
+        assert_eq!(
+            tris_desc.len(),
+            1,
+            "active sort column must paint one vector caret"
+        );
+        // Descending caret points down: single tip vertex has larger y than the two-vertex base.
+        let desc_ys: Vec<f32> = tris_desc[0].iter().map(|p| p.y).collect();
+        let desc_min_y = desc_ys.iter().copied().fold(f32::INFINITY, f32::min);
+        let desc_max_y = desc_ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(
+            desc_ys
+                .iter()
+                .filter(|y| (**y - desc_max_y).abs() < 0.01)
+                .count(),
+            1
+        );
+        assert_eq!(
+            desc_ys
+                .iter()
+                .filter(|y| (**y - desc_min_y).abs() < 0.01)
+                .count(),
+            2
+        );
+
+        let (text_tri_asc, tris_asc) = render_header(FileSortColumn::File, true);
+        assert!(!text_tri_asc);
+        assert_eq!(tris_asc.len(), 1);
+        // Ascending caret points up: single tip vertex has smaller y than the two-vertex base.
+        let asc_ys: Vec<f32> = tris_asc[0].iter().map(|p| p.y).collect();
+        let asc_min_y = asc_ys.iter().copied().fold(f32::INFINITY, f32::min);
+        let asc_max_y = asc_ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(
+            asc_ys
+                .iter()
+                .filter(|y| (**y - asc_min_y).abs() < 0.01)
+                .count(),
+            1
+        );
+        assert_eq!(
+            asc_ys
+                .iter()
+                .filter(|y| (**y - asc_max_y).abs() < 0.01)
+                .count(),
+            2
         );
     }
 }

@@ -21,9 +21,11 @@ const MAX_FDS: usize = 4_096;
 const HANDLE_ENUMERATION_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ProcessIoCounters {
-    read_bytes: Option<u64>,
-    write_bytes: Option<u64>,
+pub(super) struct ProcessIoCounters {
+    pub rchar: Option<u64>,
+    pub wchar: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,11 +42,27 @@ struct FdInfo {
 
 struct HandleFact {
     path: String,
+    dev: u64,
+    ino: u64,
     file_size: Option<u64>,
     offset: Option<u64>,
     access_known: bool,
     is_read: bool,
     is_write: bool,
+}
+
+/// One grouped open file together with its filesystem `(dev, ino)` pair.
+pub(super) struct OpenHandleRow {
+    pub file: ProcessFileIo,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Detailed open-handle + counter read used by the privileged file-I/O tracer.
+pub(super) struct DetailedFileIoRead {
+    pub files: Vec<OpenHandleRow>,
+    pub counters: ProcessIoCounters,
+    pub coverage: HandleCoverage,
 }
 
 /// Why an open-handle walk could not see everything it wanted to.
@@ -67,11 +85,12 @@ pub(super) enum HandleCoverage {
 /// One per-file I/O read: the rows plus how much of the handle table they cover.
 pub(super) struct FileIoRead {
     pub(super) snapshot: ProcessFileIoSnapshot,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) coverage: HandleCoverage,
 }
 
 struct HandleEnumeration {
-    files: Vec<ProcessFileIo>,
+    files: Vec<OpenHandleRow>,
     coverage: HandleCoverage,
 }
 
@@ -79,6 +98,22 @@ pub(super) fn list_process_file_io(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
 ) -> Result<FileIoRead> {
+    let detailed = list_process_file_io_detailed(pid, expected_start_epoch_s)?;
+    let files = detailed.files.into_iter().map(|row| row.file).collect();
+    Ok(FileIoRead {
+        coverage: detailed.coverage,
+        snapshot: snapshot(
+            files,
+            detailed.counters,
+            detailed.coverage == HandleCoverage::Complete,
+        ),
+    })
+}
+
+pub(super) fn list_process_file_io_detailed(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<DetailedFileIoRead> {
     // The start tick brackets both procfs walks. A recycled PID must not let a
     // partially old handle list and a partially new counter read become one
     // coherent-looking answer. A sampled generation that is not known yet — a
@@ -90,13 +125,10 @@ pub(super) fn list_process_file_io(
     let counters = read_process_counters(pid);
     super::ensure_process_generation(pid, before)?;
 
-    Ok(FileIoRead {
+    Ok(DetailedFileIoRead {
+        files: handles.files,
+        counters,
         coverage: handles.coverage,
-        snapshot: snapshot(
-            handles.files,
-            counters,
-            handles.coverage == HandleCoverage::Complete,
-        ),
     })
 }
 
@@ -268,6 +300,8 @@ fn inspect_fd(
 
     Some(HandleFact {
         path,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
         file_size: Some(metadata.len()),
         offset: fdinfo.offset,
         access_known,
@@ -329,28 +363,37 @@ fn access_from_flags(flags: u32) -> Option<FdAccess> {
     }
 }
 
-fn merge_handle_fact(files: &mut HashMap<String, ProcessFileIo>, fact: HandleFact) {
+fn merge_handle_fact(files: &mut HashMap<String, OpenHandleRow>, fact: HandleFact) {
     let HandleFact {
         path,
+        dev,
+        ino,
         file_size,
         offset,
         access_known,
         is_read,
         is_write,
     } = fact;
-    let file = files.entry(path.clone()).or_insert_with(|| ProcessFileIo {
-        path,
-        read_bytes: None,
-        write_bytes: None,
-        read_ops: None,
-        write_ops: None,
-        file_size,
-        offset,
-        access_known: false,
-        is_read: false,
-        is_write: false,
-        open_handles: 0,
+    let row = files.entry(path.clone()).or_insert_with(|| OpenHandleRow {
+        file: ProcessFileIo {
+            path,
+            read_bytes: None,
+            write_bytes: None,
+            read_ops: None,
+            write_ops: None,
+            file_size,
+            offset,
+            access_known: false,
+            is_read: false,
+            is_write: false,
+            open_handles: 0,
+        },
+        dev,
+        ino,
     });
+    row.dev = dev;
+    row.ino = ino;
+    let file = &mut row.file;
     file.open_handles = file.open_handles.saturating_add(1);
     file.access_known |= access_known;
     file.is_read |= is_read;
@@ -378,10 +421,12 @@ fn parse_process_counters(content: &str) -> ProcessIoCounters {
             continue;
         };
         match key.trim() {
-            // These are the kernel's storage-layer byte totals, matching the
-            // non-cache-inclusive counter carried by the other backends. The
-            // syscall-byte fields (`rchar`/`wchar`) and operation totals are a
-            // different measurement and must not be substituted here.
+            // `read_bytes`/`write_bytes` are the kernel's storage-layer byte
+            // totals, matching the non-cache-inclusive counter carried by the
+            // other backends. `rchar`/`wchar` are the VFS-layer read/write byte
+            // totals (all files, pipes, sockets), matching the VFS tracer's unit.
+            "rchar" => counters.rchar = value.trim().parse().ok(),
+            "wchar" => counters.wchar = value.trim().parse().ok(),
             "read_bytes" => counters.read_bytes = value.trim().parse().ok(),
             "write_bytes" => counters.write_bytes = value.trim().parse().ok(),
             _ => {}
@@ -411,6 +456,8 @@ mod tests {
         assert_eq!(
             counters,
             ProcessIoCounters {
+                rchar: Some(11),
+                wchar: Some(22),
                 read_bytes: Some(4096),
                 write_bytes: Some(8192),
             }
@@ -419,6 +466,7 @@ mod tests {
         let incomplete = parse_process_counters("read_bytes: nope\nwchar: 22\n");
         assert_eq!(incomplete.read_bytes, None);
         assert_eq!(incomplete.write_bytes, None);
+        assert_eq!(incomplete.wchar, Some(22));
     }
 
     #[test]
@@ -450,6 +498,8 @@ mod tests {
             &mut files,
             HandleFact {
                 path: "/tmp/report".into(),
+                dev: 1,
+                ino: 100,
                 file_size: Some(100),
                 offset: Some(25),
                 access_known: true,
@@ -461,6 +511,8 @@ mod tests {
             &mut files,
             HandleFact {
                 path: "/tmp/report".into(),
+                dev: 1,
+                ino: 100,
                 file_size: Some(120),
                 offset: Some(75),
                 access_known: true,
@@ -469,7 +521,8 @@ mod tests {
             },
         );
 
-        let file = files.get("/tmp/report").expect("grouped file");
+        let row = files.get("/tmp/report").expect("grouped file");
+        let file = &row.file;
         assert_eq!(file.open_handles, 2);
         assert_eq!(file.file_size, Some(120));
         assert_eq!(file.offset, Some(75));
@@ -486,6 +539,8 @@ mod tests {
         let snapshot = snapshot(
             Vec::new(),
             ProcessIoCounters {
+                rchar: None,
+                wchar: None,
                 read_bytes: Some(4096),
                 write_bytes: Some(8192),
             },
