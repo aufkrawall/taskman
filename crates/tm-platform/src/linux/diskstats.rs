@@ -77,12 +77,6 @@ fn prev_store() -> &'static Mutex<HashMap<String, Prev>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Drop the previous counters. The next [`read`] starts a new window, so its
-/// first sample is unmeasured instead of a rate spanning the skipped ticks.
-pub fn forget() {
-    tm_core::sync::lock(prev_store()).clear();
-}
-
 /// Parse /proc/diskstats and attach previous-tick deltas.
 pub fn read() -> Vec<DiskStat> {
     let raw = parse_raw();

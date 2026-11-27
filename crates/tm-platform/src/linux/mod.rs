@@ -347,16 +347,10 @@ impl SystemCollector for LinuxCollector {
             providers.process_net,
         );
 
-        // Disk rates and active time are one `/proc/diskstats` read per tick;
-        // they follow the demand that shows them. Forgetting the previous
-        // counters while it is off keeps the first tick back unmeasured instead
-        // of dividing a whole off window by one tick.
-        let diskstats = if providers.disk_rates {
-            diskstats::read()
-        } else {
-            diskstats::forget();
-            Vec::new()
-        };
+        // Disk rates and active time are a single `/proc/diskstats` read per
+        // tick; keep them active even while hidden to tray (like CPU and
+        // network) so Performance disk graphs have no gaps on restore.
+        let diskstats = diskstats::read();
         let disks = collect_disks(
             &self.disks,
             &mut self.disk_topology,
@@ -415,7 +409,10 @@ impl SystemCollector for LinuxCollector {
             .map(|text| linux_telemetry::parse_meminfo(&text))
             .unwrap_or_default();
         let page_lists = linux_telemetry::page_lists(&meminfo);
-        let mut gpus = drm::gpus(providers.measure_gpus);
+        // Device-level DRM/NVML stats are cheap to query and keep Performance
+        // GPU graphs continuous while hidden to tray; per-process GPU fdinfo
+        // walks below still follow `providers.process_gpu`.
+        let mut gpus = drm::gpus(true);
         if providers.process_gpu {
             self.process_gpu
                 .apply(&mut processes, &mut gpus, interval_s, started);
