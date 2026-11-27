@@ -1870,10 +1870,19 @@ fn list_process_file_io_with_a_creation_time_keeps_the_accounting_consistent() {
             accounting.since_ms
         );
     } else {
-        assert_eq!(
-            accounting.state,
-            FileIoAccountingState::Unavailable,
-            "an unelevated host has no source; a live trace reports another state"
+        // Two states mean "no delivered accounting": `Unavailable` when the host
+        // has no source at all (an unelevated session), and `Undelivered` when a
+        // session exists but has delivered nothing yet. A CI runner is elevated,
+        // so the session starts there and its kernel provider may stay silent;
+        // that is a missing source, not a measured zero. Only `Measured` may
+        // carry bytes, which the assertions below pin either way.
+        assert!(
+            matches!(
+                accounting.state,
+                FileIoAccountingState::Unavailable | FileIoAccountingState::Undelivered
+            ),
+            "a host without delivered accounting reports Unavailable or Undelivered, not {:?}",
+            accounting.state
         );
         assert!(
             file_io
@@ -1885,7 +1894,10 @@ fn list_process_file_io_with_a_creation_time_keeps_the_accounting_consistent() {
         assert_eq!(accounting.read_bytes, 0);
         assert_eq!(accounting.write_bytes, 0);
         assert_eq!(accounting.since_ms, 0);
-        eprintln!("per-file trace unavailable here (no elevated session); accounting stayed empty");
+        eprintln!(
+            "no per-file accounting delivered here ({:?}); accounting stayed empty",
+            accounting.state
+        );
     }
 }
 
@@ -1929,7 +1941,19 @@ fn files_of_a_child_process_survive_handle_type_probing() {
         }
     };
     let pid = holder.0.id();
-    let expected = path.to_string_lossy().to_ascii_lowercase();
+    // The kernel reports the file's long, fully qualified path, while
+    // `temp_dir()` can hand back the 8.3 short form (`C:\Users\RUNNER~1\...`) on
+    // CI runners, so both sides are resolved before they are compared.
+    // `canonicalize` re-adds the verbatim prefix the collector strips.
+    let expected = std::fs::canonicalize(&path)
+        .map(|resolved| {
+            let text = resolved.to_string_lossy().into_owned();
+            text.strip_prefix(r"\\?\")
+                .map(str::to_string)
+                .unwrap_or(text)
+        })
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+        .to_ascii_lowercase();
 
     let actions = tm_platform::win::WinActions;
     // What the last walk reported or why it failed, so a timeout can name the
