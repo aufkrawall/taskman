@@ -625,8 +625,11 @@ pub struct ProcessEntry {
     /// nobody made.
     #[serde(default)]
     pub cpu_pct: Option<f32>,
-    /// Resident memory attributed to the process (Private Working Set by default on Windows).
+    /// Resident memory attributed to the process (Private Working Set by default on Windows, RSS on Linux/macOS).
     pub mem_bytes: u64,
+    /// Private working set (resident physical memory exclusively used by this process) when measured.
+    #[serde(default)]
+    pub private_working_set_bytes: Option<u64>,
     /// Total working set (resident memory including shared pages) when available.
     #[serde(default)]
     pub working_set_bytes: Option<u64>,
@@ -787,9 +790,10 @@ impl ProcessEntry {
     }
 
     /// Resident memory shared with other processes (Total Working Set minus Private Working Set).
+    /// Returns `None` when either total or private working set was not measured.
     pub fn shared_working_set_bytes(&self) -> Option<u64> {
-        self.working_set_bytes
-            .map(|ws| ws.saturating_sub(self.mem_bytes))
+        let private = self.private_working_set_bytes?;
+        self.working_set_bytes.map(|ws| ws.saturating_sub(private))
     }
 
     fn default_entry() -> Self {
@@ -808,6 +812,7 @@ impl ProcessEntry {
             session_id: None,
             cpu_pct: None,
             mem_bytes: 0,
+            private_working_set_bytes: None,
             working_set_bytes: None,
             commit_bytes: None,
             peak_mem_bytes: None,
@@ -1105,12 +1110,18 @@ mod tests {
         let mut entry = ProcessEntry::new(100, "test.exe");
         assert_eq!(entry.shared_working_set_bytes(), None);
 
+        // When private working set is unmeasured (e.g. Linux/macOS RSS),
+        // shared working set must stay None rather than fabricating 0.
         entry.working_set_bytes = Some(100 * 1024 * 1024);
+        entry.mem_bytes = 100 * 1024 * 1024;
+        assert_eq!(entry.shared_working_set_bytes(), None);
+
+        entry.private_working_set_bytes = Some(70 * 1024 * 1024);
         entry.mem_bytes = 70 * 1024 * 1024;
         assert_eq!(entry.shared_working_set_bytes(), Some(30 * 1024 * 1024));
 
         // Saturates at 0 if private WS somehow exceeds total WS (e.g. transient race)
-        entry.mem_bytes = 120 * 1024 * 1024;
+        entry.private_working_set_bytes = Some(120 * 1024 * 1024);
         assert_eq!(entry.shared_working_set_bytes(), Some(0));
     }
 

@@ -611,6 +611,10 @@ keys! {
         "Arbeitsspeicher (aktiver privater Arbeitssatz)",
         "Memory (active private working set)",
     ],
+    ColMemoryRss => [
+        "Arbeitsspeicher (RSS)",
+        "Memory (RSS)",
+    ],
     ColWorkingSet => [
         "Arbeitssatz (Speicher)",
         "Working set (memory)",
@@ -1157,9 +1161,17 @@ keys! {
         "Arbeitsspeicher (aktiver privater Arbeitssatz). Weitere Speichermetriken (Arbeitssatz, Spitzenwert, gemeinsam, zugesichert) können im Reiter Details hinzugefügt werden.",
         "Memory (active private working set). Additional memory metrics (working set, peak, shared, commit) can be added in Details.",
     ],
+    TipProcessesMemoryRss => [
+        "Arbeitsspeicher (Resident Set Size, RSS). Weitere Speichermetriken (Spitzenwert, zugesicherter Speicher) können im Reiter Details hinzugefügt werden.",
+        "Memory (resident set size, RSS). Additional memory metrics (peak, commit size) can be added in Details.",
+    ],
     TipMemoryWsPrivate => [
         "Arbeitsspeicher (aktiver privater Arbeitssatz): Vom Prozess exklusiv belegter physischer Speicher.",
         "Memory (active private working set): physical memory exclusively used by this process.",
+    ],
+    TipMemoryRss => [
+        "Arbeitsspeicher (Resident Set Size, RSS): Derzeit vom Prozess belegter physischer Speicher (privat + gemeinsam).",
+        "Memory (resident set size, RSS): physical memory currently used by this process (private + shared).",
     ],
     TipWorkingSet => [
         "Arbeitssatz (Speicher): Derzeit genutzter physischer Gesamtspeicher des Prozesses (privat + gemeinsam).",

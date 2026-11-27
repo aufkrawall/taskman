@@ -1641,6 +1641,7 @@ impl Sampler {
             let ws_private = self
                 .cpu_load
                 .working_set_private_of(pid_u, entry.start_epoch_s);
+            entry.private_working_set_bytes = ws_private;
             entry.mem_bytes = ws_private.or(ws_total).unwrap_or(0);
             // Neither source answering means unknown: "0 K" would claim a
             // measurement nobody made.

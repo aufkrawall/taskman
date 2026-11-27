@@ -387,8 +387,12 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::Memory,
         col: || {
-            TmColumn::num("mem", i18n::tr(K::ColMemoryPrivateWs), 160.0)
-                .with_tooltip(i18n::tr(K::TipMemoryWsPrivate))
+            let (label, tip) = if cfg!(target_os = "windows") {
+                (K::ColMemoryPrivateWs, K::TipMemoryWsPrivate)
+            } else {
+                (K::ColMemoryRss, K::TipMemoryRss)
+            };
+            TmColumn::num("mem", i18n::tr(label), 160.0).with_tooltip(i18n::tr(tip))
         },
         default_visible: true,
     },
@@ -4276,12 +4280,14 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
                     .unwrap_or_else(|| "—".into()),
                 false,
             );
-            property_row(
-                ui,
-                i18n::tr(K::PropPrivateWorkingSet),
-                format::format_bytes_loc(process.mem_bytes),
-                false,
-            );
+            if cfg!(target_os = "windows") || process.private_working_set_bytes.is_some() {
+                property_row(
+                    ui,
+                    i18n::tr(K::PropPrivateWorkingSet),
+                    option_bytes(process.private_working_set_bytes),
+                    false,
+                );
+            }
             if let Some(ws) = process.working_set_bytes {
                 property_row(
                     ui,
@@ -5753,8 +5759,10 @@ mod tests {
                 }
                 ColumnId::SharedWorkingSet => {
                     a.working_set_bytes = Some(10);
+                    a.private_working_set_bytes = Some(9);
                     a.mem_bytes = 9;
                     b.working_set_bytes = Some(10);
+                    b.private_working_set_bytes = Some(8);
                     b.mem_bytes = 8;
                 }
                 ColumnId::GpuDedicated => {
