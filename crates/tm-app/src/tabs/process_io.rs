@@ -602,15 +602,7 @@ fn cmp_known_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::c
 /// Slice of process I/O history visible in the current graph window,
 /// including one lead-in point left of the axis cutoff.
 pub fn visible_io_slice(history: &[IoSample], seconds: u32) -> &[IoSample] {
-    let Some(last) = history.last() else {
-        return &[];
-    };
-    let cutoff = last.t_ms.saturating_sub(seconds as u64 * 1000);
-    let mut start = history.len();
-    while start > 0 && history[start - 1].t_ms >= cutoff {
-        start -= 1;
-    }
-    &history[start.saturating_sub(1)..]
+    crate::widgets::chart::visible_window(history, seconds, |sample| sample.t_ms)
 }
 
 fn fmt_io_rate(v: f64) -> String {
@@ -2165,6 +2157,31 @@ mod tests {
         assert_eq!(slice.first().unwrap().t_ms, 68_000);
         assert_eq!(slice.last().unwrap().t_ms, 99_000);
         assert_eq!(slice.len(), 32);
+
+        // Backward clock step must not retain pre-jump samples on top of post-jump data.
+        let mut stepped = history;
+        stepped.push(IoSample {
+            t_ms: 85_000,
+            read_bps: Some(1.0),
+            write_bps: Some(1.0),
+            other_bps: Some(1.0),
+            read_delta: Some(1),
+            write_delta: Some(1),
+            other_delta: Some(1),
+        });
+        stepped.push(IoSample {
+            t_ms: 86_000,
+            read_bps: Some(2.0),
+            write_bps: Some(2.0),
+            other_bps: Some(2.0),
+            read_delta: Some(2),
+            write_delta: Some(2),
+            other_delta: Some(2),
+        });
+        let post = visible_io_slice(&stepped, 30);
+        assert_eq!(post.len(), 2);
+        assert_eq!(post[0].t_ms, 85_000);
+        assert_eq!(post[1].t_ms, 86_000);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::actions::*;
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
     UpdateKind,
@@ -354,10 +354,7 @@ fn open_file_count() -> usize {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    tm_core::monotonic_epoch_ms()
 }
 
 fn threads_total(sys: &System) -> usize {

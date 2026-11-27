@@ -5,10 +5,29 @@ use crate::classify::DesktopRoleEvidence;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Monotonic epoch-anchored timestamp in milliseconds (`>= 1`).
+///
+/// Anchors `SystemTime::now()` once per process and advances strictly with
+/// `Instant` so wall-clock adjustments (NTP corrections, manual clock changes,
+/// DST shifts) never step snapshot timestamps backward or forward.
+pub fn monotonic_epoch_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    static ANCHOR: OnceLock<(u64, Instant)> = OnceLock::new();
+    let &(epoch_ms, start) = ANCHOR.get_or_init(|| {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(1, |d| (d.as_millis() as u64).max(1));
+        (ms, Instant::now())
+    });
+    epoch_ms.saturating_add(start.elapsed().as_millis() as u64)
+}
+
 /// A single consistent sample of the whole system.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
-    /// Wall-clock timestamp of this snapshot (ms since UNIX epoch).
+    /// Monotonic epoch-anchored timestamp of this snapshot (ms).
     pub timestamp_ms: u64,
     /// How long the sampling pass took (ms) — useful for diagnostics.
     pub sample_duration_ms: u64,
@@ -1230,5 +1249,13 @@ mod tests {
         p2.start_epoch_s = Some(t2);
         assert!(is_plausible_parent(&p1, &p2));
         assert!(!is_plausible_parent(&p2, &p1));
+    }
+
+    #[test]
+    fn monotonic_epoch_ms_is_positive_and_non_decreasing() {
+        let a = super::monotonic_epoch_ms();
+        let b = super::monotonic_epoch_ms();
+        assert!(a > 0);
+        assert!(b >= a);
     }
 }

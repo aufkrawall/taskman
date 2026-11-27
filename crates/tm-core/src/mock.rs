@@ -6,14 +6,12 @@
 use crate::engine::SystemCollector;
 use crate::error::Result;
 use crate::model::*;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Build a small deterministic snapshot. `seed` shifts values so tests can
 /// observe changes between ticks.
 pub fn snapshot(seed: u32) -> Snapshot {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
+    let now = monotonic_epoch_ms();
     let s = seed as f32;
 
     let mut p1 = ProcessEntry::new(1000 + seed % 7, "mockapp.exe");

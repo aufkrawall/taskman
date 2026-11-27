@@ -49,6 +49,34 @@ fn readout_text(value: Option<f64>, fmt: ValueFmt) -> String {
         .map_or_else(|| "—".to_owned(), fmt)
 }
 
+/// Slice of chronologically appended samples within the last `seconds` of the
+/// newest sample, plus one monotonic lead-in sample just before the cutoff.
+///
+/// Stops at any backward or duplicate timestamp step so pre-jump samples from
+/// an earlier wall-clock epoch never mix into the sparkline or overlap the
+/// current timeline on the chart.
+pub fn visible_window<T>(items: &[T], seconds: u32, stamp: impl Fn(&T) -> u64) -> &[T] {
+    let Some(last) = items.last() else {
+        return &[];
+    };
+    let last_t = stamp(last);
+    let cutoff = last_t.saturating_sub(u64::from(seconds) * 1000);
+    let mut start = items.len() - 1;
+    let mut next_t = last_t;
+    while start > 0 {
+        let prev_t = stamp(&items[start - 1]);
+        if prev_t < cutoff || prev_t >= next_t {
+            break;
+        }
+        start -= 1;
+        next_t = prev_t;
+    }
+    if start > 0 && stamp(&items[start - 1]) < stamp(&items[start]) {
+        start -= 1;
+    }
+    &items[start..]
+}
+
 /// The x axis of a rolling chart: when the samples were taken, and how wide
 /// the axis is in time.
 ///
@@ -487,6 +515,18 @@ fn nearest_at(ts: &[u64], query: u64) -> usize {
     if ts.is_empty() {
         return 0;
     }
+    if !ts.is_sorted() {
+        let mut best = 0usize;
+        let mut best_dist = ts[0].abs_diff(query);
+        for (i, &t) in ts.iter().enumerate().skip(1) {
+            let d = t.abs_diff(query);
+            if d <= best_dist {
+                best_dist = d;
+                best = i;
+            }
+        }
+        return best;
+    }
     let hi = ts.partition_point(|&t| t < query);
     if hi == 0 {
         return 0;
@@ -788,7 +828,7 @@ impl<'a> ChartGeometry<'a> {
                 runs.push(run);
             }
         }
-        runs
+        trim_overlapped_runs(runs)
     }
 
     /// [`runs`](Self::runs) for a raw `&[f64]` series, the form `performance`
@@ -818,6 +858,67 @@ fn kernel_runs(values: &[f64], kernels: &[f64], geometry: &ChartGeometry<'_>) ->
         .map(|(value, kernel)| value.is_finite().then_some(*kernel))
         .collect();
     geometry.runs(&band)
+}
+
+/// Prevent stacked transparent area fills and overlapping strokes when
+/// non-monotonic timestamps cause an earlier run to share x-coordinates with a
+/// newer run. Later runs win; any earlier point or bridging segment inside a
+/// newer multi-point run's `(lo, hi)` open x-span is trimmed or split.
+fn trim_overlapped_runs(runs: SeriesPaths) -> SeriesPaths {
+    if runs.len() <= 1 {
+        return runs;
+    }
+    let mut kept_rev: SeriesPaths = Vec::with_capacity(runs.len());
+    let mut covered: Vec<(f32, f32)> = Vec::new();
+
+    for run in runs.into_iter().rev() {
+        if covered.is_empty() {
+            if let (Some(first), Some(last)) = (run.first(), run.last())
+                && run.len() >= 2
+                && last.x > first.x
+            {
+                covered.push((first.x, last.x));
+            }
+            kept_rev.push(run);
+            continue;
+        }
+
+        let mut pieces: SeriesPaths = vec![run];
+        for &(lo, hi) in &covered {
+            let mut next_pieces = Vec::with_capacity(pieces.len());
+            for piece in pieces {
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                for p in piece {
+                    if p.x <= lo {
+                        left.push(p);
+                    } else if p.x >= hi {
+                        right.push(p);
+                    }
+                }
+                if !left.is_empty() {
+                    next_pieces.push(left);
+                }
+                if !right.is_empty() {
+                    next_pieces.push(right);
+                }
+            }
+            pieces = next_pieces;
+        }
+
+        for piece in pieces.into_iter().rev() {
+            if let (Some(first), Some(last)) = (piece.first(), piece.last())
+                && piece.len() >= 2
+                && last.x > first.x
+            {
+                covered.push((first.x, last.x));
+            }
+            kept_rev.push(piece);
+        }
+    }
+
+    kept_rev.reverse();
+    kept_rev
 }
 
 /// Area fill for every run of one series: the region between the polyline and
@@ -2674,5 +2775,57 @@ mod tests {
         for clipped in &output.shapes {
             assert_shape_positions_finite(&clipped.shape);
         }
+    }
+
+    #[test]
+    fn overlapping_runs_from_a_backward_clock_step_never_overlap_in_x() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 180.0));
+        let base = 1_797_000_000_000u64;
+        // Pre-jump 100% run (1s..13s), then 9s backward step (4s..60s).
+        let mut stamps = Vec::new();
+        let mut samples = Vec::new();
+        for s in 1..=13 {
+            stamps.push(base + s * 1_000);
+            samples.push(100.0);
+        }
+        for s in 4..=60 {
+            stamps.push(base + s * 1_000);
+            samples.push(if s < 7 { 100.0 } else { 40.0 });
+        }
+
+        let axis = TimeAxis::new(&stamps, 60);
+        let runs = ChartGeometry::new(rect, 100.0, Some(axis), samples.len()).runs_of(&samples);
+        assert!(runs.len() >= 2, "expected multiple runs after clock step");
+        // No two multi-point runs may overlap in their open x-interval.
+        for (i, a) in runs.iter().enumerate() {
+            if a.len() < 2 {
+                continue;
+            }
+            let (ax0, ax1) = (a.first().unwrap().x, a.last().unwrap().x);
+            for b in &runs[i + 1..] {
+                if b.len() < 2 {
+                    continue;
+                }
+                let (bx0, bx1) = (b.first().unwrap().x, b.last().unwrap().x);
+                assert!(
+                    ax1 <= bx0 || bx1 <= ax0,
+                    "runs overlap horizontally: [{ax0}, {ax1}] vs [{bx0}, {bx1}]"
+                );
+            }
+        }
+        // Unsorted nearest_at stays accurate for hover lookup, and prefers the
+        // post-jump timeline when two runs share a timestamp.
+        assert_eq!(nearest_at(&stamps, base + 50_000), 59);
+        assert_eq!(nearest_at(&stamps, base + 8_000), 17);
+    }
+
+    #[test]
+    fn visible_window_stops_at_backward_clock_step() {
+        let mut stamps: Vec<u64> = (1..=13).map(|s| 1_000_000 + s * 1_000).collect();
+        stamps.extend((4..=60).map(|s| 1_000_000 + s * 1_000));
+        let win = visible_window(&stamps, 60, |&t| t);
+        assert_eq!(win.first().copied(), Some(1_004_000));
+        assert_eq!(win.last().copied(), Some(1_060_000));
+        assert_eq!(win.len(), 57);
     }
 }

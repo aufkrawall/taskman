@@ -16,7 +16,7 @@ use crate::win::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
     UpdateKind, Users,
@@ -2717,9 +2717,7 @@ fn hostname() -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    tm_core::monotonic_epoch_ms()
 }
 
 #[cfg(test)]

@@ -1,3 +1,8 @@
+## 2026-11-27 - Overlapping chart fills after backward clock step
+
+- Diagnosis: a notebook screenshot (`Intel Celeron N4000`, `0:00:04:11` uptime) showed "stacked transparent layers" on the big CPU chart (`1 Min.`) while the card sparkline did not overlap: pixel inspection showed Run 1 (`100%` from `x=435..551`) and Run 2 (`100%->60%->...` from `x=460..1008`) overlapping across `9.3 s` with double-blended `area_fill` (`rgb(60,117,146)` vs `rgb(53,86,103)`). Cause: `Snapshot::timestamp_ms` used `SystemTime::now()` (NTP stepped backward ~9.3 s shortly after boot), `visible_slice`/`visible_io_slice` retained pre-jump samples alongside post-jump samples, and `ChartGeometry::runs` painted both runs on the shared x-range.
+- Fixes: `tm_core::monotonic_epoch_ms` (process-lifetime `SystemTime` anchor + `Instant`, with `CLOCK_BOOTTIME` in `tm-platform/src/linux/mod.rs` so Linux suspend gaps remain real) keeps snapshot timestamps monotonic; `chart::visible_window` (shared by `performance::visible_slice` and `process_io::visible_io_slice`) stops at backward/duplicate steps without pulling a pre-jump lead-in; `ChartGeometry::runs` trims/splits earlier runs overlapping newer multi-point runs (`trim_overlapped_runs`); `nearest_at` falls back to linear scan when unsorted. Pinned by unit tests in `model`, `chart`, `performance`, `process_io` and a software-rasterizer pixel test in `render_snapshot`.
+
 ## 2026-11-27 - Font rendering review fixes
 
 - Review of 2f191f6b/ca991bb9 found: a theme-keyed grayscale curve that thinned the Light

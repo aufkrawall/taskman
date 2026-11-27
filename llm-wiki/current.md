@@ -1377,7 +1377,11 @@ rebase runbook.
   readout is dropped), because `x_on_axis` clamps a refused stamp onto the edge
   and `sample_age` would saturate it to "Now". The keyboard cursor additionally
   clamps to `first_on_axis` on both charts, so `Home` cannot land on the
-  off-axis lead-in. See `log/recent.md` 2026-09-11.
+  off-axis lead-in. Snapshot timestamps advance on a monotonic epoch-anchored
+  clock (`tm_core::monotonic_epoch_ms`, `CLOCK_BOOTTIME` on Linux), while
+  `chart::visible_window` stops at backward/duplicate steps and
+  `ChartGeometry::runs` trims earlier runs that overlap newer ones so
+  translucent fills never stack. See `log/recent.md` 2026-11-27 / 2026-09-11.
 - Build: `build.py` release driver (host + Linux by default), profiles
   tuned for compile speed (thin LTO, parallel codegen, line-tables-only
   debuginfo).

@@ -1521,6 +1521,81 @@ mod tests {
             );
         }
     }
+
+    /// Regression: a wall-clock step backward splits the series into two runs
+    /// that share an x-interval; painting both runs stacks two translucent area
+    /// fills on top of each other ("stacked transparent layers").
+    #[test]
+    fn backward_clock_step_never_stacks_translucent_area_fills() {
+        const PW: u32 = 620;
+        const PH: u32 = 200;
+        const BASE: u64 = 1_797_000_000_000;
+
+        let mut stamps = Vec::new();
+        let mut values = Vec::new();
+        for s in 1..=13 {
+            stamps.push(BASE + s * 1_000);
+            values.push(100.0);
+        }
+        for s in 4..=60 {
+            stamps.push(BASE + s * 1_000);
+            values.push(if s < 7 { 100.0 } else { 55.0 });
+        }
+
+        let ctx = egui::Context::default();
+        theme::install_visuals(&ctx);
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut tiles = Vec::new();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(PW as f32, PH as f32))),
+                ..Default::default()
+            },
+            |ui| {
+                let axis = chart::TimeAxis::new(&stamps, 60);
+                let response = chart::chart_multi(
+                    ui,
+                    vec2(600.0, 180.0),
+                    &[chart::MultiSeries::new(
+                        "CPU",
+                        values.clone(),
+                        theme::DARK.cpu_graph,
+                    )],
+                    100.0,
+                    Some(axis),
+                    chart::fmt_percent,
+                );
+                tiles.push(response.rect);
+            },
+        );
+        let mut frame = Frame::finish(ctx, tiles, output);
+        let buf = frame.paint(PW, PH);
+        let rect = frame.tiles[0];
+
+        // Expected single-layer fill blue channel over card_bg (43,43,43): ~103.
+        // A stacked double layer produces B ~= 146. Sample well inside the
+        // bottom half (20..40% height, i.e. 100% under the 55% curve) and away
+        // from horizontal/vertical gridlines.
+        let sample_y = (rect.bottom() - 20.0) as u32;
+        let mut max_blue_in_fill = 0u32;
+        for x in (rect.left() as u32 + 12)..(rect.right() as u32 - 4) {
+            let px = buf[(sample_y * PW + x) as usize];
+            let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+            // Ignore neutral grey gridlines/borders.
+            if b > r + 20 {
+                max_blue_in_fill = max_blue_in_fill.max(b);
+                assert!(
+                    b <= 115 && g <= 96,
+                    "stacked translucent fill at x={x}: rgb=({r},{g},{b})"
+                );
+            }
+        }
+        assert!(
+            max_blue_in_fill >= 90,
+            "expected single-layer fill pixels, got max blue={max_blue_in_fill}"
+        );
+    }
 }
 
 /// Write the CPU-rendered frame to a PNG so it can actually be looked at.

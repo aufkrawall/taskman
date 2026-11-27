@@ -29,27 +29,7 @@ use crate::widgets::menu;
 /// `chart::x_on_axis` places it off the left edge and the painter clips the
 /// overhang.
 pub fn visible_slice(history: &[HistoryPoint], seconds: u32) -> &[HistoryPoint] {
-    &history[window_start(history, seconds).saturating_sub(1)..]
-}
-
-/// Index of the oldest point inside the window (0 when the history is empty).
-fn window_start(history: &[HistoryPoint], seconds: u32) -> usize {
-    let Some(last) = history.last() else {
-        return 0;
-    };
-    let cutoff = last.t_ms.saturating_sub(seconds as u64 * 1000);
-    // Backward scan instead of `partition_point`: history is appended in
-    // sample order, but a wall-clock step BACKWARD (NTP correction after
-    // resume) leaves older points with larger timestamps. A binary search
-    // over that temporarily-unsorted buffer can drop the newest points and
-    // freeze the charts until they age out; scanning back from the newest
-    // sample always keeps the latest data in view (at worst the window is
-    // briefly too wide until the stale points are evicted).
-    let mut start = history.len();
-    while start > 0 && history[start - 1].t_ms >= cutoff {
-        start -= 1;
-    }
-    start
+    crate::widgets::chart::visible_window(history, seconds, |point| point.t_ms)
 }
 
 /// Human label for the graph window ("30 Sekunden"/"30 seconds", "2 min")
@@ -152,6 +132,11 @@ mod tests {
             win.last().unwrap().t_ms,
             91_000,
             "newest point must stay in view"
+        );
+        assert_eq!(
+            win.first().unwrap().t_ms,
+            90_000,
+            "pre-jump points must not mix into the post-jump window"
         );
         assert!(win.len() >= 2, "window must still hold plottable data");
     }

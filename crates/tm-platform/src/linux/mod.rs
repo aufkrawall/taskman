@@ -1141,11 +1141,37 @@ fn hostname() -> String {
         .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_default())
 }
 
+fn boot_clock_ms() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for `clock_gettime(CLOCK_BOOTTIME)`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    if rc == 0 && ts.tv_sec >= 0 && ts.tv_nsec >= 0 {
+        let secs = u64::try_from(ts.tv_sec).ok()?;
+        let nsec = u64::try_from(ts.tv_nsec).ok()?;
+        Some(secs.saturating_mul(1_000).saturating_add(nsec / 1_000_000))
+    } else {
+        None
+    }
+}
+
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static ANCHOR: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let anchor = *ANCHOR.get_or_init(|| {
+        let boot = boot_clock_ms()?;
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(1, |d| (d.as_millis() as u64).max(1));
+        Some((epoch, boot))
+    });
+    if let Some((epoch_ms, start_boot_ms)) = anchor
+        && let Some(now_boot_ms) = boot_clock_ms()
+    {
+        return epoch_ms.saturating_add(now_boot_ms.saturating_sub(start_boot_ms));
+    }
+    tm_core::monotonic_epoch_ms()
 }
 
 /// System-wide open file handles: allocated `struct file`s (every fd,
