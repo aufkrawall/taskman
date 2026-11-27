@@ -440,11 +440,7 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
 }
 
 fn canonical_components(path: &str) -> Option<Vec<&str>> {
-    if path.len() > MAX_CGROUP_PATH_BYTES
-        || !path.starts_with('/')
-        || path.contains('\\')
-        || !path.is_ascii()
-    {
+    if path.len() > MAX_CGROUP_PATH_BYTES || !path.starts_with('/') || !path.is_ascii() {
         return None;
     }
     if path == "/" {
@@ -455,17 +451,43 @@ fn canonical_components(path: &str) -> Option<Vec<&str>> {
         return None;
     }
     let components: Vec<&str> = body.split('/').collect();
-    if components.iter().any(|component| {
-        component.is_empty()
-            || *component == "."
-            || *component == ".."
-            || !component
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() && byte != b'\\' && byte != b'/')
-    }) {
+    if components
+        .iter()
+        .any(|component| !valid_cgroup_component(component))
+    {
         return None;
     }
     Some(components)
+}
+
+/// Systemd escapes hyphens and special bytes in unit/slice names as `\xHH`
+/// (e.g. `app-brave\x2dbrowser@....service`). Accept those 4-byte hex escapes
+/// while rejecting bare backslashes or path-traversal segments.
+fn valid_cgroup_component(component: &str) -> bool {
+    if component.is_empty() || component == "." || component == ".." {
+        return false;
+    }
+    let bytes = component.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            if i + 3 >= bytes.len()
+                || bytes[i + 1] != b'x'
+                || !bytes[i + 2].is_ascii_hexdigit()
+                || !bytes[i + 3].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            i += 4;
+            continue;
+        }
+        if !b.is_ascii_graphic() || b == b'/' {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn parse_user_slice(component: &str) -> Option<u32> {
@@ -491,16 +513,18 @@ fn parse_decimal(value: &str) -> Option<u32> {
 }
 
 fn valid_user_unit(component: &str) -> bool {
-    if component.len() > MAX_UNIT_BYTES {
+    if component.len() > MAX_UNIT_BYTES || !valid_cgroup_component(component) {
         return false;
     }
     let stem = component
         .strip_suffix(".scope")
-        .or_else(|| component.strip_suffix(".service"));
+        .or_else(|| component.strip_suffix(".service"))
+        .or_else(|| component.strip_suffix(".slice"));
     stem.is_some_and(|stem| {
         !stem.is_empty()
             && component.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@' | b':')
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'.' | b'_' | b'-' | b'@' | b':' | b'\\')
             })
     })
 }
@@ -515,6 +539,7 @@ fn valid_application_unit(component: &str) -> bool {
     let stem = component
         .strip_suffix(".scope")
         .or_else(|| component.strip_suffix(".service"))
+        .or_else(|| component.strip_suffix(".slice"))
         .unwrap_or_default();
     let standard_app = stem
         .strip_prefix("app-")
@@ -946,12 +971,27 @@ mod tests {
         for path in [
             "user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example-1.scope",
             "/user.slice/../system.slice/org.example.service",
-            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example\\x2d1.scope",
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example\\foo.scope",
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example\\xZZ.scope",
             "/user.slice/user-1000.slice/user@1001.service/app.slice/app-org.example-1.scope",
             "/user.slice/user-1000.slice/app.slice/app-org.example-1.scope",
         ] {
             assert_eq!(parse_v2(path), None, "{path}");
         }
+        // Systemd escapes '-' as '\x2d' in real desktop unit names (e.g.
+        // app-brave\x2dbrowser@....service, app-dbus\x2d...slice).
+        let escaped = parse_v2(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-brave\\x2dbrowser@abc.service",
+        )
+        .expect("systemd hex-escaped unit");
+        assert!(escaped.user_session);
+        assert!(escaped.app_unit_group.is_some());
+        let nested_slice = parse_v2(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-dbus\\x2d:1.2\\x2dorg.kde.kwalletd6.slice/dbus-:1.2-org.kde.kwalletd6@0.service",
+        )
+        .expect("nested systemd slice under app.slice");
+        assert!(nested_slice.user_session);
+        assert!(nested_slice.app_unit_group.is_some());
         let manager = parse_v2("/user.slice/user-1000.slice/user@1000.service/init.scope")
             .expect("user manager path");
         assert_eq!(manager.manager_uid, Some(1000));

@@ -785,7 +785,22 @@ impl GlowWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
-        if is_visible {
+        let reveal_first_frame = !viewport_output
+            .get(&ViewportId::ROOT)
+            .is_some_and(|output| {
+                output
+                    .commands
+                    .iter()
+                    .rev()
+                    .find_map(|cmd| match cmd {
+                        egui::ViewportCommand::Visible(v) => Some(*v),
+                        _ => None,
+                    })
+                    == Some(false)
+            });
+        // TaskMan fork: do not swap/present on the first frame if the app
+        // explicitly asked to stay hidden (`--minimized-to-tray`).
+        if is_visible && (!integration.is_first_frame || reveal_first_frame) {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
             {

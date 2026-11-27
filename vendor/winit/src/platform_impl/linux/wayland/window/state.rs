@@ -86,6 +86,10 @@ pub struct WindowState {
     /// The current window title.
     title: String,
 
+    /// TaskMan fork: cached `app_id` so a surface remapped after a null-buffer
+    /// unmap can re-apply its `xdg_toplevel` identity before the initial commit.
+    app_id: Option<String>,
+
     /// Whether the frame is resizable.
     resizable: bool,
 
@@ -305,6 +309,7 @@ impl WindowState {
             text_inputs: Vec::new(),
             theme,
             title: String::default(),
+            app_id: None,
             transparent: false,
             viewport,
             window,
@@ -1290,6 +1295,26 @@ impl WindowState {
     #[inline]
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// TaskMan fork: store and apply `xdg_toplevel.set_app_id`.
+    pub fn set_app_id(&mut self, app_id: String) {
+        self.window.set_app_id(&app_id);
+        self.app_id = Some(app_id);
+    }
+
+    /// TaskMan fork: re-apply `xdg_toplevel` metadata (`app_id`, `title`, size
+    /// hints) before a remap's initial commit, because unmapping via a null
+    /// buffer resets `xdg_toplevel` state on the compositor.
+    pub fn reapply_toplevel_state(&self) {
+        if let Some(app_id) = &self.app_id {
+            self.window.set_app_id(app_id);
+        }
+        if !self.title.is_empty() {
+            self.window.set_title(&self.title);
+        }
+        self.window.set_min_size(Some(self.min_inner_size.into()));
+        self.window.set_max_size(self.max_inner_size.map(Into::into));
     }
 }
 

@@ -232,14 +232,27 @@ impl SystemCollector for LinuxCollector {
                 .as_deref()
                 .and_then(process_cpu::parse_pid_cpu_stat)
                 .map(|stat| self.process_cpu.observe(pid_u, stat));
-            let desktop_evidence = boot_start_ticks
-                .map_or_else(desktop_session::DesktopEvidence::default, |ticks| {
+            let is_kthread = stat_bytes
+                .as_deref()
+                .is_some_and(parse_proc_stat_is_kthread);
+            let desktop_evidence = if is_kthread {
+                let mut evidence = desktop_session::DesktopEvidence::default();
+                evidence.role = Some(classify::DesktopRoleEvidence::System);
+                evidence
+            } else {
+                boot_start_ticks.map_or_else(desktop_session::DesktopEvidence::default, |ticks| {
                     self.desktop_evidence.evidence(pid_u, ticks, started)
-                });
-            // Only a process whose generation this tick bracketed has an
-            // authoritative role. `None` tells the classifier that nothing was
-            // observed, so it may still use its userspace-name fallback.
-            let desktop_role = boot_start_ticks.map(|_| desktop_evidence.role_marker());
+                })
+            };
+            // Only a process whose generation this tick bracketed (or a kernel
+            // thread proven by `PF_KTHREAD`) has an authoritative role. `None`
+            // tells the classifier that nothing was observed, so it may still
+            // use its userspace-name fallback.
+            let desktop_role = if is_kthread {
+                Some(classify::DesktopRoleEvidence::System)
+            } else {
+                boot_start_ticks.map(|_| desktop_evidence.role_marker())
+            };
             let has_window = window_evidence(
                 window_observation.owners.get(&pid_u).copied(),
                 boot_start_ticks,
@@ -1965,6 +1978,29 @@ fn parse_proc_stat_starttime(pid_stat: &[u8]) -> Option<i64> {
     std::str::from_utf8(ticks).ok()?.parse().ok()
 }
 
+/// True when `/proc/<pid>/stat` field 9 (`flags`) carries `PF_KTHREAD` (`0x00200000`).
+fn parse_proc_stat_is_kthread(pid_stat: &[u8]) -> bool {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    let Some(after_comm) = pid_stat
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .map(|i| i + 1)
+    else {
+        return false;
+    };
+    let Some(flags) = pid_stat[after_comm..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|part| !part.is_empty())
+        .nth(6)
+    else {
+        return false;
+    };
+    std::str::from_utf8(flags)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|f| (f & PF_KTHREAD) != 0)
+}
+
 fn linux_start_timestamp(btime_s: u64, ticks_since_boot: i64, clk_tck: u64) -> Option<i64> {
     if btime_s == 0 || clk_tck == 0 {
         return None;
@@ -2524,5 +2560,25 @@ mod tests {
             !may_escalate(&vanished, Some(9)),
             "a vanished target answers the same under any identity"
         );
+    }
+
+    #[test]
+    fn kernel_threads_are_detected_from_proc_stat_flags() {
+        // Real `/proc/22/stat` shape: PF_KTHREAD (0x00200000 = 2097152) in flags (field 9).
+        let kthread = b"23 (idle_inject/0) S 2 0 0 0 -1 69238848 0 0 0 0 0 0 0 0 -51 0 1 0 21 0";
+        assert!(parse_proc_stat_is_kthread(kthread));
+        assert_eq!(
+            classify_collected_process(
+                23,
+                "idle_inject/0",
+                None,
+                Some(classify::DesktopRoleEvidence::System),
+            ),
+            ProcCategory::System
+        );
+
+        // Normal user process without PF_KTHREAD (even with spaces/parens in comm).
+        let user = b"1234 (my (app)) S 1000 1234 1234 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 99 0";
+        assert!(!parse_proc_stat_is_kthread(user));
     }
 }

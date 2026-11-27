@@ -891,9 +891,13 @@ impl WgpuWinitRunning<'_> {
             None => true,
         };
         let is_first_reveal = integration.is_first_frame && reveal_first_frame;
+        // TaskMan fork: do not present on the first frame when the app
+        // explicitly requested `Visible(false)` (e.g. `--minimized-to-tray`);
+        // presenting on Wayland immediately maps the surface for one frame.
+        let should_present = is_visible && (!integration.is_first_frame || reveal_first_frame);
 
         let mut first_frame_reveal_in_progress = false;
-        let vsync_secs = if is_visible {
+        let vsync_secs = if should_present {
             // Building the pipelines is most of the time between "the window exists" and "the
             // window shows something". Present one cleared frame in the app's own background
             // colour and reveal the window through it, so that wait happens with the themed

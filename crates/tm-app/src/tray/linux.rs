@@ -485,13 +485,12 @@ impl StatusNotifierItem {
         item_pixmap()
     }
 
-    /// The menu is the item's primary interface: a host that honours this flag
-    /// puts the `Open` entry on the left click and reaches the window through
-    /// it. Every host that ignores it (Plasma asks for `Activate` instead)
-    /// still opens the window, which is why both paths end in the same action.
+    /// Left click activates the item (`Activate` -> Open/restore the window)
+    /// rather than popping up the context menu; right click still opens the
+    /// `com.canonical.dbusmenu` menu.
     #[zbus(property(emits_changed_signal = "const"))]
     fn item_is_menu(&self) -> bool {
-        true
+        false
     }
 
     /// Object path of the menu a panel calls for the context menu.

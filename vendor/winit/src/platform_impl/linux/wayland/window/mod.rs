@@ -127,7 +127,8 @@ impl Window {
 
         // Set the app_id.
         if let Some(name) = attributes.platform_specific.name.map(|name| name.general) {
-            window.set_app_id(name);
+            // TaskMan fork: cache `app_id` in `WindowState` for remap after unmap.
+            window_state.set_app_id(name);
         }
 
         // Set the window title.
@@ -262,7 +263,14 @@ impl Window {
     /// reports while unmapped. See `TASKMAN-FORK.md` §5.
     #[inline]
     pub fn set_visible(&self, visible: bool) {
-        let change = self.window_state.lock().unwrap().set_hidden(!visible);
+        let change = {
+            let mut state = self.window_state.lock().unwrap();
+            let change = state.set_hidden(!visible);
+            if matches!(change, VisibilityChange::Remap) {
+                state.reapply_toplevel_state();
+            }
+            change
+        };
         let surface = self.window.wl_surface();
         match change {
             VisibilityChange::None | VisibilityChange::HideUnmapped => return,
