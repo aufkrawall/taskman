@@ -1893,7 +1893,15 @@ fn list_process_file_io_with_a_creation_time_keeps_the_accounting_consistent() {
         );
         assert_eq!(accounting.read_bytes, 0);
         assert_eq!(accounting.write_bytes, 0);
-        assert_eq!(accounting.since_ms, 0);
+        // `since_ms` is the age of the trace session, so a running session that
+        // has not delivered a transfer reports how long it has been waiting
+        // rather than zero. Only a host with no session has no window at all.
+        if accounting.state == FileIoAccountingState::Unavailable {
+            assert_eq!(
+                accounting.since_ms, 0,
+                "a host with no session reports no accounting window"
+            );
+        }
         eprintln!(
             "no per-file accounting delivered here ({:?}); accounting stayed empty",
             accounting.state
