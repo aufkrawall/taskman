@@ -479,7 +479,7 @@ read_manifest_uids() {
 }
 
 render_manifest() {
-  local out=$1 text uids= clients= uid client
+  local out=$1 text uids="" clients="" uid client
   if [ ! -f "$TEMPLATE" ]; then
     die "missing manifest template: $TEMPLATE"
   fi

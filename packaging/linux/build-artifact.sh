@@ -36,8 +36,10 @@ rustc_bin=$(command -v rustc) || {
 }
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-readonly REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
+readonly REPO_ROOT
 readonly PACKAGING=$SCRIPT_DIR
 readonly SERVICE_BINARY=taskman-service
 readonly PAYLOAD_FILES=(
