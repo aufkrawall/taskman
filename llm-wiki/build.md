@@ -1,6 +1,6 @@
 # Build System
 
-Last verified: 2026-11-21
+Last verified: 2026-11-27
 
 Primary sources:
 - `build.py`
@@ -74,14 +74,50 @@ yields `taskman-v<version>-debian-ubuntu-<arch>.deb` and
 `tools/distpkg.py` (pure Python: `build.py` runs on hosts without `dpkg-deb`
 and `rpmbuild`; structure covered by `tools/tests/test_distpkg.py`, but a real
 `apt`/`dnf` install is NOT verified in CI -- open question). The payload is the
-tree `install-linux.sh --packaged --root` stages, so only the Linux host path
-works (a Windows host logs a skip). The arch package is renamed to
+tree `install-linux.sh --packaged --root` stages, so the packaging needs a Linux
+host with POSIX file modes; a Windows host logs a skip and the packages are
+built inside the Arch WSL distro instead (`tools/linux_packages.py`, see
+§ Release artifact set). The arch package is renamed to
 `taskman-v<version>-arch-x86_64.pkg.tar.zst`. `--no-distro-packages` skips the
 deb/rpm; the musl flavor never produces them. Scriptlets of all three call
 `install-linux.sh --post-install`, which restarts `taskman-core.service` and then
 `restart_gui()` relaunches each running `/usr/bin/taskman` as its owner
 (environment and args copied from `/proc/<pid>`). The rpm declares the
 dlopen'd libraries as soname capabilities, the deb by package name.
+
+### Release artifact set
+
+Every release carries all of these, and one of them missing makes the release
+incomplete: `--require-all-targets` (the release switch) fails the run when a
+release package is not in `dist/`, instead of finishing quietly.
+
+| artifact | produced by | needs |
+| --- | --- | --- |
+| `taskman-v<version>-windows-<arch>.zip` + `-setup.exe` | `build.py` | the host build; ARM64 under `--all-targets` |
+| `taskman-v<version>-linux-<arch>.tar.gz` | `build.py` | `cross`/`cargo-zigbuild`, or the musl fallback; ARM64 under `--all-targets` |
+| `taskman-v<version>-arch-x86_64.pkg.tar.zst` | `makepkg` | an Arch host, or an Arch WSL distro on Windows |
+| `taskman-v<version>-debian-ubuntu-<arch>.deb` | `tools/distpkg.py` | a Linux host: `install-linux.sh --packaged` needs POSIX modes |
+| `taskman-v<version>-fedora-<arch>.rpm` | `tools/distpkg.py` | same |
+
+Every artifact ships a `<artifact>.sha256` sidecar in `sha256sum` format
+(`<hex>  <file name>`), which `sha256sum -c` consumes as-is.
+
+A Windows host produces the Windows installers and the Linux tarballs itself.
+The three distribution packages need a Linux filesystem, so that half runs in
+the distro `arch_package_host()` already looks for, with the checkout still on
+the Windows side:
+
+    python build.py --all-targets            # host, Linux tarballs, Windows ARM64
+    wsl.exe -d <distro> -- python3 /mnt/c/<checkout>/tools/linux_packages.py
+    # then attach dist/taskman-v<version>-* and their .sha256 sidecars
+
+`tools/linux_packages.py` stages the payload with the installer, writes the
+deb/rpm through `tools/distpkg.py` for every architecture whose cross-built
+binaries exist, and runs `makepkg` for the pacman package. `--no-distro` and
+`--no-arch-package` narrow it to one half; `--arch` narrows the deb/rpm to one
+release architecture. The staged manifest carries the install time, so two runs
+of the same version differ in that field — regenerate the `.sha256` sidecars
+after the last run that touches `dist/`.
 
 ### Windows x86_64 from a Linux/macOS host
 

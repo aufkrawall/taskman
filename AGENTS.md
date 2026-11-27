@@ -39,6 +39,15 @@
   glibc binary, and without either the self-contained `rust-lld` musl path is
   used (rustup std component only). `--host-only` skips Linux;
   `--require-all-targets` makes a skipped Linux build fatal.
+- **Every release ships the Linux packages too, always:** the pacman package
+  and the Debian/Ubuntu and Fedora packages belong to the release artifact set
+  next to the tarballs and installers — a release missing any of them is
+  incomplete and must not be published. They need `makepkg` (Arch host or Arch
+  WSL distro) and a Linux host with POSIX file modes for `install-linux.sh
+  --packaged`, so a Windows-only run does not produce them: run the packaging
+  step inside the distro before tagging. `--require-all-targets` fails when a
+  package is missing from `dist/`. See `llm-wiki/build.md` § Release artifact
+  set for the asset list and the exact commands.
 - Compile-time policy: profiles are tuned for fast iteration and fast
   releases (thin LTO, parallel codegen units, line-tables-only debuginfo).
   Do NOT reintroduce fat LTO / `codegen-units = 1`; the measured benefit was

@@ -1123,9 +1123,9 @@ def build_arch_package(version: str) -> bool:
     """Build the pacman package from `packaging/arch` into `dist/`.
 
     Returns False only for a real failure. A host with no makepkg anywhere is
-    a documented skip, not a failure: the tarball and the installers are the
-    artifacts this driver owns unconditionally, and an Arch user can always run
-    `makepkg` from `packaging/arch` by hand. The PKGBUILD has no `source`
+    a skip rather than a failure, because `--check` runs here too; the package
+    is still part of every release, so a release run (`--require-all-targets`)
+    fails when it is missing from `dist/`. The PKGBUILD has no `source`
     array — it compiles the two binaries from THIS checkout — so the packaged
     version must be the version this run just built; a bump that forgets the
     PKGBUILD would otherwise silently package a different release.
@@ -1137,7 +1137,9 @@ def build_arch_package(version: str) -> bool:
     if host is None:
         log(
             "no makepkg on this host and no Arch WSL distro - skipping the arch "
-            f"package (set {ARCH_WSL_DISTRO_ENV} to name the distro to use)"
+            f"package (set {ARCH_WSL_DISTRO_ENV} to name the distro to use); "
+            "it is part of every release, so build it on an Arch host or in an "
+            "Arch WSL distro (see llm-wiki/build.md, 'Release artifact set')"
         )
         return True
     pkgbuild = ARCH_PACKAGING / "PKGBUILD"
@@ -1185,6 +1187,34 @@ def distro_package_name(version: str, distro: str, arch: str, ext: str) -> str:
     return f"taskman-v{version}-{distro}-{arch}.{ext}"
 
 
+def release_package_names(
+    version: str,
+    distro_arches: list[str],
+    *,
+    arch_package: bool,
+    distro_packages: bool,
+) -> list[str]:
+    """The Linux packages every release ships, by file name.
+
+    They are not extras: a release without the pacman package and the deb/rpm
+    pair is incomplete, which is why `--require-all-targets` refuses to finish
+    when one of these is missing from `dist/`.
+    """
+    names: list[str] = []
+    if arch_package:
+        names.append(distro_package_name(version, "arch", "x86_64", "pkg.tar.zst"))
+    if distro_packages:
+        for arch in distro_arches:
+            names.append(distro_package_name(version, "debian-ubuntu", arch, "deb"))
+            names.append(distro_package_name(version, "fedora", arch, "rpm"))
+    return names
+
+
+def missing_release_packages(names: list[str], dist: Path) -> list[str]:
+    """The names of `names` that `dist` does not carry."""
+    return [name for name in names if not (dist / name).is_file()]
+
+
 def load_distpkg():
     spec = importlib.util.spec_from_file_location(
         "taskman_distpkg", ROOT / "tools" / "distpkg.py"
@@ -1203,7 +1233,11 @@ def build_distro_packages(version: str, gui_exe: Path, arch: str) -> bool:
     logs a skip, like a missing makepkg.
     """
     if platform.system() != "Linux":
-        log("deb/rpm packages are built on a Linux host - skipping")
+        log(
+            "deb/rpm packages need a Linux host with POSIX file modes - skipping; "
+            "they are part of every release, so build them in a Linux/WSL distro "
+            "(see llm-wiki/build.md, 'Release artifact set')"
+        )
         return True
     service_exe = gui_exe.with_name(LINUX_SERVICE_BINARY)
     if not service_exe.exists():
@@ -1795,6 +1829,24 @@ def main() -> int:
         for gui_exe, arch in linux_distro_exes:
             if not build_distro_packages(version, gui_exe, arch):
                 failures += 1
+
+    # The packages above are part of the release, not an extra: the release
+    # switch (`--require-all-targets`) therefore also refuses to finish without
+    # them, instead of leaving a published release that quietly lacks them.
+    if args.require_all_targets and not args.no_package:
+        expected = release_package_names(
+            version,
+            [arch for _exe, arch in linux_distro_exes],
+            arch_package=linux_requested and not args.no_arch_package,
+            distro_packages=not args.no_distro_packages,
+        )
+        missing = missing_release_packages(expected, DIST)
+        if missing:
+            log(
+                "missing release packages (--require-all-targets): "
+                + ", ".join(missing)
+            )
+            failures += len(missing)
 
     if failures:
         log(f"DONE with {failures} failure(s)")

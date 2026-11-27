@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The pacman, Debian/Ubuntu and Fedora packages are part of every release, not a host-dependent extra.** A release published from a host without `makepkg`, or without the POSIX filesystem `install-linux.sh --packaged` stages into, has gone out without them; they were the only download missing from the release page while the tarballs and installers were there. The three packages now belong to the release artifact set: `--require-all-targets` (the release switch) fails instead of finishing when one is missing from `dist/`, and the packages themselves are produced by `tools/linux_packages.py`, which runs in a Linux/Arch WSL distro and writes the `.deb`, the `.rpm` for every architecture whose Linux binaries exist, and the pacman package. A Windows host therefore produces the whole set: build the tarballs with `python build.py --all-targets`, run the packaging step in the distro, and attach everything with its `.sha256` sidecar. The staged manifest embeds the install time, so packages written for the same version by two runs differ in that one field and their sidecars must be regenerated after the last run that touches `dist/` (`llm-wiki/build.md` § Release artifact set).
+
 ## 0.1.36 - 2026-11-27
 
 ### New
