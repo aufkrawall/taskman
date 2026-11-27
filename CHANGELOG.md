@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.35 - 2026-11-27
 
 ### New
 
@@ -56,7 +56,7 @@
 - **Linux: one Users row per login.** systemd's per-user service manager was listed as a second session of the same user with no processes, while most of the user's processes (everything started through systemd) counted towards no session. The manager session is hidden and its processes count towards the user's login. Session state and logon time were never read at all, because current `loginctl` ignores a comma-separated property list.
 - **Linux: the GPU page no longer shows a permanently empty shared-memory chart** on drivers that expose no shared pool (the proprietary NVIDIA driver); amdgpu/Intel keep their GTT-based reading.
 - **Linux: Settings reflects the installed service.** With the TaskMan service running, Settings still said privileged actions "may be limited"; it now names the service and its state.
- across two Processes sections.** A windowless helper of an app that used at least 1 % CPU and ran a different executable was lifted out of the app into Background processes, together with its own children but not its parent — so a `cargo.exe` started from an editor's terminal stayed in the editor's tree while its busy `rustc.exe` children appeared under Background, and rows jumped between the two sections whenever a compiler crossed the threshold. The rule predates the nested app trees and was there to keep busy tools visible; an expanded app row now shows its whole subtree with the same parent links as the Details tree, and the app row's totals already include the tool's load, so the helpers stay where they belong. Background "Name (N)" family rows still keep a busy different-image helper out of the collapsed group.
+- **A busy build no longer splits across two Processes sections.** A windowless helper of an app that used at least 1 % CPU and ran a different executable was lifted out of the app into Background processes, together with its own children but not its parent — so a `cargo.exe` started from an editor's terminal stayed in the editor's tree while its busy `rustc.exe` children appeared under Background, and rows jumped between the two sections whenever a compiler crossed the threshold. The rule predates the nested app trees and was there to keep busy tools visible; an expanded app row now shows its whole subtree with the same parent links as the Details tree, and the app row's totals already include the tool's load, so the helpers stay where they belong. Background "Name (N)" family rows still keep a busy different-image helper out of the collapsed group.
 
 ## 0.1.34 - 2026-11-26
 
