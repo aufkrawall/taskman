@@ -62,7 +62,7 @@ jobs:
           # about correctness instead of formatting taste.
           shellcheck -x -S warning packaging/linux/install-linux.sh packaging/linux/uninstall-linux.sh packaging/linux/build-artifact.sh
       - name: Python build tests
-        run: python tools/tests/test_build_linux.py && python tools/tests/test_build_host.py && python tools/tests/test_build_arch.py
+        run: python tools/tests/test_build_linux.py && python tools/tests/test_build_host.py && python tools/tests/test_build_arch.py && python tools/tests/test_distpkg.py
       - name: glibc GUI artifact (build.py cannot make this on Windows)
         run: packaging/linux/build-artifact.sh --verify
       - uses: actions/upload-artifact@v4

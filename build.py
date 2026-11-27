@@ -19,11 +19,18 @@ manifest template, desktop entry, icon, AppStream metadata), so the archive is
 installable by extracting it and running `install-linux.sh`.
 
 Every packaging run also builds the pacman package
-(`dist/taskman-<version>-<pkgrel>-x86_64.pkg.tar.zst`) from
+(`dist/taskman-v<version>-arch-x86_64.pkg.tar.zst`) from
 `packaging/arch`. `makepkg` runs natively on an Arch host and through `wsl.exe`
 in an Arch WSL distro on Windows, where pacman is not installed at all; a host
 with neither is a documented skip, never a failure. `--no-arch-package` skips
 it on purpose.
+
+Linux builds with a glibc binary also produce a Debian/Ubuntu package
+(`taskman-v<version>-debian-ubuntu-<arch>.deb`) and a Fedora package
+(`taskman-v<version>-fedora-<arch>.rpm`), written by `tools/distpkg.py` from
+the payload `install-linux.sh --packaged` stages. `--no-distro-packages` skips
+them. Their scriptlets run `install-linux.sh --post-install`, which restarts
+the core service and relaunches any running GUI.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 from functools import cache
 from pathlib import Path
@@ -1147,7 +1155,101 @@ def build_arch_package(version: str) -> bool:
     log(f"building the arch package with {host.label}")
     # PKGDEST keeps the package next to the other artifacts instead of littering
     # the packaging directory.
-    return host.run(["--force", "--noconfirm"])
+    if not host.run(["--force", "--noconfirm"]):
+        return False
+    # makepkg names it `taskman-<ver>-<rel>-<arch>.pkg.tar.zst`; the release
+    # files carry the distribution instead so a user can pick theirs at a glance.
+    built = sorted(DIST.glob(f"taskman-{version}-*-x86_64.pkg.tar.*"))
+    built = [p for p in built if not p.name.endswith(".sig")]
+    if not built:
+        log(f"makepkg succeeded but no taskman-{version}-*-x86_64.pkg.tar.* is in {DIST}")
+        return False
+    suffix = built[-1].name.split(".pkg.tar", 1)[1]
+    dest = DIST / distro_package_name(version, "arch", "x86_64", f"pkg.tar{suffix}")
+    built[-1].replace(dest)
+    log(f"packaged: {dest}")
+    return True
+
+
+DISTRO_PACKAGE_RELEASE = "1"
+
+
+def distro_package_name(version: str, distro: str, arch: str, ext: str) -> str:
+    """`taskman-v0.1.34-debian-ubuntu-x86_64.deb`: distro and arch in the name."""
+    return f"taskman-v{version}-{distro}-{arch}.{ext}"
+
+
+def load_distpkg():
+    spec = importlib.util.spec_from_file_location(
+        "taskman_distpkg", ROOT / "tools" / "distpkg.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_distro_packages(version: str, gui_exe: Path, arch: str) -> bool:
+    """Write the Debian/Ubuntu `.deb` and the Fedora `.rpm` for one Linux target.
+
+    `arch` is the release naming (`x86_64` or `arm64`). The payload is staged by
+    `install-linux.sh --packaged`, the installer every other artifact uses, so
+    the layout is described exactly once. Needs a POSIX `bash`: a Windows host
+    logs a skip, like a missing makepkg.
+    """
+    if platform.system() != "Linux":
+        log("deb/rpm packages are built on a Linux host - skipping")
+        return True
+    service_exe = gui_exe.with_name(LINUX_SERVICE_BINARY)
+    if not service_exe.exists():
+        log(f"core service binary missing for the deb/rpm packages: {service_exe}")
+        return False
+    distpkg = load_distpkg()
+    deb_arch, rpm_arch = {"x86_64": ("amd64", "x86_64"), "arm64": ("arm64", "aarch64")}[
+        arch
+    ]
+    mtime = int(os.environ.get("SOURCE_DATE_EPOCH", "0")) or int(
+        (ROOT / "Cargo.toml").stat().st_mtime
+    )
+    DIST.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="taskman-distpkg-") as tmp:
+        payload = Path(tmp) / "payload"
+        stage = Path(tmp) / "stage"
+        (payload / "bin").mkdir(parents=True)
+        stage.mkdir()
+        shutil.copy2(gui_exe, payload / "bin" / "taskman")
+        shutil.copy2(service_exe, payload / "bin" / LINUX_SERVICE_BINARY)
+        if not run(
+            [
+                "bash",
+                str(LINUX_PACKAGING / "install-linux.sh"),
+                "--packaged",
+                "--quiet",
+                "--root",
+                str(stage),
+                "--source-dir",
+                str(payload),
+            ]
+        ):
+            log("staging the deb/rpm payload failed")
+            return False
+        try:
+            entries = distpkg.stage_tree(stage)
+            deb = distpkg.build_deb(
+                entries, version, DISTRO_PACKAGE_RELEASE, deb_arch, mtime
+            )
+            rpm = distpkg.build_rpm(
+                entries, version, DISTRO_PACKAGE_RELEASE, rpm_arch, mtime
+            )
+        except (OSError, ValueError) as err:
+            log(f"building the deb/rpm packages failed: {err}")
+            return False
+    for data, name in (
+        (deb, distro_package_name(version, "debian-ubuntu", arch, "deb")),
+        (rpm, distro_package_name(version, "fedora", arch, "rpm")),
+    ):
+        (DIST / name).write_bytes(data)
+        log(f"packaged: {DIST / name}")
+    return True
 
 
 def package_zip(name: str, files: list[tuple[Path, str]]) -> Path:
@@ -1475,6 +1577,11 @@ def main() -> int:
         help="run dependency-advisory and secrets scanners first (cargo-audit, gitleaks)",
     )
     ap.add_argument(
+        "--no-distro-packages",
+        action="store_true",
+        help="skip the Debian/Ubuntu .deb and Fedora .rpm packages",
+    )
+    ap.add_argument(
         "--live-tests",
         action="store_true",
         help="run the #[ignore]d live-kernel/ETW tests (Windows, elevated) and exit",
@@ -1622,10 +1729,15 @@ def main() -> int:
                         log(f"setup installer ready: {setup}")
 
     linux_x86_64_flavor: str | None = None
+    linux_distro_exes: list[tuple[Path, str]] = []
     if linux_requested:
         exe, attempted, flavor = build_linux(profile)
         if exe is not None:
             linux_x86_64_flavor = flavor
+            if flavor == "gnu":
+                linux_distro_exes.append((exe, "x86_64"))
+            else:
+                log("static musl build is headless: no deb/rpm package is made from it")
             log(f"linux binary ready ({flavor}): {exe}")
             files = linux_payload_files(exe, flavor)
             if files is None:
@@ -1643,6 +1755,7 @@ def main() -> int:
         exe, attempted, flavor = build_linux(profile, LINUX_ARM64_TARGET)
         if exe is not None:
             log(f"linux arm64 binary ready ({flavor}): {exe}")
+            linux_distro_exes.append((exe, "arm64"))
             files = linux_payload_files(exe, flavor)
             if files is None:
                 failures += 1
@@ -1670,6 +1783,11 @@ def main() -> int:
     if not args.no_package and not args.no_arch_package and linux_requested:
         if not build_arch_package(version):
             failures += 1
+
+    if not args.no_package and not args.no_distro_packages:
+        for gui_exe, arch in linux_distro_exes:
+            if not build_distro_packages(version, gui_exe, arch):
+                failures += 1
 
     if failures:
         log(f"DONE with {failures} failure(s)")

@@ -517,10 +517,15 @@ validate_manifest_json() {
 # was deliberately kept.
 remove_superseded_placeholder() {
   local stale=$1
-  if [ -e "$stale" ]; then
-    rm -f -- "$stale"
-    log "removed the superseded placeholder $stale"
-  fi
+  local variant
+  # Each package manager parks the placeholder under its own suffix: pacman
+  # .pacnew, rpm .rpmnew, dpkg .dpkg-new/.dpkg-dist.
+  for variant in "$stale" "${stale%.pacnew}.rpmnew" "${stale%.pacnew}.dpkg-new" "${stale%.pacnew}.dpkg-dist"; do
+    if [ -e "$variant" ]; then
+      rm -f -- "$variant"
+      log "removed the superseded placeholder $variant"
+    fi
+  done
 }
 
 # Write the manifest atomically. A partly written policy file would make the
@@ -678,6 +683,9 @@ owned_files() {
     "$ROOT$CONF_DIR/$MANIFEST_NAME"
     "$ROOT$CONF_DIR/$MANIFEST_NAME.bak"
     "$ROOT$CONF_DIR/$MANIFEST_NAME.pacnew"
+    "$ROOT$CONF_DIR/$MANIFEST_NAME.rpmnew"
+    "$ROOT$CONF_DIR/$MANIFEST_NAME.dpkg-new"
+    "$ROOT$CONF_DIR/$MANIFEST_NAME.dpkg-dist"
   )
 }
 
@@ -792,6 +800,64 @@ collect_manifest_policy() {
   fi
 }
 
+# Relaunch every running GUI so an upgrade replaces the process image the user
+# is looking at, exactly like the restart of the broker above. The GUI is an
+# ordinary user process, so it is started again as the SAME user, with the
+# display/session variables and arguments of the instance it replaces; an
+# instance whose session cannot be reproduced is left running with a warning
+# rather than killed for nothing. Staging builds never touch processes.
+restart_gui() {
+  if [ -n "$ROOT" ]; then
+    return 0
+  fi
+  local gui=$BIN_DIR/$GUI_BINARY proc pid exe uid user gid line key waited
+  local -a args env_pairs
+  for proc in /proc/[0-9]*; do
+    pid=${proc#/proc/}
+    exe=$(readlink -- "$proc/exe" 2>/dev/null) || continue
+    # An upgraded binary is reported as "<path> (deleted)" by the old process.
+    exe=${exe% (deleted)}
+    [ "$exe" = "$gui" ] || continue
+    mapfile -d '' -t args < "$proc/cmdline" 2>/dev/null || continue
+    case " ${args[*]} " in
+      *" --selfcheck "*) continue ;;
+    esac
+    uid=$(awk '/^Uid:/ { print $2; exit }' "$proc/status" 2>/dev/null) || continue
+    if [ -z "$uid" ] || [ "$uid" -eq 0 ]; then
+      warn "a GUI (pid $pid) runs as root; restart it by hand to load the new version"
+      continue
+    fi
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    gid=$(id -g "$uid" 2>/dev/null) || continue
+    env_pairs=("HOME=$(getent passwd "$uid" | cut -d: -f6)" "USER=$user" "LOGNAME=$user")
+    while IFS= read -r -d '' line; do
+      key=${line%%=*}
+      case $key in
+        DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP|XDG_SESSION_ID|XDG_DATA_DIRS|DBUS_SESSION_BUS_ADDRESS|DESKTOP_SESSION|LANG|LC_ALL|TASKMAN_*)
+          env_pairs+=("$line") ;;
+      esac
+    done < "$proc/environ" 2>/dev/null || true
+    if ! kill -TERM "$pid" 2>/dev/null; then
+      continue
+    fi
+    # Bounded wait for the old instance to release its window and settings.
+    waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    if setsid -f setpriv --reuid "$uid" --regid "$gid" --init-groups \
+      env "${env_pairs[@]}" "$gui" "${args[@]:1}" </dev/null >/dev/null 2>&1; then
+      log "restarted the GUI of $user (was pid $pid)"
+    else
+      warn "could not relaunch the GUI of $user; start it from the application menu"
+    fi
+  done
+}
+
 do_install() {
   local headline=TaskMan
   resolve_self
@@ -824,6 +890,7 @@ do_install() {
     enable_and_start
     refresh_caches
     report_service_state
+    restart_gui
     log "done: start the GUI from the application menu, or remove this install with '$LIB_DIR/install-linux.sh --uninstall'"
   else
     log "staged into $ROOT; the package scriptlet runs '--post-install' after the files are written"
@@ -899,6 +966,7 @@ do_post_install() {
   refresh_caches
   if [ "$unconfigured" -eq 0 ]; then
     report_service_state
+    restart_gui
   fi
   return 0
 }

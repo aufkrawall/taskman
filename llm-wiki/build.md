@@ -68,6 +68,21 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    anywhere is a logged skip, never a failed build, and `--no-arch-package`
    skips it on purpose.
 
+Distribution packages. Besides the pacman package, a glibc Linux build also
+yields `taskman-v<version>-debian-ubuntu-<arch>.deb` and
+`taskman-v<version>-fedora-<arch>.rpm` (`build_distro_packages()`), written by
+`tools/distpkg.py` (pure Python: `build.py` runs on hosts without `dpkg-deb`
+and `rpmbuild`; structure covered by `tools/tests/test_distpkg.py`, but a real
+`apt`/`dnf` install is NOT verified in CI -- open question). The payload is the
+tree `install-linux.sh --packaged --root` stages, so only the Linux host path
+works (a Windows host logs a skip). The arch package is renamed to
+`taskman-v<version>-arch-x86_64.pkg.tar.zst`. `--no-distro-packages` skips the
+deb/rpm; the musl flavor never produces them. Scriptlets of all three call
+`install-linux.sh --post-install`, which restarts `taskman-core.service` and then
+`restart_gui()` relaunches each running `/usr/bin/taskman` as its owner
+(environment and args copied from `/proc/<pid>`). The rpm declares the
+dlopen'd libraries as soname capabilities, the deb by package name.
+
 ### Windows x86_64 from a Linux/macOS host
 
 A non-Windows host also produces `taskman-v<version>-windows-x86_64.zip` and
@@ -180,8 +195,10 @@ Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
    `dist/taskman-vX.Y.Z-linux-x86_64[-musl].tar.gz` and
    `dist/taskman-vX.Y.Z-linux-arm64.tar.gz`, plus the Windows setup
    installers `dist/taskman-vX.Y.Z-windows-x86_64-setup.exe` and
-   `dist/taskman-vX.Y.Z-windows-arm64-setup.exe`. Write
-   `<sha256>  <filename>` next to each archive and installer.
+   `dist/taskman-vX.Y.Z-windows-arm64-setup.exe`. The same run writes the
+   `.pkg.tar.zst` (`-arch-`), `.deb` (`-debian-ubuntu-`) and `.rpm`
+   (`-fedora-`) packages into `dist/`; publish them too. Write
+   `<sha256>  <filename>` next to each archive, installer and package.
 4. Publish with the GitHub CLI:
    `gh release create vX.Y.Z --target <bump-sha> --title 'TaskMan vX.Y.Z'
    --notes-file <notes> --latest <archives + .sha256 files>`. This creates

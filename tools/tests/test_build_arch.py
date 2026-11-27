@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -227,8 +228,26 @@ class BuildArchPackageTests(unittest.TestCase):
     @patch.object(build, "log")
     def test_package_lands_in_dist_through_pkgdest(self, *_):
         host = FakeHost()
-        with patch.object(build, "arch_package_host", return_value=host):
-            self.assertTrue(build.build_arch_package(build.read_version()))
+        version = build.read_version()
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            makepkg_name = dist / f"taskman-{version}-1-x86_64.pkg.tar.zst"
+
+            def run(args, env=None):
+                makepkg_name.write_bytes(b"pkg")
+                return FakeHost.run(host, args, env)
+
+            host.run = run
+            with (
+                patch.object(build, "DIST", dist),
+                patch.object(build, "arch_package_host", return_value=host),
+            ):
+                self.assertTrue(build.build_arch_package(version))
+            # Renamed so the release file names the distribution.
+            self.assertFalse(makepkg_name.exists())
+            self.assertTrue(
+                (dist / f"taskman-v{version}-arch-x86_64.pkg.tar.zst").is_file()
+            )
         self.assertEqual(
             host.runs,
             [(["--force", "--noconfirm"], None)],
