@@ -456,6 +456,7 @@ fn system_ui_font() -> Option<(&'static str, Vec<u8>)> {
         ]
     } else {
         &[
+            "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
             "/usr/share/fonts/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",

@@ -572,9 +572,26 @@ on this host.
   surface; heat cells, selection rows and overlapping glyph margins stay a few LSB off the CPU
   result. Removing that needs destination reads (framebuffer fetch or an offscreen copy),
   which fixed-function dual-source blending cannot provide.
-- **Only Windows' 100/125/150 % are measured against native text**, on Segoe UI Variable.
-  175/200 % and Linux faces have CPU/GPU parity coverage (2.0 `ppp`) but no native reference;
-  Linux would need a FreeType/cairo reference renderer.
+- **Only Windows' 100/125/150 % are measured against native text in the gate**, on Segoe UI
+  Variable; 175/200 % have CPU/GPU parity coverage (2.0 `ppp`) but no native reference.
+- **Linux weight against FreeType + cairo is measured, not gated.**
+  `TASKMAN_LINUX_TEXT_REFERENCE=1 cargo test -p tm-app linux_weight_against_freetype_cairo
+  -- --nocapture` renders the Fontconfig `sans-serif` face with `/usr/bin/pango-view` (the
+  GTK/cairo stack) and prints ratios. Measured 2026-11-27 in Arch WSL (Adwaita Sans,
+  `hintslight`; the rasterizer is the same code as bare metal): Dark Sharp 1.02-1.10, Standard
+  1.08-1.19 (TaskMan gamma-corrects, cairo blends in sRGB, which thins light-on-dark text);
+  Light grayscale Sharp 0.92-0.94, Standard ~1.0; **Light subpixel Sharp 0.85-0.87 and
+  Standard 0.80-0.83** -- lighter than cairo, and Standard lighter than Sharp, because Linux
+  reports `contrast = 0` and Standard then blends dark ink at the raw gamma 1.8 while Sharp
+  scales it down to ~1.58. Open decision: calibrate Linux LCD weight toward cairo (the
+  desktop's look) or keep the Windows-calibrated gamma-corrected look; either way the
+  Standard/Sharp inversion should go. Qt and GTK 4 blend differently from cairo's image
+  surface, so this reference is the GTK3/cairo look, not "Linux".
+- **WSL cannot test the GPU LCD path.** Its Vulkan device is Mesa Dozen on the Windows
+  D3D12 driver and reports `dualSrcBlend = false`, so TaskMan falls back to grayscale there and
+  the hardware suite fails (correctly, not a skip); the test process then segfaulted at teardown
+  inside the Dozen/loader stack. WSLg presents through Weston + RDP, so visual checks there are
+  not representative either. RADV/ANV/NVIDIA-Linux need bare-metal runs.
 - **Performance work.** The rasterizer and application loops are optimized for low CPU load:
   - Axis-aligned rect fast path (`span::fast_rect` with `Shape::Vec` recursive flattening for containers).
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.

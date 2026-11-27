@@ -30,8 +30,7 @@
 //! perceived thickness.
 
 use eframe::egui::epaint::text::{
-    FontData, FontDefinitions, FontFamily, FontTweak, HintingTarget, LcdFilter, SubpixelMode,
-    VariationCoords,
+    FontData, FontDefinitions, FontFamily, FontTweak, LcdFilter, SubpixelMode, VariationCoords,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, pos2, vec2};
 use egui_software::{Painter, ShapeContext, Target};
@@ -42,11 +41,6 @@ const W: u32 = 460;
 const H: u32 = 44;
 const ZOOM: u32 = 5;
 const SAMPLE: &str = "Brave Browser (43)  18.4%  2410 MB";
-
-/// The grid-fitting profile: the app's own map, with the platform's hint style.
-fn hinting_target(smoothing: TextSmoothing) -> HintingTarget {
-    crate::fonts::hinting_target(smoothing, crate::theme::subpixel_params().hint_style)
-}
 
 /// Largest font face the comparison will load.
 ///
@@ -108,11 +102,16 @@ fn ui_font() -> UiFont {
     UiFont::Absent
 }
 
-fn definitions(bytes: &[u8], smoothing: TextSmoothing) -> FontDefinitions {
+fn definitions(
+    bytes: &[u8],
+    smoothing: TextSmoothing,
+    params: &tm_platform::text_rendering::Params,
+    coords: VariationCoords,
+) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let data = FontData::from_owned(bytes.to_vec()).tweak(FontTweak {
-        hinting_target: hinting_target(smoothing),
-        coords: VariationCoords::new([(b"wght", 400.0), (b"opsz", 10.5)]),
+        hinting_target: crate::fonts::hinting_target(smoothing, params.hint_style),
+        coords,
         ..Default::default()
     });
     fonts
@@ -141,6 +140,12 @@ struct Cfg {
     colors: Option<(Color32, Color32)>,
     /// Overrides the app's grayscale coverage curve.
     transfer: Option<egui::epaint::FontColorTransferFunction>,
+    /// Platform text parameters; `None` uses what the app currently holds.
+    params: Option<tm_platform::text_rendering::Params>,
+    /// Segoe UI Variable Text's `wght 400, opsz 10.5` instance (the app's Windows
+    /// coordinates); `false` renders the face's default instance, as the app does for a
+    /// Fontconfig-selected Linux face.
+    segoe_text_coords: bool,
 }
 
 impl Cfg {
@@ -154,7 +159,15 @@ impl Cfg {
             blend: None,
             colors: None,
             transfer: None,
+            params: None,
+            segoe_text_coords: true,
         }
+    }
+    #[cfg(target_os = "linux")]
+    fn platform(mut self, params: tm_platform::text_rendering::Params) -> Self {
+        self.params = Some(params);
+        self.segoe_text_coords = false;
+        self
     }
     fn colors(mut self, background: Color32, text: Color32) -> Self {
         self.colors = Some((background, text));
@@ -205,22 +218,24 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
         blend,
         colors,
         transfer,
+        params,
+        segoe_text_coords,
     } = cfg;
+    let params = params.unwrap_or_else(crate::theme::subpixel_params);
+    let coords = if segoe_text_coords {
+        VariationCoords::new([(b"wght", 400.0), (b"opsz", 10.5)])
+    } else {
+        VariationCoords::default()
+    };
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(ppp);
-    ctx.set_fonts(definitions(bytes, smoothing));
+    ctx.set_fonts(definitions(bytes, smoothing, &params, coords));
     for t in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.style_mut_of(t, |style| {
             let o = &mut style.visuals.text_options;
             // Exactly what the app would pick for this profile, so the profile rows show
             // real behaviour; the sweeps below then override single knobs.
-            crate::theme::configure_text_options(
-                o,
-                smoothing,
-                t,
-                subpixel,
-                &crate::theme::subpixel_params(),
-            );
+            crate::theme::configure_text_options(o, smoothing, t, subpixel, &params);
             if let Some(filter) = filter {
                 o.lcd_filter = filter;
             }
@@ -702,6 +717,126 @@ mod tests {
             "text weight drifted from native DirectWrite:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// Linux: TaskMan's text weight against FreeType + cairo (`pango-view`), the GTK/cairo
+    /// text stack, on the Fontconfig-selected `sans-serif` face with the desktop's own
+    /// Fontconfig settings (hint style, LCD filter).
+    ///
+    /// A diagnostic, not a gate: Linux has no single native renderer (Qt and GTK 4 blend
+    /// differently from cairo's image surface) and the face differs per desktop. Off unless
+    /// `TASKMAN_LINUX_TEXT_REFERENCE=1`; then it fails only when the reference cannot be
+    /// rendered, and prints every ratio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_weight_against_freetype_cairo() {
+        use tm_platform::text_rendering::{HintStyleChoice, LcdFilterChoice};
+        if std::env::var_os("TASKMAN_LINUX_TEXT_REFERENCE").is_none() {
+            return;
+        }
+        let (path, _index) = tm_platform::fontconfig::match_face("sans-serif")
+            .expect("fc-match resolved no sans-serif face");
+        let bytes = std::fs::read(&path).expect("read the sans-serif face");
+        let desktop = tm_platform::text_rendering::query(None);
+        eprintln!("linux reference: face {path}, fontconfig {desktop:?}");
+        let hinting = match desktop.hint_style {
+            HintStyleChoice::None => "none",
+            HintStyleChoice::Slight => "slight",
+            HintStyleChoice::Medium => "medium",
+            HintStyleChoice::Full | HintStyleChoice::Default => "full",
+        };
+        let dir = temp_dir("linux-ref");
+        for ppp in [1.0_f32, 1.25, 1.5] {
+            for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                let (bg, fg) = match theme {
+                    egui::Theme::Dark => ("#191919", "#e6e6e6"),
+                    egui::Theme::Light => ("#f3f3f3", "#1a1a1a"),
+                };
+                let measure = |buf: &[u32]| match theme {
+                    egui::Theme::Dark => ink(buf),
+                    egui::Theme::Light => dark_ink(buf),
+                };
+                for (aa, subpixel) in [("gray", SubpixelMode::Off), ("subpixel", SubpixelMode::Rgb)]
+                {
+                    let png = dir.join(format!("{aa}-{theme:?}-{ppp}.png"));
+                    let status = std::process::Command::new("/usr/bin/pango-view")
+                        .args([
+                            "-q",
+                            "--font",
+                            &format!("sans-serif {}px", 13.0 * ppp),
+                            "--antialias",
+                            aa,
+                            "--subpixel-order",
+                            "rgb",
+                            "--hinting",
+                            hinting,
+                            "--hint-metrics",
+                            "off",
+                            "--subpixel-positions",
+                            "--foreground",
+                            fg,
+                            "--background",
+                            bg,
+                            "--margin",
+                            "8",
+                            "--text",
+                            SAMPLE,
+                            "--output",
+                        ])
+                        .arg(&png)
+                        .status()
+                        .expect("run /usr/bin/pango-view");
+                    assert!(status.success(), "pango-view failed: {status}");
+                    let native = measure(&decode_png(&png));
+                    // KDE's default is RGB with the default LCD filter; the desktop's own
+                    // choice when it made one.
+                    let mut params = desktop;
+                    if !subpixel.is_off() {
+                        params.enabled = true;
+                        params.bgr = false;
+                        if params.lcd_filter == LcdFilterChoice::PlatformDefault {
+                            params.lcd_filter = LcdFilterChoice::Default;
+                        }
+                    }
+                    let mut line = format!("linux ink ratio ppp={ppp} {theme:?} {aa}:");
+                    for (name, smoothing) in [
+                        ("sharp", TextSmoothing::Sharp),
+                        ("standard", TextSmoothing::Standard),
+                    ] {
+                        let ours = measure(&render_cfg(
+                            &bytes,
+                            Cfg::new(smoothing, subpixel)
+                                .theme(theme)
+                                .ppp(ppp)
+                                .platform(params),
+                        ));
+                        line += &format!(" {name}={:.3}", ours / native);
+                    }
+                    eprintln!("{line}");
+                }
+            }
+        }
+    }
+
+    /// `0x00RRGGBB` pixels of an 8-bit RGB or RGBA PNG.
+    #[cfg(target_os = "linux")]
+    fn decode_png(path: &std::path::Path) -> Vec<u32> {
+        let file = std::fs::File::open(path).expect("open png");
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file))
+            .read_info()
+            .expect("png header");
+        let mut data = vec![0; reader.output_buffer_size().expect("png size")];
+        let info = reader.next_frame(&mut data).expect("png frame");
+        assert_eq!(info.bit_depth, png::BitDepth::Eight, "8-bit PNG expected");
+        let channels = match info.color_type {
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            other => panic!("unexpected PNG colour type {other:?}"),
+        };
+        data[..info.buffer_size()]
+            .chunks(channels)
+            .map(|px| (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]))
+            .collect()
     }
 
     /// Grayscale text whose polarity opposes the theme -- the Light theme's white label on

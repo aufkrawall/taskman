@@ -15,6 +15,11 @@
   Retuned: Light gamma scale 1.10 -> 0.88, grayscale dark-text exponents 1.50/1.30 ->
   1.15/0.95. Needs a visual check by the user on the installed build.
 - Debug trap: in WGSL `select(a < b, c > d, x)` parses as a template list; parenthesize.
+- Linux/WSL follow-up: FreeType+cairo reference via `pango-view` (env-gated diagnostic in
+  `text_compare`); Light subpixel text is 0.80-0.87 of cairo and Standard < Sharp there
+  (Linux `contrast = 0`). Dozen in WSL has no dual-source blending, so no GPU LCD testing in
+  WSL. A WSL target dir in `$HOME` (`CARGO_TARGET_DIR=$HOME/tm-target`) keeps builds off
+  `/mnt/c` and away from the Windows target dir.
 - Parity diagnosis: isolated 10 LSB pixels on upright text (7 after the Light retune) were overlapping glyph margins
   (second glyph solved against the surface, pixel already inked), not calibration drift;
   `TASKMAN_PARITY_DUMP=<dir>` writes the frames.
