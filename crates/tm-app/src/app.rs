@@ -2494,11 +2494,13 @@ impl eframe::App for TaskManApp {
 
         // Track window size for persistence (only while remembering), and notify
         // the taskbar monitor if our own window moved or resized.
-        let (outer_rect, inner_rect, maximized) = ctx.input(|i| {
+        let (outer_rect, inner_rect, maximized, minimized, screen_rect) = ctx.input(|i| {
             (
                 i.viewport().outer_rect,
                 i.viewport().inner_rect,
                 i.viewport().maximized.unwrap_or(false),
+                i.viewport().minimized.unwrap_or(false),
+                i.raw.screen_rect,
             )
         });
         let rects = (outer_rect, inner_rect);
@@ -2506,11 +2508,14 @@ impl eframe::App for TaskManApp {
             self.taskbar_monitor.request_refresh();
         }
         self.last_viewport_rects = Some(rects);
-        if self.shared.settings.remember_window
-            && !maximized
-            && let Some(sz) = inner_rect.map(|r| r.size())
-        {
-            self.shared.settings.window_size = [sz.x, sz.y];
+        if let Some(sz) = resolved_window_size(
+            self.shared.settings.remember_window,
+            maximized,
+            minimized,
+            inner_rect,
+            screen_rect,
+        ) {
+            self.shared.settings.window_size = sz;
         }
         // Sampling no longer starts here: this pass has not been painted yet,
         // so the log file and the sampling thread stay behind
@@ -2526,6 +2531,24 @@ impl eframe::App for TaskManApp {
     fn on_exit(&mut self) {
         self.shutdown();
     }
+}
+
+/// Resolve the window size to persist when `remember_window` is enabled.
+///
+/// Prefers `inner_rect`, and falls back to `screen_rect` for backends (such as
+/// Wayland) where window position is unavailable so `inner_rect` is `None`.
+fn resolved_window_size(
+    remember_window: bool,
+    maximized: bool,
+    minimized: bool,
+    inner_rect: Option<egui::Rect>,
+    screen_rect: Option<egui::Rect>,
+) -> Option<[f32; 2]> {
+    if !remember_window || maximized || minimized {
+        return None;
+    }
+    let sz = inner_rect.or(screen_rect)?.size();
+    (sz.x.is_finite() && sz.y.is_finite() && sz.x > 0.0 && sz.y > 0.0).then_some([sz.x, sz.y])
 }
 
 /// Fastest sampling interval the engine can run at; used to size the
@@ -4103,5 +4126,33 @@ mod tests {
         // A mock session keeps the store in memory and touches no file.
         let mock = StartupTask::LoadStartupImpact(None);
         assert_eq!(startup_tasks(None), vec![mock, StartupTask::StartSampling]);
+    }
+
+    #[test]
+    fn resolved_window_size_falls_back_to_screen_rect_when_inner_rect_absent() {
+        let inner = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1280.0, 800.0));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        assert_eq!(
+            super::resolved_window_size(true, false, false, Some(inner), Some(screen)),
+            Some([1280.0, 800.0])
+        );
+        // Wayland: inner_rect is None because window position is unsupported.
+        assert_eq!(
+            super::resolved_window_size(true, false, false, None, Some(screen)),
+            Some([1440.0, 900.0])
+        );
+        // Maximized, minimized, or disabled remember_window never overwrite saved size.
+        assert_eq!(
+            super::resolved_window_size(true, true, false, None, Some(screen)),
+            None
+        );
+        assert_eq!(
+            super::resolved_window_size(true, false, true, None, Some(screen)),
+            None
+        );
+        assert_eq!(
+            super::resolved_window_size(false, false, false, None, Some(screen)),
+            None
+        );
     }
 }

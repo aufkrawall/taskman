@@ -659,6 +659,13 @@ remain follow-up rather than being simulated in headless tests:
   window.** Restoring from the tray is acknowledged (remap), but raising a
   visible window needs the launcher's xdg-activation token forwarded over the
   activation socket and applied by winit, which is not implemented.
+- **Window position is not persisted or restored on Wayland.** Standard
+  `xdg-shell` does not expose global window coordinates or allow clients to
+  position toplevel windows (`winit` returns `NotSupportedError` for
+  `inner_position`/`outer_position` and ignores `set_outer_position`); window
+  size (`config.ini` via `raw.screen_rect`) and `maximized` (`window-state.ini`)
+  are persisted instead, and compositor rules (such as KWin Window Rules on
+  `app_id = "taskman"`) own placement.
 
 ### 2026-11-24 Linux CPU-renderer, per-process CPU, and icon residuals
 

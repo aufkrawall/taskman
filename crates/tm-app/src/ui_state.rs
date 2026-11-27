@@ -126,14 +126,14 @@ pub fn set_window_maximized(maximized: bool) {
     }
 }
 
-/// Persist only at a clean app shutdown. The caller applies the application's
-/// autosave and remember-window gates before invoking this function.
-pub fn save() {
-    let Ok(guard) = slot().lock() else { return };
-    if guard.pos.is_none() && guard.pos_px.is_none() {
+fn should_save(p: &Placement, path_exists: bool) -> bool {
+    p.pos.is_some() || p.pos_px.is_some() || p.maximized || path_exists
+}
+
+fn save_to(path: &std::path::Path, p: &Placement) {
+    if !should_save(p, path.exists()) {
         return;
     }
-    let path = state_path();
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -144,16 +144,23 @@ pub fn save() {
     // place instead of rename-over-existing: `rename` replacement semantics
     // differ by platform and can fail for an existing destination on Windows.
     let mut body = String::from("# Native window placement.\n");
-    if let Some(pos) = guard.pos {
+    if let Some(pos) = p.pos {
         body.push_str(&format!("position={},{}\n", pos[0], pos[1]));
     }
-    if let Some(pos) = guard.pos_px {
+    if let Some(pos) = p.pos_px {
         body.push_str(&format!("position_px={},{}\n", pos[0], pos[1]));
     }
-    body.push_str(&format!("maximized={}\n", guard.maximized));
-    if let Err(e) = std::fs::write(&path, body) {
+    body.push_str(&format!("maximized={}\n", p.maximized));
+    if let Err(e) = std::fs::write(path, body) {
         tracing::warn!(error = %e, "failed to save window position");
     }
+}
+
+/// Persist only at a clean app shutdown. The caller applies the application's
+/// autosave and remember-window gates before invoking this function.
+pub fn save() {
+    let Ok(guard) = slot().lock() else { return };
+    save_to(&state_path(), &guard);
 }
 
 #[cfg(test)]
@@ -228,6 +235,41 @@ mod tests {
         assert_eq!(read_state_text(&over), None);
         // An absent file takes the same path: nothing to apply.
         assert_eq!(read_state_text(&dir.join("missing.ini")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maximized_state_is_saved_and_cleared_without_window_position() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-ui-state-wayland-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        let path = dir.join("window-state.ini");
+
+        // Never maximized and no position: do not create an empty file.
+        save_to(&path, &Placement::default());
+        assert!(!path.exists());
+
+        // Maximized without position (e.g. Wayland): persist maximized=true.
+        save_to(
+            &path,
+            &Placement {
+                pos: None,
+                pos_px: None,
+                maximized: true,
+            },
+        );
+        let text = read_state_text(&path).expect("maximized state should be written");
+        assert!(parse_placement(&text).maximized);
+
+        // Unmaximized later: update existing file so maximized=true does not stick.
+        save_to(&path, &Placement::default());
+        let text = read_state_text(&path).expect("existing state file should be updated");
+        assert!(!parse_placement(&text).maximized);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
