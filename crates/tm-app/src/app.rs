@@ -513,6 +513,7 @@ pub struct TaskManApp {
     taskbar_monitor: Arc<tm_platform::taskbar_monitor::TaskbarMonitorHandle>,
     taskbar_config_applied: Option<tm_platform::taskbar_monitor::Config>,
     last_taskbar_interval_active: bool,
+    pending_hidden_trim_at: Option<std::time::Instant>,
     /// Last viewport outer/inner rects observed in `ui`, used to refresh the
     /// taskbar monitor when our own window moves or resizes (since own-process
     /// windows skip `EVENT_OBJECT_LOCATIONCHANGE` hooks).
@@ -1206,6 +1207,7 @@ impl TaskManApp {
             taskbar_monitor,
             taskbar_config_applied: None,
             last_taskbar_interval_active: false,
+            pending_hidden_trim_at: None,
             last_viewport_rects: None,
             input_stats,
             icons_prefetch: IconPrefetch::default(),
@@ -1579,6 +1581,12 @@ impl TaskManApp {
     /// back in it restores all three and forces one immediate sample so the
     /// restored window does not open on data up to [`HIDDEN_INTERVAL`] old.
     fn sync_surface_visibility(&mut self) {
+        if let Some(trim_at) = self.pending_hidden_trim_at
+            && std::time::Instant::now() >= trim_at
+        {
+            self.pending_hidden_trim_at = None;
+            tm_platform::trim_process_memory();
+        }
         let visible = std::mem::replace(&mut self.painted_last_frame, false);
         let taskbar_active =
             self.shared.settings.taskbar_monitor_enabled && self.taskbar_monitor.is_visible();
@@ -1610,6 +1618,21 @@ impl TaskManApp {
         }
         if transition.background.is_some() {
             tracing::debug!(visible, "surface visibility changed");
+        }
+        match transition.background {
+            Some(true) => {
+                // Release transient icon RGBA caches and return freed heap pages
+                // to the OS immediately, then trim again once eframe's 15 s
+                // hidden-residency grace drops GPU/SHM surfaces.
+                tm_platform::xdg_icons::shrink_transient_caches();
+                tm_platform::trim_process_memory();
+                self.pending_hidden_trim_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(16));
+            }
+            Some(false) => {
+                self.pending_hidden_trim_at = None;
+            }
+            None => {}
         }
     }
 

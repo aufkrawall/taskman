@@ -54,7 +54,8 @@ use crate::{
     native::{
         epi_integration::{self, EpiIntegration},
         winit_integration::{
-            EventResult, UserEvent, WinitApp, create_egui_context, sleep_if_invisible_or_minimized,
+            EventResult, ResidencyAction, ResidencyTimer, UserEvent, WinitApp, create_egui_context,
+            sleep_if_invisible_or_minimized,
         },
     },
 };
@@ -735,7 +736,10 @@ struct SoftwareWinitRunning<'app> {
     /// `Context` must outlive `Surface`, and both borrow the window, so they are kept
     /// together and behind an `Rc<RefCell<..>>` for the same reason glow keeps its
     /// painter that way: the repaint callback needs a weak handle.
-    surface: Rc<RefCell<SurfaceState>>,
+    surface: Rc<RefCell<Option<SurfaceState>>>,
+    /// Tracks how long the window has been hidden so non-Windows SHM surfaces
+    /// can be released after `HIDDEN_RESIDENCY_GRACE`.
+    residency: ResidencyTimer,
 
     /// Whether any frame has been presented yet. The first one has to happen even
     /// while the window is hidden, because it is what triggers `post_rendering` to show
@@ -947,7 +951,8 @@ impl<'app> SoftwareWinitApp<'app> {
             egui_winit,
             info,
             painter: egui_software::Painter::new(),
-            surface: Rc::new(RefCell::new(surface_state)),
+            surface: Rc::new(RefCell::new(Some(surface_state))),
+            residency: ResidencyTimer::default(),
             has_presented_once: false,
             presented_while_visible: false,
             logged_first_frame: false,
@@ -960,6 +965,31 @@ impl<'app> SoftwareWinitApp<'app> {
 }
 
 impl SoftwareWinitRunning<'_> {
+    fn sync_hidden_residency(&mut self, visible: bool) {
+        let now = Instant::now();
+        let was_suspended = self.residency.is_suspended();
+        let action = self.residency.observe(now, visible);
+        match action {
+            ResidencyAction::Keep => {}
+            ResidencyAction::Pause | ResidencyAction::KeepResident => {
+                if cfg!(not(target_os = "windows")) {
+                    self.integration
+                        .egui_ctx
+                        .request_repaint_after(self.residency.remaining_grace(now));
+                }
+            }
+            ResidencyAction::Suspend => {
+                if cfg!(not(target_os = "windows")) {
+                    let dropped = self.surface.borrow_mut().take().is_some();
+                    self.presented_while_visible = false;
+                    if dropped || !was_suspended {
+                        log::debug!("Released the software surface after the grace");
+                    }
+                }
+            }
+        }
+    }
+
     /// Build the [`egui_software::ShapeContext`] for this frame.
     ///
     /// These are the same values `egui::Context::tessellate` reads internally; the
@@ -1042,6 +1072,7 @@ impl SoftwareWinitRunning<'_> {
                 || self.info.occluded == Some(true);
             let now_size = self.window.inner_size();
             if now_hidden || now_size.width == 0 || now_size.height == 0 {
+                self.sync_hidden_residency(false);
                 sleep_if_invisible_or_minimized(Some(&self.window));
                 self.integration
                     .maybe_autosave(self.app.as_mut(), Some(&self.window));
@@ -1123,6 +1154,7 @@ impl SoftwareWinitRunning<'_> {
             self.presented_while_visible = false;
         }
         if paintable {
+            self.sync_hidden_residency(!hidden);
             // Sub-pixel mode *and* its blend parameters both come from the atlas's
             // options, so the way glyphs were rasterized and the way they are blended
             // cannot disagree.
@@ -1152,139 +1184,156 @@ impl SoftwareWinitRunning<'_> {
 
             if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
             {
-                let mut state = self.surface.borrow_mut();
-                let os_dirty = if hidden { None } else { state.os_update_rect() };
-                if let Err(err) = state.resize(w, h) {
-                    log::warn!("software renderer resize({w}x{h}) failed: {err}");
-                    self.presented_while_visible = false;
-                    self.integration
-                        .egui_ctx
-                        .request_repaint_after(std::time::Duration::from_millis(50));
-                } else {
-                    let paint_outcome = match state.buffer_mut() {
-                        Ok(mut buffer) => {
-                            let buffer_age = buffer.age();
-                            let force_full = should_force_full_paint(
-                                self.has_presented_once,
-                                self.presented_while_visible,
-                                buffer_age,
-                            );
-                            let paint_start = Instant::now();
-                            let damage = if let Some(mut target) = egui_software::Target::new(
-                                buffer.pixels_mut(),
-                                size.width,
-                                size.height,
-                            ) {
-                                let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                                let clear_color = egui::Color32::from_rgb(
-                                    byte(clear[0]),
-                                    byte(clear[1]),
-                                    byte(clear[2]),
-                                );
-                                self.painter.paint_shapes_damaged_aged(
-                                    &mut target,
-                                    &shape_ctx,
-                                    shapes,
-                                    clear_color,
-                                    force_full,
-                                    buffer_age,
-                                )
-                            } else {
-                                egui_software::DamageStats::default()
-                            };
-                            let paint_ns = paint_start.elapsed().as_nanos() as u64;
-                            SOFTWARE_FRAME_STATS
-                                .paint_ns_sum
-                                .fetch_add(paint_ns, Ordering::Relaxed);
-                            update_max(&SOFTWARE_FRAME_STATS.paint_ns_max, paint_ns);
-                            SOFTWARE_FRAME_STATS
-                                .dirty_tiles
-                                .fetch_add(damage.dirty_tiles as u64, Ordering::Relaxed);
-                            SOFTWARE_FRAME_STATS
-                                .total_tiles
-                                .fetch_add(damage.total_tiles as u64, Ordering::Relaxed);
-                            Some((damage, force_full))
-                        }
+                let mut surface_slot = self.surface.borrow_mut();
+                if surface_slot.is_none() {
+                    match SurfaceState::new(&self.window) {
+                        Ok(fresh) => *surface_slot = Some(fresh),
                         Err(err) => {
-                            log::warn!("software renderer buffer access failed: {err}");
+                            log::warn!("software renderer surface recreate failed: {err}");
                             self.presented_while_visible = false;
                             self.integration
                                 .egui_ctx
                                 .request_repaint_after(std::time::Duration::from_millis(50));
-                            None
                         }
-                    };
+                    }
+                }
+                if let Some(state) = surface_slot.as_mut() {
+                    let os_dirty = if hidden { None } else { state.os_update_rect() };
+                    if let Err(err) = state.resize(w, h) {
+                        log::warn!("software renderer resize({w}x{h}) failed: {err}");
+                        self.presented_while_visible = false;
+                        self.integration
+                            .egui_ctx
+                            .request_repaint_after(std::time::Duration::from_millis(50));
+                    } else {
+                        let paint_outcome = match state.buffer_mut() {
+                            Ok(mut buffer) => {
+                                let buffer_age = buffer.age();
+                                let force_full = should_force_full_paint(
+                                    self.has_presented_once,
+                                    self.presented_while_visible,
+                                    buffer_age,
+                                );
+                                let paint_start = Instant::now();
+                                let damage = if let Some(mut target) = egui_software::Target::new(
+                                    buffer.pixels_mut(),
+                                    size.width,
+                                    size.height,
+                                ) {
+                                    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                                    let clear_color = egui::Color32::from_rgb(
+                                        byte(clear[0]),
+                                        byte(clear[1]),
+                                        byte(clear[2]),
+                                    );
+                                    self.painter.paint_shapes_damaged_aged(
+                                        &mut target,
+                                        &shape_ctx,
+                                        shapes,
+                                        clear_color,
+                                        force_full,
+                                        buffer_age,
+                                    )
+                                } else {
+                                    egui_software::DamageStats::default()
+                                };
+                                let paint_ns = paint_start.elapsed().as_nanos() as u64;
+                                SOFTWARE_FRAME_STATS
+                                    .paint_ns_sum
+                                    .fetch_add(paint_ns, Ordering::Relaxed);
+                                update_max(&SOFTWARE_FRAME_STATS.paint_ns_max, paint_ns);
+                                SOFTWARE_FRAME_STATS
+                                    .dirty_tiles
+                                    .fetch_add(damage.dirty_tiles as u64, Ordering::Relaxed);
+                                SOFTWARE_FRAME_STATS
+                                    .total_tiles
+                                    .fetch_add(damage.total_tiles as u64, Ordering::Relaxed);
+                                Some((damage, force_full))
+                            }
+                            Err(err) => {
+                                log::warn!("software renderer buffer access failed: {err}");
+                                self.presented_while_visible = false;
+                                self.integration
+                                    .egui_ctx
+                                    .request_repaint_after(std::time::Duration::from_millis(50));
+                                None
+                            }
+                        };
 
-                    if let Some((damage, force_full)) = paint_outcome {
-                        self.has_presented_once = true;
-                        if !self.logged_first_frame {
-                            self.logged_first_frame = true;
-                            log::info!(
-                                "software renderer: first frame {}x{} px, sub-pixel text {:?}",
+                        if let Some((damage, force_full)) = paint_outcome {
+                            self.has_presented_once = true;
+                            if !self.logged_first_frame {
+                                self.logged_first_frame = true;
+                                log::info!(
+                                    "software renderer: first frame {}x{} px, sub-pixel text {:?}",
+                                    size.width,
+                                    size.height,
+                                    subpixel
+                                );
+                            }
+
+                            let (mut present_rects, full_screen) = rects_to_present(
+                                &damage.dirty_rects,
+                                os_dirty,
                                 size.width,
                                 size.height,
-                                subpixel
                             );
-                        }
-
-                        let (mut present_rects, full_screen) = rects_to_present(
-                            &damage.dirty_rects,
-                            os_dirty,
-                            size.width,
-                            size.height,
-                        );
-                        if present_rects.is_empty() && !hidden && is_wayland(&self.window) {
-                            // Wayland paces redraws by the frame callback that only a
-                            // commit earns, so an unchanged frame that skipped its present
-                            // left nothing to wait on: a repaint request that changes no
-                            // pixel (a tooltip timer, an animation at rest) spun the loop.
-                            // The back buffer already holds this frame -- nothing changed
-                            // since its own -- so commit it with a token damage rect.
-                            SOFTWARE_FRAME_STATS
-                                .skipped_damage
-                                .fetch_add(1, Ordering::Relaxed);
-                            present_rects.push(egui_software::PixelRect {
-                                min_x: 0,
-                                min_y: 0,
-                                max_x: 1,
-                                max_y: 1,
-                            });
-                        }
-                        if present_rects.is_empty() {
-                            SOFTWARE_FRAME_STATS
-                                .skipped_damage
-                                .fetch_add(1, Ordering::Relaxed);
-                            // No present, so no buffer aged: the painter's record of
-                            // per-present changes must not count this frame.
-                            self.painter.forget_unpresented_frame();
-                        } else {
-                            let present_start = Instant::now();
-                            // TaskMan fork: announce the present so winit can
-                            // throttle the next redraw to the compositor's
-                            // frame callback (Wayland). Without it every input
-                            // event of a scroll or scrollbar drag repainted the
-                            // whole window at the event rate, not the display
-                            // rate — a full core on a 1000 Hz mouse. The GPU
-                            // backends already do this in `egui-wgpu`.
-                            self.window.pre_present_notify();
-                            match state.present_rects(&present_rects, full_screen) {
-                                Ok(()) => {
-                                    let present_ns = present_start.elapsed().as_nanos() as u64;
-                                    SOFTWARE_FRAME_STATS
-                                        .present_ns_sum
-                                        .fetch_add(present_ns, Ordering::Relaxed);
-                                    update_max(&SOFTWARE_FRAME_STATS.present_ns_max, present_ns);
-                                    if !hidden && (full_screen || force_full) {
-                                        self.presented_while_visible = true;
+                            if present_rects.is_empty() && !hidden && is_wayland(&self.window) {
+                                // Wayland paces redraws by the frame callback that only a
+                                // commit earns, so an unchanged frame that skipped its present
+                                // left nothing to wait on: a repaint request that changes no
+                                // pixel (a tooltip timer, an animation at rest) spun the loop.
+                                // The back buffer already holds this frame -- nothing changed
+                                // since its own -- so commit it with a token damage rect.
+                                SOFTWARE_FRAME_STATS
+                                    .skipped_damage
+                                    .fetch_add(1, Ordering::Relaxed);
+                                present_rects.push(egui_software::PixelRect {
+                                    min_x: 0,
+                                    min_y: 0,
+                                    max_x: 1,
+                                    max_y: 1,
+                                });
+                            }
+                            if present_rects.is_empty() {
+                                SOFTWARE_FRAME_STATS
+                                    .skipped_damage
+                                    .fetch_add(1, Ordering::Relaxed);
+                                // No present, so no buffer aged: the painter's record of
+                                // per-present changes must not count this frame.
+                                self.painter.forget_unpresented_frame();
+                            } else {
+                                let present_start = Instant::now();
+                                // TaskMan fork: announce the present so winit can
+                                // throttle the next redraw to the compositor's
+                                // frame callback (Wayland). Without it every input
+                                // event of a scroll or scrollbar drag repainted the
+                                // whole window at the event rate, not the display
+                                // rate — a full core on a 1000 Hz mouse. The GPU
+                                // backends already do this in `egui-wgpu`.
+                                self.window.pre_present_notify();
+                                match state.present_rects(&present_rects, full_screen) {
+                                    Ok(()) => {
+                                        let present_ns = present_start.elapsed().as_nanos() as u64;
+                                        SOFTWARE_FRAME_STATS
+                                            .present_ns_sum
+                                            .fetch_add(present_ns, Ordering::Relaxed);
+                                        update_max(
+                                            &SOFTWARE_FRAME_STATS.present_ns_max,
+                                            present_ns,
+                                        );
+                                        if !hidden && (full_screen || force_full) {
+                                            self.presented_while_visible = true;
+                                        }
                                     }
-                                }
-                                Err(err) => {
-                                    log::warn!("software renderer present failed: {err}");
-                                    self.painter.forget_unpresented_frame();
-                                    self.presented_while_visible = false;
-                                    self.integration.egui_ctx.request_repaint_after(
-                                        std::time::Duration::from_millis(50),
-                                    );
+                                    Err(err) => {
+                                        log::warn!("software renderer present failed: {err}");
+                                        self.painter.forget_unpresented_frame();
+                                        self.presented_while_visible = false;
+                                        self.integration.egui_ctx.request_repaint_after(
+                                            std::time::Duration::from_millis(50),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1318,7 +1367,8 @@ impl SoftwareWinitRunning<'_> {
                 };
                 let mut presented_now = false;
                 let mut present_failed = false;
-                if let Ok(mut state) = self.surface.try_borrow_mut()
+                if let Ok(mut slot) = self.surface.try_borrow_mut()
+                    && let Some(state) = slot.as_mut()
                     && state.buffer_mut().is_ok_and(|b| b.age() == 1)
                 {
                     self.window.pre_present_notify();
@@ -1349,6 +1399,7 @@ impl SoftwareWinitRunning<'_> {
             if hidden {
                 self.presented_while_visible = false;
             }
+            self.sync_hidden_residency(false);
             // Nothing was painted, so the shapes are dropped here. The deltas are NOT:
             // they stay in `pending_deltas` for the next paintable frame.
             drop(shapes);

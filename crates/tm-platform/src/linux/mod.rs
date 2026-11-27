@@ -69,8 +69,12 @@ pub struct LinuxCollector {
     /// Which optional providers the UI currently needs. Cheap collectors stay
     /// on at every demand, exactly like the Windows sampler's core set.
     demand: TelemetryDemand,
-    /// Command lines keyed by pid, with the start ticks they were read for.
-    cmdlines: HashMap<u32, (i64, Option<String>)>,
+    /// Whether the GUI window is hidden/minimized/occluded, letting heavy
+    /// per-row walks that only paint on screen (like `smaps_rollup` and
+    /// brokered I/O) pause until visibility returns.
+    background: bool,
+    /// Command lines keyed by pid, with the start ticks and retry stamp.
+    cmdlines: HashMap<u32, CmdlineEntry>,
     /// L1/L2/L3 totals in KB; cache geometry is static, so the sysfs walk
     /// over every CPU runs once instead of every tick.
     cache_kb: [u64; 3],
@@ -82,6 +86,12 @@ pub struct LinuxCollector {
     disk_topology: Option<DiskTopology>,
     process_net: process_net::ProcessNet,
     process_gpu: process_gpu::ProcessGpu,
+    /// Cached Private Working Set (`smaps_rollup`) per process generation,
+    /// refreshed when RSS moves materially or on a staggered TTL.
+    private_ws: HashMap<u32, PrivateWsEntry>,
+    /// Cached `VmHWM` (`status`) per process generation, refreshed when RSS
+    /// exceeds the high-water mark or on a staggered TTL.
+    peak_mem: HashMap<u32, PeakMemEntry>,
     /// Whether each process generation's image is a 32-bit ELF (the Details
     /// Platform column); the header is read once per generation.
     elf_classes: HashMap<u32, (Option<i64>, Option<bool>)>,
@@ -97,6 +107,89 @@ pub struct LinuxCollector {
 
 /// How long the sampler pauses telemetry broker requests after a refusal/error.
 const BROKER_REFUSAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Minimum RSS movement (bytes) that triggers an immediate `smaps_rollup`
+/// rescan before the staggered TTL expires.
+const PRIVATE_WS_RSS_DELTA_BYTES: u64 = 64 * 1024;
+const PRIVATE_WS_BASE_TTL_SECS: u64 = 8;
+const PEAK_MEM_BASE_TTL_SECS: u64 = 5;
+const CMDLINE_NONE_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone)]
+struct CmdlineEntry {
+    start_ticks: i64,
+    value: Option<String>,
+    sampled_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct PrivateWsEntry {
+    start_ticks: i64,
+    last_rss: u64,
+    pws_bytes: Option<u64>,
+    sampled_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct PeakMemEntry {
+    start_ticks: i64,
+    peak_bytes: Option<u64>,
+    sampled_at: Instant,
+}
+
+fn staggered_ttl(base_secs: u64, pid: u32, spread: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(base_secs + u64::from(pid) % spread)
+}
+
+/// Stack-allocated `/proc/<pid>/<suffix>` buffer that avoids per-PID heap
+/// allocations while serving both `Path` and NUL-terminated `CStr` callers.
+struct ProcPath {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl ProcPath {
+    fn for_pid(pid: u32, suffix: &str) -> Option<Self> {
+        use std::io::Write as _;
+        let mut buf = [0u8; 64];
+        let mut cursor = std::io::Cursor::new(&mut buf[..63]);
+        write!(cursor, "/proc/{pid}/{suffix}").ok()?;
+        let len = cursor.position() as usize;
+        buf[len] = 0;
+        Some(Self { buf, len })
+    }
+
+    fn as_path(&self) -> &Path {
+        use std::os::unix::ffi::OsStrExt as _;
+        Path::new(std::ffi::OsStr::from_bytes(&self.buf[..self.len]))
+    }
+
+    fn as_cstr(&self) -> &std::ffi::CStr {
+        // SAFETY: `for_pid` writes ASCII `/proc/<digits>/<suffix>` with no
+        // interior NUL and terminates with NUL at `buf[len]`.
+        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(&self.buf[..=self.len]) }
+    }
+}
+
+fn read_proc_bytes(pid: u32, suffix: &str, out: &mut Vec<u8>) -> Option<()> {
+    use std::io::Read as _;
+    let path = ProcPath::for_pid(pid, suffix)?;
+    let mut file = std::fs::File::open(path.as_path()).ok()?;
+    out.clear();
+    file.read_to_end(out).ok()?;
+    Some(())
+}
+
+fn read_proc_string(pid: u32, suffix: &str, out: &mut String) -> std::io::Result<()> {
+    use std::io::Read as _;
+    let path = ProcPath::for_pid(pid, suffix).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "proc path overflow")
+    })?;
+    let mut file = std::fs::File::open(path.as_path())?;
+    out.clear();
+    file.read_to_string(out)?;
+    Ok(())
+}
 
 /// How long the physical-drive list and the volume → drive resolution stay
 /// valid. A drive plugged in shows up within this long.
@@ -115,6 +208,10 @@ impl SystemCollector for LinuxCollector {
 
     fn set_demand(&mut self, demand: TelemetryDemand) {
         self.demand = demand;
+    }
+
+    fn set_background(&mut self, background: bool) {
+        self.background = background;
     }
 
     fn sample(&mut self, started: Instant) -> Result<Snapshot> {
@@ -136,6 +233,8 @@ impl SystemCollector for LinuxCollector {
             refresh = refresh.with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency());
         }
         self.sys.refresh_specifics(refresh);
+        let mut stat_buf = Vec::with_capacity(512);
+        let mut text_buf = String::with_capacity(2048);
         // Bracket sysinfo's observation. An identity read only after the
         // refresh could belong to a later occupant of the same PID.
         let before_refresh: HashMap<_, _> = self
@@ -145,7 +244,7 @@ impl SystemCollector for LinuxCollector {
             .filter(|p| p.thread_kind().is_none())
             .filter_map(|p| {
                 let pid = p.pid().as_u32();
-                linux_proc_start_ticks(pid).map(|ticks| (pid, ticks))
+                linux_proc_start_ticks_into(pid, &mut stat_buf).map(|ticks| (pid, ticks))
             })
             .collect();
         // No `.with_cpu()`: every CPU number comes from `/proc` above
@@ -154,7 +253,11 @@ impl SystemCollector for LinuxCollector {
         // accumulator whose gate skips refreshes closer than 200 ms.
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
-        self.disks.refresh(true);
+        let refresh_disk_list = self
+            .disk_topology
+            .as_ref()
+            .is_none_or(|topology| started.duration_since(topology.read_at) >= DISK_TOPOLOGY_TTL);
+        self.disks.refresh(refresh_disk_list);
         self.networks.refresh(true);
 
         let cpus = self.sys.cpus();
@@ -217,7 +320,7 @@ impl SystemCollector for LinuxCollector {
         // disk-time attribution after the drives are read.
         let mut block_bytes: HashMap<u32, u64> = HashMap::new();
         let mut attributable_net_pids: HashSet<u32> = HashSet::with_capacity(n_procs);
-        let mut deferred_io: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+        let mut deferred_io: Vec<(usize, Option<(u64, u64)>)> = Vec::new();
         let mut need_broker_fd: HashSet<u32> = HashSet::new();
         let mut need_broker_private_ws: HashSet<u32> = HashSet::new();
         // One logind record read per user per tick, not per process.
@@ -241,17 +344,16 @@ impl SystemCollector for LinuxCollector {
             // One `/proc/<pid>/stat` read feeds both the identity bracket and
             // the CPU accountant, so the counters can only describe the record
             // the bracket just validated.
-            let stat_bytes = std::fs::read(format!("/proc/{pid_u}/stat")).ok();
-            let boot_start_ticks = before_refresh.get(&pid_u).copied().filter(|&before| {
-                stat_bytes.as_deref().and_then(parse_proc_stat_starttime) == Some(before)
-            });
-            let proc_cpu = stat_bytes
-                .as_deref()
+            let has_stat = read_proc_bytes(pid_u, "stat", &mut stat_buf).is_some();
+            let stat_slice = has_stat.then_some(stat_buf.as_slice());
+            let boot_start_ticks = before_refresh
+                .get(&pid_u)
+                .copied()
+                .filter(|&before| stat_slice.and_then(parse_proc_stat_starttime) == Some(before));
+            let proc_cpu = stat_slice
                 .and_then(process_cpu::parse_pid_cpu_stat)
                 .map(|stat| self.process_cpu.observe(pid_u, stat));
-            let is_kthread = stat_bytes
-                .as_deref()
-                .is_some_and(parse_proc_stat_is_kthread);
+            let is_kthread = stat_slice.is_some_and(parse_proc_stat_is_kthread);
             let desktop_evidence = if is_kthread {
                 let mut evidence = desktop_session::DesktopEvidence::default();
                 evidence.role = Some(classify::DesktopRoleEvidence::System);
@@ -277,7 +379,11 @@ impl SystemCollector for LinuxCollector {
             );
             let category = classify_collected_process(pid_u, &name, has_window, desktop_role);
 
-            let command_line = cached_cmdline(&mut self.cmdlines, pid_u, boot_start_ticks);
+            let command_line = if is_kthread {
+                None
+            } else {
+                cached_cmdline(&mut self.cmdlines, pid_u, boot_start_ticks, started)
+            };
             // The kernel's `comm` holds at most 15 bytes; the executable or
             // argv name it was cut from is what the user knows the process by.
             // Classification above keeps the kernel name it was written for.
@@ -292,20 +398,99 @@ impl SystemCollector for LinuxCollector {
             let rss = p.memory();
             entry.working_set_bytes = Some(rss);
             if !is_kthread && rss > 0 {
-                if let Some(pws) = read_local_private_working_set(pid_u) {
-                    entry.private_working_set_bytes = Some(pws);
-                    entry.mem_bytes = pws;
+                if let Some(ticks) = boot_start_ticks {
+                    let cached = self
+                        .private_ws
+                        .get(&pid_u)
+                        .copied()
+                        .filter(|c| c.start_ticks == ticks);
+                    if self.background {
+                        if let Some(pws) = cached.and_then(|c| c.pws_bytes) {
+                            let clamped = pws.min(rss);
+                            entry.private_working_set_bytes = Some(clamped);
+                            entry.mem_bytes = clamped;
+                        } else {
+                            entry.mem_bytes = rss;
+                        }
+                    } else if let Some(cached) =
+                        cached.filter(|c| !private_ws_refresh_needed(c, pid_u, ticks, rss, started))
+                    {
+                        if let Some(pws) = cached.pws_bytes {
+                            let clamped = pws.min(rss);
+                            entry.private_working_set_bytes = Some(clamped);
+                            entry.mem_bytes = clamped;
+                        } else {
+                            entry.mem_bytes = rss;
+                        }
+                    } else {
+                        match read_local_private_working_set_into(pid_u, &mut text_buf) {
+                            LocalPrivateWs::Measured(pws) => {
+                                self.private_ws.insert(
+                                    pid_u,
+                                    PrivateWsEntry {
+                                        start_ticks: ticks,
+                                        last_rss: rss,
+                                        pws_bytes: Some(pws),
+                                        sampled_at: started,
+                                    },
+                                );
+                                entry.private_working_set_bytes = Some(pws);
+                                entry.mem_bytes = pws;
+                            }
+                            LocalPrivateWs::PermissionDenied => {
+                                self.private_ws.insert(
+                                    pid_u,
+                                    PrivateWsEntry {
+                                        start_ticks: ticks,
+                                        last_rss: rss,
+                                        pws_bytes: cached.and_then(|c| c.pws_bytes),
+                                        sampled_at: started,
+                                    },
+                                );
+                                if let Some(pws) = cached.and_then(|c| c.pws_bytes) {
+                                    let clamped = pws.min(rss);
+                                    entry.private_working_set_bytes = Some(clamped);
+                                    entry.mem_bytes = clamped;
+                                } else {
+                                    entry.mem_bytes = rss;
+                                }
+                                need_broker_private_ws.insert(pid_u);
+                            }
+                            LocalPrivateWs::Unavailable => {
+                                entry.mem_bytes = rss;
+                            }
+                        }
+                    }
+                } else if !self.background {
+                    match read_local_private_working_set_into(pid_u, &mut text_buf) {
+                        LocalPrivateWs::Measured(pws) => {
+                            entry.private_working_set_bytes = Some(pws);
+                            entry.mem_bytes = pws;
+                        }
+                        LocalPrivateWs::PermissionDenied | LocalPrivateWs::Unavailable => {
+                            entry.mem_bytes = rss;
+                        }
+                    }
                 } else {
                     entry.mem_bytes = rss;
-                    if boot_start_ticks.is_some() {
-                        need_broker_private_ws.insert(pid_u);
-                    }
                 }
             } else {
                 entry.mem_bytes = rss;
             }
             entry.commit_bytes = Some(p.virtual_memory());
-            entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
+            entry.peak_mem_bytes = if is_kthread {
+                None
+            } else {
+                cached_peak_mem(
+                    &mut self.peak_mem,
+                    pid_u,
+                    boot_start_ticks,
+                    rss,
+                    started,
+                    self.background,
+                    &mut text_buf,
+                )
+            };
             entry.boot_start_ticks = boot_start_ticks;
             entry.start_epoch_s =
                 entry
@@ -316,35 +501,39 @@ impl SystemCollector for LinuxCollector {
                     });
             entry.cpu_time_s = proc_cpu.and_then(|cpu| cpu.cpu_time_s);
             let proc_idx = processes.len();
-            match read_local_proc_io(pid_u) {
-                LocalProcIo::Measured(io) => {
-                    if let Some(bytes) = apply_activity(
-                        &mut self.activity,
-                        &mut entry,
-                        stat_bytes.as_deref(),
-                        Some(io),
-                        interval_s,
-                    ) {
-                        block_bytes.insert(pid_u, bytes);
+            let faults = stat_slice.and_then(linux_telemetry::parse_proc_stat_faults);
+            if is_kthread {
+                apply_activity(&mut self.activity, &mut entry, faults, None, interval_s);
+            } else {
+                match read_local_proc_io_into(pid_u, &mut text_buf) {
+                    LocalProcIo::Measured(io) => {
+                        if let Some(bytes) = apply_activity(
+                            &mut self.activity,
+                            &mut entry,
+                            faults,
+                            Some(io),
+                            interval_s,
+                        ) {
+                            block_bytes.insert(pid_u, bytes);
+                        }
+                    }
+                    LocalProcIo::PermissionDenied
+                        if boot_start_ticks.is_some()
+                            && (!self.background || providers.process_disk) =>
+                    {
+                        deferred_io.push((proc_idx, faults));
+                    }
+                    LocalProcIo::PermissionDenied | LocalProcIo::Unavailable => {
+                        apply_activity(&mut self.activity, &mut entry, faults, None, interval_s);
                     }
                 }
-                LocalProcIo::PermissionDenied if !is_kthread && boot_start_ticks.is_some() => {
-                    deferred_io.push((proc_idx, stat_bytes.clone()));
-                }
-                LocalProcIo::PermissionDenied | LocalProcIo::Unavailable => {
-                    apply_activity(
-                        &mut self.activity,
-                        &mut entry,
-                        stat_bytes.as_deref(),
-                        None,
-                        interval_s,
-                    );
-                }
             }
-            if descriptors_listable(pid_u) {
-                attributable_net_pids.insert(pid_u);
-            } else if providers.process_net && !is_kthread && boot_start_ticks.is_some() {
-                need_broker_fd.insert(pid_u);
+            if providers.process_net {
+                if descriptors_listable(pid_u) {
+                    attributable_net_pids.insert(pid_u);
+                } else if !is_kthread && boot_start_ticks.is_some() {
+                    need_broker_fd.insert(pid_u);
+                }
             }
             entry.has_window = has_window == Some(true);
             entry.app_group = if category == ProcCategory::App {
@@ -353,12 +542,16 @@ impl SystemCollector for LinuxCollector {
                 None
             };
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
-            entry.wow64 = cached_elf_32bit(
-                &mut self.elf_classes,
-                pid_u,
-                boot_start_ticks,
-                entry.exe_path.as_deref(),
-            );
+            entry.wow64 = if is_kthread || entry.exe_path.is_none() {
+                None
+            } else {
+                cached_elf_32bit(
+                    &mut self.elf_classes,
+                    pid_u,
+                    boot_start_ticks,
+                    entry.exe_path.as_deref(),
+                )
+            };
             entry.user = p
                 .user_id()
                 .and_then(|uid| username_for_uid(&self.users, uid));
@@ -375,13 +568,11 @@ impl SystemCollector for LinuxCollector {
                     })
                 });
             }
-            entry.threads = stat_bytes
-                .as_deref()
-                .and_then(linux_telemetry::parse_proc_stat_num_threads);
+            entry.threads = stat_slice.and_then(linux_telemetry::parse_proc_stat_num_threads);
             thread_total += entry.threads.map_or(1, |n| n as usize);
             entry.handles = fd_count(pid_u);
             entry.command_line = command_line;
-            entry.priority = proc_priority(stat_bytes.as_deref());
+            entry.priority = proc_priority(stat_slice);
             entry.elevated = entry.user.as_deref().map(|u| u == "root");
             classification_ctx.push((name, has_window, desktop_evidence));
             processes.push(entry);
@@ -389,6 +580,8 @@ impl SystemCollector for LinuxCollector {
         self.desktop_evidence.retain_live(&live_pids);
         self.process_cpu.retain_live(&live_pids);
         self.cmdlines.retain(|pid, _| live_pids.contains(pid));
+        self.private_ws.retain(|pid, _| live_pids.contains(pid));
+        self.peak_mem.retain(|pid, _| live_pids.contains(pid));
         self.activity.retain(|pid, _| live_pids.contains(pid));
         self.elf_classes.retain(|pid, _| live_pids.contains(pid));
         let mut graphical_uids: HashSet<u32> = HashSet::new();
@@ -440,25 +633,32 @@ impl SystemCollector for LinuxCollector {
                     .filter(|telem| Some(telem.start_ticks) == entry.boot_start_ticks)
                     .and_then(|telem| telem.private_working_set_bytes)
                 {
+                    if let Some(ticks) = entry.boot_start_ticks {
+                        self.private_ws.insert(
+                            entry.pid,
+                            PrivateWsEntry {
+                                start_ticks: ticks,
+                                last_rss: entry.working_set_bytes.unwrap_or(pws),
+                                pws_bytes: Some(pws),
+                                sampled_at: started,
+                            },
+                        );
+                    }
                     entry.private_working_set_bytes = Some(pws);
                     entry.mem_bytes = pws;
                 }
             }
         }
-        for (proc_idx, stat_bytes) in deferred_io {
+        for (proc_idx, faults) in deferred_io {
             let entry = &mut processes[proc_idx];
             let broker_io = broker_entries
                 .get(&entry.pid)
                 .filter(|telem| Some(telem.start_ticks) == entry.boot_start_ticks)
                 .and_then(|telem| telem.io)
                 .map(proc_io_from_wire);
-            if let Some(bytes) = apply_activity(
-                &mut self.activity,
-                entry,
-                stat_bytes.as_deref(),
-                broker_io,
-                interval_s,
-            ) {
+            if let Some(bytes) =
+                apply_activity(&mut self.activity, entry, faults, broker_io, interval_s)
+            {
                 block_bytes.insert(entry.pid, bytes);
             }
         }
@@ -673,14 +873,40 @@ enum LocalProcIo {
     Unavailable,
 }
 
-fn read_local_private_working_set(pid: u32) -> Option<u64> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
-    linux_telemetry::parse_smaps_rollup_private_bytes(&text)
+enum LocalPrivateWs {
+    Measured(u64),
+    PermissionDenied,
+    Unavailable,
 }
 
-fn read_local_proc_io(pid: u32) -> LocalProcIo {
-    match std::fs::read_to_string(format!("/proc/{pid}/io")) {
-        Ok(text) => match linux_telemetry::parse_proc_io(&text) {
+fn private_ws_refresh_needed(
+    entry: &PrivateWsEntry,
+    pid: u32,
+    start_ticks: i64,
+    rss: u64,
+    now: Instant,
+) -> bool {
+    entry.start_ticks != start_ticks
+        || rss.abs_diff(entry.last_rss) >= PRIVATE_WS_RSS_DELTA_BYTES
+        || now.duration_since(entry.sampled_at) >= staggered_ttl(PRIVATE_WS_BASE_TTL_SECS, pid, 5)
+}
+
+fn read_local_private_working_set_into(pid: u32, buf: &mut String) -> LocalPrivateWs {
+    match read_proc_string(pid, "smaps_rollup", buf) {
+        Ok(()) => match linux_telemetry::parse_smaps_rollup_private_bytes(buf) {
+            Some(bytes) => LocalPrivateWs::Measured(bytes),
+            None => LocalPrivateWs::Unavailable,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            LocalPrivateWs::PermissionDenied
+        }
+        Err(_) => LocalPrivateWs::Unavailable,
+    }
+}
+
+fn read_local_proc_io_into(pid: u32, buf: &mut String) -> LocalProcIo {
+    match read_proc_string(pid, "io", buf) {
+        Ok(()) => match linux_telemetry::parse_proc_io(buf) {
             Some(io) => LocalProcIo::Measured(io),
             None => LocalProcIo::Unavailable,
         },
@@ -705,7 +931,7 @@ fn proc_io_from_wire(wire: WireProcIo) -> linux_telemetry::ProcIo {
 fn collect_broker_telemetry(
     refused_until: &mut Option<Instant>,
     processes: &[ProcessEntry],
-    deferred_io: &[(usize, Option<Vec<u8>>)],
+    deferred_io: &[(usize, Option<(u64, u64)>)],
     need_broker_fd: &HashSet<u32>,
     need_broker_private_ws: &HashSet<u32>,
     wanted_socket_inodes: &[u64],
@@ -836,11 +1062,10 @@ struct Activity {
 fn apply_activity(
     activity: &mut HashMap<u32, Activity>,
     entry: &mut ProcessEntry,
-    stat: Option<&[u8]>,
+    faults: Option<(u64, u64)>,
     io: Option<linux_telemetry::ProcIo>,
     interval_s: f64,
 ) -> Option<u64> {
-    let faults = stat.and_then(linux_telemetry::parse_proc_stat_faults);
     let previous = activity
         .get(&entry.pid)
         .filter(|previous| previous.start_ticks == entry.boot_start_ticks);
@@ -1238,9 +1463,9 @@ fn mark_desktop_app_roots(processes: &mut [ProcessEntry]) {
     }
 }
 
-fn proc_status_kb(pid: u32, field: &str) -> Option<u64> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in text.lines() {
+fn proc_status_kb_into(pid: u32, field: &str, buf: &mut String) -> Option<u64> {
+    read_proc_string(pid, "status", buf).ok()?;
+    for line in buf.lines() {
         if line.split(':').next() == Some(field) {
             let kb = line
                 .split_whitespace()
@@ -1251,33 +1476,80 @@ fn proc_status_kb(pid: u32, field: &str) -> Option<u64> {
     None
 }
 
+fn peak_mem_refresh_needed(
+    entry: &PeakMemEntry,
+    pid: u32,
+    start_ticks: i64,
+    rss: u64,
+    now: Instant,
+) -> bool {
+    entry.start_ticks != start_ticks
+        || entry.peak_bytes.is_some_and(|peak| rss > peak)
+        || now.duration_since(entry.sampled_at) >= staggered_ttl(PEAK_MEM_BASE_TTL_SECS, pid, 5)
+}
+
+fn cached_peak_mem(
+    cache: &mut HashMap<u32, PeakMemEntry>,
+    pid: u32,
+    start_ticks: Option<i64>,
+    rss: u64,
+    now: Instant,
+    background: bool,
+    buf: &mut String,
+) -> Option<u64> {
+    let Some(ticks) = start_ticks else {
+        return (!background)
+            .then(|| proc_status_kb_into(pid, "VmHWM", buf))
+            .flatten();
+    };
+    if let Some(cached) = cache.get(&pid).copied().filter(|c| c.start_ticks == ticks)
+        && (background || !peak_mem_refresh_needed(&cached, pid, ticks, rss, now))
+    {
+        return cached.peak_bytes.map(|peak| peak.max(rss));
+    }
+    if background {
+        return None;
+    }
+    let peak = proc_status_kb_into(pid, "VmHWM", buf);
+    cache.insert(
+        pid,
+        PeakMemEntry {
+            start_ticks: ticks,
+            peak_bytes: peak,
+            sampled_at: now,
+        },
+    );
+    peak
+}
+
 /// Whether this token may list `/proc/<pid>/fd` -- the access the socket and
 /// GPU descriptor walks need. One `access` call, no listing.
 pub(super) fn descriptors_listable(pid: u32) -> bool {
-    let Ok(path) = std::ffi::CString::new(format!("/proc/{pid}/fd")) else {
+    let Some(path) = ProcPath::for_pid(pid, "fd") else {
         return false;
     };
-    // SAFETY: `path` is a valid NUL-terminated string.
-    unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::X_OK) == 0 }
+    // SAFETY: `path.as_cstr()` is a valid NUL-terminated string.
+    unsafe { libc::access(path.as_cstr().as_ptr(), libc::R_OK | libc::X_OK) == 0 }
 }
 
 fn fd_count(pid: u32) -> Option<u32> {
-    let dir = format!("/proc/{pid}/fd");
+    let path = ProcPath::for_pid(pid, "fd")?;
+    let dir = path.as_path();
     // Linux 6.2+ reports the number of open descriptors as the directory's
     // size, one `stat` instead of listing every descriptor. Older kernels
     // report 0, which is also what a process with no descriptors shows, so 0
     // falls back to counting.
-    let size = std::fs::metadata(&dir).ok()?.len();
+    let size = std::fs::metadata(dir).ok()?.len();
     let count = if size > 0 {
         usize::try_from(size).ok()?
     } else {
-        std::fs::read_dir(&dir).ok()?.count()
+        std::fs::read_dir(dir).ok()?.count()
     };
     u32::try_from(count).ok()
 }
 
 fn proc_cmdline(pid: u32) -> Option<String> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let bytes = std::fs::read(ProcPath::for_pid(pid, "cmdline")?.as_path()).ok()?;
     if bytes.is_empty() {
         return None;
     }
@@ -1294,29 +1566,33 @@ fn proc_cmdline(pid: u32) -> Option<String> {
 /// Read once per (pid, start ticks) instead of on every tick. Two honest limits: `execve`
 /// keeps the creation ticks, so a process that re-execs itself keeps the command line it was
 /// first seen with, and a `setproctitle`/`PR_SET_MM_ARG_START` rewrite is not observed until
-/// it exits — Windows makes the same trade. A failed read is deliberately not remembered:
-/// `hidepid` and a fork that has not filled `argv` yet both clear, so the next tick retries
-/// instead of blanking that row for the rest of the session. A kernel thread has no command
-/// line at all, so it stays uncached and is re-read each tick — which is what the pre-cache
-/// code did for every process.
+/// it exits — Windows makes the same trade. A failed read is negative-cached briefly
+/// ([`CMDLINE_NONE_RETRY_TTL`]) so `hidepid` or fork→`exec` races recover quickly without
+/// reopening every empty/unreadable PID on every single tick.
 fn cached_cmdline(
-    cache: &mut HashMap<u32, (i64, Option<String>)>,
+    cache: &mut HashMap<u32, CmdlineEntry>,
     pid: u32,
     start_ticks: Option<i64>,
+    now: Instant,
 ) -> Option<String> {
     let Some(ticks) = start_ticks else {
         return proc_cmdline(pid);
     };
-    let known = cache
-        .get(&pid)
-        .is_some_and(|(cached_ticks, _)| *cached_ticks == ticks);
-    if known {
-        return cache.get(&pid).and_then(|(_, cmdline)| cmdline.clone());
+    if let Some(entry) = cache.get(&pid)
+        && entry.start_ticks == ticks
+        && (entry.value.is_some() || now.duration_since(entry.sampled_at) < CMDLINE_NONE_RETRY_TTL)
+    {
+        return entry.value.clone();
     }
     let cmdline = proc_cmdline(pid);
-    if cmdline.is_some() {
-        cache.insert(pid, (ticks, cmdline.clone()));
-    }
+    cache.insert(
+        pid,
+        CmdlineEntry {
+            start_ticks: ticks,
+            value: cmdline.clone(),
+            sampled_at: now,
+        },
+    );
     cmdline
 }
 
@@ -2432,9 +2708,14 @@ fn linux_start_timestamp(btime_s: u64, ticks_since_boot: i64, clk_tck: u64) -> O
     i64::try_from(boot_ticks + offset_ticks).ok()
 }
 
+fn linux_proc_start_ticks_into(pid: u32, buf: &mut Vec<u8>) -> Option<i64> {
+    read_proc_bytes(pid, "stat", buf)?;
+    parse_proc_stat_starttime(buf)
+}
+
 fn linux_proc_start_ticks(pid: u32) -> Option<i64> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    parse_proc_stat_starttime(&stat)
+    let mut buf = Vec::with_capacity(512);
+    linux_proc_start_ticks_into(pid, &mut buf)
 }
 
 fn read_proc_start_ticks(pid: u32) -> Result<i64> {
@@ -2576,6 +2857,7 @@ pub fn create_collector() -> LinuxCollector {
         last_tick: None,
         first_tick_done: false,
         demand: TelemetryDemand::core(),
+        background: false,
         cmdlines: HashMap::new(),
         cache_kb: cache_totals_kb(&read_cache_indexes()),
         window_observer: x11_windows::WindowObserver::new(),
@@ -2583,6 +2865,8 @@ pub fn create_collector() -> LinuxCollector {
         disk_topology: None,
         process_net: process_net::ProcessNet::default(),
         process_gpu: process_gpu::ProcessGpu::default(),
+        private_ws: HashMap::new(),
+        peak_mem: HashMap::new(),
         activity: HashMap::new(),
         elf_classes: HashMap::new(),
         net_totals: HashMap::new(),
@@ -3212,5 +3496,95 @@ mod tests {
         assert_eq!(processes[1].net_sent_bps, Some(500.0));
         assert_eq!(processes[2].net_recv_bps, None);
         assert_eq!(processes[2].net_sent_bps, None);
+    }
+
+    #[test]
+    fn private_ws_refresh_triggers_on_generation_delta_or_staggered_ttl() {
+        let base = Instant::now();
+        let entry = PrivateWsEntry {
+            start_ticks: 100,
+            last_rss: 10 * 1024 * 1024,
+            pws_bytes: Some(8 * 1024 * 1024),
+            sampled_at: base,
+        };
+        assert!(!private_ws_refresh_needed(
+            &entry,
+            42,
+            100,
+            10 * 1024 * 1024 + PRIVATE_WS_RSS_DELTA_BYTES - 1,
+            base + std::time::Duration::from_secs(1),
+        ));
+        assert!(private_ws_refresh_needed(
+            &entry,
+            42,
+            100,
+            10 * 1024 * 1024 + PRIVATE_WS_RSS_DELTA_BYTES,
+            base + std::time::Duration::from_secs(1),
+        ));
+        assert!(private_ws_refresh_needed(
+            &entry,
+            42,
+            100,
+            10 * 1024 * 1024 - PRIVATE_WS_RSS_DELTA_BYTES,
+            base + std::time::Duration::from_secs(1),
+        ));
+        assert!(private_ws_refresh_needed(
+            &entry,
+            42,
+            101,
+            10 * 1024 * 1024,
+            base + std::time::Duration::from_secs(1),
+        ));
+        let pid_ttl = staggered_ttl(PRIVATE_WS_BASE_TTL_SECS, 42, 5);
+        assert!(!private_ws_refresh_needed(
+            &entry,
+            42,
+            100,
+            10 * 1024 * 1024,
+            base + pid_ttl - std::time::Duration::from_millis(1),
+        ));
+        assert!(private_ws_refresh_needed(
+            &entry,
+            42,
+            100,
+            10 * 1024 * 1024,
+            base + pid_ttl,
+        ));
+    }
+
+    #[test]
+    fn peak_mem_refresh_triggers_only_when_rss_exceeds_peak_or_ttl_expires() {
+        let base = Instant::now();
+        let entry = PeakMemEntry {
+            start_ticks: 77,
+            peak_bytes: Some(2048),
+            sampled_at: base,
+        };
+        assert!(!peak_mem_refresh_needed(
+            &entry,
+            10,
+            77,
+            2048,
+            base + std::time::Duration::from_secs(1),
+        ));
+        assert!(peak_mem_refresh_needed(
+            &entry,
+            10,
+            77,
+            2049,
+            base + std::time::Duration::from_secs(1),
+        ));
+        let ttl = staggered_ttl(PEAK_MEM_BASE_TTL_SECS, 10, 5);
+        assert!(peak_mem_refresh_needed(&entry, 10, 77, 1024, base + ttl,));
+    }
+
+    #[test]
+    fn proc_path_formats_pid_paths_without_truncation() {
+        let path = ProcPath::for_pid(u32::MAX, "smaps_rollup").expect("fits in buffer");
+        assert_eq!(path.as_path(), Path::new("/proc/4294967295/smaps_rollup"));
+        assert_eq!(
+            path.as_cstr().to_str().unwrap(),
+            "/proc/4294967295/smaps_rollup"
+        );
     }
 }

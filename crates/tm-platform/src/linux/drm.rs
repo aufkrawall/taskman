@@ -105,33 +105,33 @@ fn card_cache() -> &'static Mutex<Option<CardCache>> {
 /// adapters are still listed — as Windows lists the adapters it enumerated —
 /// while their measurements stay unavailable.
 pub fn gpus(measure: bool) -> Vec<GpuInfo> {
-    // Warm the one-second NVML window before the identity cache lock: the first
-    // call in a process loads the driver library, and that should not happen
-    // while the adapter cache is held. The per-adapter lookups below then hit
-    // the same cached enumeration, and none of them waits on a socket — the
-    // brokered fallback lives on its own worker thread.
-    if measure {
+    let (cards, nvidia_names) = {
+        let mut guard = tm_core::sync::lock(card_cache());
+        let stale = guard
+            .as_ref()
+            .is_none_or(|cache| cache.read_at.elapsed() >= IDENTITY_TTL || !cache.still_accurate());
+        if stale {
+            // A listing that failed is not "no cards": keep the adapters we already
+            // described instead of blanking the GPU page for a whole cache window.
+            if let Some(fresh) = scan_cards() {
+                *guard = Some(fresh);
+            }
+        }
+        let Some(cache) = guard.as_ref() else {
+            return Vec::new();
+        };
+        (cache.cards.clone(), cache.nvidia_names.clone())
+    };
+    // Warm the one-second NVML window outside the identity cache lock and only
+    // when at least one enumerated DRM card is NVIDIA: initializing NVML on a
+    // non-NVIDIA host would load driver libraries/tables for nothing.
+    if measure && cards.iter().any(|card| is_nvidia_card(&card.facts)) {
         let _ = sensors::nvml_gpus();
     }
-    let mut guard = tm_core::sync::lock(card_cache());
-    let stale = guard
-        .as_ref()
-        .is_none_or(|cache| cache.read_at.elapsed() >= IDENTITY_TTL || !cache.still_accurate());
-    if stale {
-        // A listing that failed is not "no cards": keep the adapters we already
-        // described instead of blanking the GPU page for a whole cache window.
-        if let Some(fresh) = scan_cards() {
-            *guard = Some(fresh);
-        }
-    }
-    let Some(cache) = guard.as_ref() else {
-        return Vec::new();
-    };
-    cache
-        .cards
+    cards
         .iter()
         .enumerate()
-        .map(|(id, card)| gpu_for(id, card, measure, cache))
+        .map(|(id, card)| gpu_for(id, card, measure, &nvidia_names))
         .collect()
 }
 
@@ -156,7 +156,12 @@ fn scan_cards() -> Option<CardCache> {
 }
 
 /// One adapter row: cached identity plus, when measured, this tick's counters.
-fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> GpuInfo {
+fn gpu_for(
+    id: usize,
+    card: &CardIdentity,
+    measure: bool,
+    nvidia_names: &HashMap<String, String>,
+) -> GpuInfo {
     let facts = if measure {
         read_live(card)
     } else {
@@ -164,7 +169,7 @@ fn gpu_for(id: usize, card: &CardIdentity, measure: bool, cache: &CardCache) -> 
     };
     let slot = facts.pci_slot.clone();
     let nvidia = is_nvidia_card(&facts);
-    let gpu = gpu_from_card(id, facts, &cache.nvidia_names);
+    let gpu = gpu_from_card(id, facts, nvidia_names);
     if !measure {
         // Identity only: an unmeasured row has no counters to fill, and asking
         // the driver for them would be a measurement nobody asked for.

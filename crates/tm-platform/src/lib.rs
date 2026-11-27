@@ -280,6 +280,49 @@ pub fn window_outer_position_px(_hwnd: isize) -> Option<[i32; 2]> {
     None
 }
 
+/// Apply Linux process memory allocator and THP tuning at single-threaded
+/// startup so arenas, large scratch buffers, and GPU/icon allocations return to
+/// the kernel rather than remaining pinned in per-thread glibc heaps.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn tune_process_allocator() {
+    const M_MMAP_THRESHOLD: libc::c_int = -3;
+    const M_TRIM_THRESHOLD: libc::c_int = -1;
+    const M_ARENA_MAX: libc::c_int = -8;
+    unsafe extern "C" {
+        fn mallopt(param: libc::c_int, value: libc::c_int) -> libc::c_int;
+    }
+    // SAFETY: `mallopt` mutates process-wide glibc malloc thresholds and is
+    // called once during single-threaded startup; `prctl(PR_SET_THP_DISABLE)`
+    // scopes transparent huge pages off for this process only.
+    unsafe {
+        mallopt(M_ARENA_MAX, 2);
+        mallopt(M_MMAP_THRESHOLD, 65_536);
+        mallopt(M_TRIM_THRESHOLD, 65_536);
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn tune_process_allocator() {}
+
+/// Return freed top-of-heap and small-bin pages from glibc back to the kernel.
+/// Call on transitions where transient startup or UI bursts subside (e.g.
+/// hiding to the tray).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn trim_process_memory() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: libc::size_t) -> libc::c_int;
+    }
+    // SAFETY: `malloc_trim(0)` is thread-safe in glibc and releases free heap
+    // pages across arenas back to the OS.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn trim_process_memory() {}
+
 /// Move the window to a physical-pixel position without resizing it.
 #[cfg(target_os = "windows")]
 pub fn set_window_outer_position_px(hwnd: isize, pos: [i32; 2]) {
@@ -777,6 +820,13 @@ pub mod taskbar_monitor {
             assert_eq!(m3.cpu_pct, None);
             assert_eq!(m3.net_recv_bps, None);
             assert_eq!(m3.net_sent_bps, Some(500.0));
+        }
+
+        #[test]
+        fn allocator_tuning_and_trim_hooks_are_safe() {
+            crate::tune_process_allocator();
+            crate::trim_process_memory();
+            crate::xdg_icons::shrink_transient_caches();
         }
     }
 }

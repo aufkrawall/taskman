@@ -158,6 +158,25 @@ fn main() {
     StartupTrace::mark("process_start");
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // Tune glibc arena/mmap thresholds and disable THP early so worker threads
+    // and libraries (NVML, icon decode, wgpu) return freed heap to Linux.
+    tm_platform::tune_process_allocator();
+
+    // MangoHud installs an implicit Vulkan layer that wakes a monitoring
+    // thread even for desktop utilities when MANGOHUD=1 is inherited from the
+    // compositor/session (~4% CPU even while hidden in tray). Opt out unless the
+    // user explicitly asks to keep MangoHud active.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISABLE_MANGOHUD").is_none()
+        && std::env::var_os("TASKMAN_ALLOW_MANGOHUD").is_none()
+    {
+        // SAFETY: Called on the main thread before logging, engine, or GUI
+        // worker threads are spawned.
+        unsafe {
+            std::env::set_var("DISABLE_MANGOHUD", "1");
+        }
+    }
+
     // Root-only diagnostic/helper entry point retained for a future protected
     // Linux install. The portable GUI never asks pkexec to execute this
     // user-writable binary; trusted service elevation launches systemctl.

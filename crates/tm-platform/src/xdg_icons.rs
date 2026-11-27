@@ -483,6 +483,16 @@ impl<K: Eq + Hash + Clone, V> Bounded<K, V> {
             }
         }
     }
+
+    fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        self.entries.retain(|k, v| keep(k, v));
+        self.order.retain(|k| self.entries.contains_key(k));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
 }
 
 /// What one directory holds, as it was when it was read.
@@ -691,12 +701,13 @@ pub struct IconResolver {
     caches: Mutex<Caches>,
 }
 
+static SHARED_RESOLVER: OnceLock<IconResolver> = OnceLock::new();
+
 impl IconResolver {
     /// Process-wide resolver built from the environment; icon extraction runs
     /// on a worker thread, so the index is built once and shared.
     pub fn shared() -> &'static Self {
-        static RESOLVER: OnceLock<IconResolver> = OnceLock::new();
-        RESOLVER.get_or_init(|| Self::new(IconLookup::from_env()))
+        SHARED_RESOLVER.get_or_init(|| Self::new(IconLookup::from_env()))
     }
 
     pub fn new(lookup: IconLookup) -> Self {
@@ -1050,6 +1061,30 @@ impl IconResolver {
             .decoded
             .insert(file.to_path_buf(), decoded.clone());
         Some(decoded)
+    }
+
+    fn shrink_caches(&self) {
+        let mut caches = tm_core::sync::lock(&self.caches);
+        caches.decoded.clear();
+        let skew = caches.clock_skew;
+        caches
+            .theme_dirs
+            .retain(|_, (_, read_at)| read_at.elapsed() + skew < LISTING_TTL);
+        caches
+            .listings
+            .retain(|_, listing| listing.read_at.elapsed() + skew < LISTING_TTL);
+        caches
+            .misses
+            .retain(|_, missed_at| missed_at.elapsed() + skew < MISS_RETRY_TTL);
+    }
+}
+
+/// Drop transient decoded RGBA buffers (the UI's texture cache already owns the
+/// uploaded icons) and prune expired directory/miss entries. Does not initialize
+/// [`IconResolver::shared`] if icon resolution has never run.
+pub fn shrink_transient_caches() {
+    if let Some(resolver) = SHARED_RESOLVER.get() {
+        resolver.shrink_caches();
     }
 }
 

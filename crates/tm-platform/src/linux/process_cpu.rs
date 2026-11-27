@@ -137,23 +137,30 @@ impl ProcessCpuSampler {
 /// non-UTF-8 data. Fixed fields therefore begin only after the final `)`.
 pub fn parse_pid_cpu_stat(input: &[u8]) -> Option<PidCpuStat> {
     let close = input.iter().rposition(|&byte| byte == b')')?;
-    let fields = input[close + 1..]
+    let parse_u64 = |field: &[u8]| std::str::from_utf8(field).ok()?.parse::<u64>().ok();
+    let mut utime = None;
+    let mut stime = None;
+    let mut starttime = None;
+    for (idx, field) in input[close + 1..]
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    let parse_u64 = |index: usize| {
-        std::str::from_utf8(fields.get(index).copied()?)
-            .ok()?
-            .parse::<u64>()
-            .ok()
-    };
-    // Field 14 (utime), field 15 (stime) and field 22 (starttime); index zero
-    // is field 3.
-    let utime = parse_u64(11)?;
-    let stime = parse_u64(12)?;
+        .enumerate()
+    {
+        // Field 14 (utime), field 15 (stime) and field 22 (starttime); index
+        // zero is field 3.
+        match idx {
+            11 => utime = parse_u64(field),
+            12 => stime = parse_u64(field),
+            19 => {
+                starttime = parse_u64(field);
+                break;
+            }
+            _ => {}
+        }
+    }
     Some(PidCpuStat {
-        cpu_ticks: utime.checked_add(stime)?,
-        start_ticks: i64::try_from(parse_u64(19)?).ok()?,
+        cpu_ticks: utime?.checked_add(stime?)?,
+        start_ticks: i64::try_from(starttime?).ok()?,
     })
 }
 
