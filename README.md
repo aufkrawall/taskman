@@ -105,6 +105,14 @@ shortcuts above stand down until the dialog is closed.
 - Rust 1.88+ (edition 2024; let-chains and `slice::as_chunks` are used)
 - Python 3.10+ for the `build.py` release driver
 
+### Linux / Wayland
+
+On Wayland, applications cannot position themselves or force their stacking
+order, so **Always on top**, **window position** (remembering/restoring it) and
+**Replace Task Manager** must be handled by the Wayland compositor instead of
+TaskMan, e.g. with KWin window rules (System Settings → Window Management →
+Window Rules).
+
 ## Building
 
 ```bash
