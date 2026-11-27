@@ -172,6 +172,7 @@ pub struct WindowState {
     blur_manager: Option<KWinBlurManager>,
     plasma_surface: Option<OrgKdePlasmaSurface>,
     plasma_shell: Option<PlasmaShell>,
+    plasma_hidden: bool,
 
     /// Whether the client side decorations have pending move operations.
     ///
@@ -284,6 +285,7 @@ impl WindowState {
             blur_manager: winit_state.kwin_blur_manager.clone(),
             plasma_surface: None,
             plasma_shell: winit_state.plasma_shell.clone(),
+            plasma_hidden: false,
             compositor,
             connection,
             csd_fails: false,
@@ -367,16 +369,17 @@ impl WindowState {
         self.frame_callback_state = FrameCallbackState::None;
         let change = visibility_change(hidden, &mut self.presented, &mut self.needs_initial_commit);
         self.awaiting_remap_configure = change == VisibilityChange::Remap;
-        if change != VisibilityChange::None {
-            self.set_plasma_hidden(hidden);
-        }
         change
     }
 
     /// TaskMan fork: tell KWin (`org_kde_plasma_surface`) to omit a hidden
     /// toplevel from the taskbar and switcher, so a surface hidden before its
-    /// first present does not leave a ghost taskbar entry.
-    fn set_plasma_hidden(&mut self, hidden: bool) {
+    /// first present does not leave a ghost or brief taskbar entry.
+    /// Returns `true` when the state changed and requests were queued.
+    pub fn set_plasma_hidden(&mut self, hidden: bool) -> bool {
+        if self.plasma_hidden == hidden {
+            return false;
+        }
         let surface = if hidden {
             if self.plasma_surface.is_none() {
                 if let Some(shell) = &self.plasma_shell {
@@ -389,13 +392,15 @@ impl WindowState {
             self.plasma_surface.as_ref()
         };
         let Some(plasma_surface) = surface else {
-            return;
+            return false;
         };
+        self.plasma_hidden = hidden;
         let skip = u32::from(hidden);
         plasma_surface.set_skip_taskbar(skip);
         if plasma_surface.version() >= 5 {
             plasma_surface.set_skip_switcher(skip);
         }
+        true
     }
 
     /// TaskMan fork: a present is about to attach a buffer.

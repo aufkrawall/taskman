@@ -181,6 +181,14 @@ impl Window {
             xdg_activation.activate(token.token, &surface);
         }
 
+        // TaskMan fork: mark initially-hidden windows (e.g. eframe's
+        // `with_visible(false)` / `--minimized-to-tray`) skip-taskbar before
+        // the initial commit so KWin never flashes a brief taskbar entry before
+        // Frame 1's `set_visible(false)` arrives.
+        if !attributes.visible {
+            window_state.set_plasma_hidden(true);
+        }
+
         // XXX Do initial commit.
         window.commit();
 
@@ -263,17 +271,24 @@ impl Window {
     /// reports while unmapped. See `TASKMAN-FORK.md` §5.
     #[inline]
     pub fn set_visible(&self, visible: bool) {
-        let change = {
+        let (change, plasma_changed) = {
             let mut state = self.window_state.lock().unwrap();
+            let plasma_changed = state.set_plasma_hidden(!visible);
             let change = state.set_hidden(!visible);
             if matches!(change, VisibilityChange::Remap) {
                 state.reapply_toplevel_state();
             }
-            change
+            (change, plasma_changed)
         };
         let surface = self.window.wl_surface();
         match change {
-            VisibilityChange::None | VisibilityChange::HideUnmapped => return,
+            VisibilityChange::None | VisibilityChange::HideUnmapped => {
+                if plasma_changed {
+                    surface.commit();
+                    self.event_loop_awakener.ping();
+                }
+                return;
+            },
             VisibilityChange::Unmap => {
                 surface.attach(None, 0, 0);
                 surface.commit();

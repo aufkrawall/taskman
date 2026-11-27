@@ -163,10 +163,12 @@ commit that maps it anew; the compositor answers with a fresh configure.
     `presented` is true.
   - `set_hidden()` resets the frame-callback throttle (an unmapped surface
     gets no frame callbacks; a stale `Requested` would block the first redraw
-    after remapping forever), updates `org_kde_plasma_surface` (`skip_taskbar` /
-    `skip_switcher` via `types/plasma_shell.rs`, so KWin does not keep a ghost
-    taskbar entry for an unpresented toplevel), and returns a `VisibilityChange`
-    from the pure `visibility_change()` rule, which has a unit test.
+    after remapping forever) and returns a `VisibilityChange` from the pure
+    `visibility_change()` rule, which has a unit test.
+  - `Window::new()` (when `!attributes.visible`) and `set_visible()` update
+    `org_kde_plasma_surface` (`skip_taskbar` / `skip_switcher` via
+    `types/plasma_shell.rs`) before the initial commit and on visibility
+    changes, so KWin never shows a ghost or brief taskbar entry while hidden.
   - `is_hidden()` is also true between a remap's initial commit and its
     configure (cleared in `configure()`): attaching a buffer before that
     configure is a protocol error that kills the connection.
