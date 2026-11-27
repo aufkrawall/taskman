@@ -1602,7 +1602,11 @@ impl TaskManApp {
             self.engine.set_interval(interval);
         }
         if transition.request_refresh {
-            self.engine.request_refresh();
+            // Avoid a sub-jiffy off-schedule sample when a hidden tick just
+            // landed: `/proc/stat` jiffies tick at 100 Hz, so a < 250 ms
+            // window can see 0 jiffies on an idle core and drop per-core data.
+            self.engine
+                .request_refresh_if_stale(std::time::Duration::from_millis(250));
         }
         if transition.background.is_some() {
             tracing::debug!(visible, "surface visibility changed");

@@ -63,6 +63,10 @@ pub enum EngineCmd {
     /// Works in Running *and* Paused state; the paused/running state itself
     /// is left untouched.
     Refresh,
+    /// Sample now only if at least `min_age` has elapsed since the previous
+    /// sample (used on window restore so a fresh snapshot does not trigger a
+    /// sub-jiffy window).
+    RefreshIfStale(Duration),
     /// Sample immediately and reply with the snapshot (tests/selfcheck only).
     SampleNow(Sender<Arc<Snapshot>>),
     Shutdown,
@@ -157,6 +161,12 @@ impl EngineHandle {
     /// sample even when the engine is paused (state stays paused).
     pub fn request_refresh(&self) {
         let _ = self.cmd_tx.send(EngineCmd::Refresh);
+    }
+
+    /// Request an out-of-band refresh only if the latest sample is at least
+    /// `min_age` old, avoiding near-zero-interval samples on window restore.
+    pub fn request_refresh_if_stale(&self, min_age: Duration) {
+        let _ = self.cmd_tx.send(EngineCmd::RefreshIfStale(min_age));
     }
 
     pub fn set_speed_paused(&self, paused: bool) {
@@ -450,6 +460,13 @@ fn run_loop(
                 last_tick = Instant::now();
                 health.sample(&mut collector, shared);
                 next_due = last_tick + *sync::read(&shared.interval);
+            }
+            Ok(EngineCmd::RefreshIfStale(min_age)) => {
+                if last_tick.elapsed() >= min_age {
+                    last_tick = Instant::now();
+                    health.sample(&mut collector, shared);
+                    next_due = last_tick + *sync::read(&shared.interval);
+                }
             }
             Ok(EngineCmd::SampleNow(reply)) => {
                 last_tick = Instant::now();
