@@ -987,31 +987,38 @@ fn username_for_uid(users: &sysinfo::Users, uid: &sysinfo::Uid) -> Option<String
 
 fn merge_child_app_groups(processes: &mut [ProcessEntry]) {
     let mut by_pid: HashMap<u32, usize> = HashMap::with_capacity(processes.len());
-    let mut group_roots: HashMap<String, usize> = HashMap::new();
+    let mut app_indices: Vec<usize> = Vec::new();
     for (index, process) in processes.iter().enumerate() {
         by_pid.insert(process.pid, index);
-        if process.category != ProcCategory::App {
-            continue;
+        if process.category == ProcCategory::App
+            && process
+                .app_group
+                .as_deref()
+                .is_some_and(|group| !group.is_empty())
+        {
+            app_indices.push(index);
         }
-        let Some(group) = process
+    }
+    app_indices.sort_by_key(|&index| app_root_key(&processes[index]));
+
+    // Check every member of each app_group, not only the group's oldest/root
+    // process: Chromium/Brave's crashpad handler can be the earliest process
+    // in the split `.service` unit while being reparented to `systemd --user`,
+    // whereas sibling zygote/utility processes in the same unit still have
+    // `ppid` pointing to the main browser process in the `.scope` unit.
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for &member_idx in &app_indices {
+        let Some(group) = processes[member_idx]
             .app_group
             .as_deref()
             .filter(|group| !group.is_empty())
         else {
             continue;
         };
-        let replace = match group_roots.get(group) {
-            Some(&existing) => app_root_key(process) < app_root_key(&processes[existing]),
-            None => true,
-        };
-        if replace {
-            group_roots.insert(group.to_owned(), index);
+        if remap.contains_key(group) {
+            continue;
         }
-    }
-
-    let mut remap: HashMap<String, String> = HashMap::new();
-    for (group, &root_idx) in &group_roots {
-        let mut cur_idx = root_idx;
+        let mut cur_idx = member_idx;
         let mut target: Option<&str> = None;
         let mut seen = HashSet::new();
         seen.insert(processes[cur_idx].pid);
@@ -1025,6 +1032,7 @@ fn merge_child_app_groups(processes: &mut [ProcessEntry]) {
             let child = &processes[cur_idx];
             let parent = &processes[parent_idx];
             if parent.category != ProcCategory::App
+                || !tm_core::model::is_plausible_parent(parent, child)
                 || parent.exe_path.is_none()
                 || parent.exe_path != child.exe_path
             {
@@ -1041,16 +1049,31 @@ fn merge_child_app_groups(processes: &mut [ProcessEntry]) {
         if let Some(parent_group) = target
             && parent_group != group
         {
-            remap.insert(group.clone(), parent_group.to_owned());
+            remap.insert(group.to_owned(), parent_group.to_owned());
         }
     }
 
     if remap.is_empty() {
         return;
     }
+    let resolved: HashMap<String, String> = remap
+        .keys()
+        .filter_map(|group| {
+            let mut cur = group.as_str();
+            let mut seen = HashSet::new();
+            seen.insert(cur);
+            while let Some(next) = remap.get(cur) {
+                if !seen.insert(next.as_str()) {
+                    break;
+                }
+                cur = next.as_str();
+            }
+            (cur != group.as_str()).then(|| (group.clone(), cur.to_owned()))
+        })
+        .collect();
     for process in processes.iter_mut() {
         if let Some(group) = process.app_group.as_deref()
-            && let Some(target) = remap.get(group)
+            && let Some(target) = resolved.get(group)
         {
             process.app_group = Some(target.clone());
         }
@@ -3067,6 +3090,58 @@ mod tests {
         assert_ne!(processes[0].app_group, processes[2].app_group);
         assert!(processes[0].app_root);
         assert!(processes[2].app_root);
+    }
+
+    #[test]
+    fn split_app_unit_with_reparented_earlier_crashpad_still_merges_via_browser_children() {
+        let brave_scope = "systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.chromium.Chromium-100.scope";
+        let brave_svc = "systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/app-brave\\x2dbrowser@abc.service";
+
+        let mut brave_main = ProcessEntry::new(100, "brave");
+        brave_main.ppid = Some(1);
+        brave_main.category = ProcCategory::App;
+        brave_main.has_window = true;
+        brave_main.exe_path = Some(std::path::PathBuf::from("/opt/brave-bin/brave"));
+        brave_main.app_group = Some(brave_scope.into());
+
+        // Crashpad was reparented to systemd --user (ppid = 1) and started
+        // before the zygote, so it would be picked first by app_root_key.
+        let mut crashpad = ProcessEntry::new(101, "chrome_crashpad_handler");
+        crashpad.ppid = Some(1);
+        crashpad.category = ProcCategory::App;
+        crashpad.exe_path = Some(std::path::PathBuf::from(
+            "/opt/brave-bin/chrome_crashpad_handler",
+        ));
+        crashpad.app_group = Some(brave_svc.into());
+
+        let mut zygote = ProcessEntry::new(102, "brave");
+        zygote.ppid = Some(100);
+        zygote.category = ProcCategory::App;
+        zygote.exe_path = Some(std::path::PathBuf::from("/opt/brave-bin/brave"));
+        zygote.app_group = Some(brave_svc.into());
+
+        let mut renderer = ProcessEntry::new(103, "brave");
+        renderer.ppid = Some(102);
+        renderer.category = ProcCategory::App;
+        renderer.exe_path = Some(std::path::PathBuf::from("/opt/brave-bin/brave"));
+        renderer.app_group = Some(brave_svc.into());
+
+        let mut processes = vec![brave_main, crashpad, zygote, renderer];
+        merge_child_app_groups(&mut processes);
+        mark_desktop_app_roots(&mut processes);
+
+        for process in &processes {
+            assert_eq!(
+                process.app_group.as_deref(),
+                Some(brave_scope),
+                "pid {} should merge into the main browser scope",
+                process.pid
+            );
+        }
+        assert!(processes[0].app_root);
+        assert!(!processes[1].app_root);
+        assert!(!processes[2].app_root);
+        assert!(!processes[3].app_root);
     }
 
     #[test]
