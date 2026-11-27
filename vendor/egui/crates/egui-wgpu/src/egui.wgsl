@@ -25,9 +25,9 @@ struct Locals {
     /// Blend-space gamma for LCD text weight compensation on non-sRGB targets.
     subpixel_gamma: f32,
 
-    /// Keep the uniform struct at 32 bytes (a multiple of the required 16-byte
-    /// uniform-struct alignment) and matched to the Rust `UniformBuffer` layout.
-    _padding: u32,
+    /// Expected sRGB background luminance in 0..=1 for calibrated fixed-function
+    /// LCD blending (matching CPU TextGamma), or < 0.0 for polarity-only fallback.
+    subpixel_bg_luma: f32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 

@@ -457,21 +457,16 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     opts.subpixel = subpixel;
     if !subpixel.is_off() {
         opts.cleartype_level = params.cleartype_level;
-        opts.lcd_filter = lcd_filter(params.lcd_filter);
+        opts.lcd_filter = lcd_filter(smoothing, params.lcd_filter);
 
-        // Under sub-pixel rendering the smoothing profile becomes a WEIGHT control, which
-        // is the only thing left for it to be: the coverage ramp it used to select is not
-        // consulted by the sub-pixel rasterizer at all.
-        //
-        // The reason a control is needed rather than just DirectWrite's numbers: those
-        // numbers describe DirectWrite's own curve, and this is a different curve (see
-        // `egui_software::gamma`). Fed in unchanged on a dark UI they lift a half-covered
-        // pixel from 128 to 178, which reads as fat and glowing next to native Windows
-        // text -- Windows errs thin. Measured at 150% scaling, dropping the contrast
-        // boost and pulling gamma back takes ~14% of the ink out and sharpens the stems.
+        // Under sub-pixel rendering the smoothing profile becomes a WEIGHT and filter
+        // control: `Sharp` pairs `LcdFilter::LIGHT` (no outer-pixel bleed around 1px stems
+        // at 100% scaling) with `contrast = 0.0` and polarity-appropriate gamma tuning so
+        // 13 px rows stay crisp and lean alongside native Windows 11 ClearType.
         let (gamma, contrast) = cleartype_weight(smoothing, theme, &params);
         opts.text_gamma = gamma;
         opts.text_contrast = contrast;
+        opts.text_background_luma = text_background_luma(theme);
     }
     // The atlas ceiling is NOT set here. `Context::update_fonts_mut` overwrites
     // `TextOptions::max_texture_side` with `RawInput::max_texture_side` on every
@@ -485,16 +480,34 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
 }
 
 /// Map the platform-neutral fontconfig choice onto the fork's filter tables.
-fn lcd_filter(choice: tm_platform::text_rendering::LcdFilterChoice) -> egui::epaint::LcdFilter {
+/// Map platform LCD filter preference and smoothing profile to epaint's 5-tap filter.
+///
+/// Shared with `text_compare` so the comparison harness mirrors app rendering.
+pub fn lcd_filter(
+    smoothing: TextSmoothing,
+    choice: tm_platform::text_rendering::LcdFilterChoice,
+) -> egui::epaint::LcdFilter {
     use tm_platform::text_rendering::LcdFilterChoice;
-    match choice {
-        LcdFilterChoice::Default => egui::epaint::LcdFilter::FREETYPE_DEFAULT,
-        LcdFilterChoice::Light => egui::epaint::LcdFilter::LIGHT,
+    match (smoothing, choice) {
+        // `Sharp` omits outer neighbor taps when using the platform default so thin
+        // 1px stems at 100% scaling do not gain gamma-boosted fringe halos.
+        (TextSmoothing::Sharp, LcdFilterChoice::Default) => egui::epaint::LcdFilter::LIGHT,
+        (_, LcdFilterChoice::Default) => egui::epaint::LcdFilter::FREETYPE_DEFAULT,
+        (_, LcdFilterChoice::Light) => egui::epaint::LcdFilter::LIGHT,
         // fontconfig's legacy filter and epaint's classic ClearType filter have the same
         // role; use the normalized five-tap approximation rather than inventing an
         // unverified FreeType coefficient table.
-        LcdFilterChoice::Legacy => egui::epaint::LcdFilter::CLASSIC,
-        LcdFilterChoice::None => egui::epaint::LcdFilter::NONE,
+        (_, LcdFilterChoice::Legacy) => egui::epaint::LcdFilter::CLASSIC,
+        (_, LcdFilterChoice::None) => egui::epaint::LcdFilter::NONE,
+    }
+}
+
+/// Expected sRGB background luminance used to calibrate GPU fixed-function LCD blending
+/// against CPU `TextGamma`.
+pub const fn text_background_luma(theme: egui::Theme) -> f32 {
+    match theme {
+        egui::Theme::Dark => 0.13,
+        egui::Theme::Light => 0.96,
     }
 }
 
@@ -503,14 +516,12 @@ fn lcd_filter(choice: tm_platform::text_rendering::LcdFilterChoice) -> egui::epa
 /// Shared with `text_compare` so the comparison harness renders what the app renders.
 /// Weight tuning for [`TextSmoothing::Sharp`] under sub-pixel rendering.
 ///
-/// Set by eye against native Windows text on a dark UI at 150% scaling, which is the
-/// regime where the difference is visible at all. `0.72`/`0.0` was measurably too thin.
-/// On light backgrounds gamma acts in the opposite direction on dark ink (`(1 - a')^(1/g)`),
-/// so lowering gamma would thicken dark-on-light text instead of thinning it; Light Mode
-/// raises gamma slightly and lowers contrast to match Dark Mode's ~14% ink reduction.
-const SHARP_DARK_GAMMA_SCALE: f32 = 0.88;
-const SHARP_LIGHT_GAMMA_SCALE: f32 = 1.06;
-const SHARP_CONTRAST: f32 = 0.25;
+/// Dropping `contrast` to `0.0` avoids lifting 1px stem edges at 100% scaling while
+/// lowering Dark gamma (`~1.40` on Windows `1.8`) and slightly raising Light gamma
+/// (`~1.98`) aligns both themes with native Windows 11 ClearType without stem erosion.
+const SHARP_DARK_GAMMA_SCALE: f32 = 0.78;
+const SHARP_LIGHT_GAMMA_SCALE: f32 = 1.10;
+const SHARP_CONTRAST: f32 = 0.0;
 
 pub fn cleartype_weight(
     smoothing: TextSmoothing,
@@ -686,19 +697,27 @@ mod tests {
     fn fontconfig_lcdfilter_choices_map_to_filter_tables() {
         use tm_platform::text_rendering::LcdFilterChoice;
         assert_eq!(
-            lcd_filter(LcdFilterChoice::Default),
-            egui::epaint::LcdFilter::FREETYPE_DEFAULT
-        );
-        assert_eq!(
-            lcd_filter(LcdFilterChoice::Light),
+            lcd_filter(TextSmoothing::Sharp, LcdFilterChoice::Default),
             egui::epaint::LcdFilter::LIGHT
         );
         assert_eq!(
-            lcd_filter(LcdFilterChoice::Legacy),
+            lcd_filter(TextSmoothing::Standard, LcdFilterChoice::Default),
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
+        );
+        assert_eq!(
+            lcd_filter(TextSmoothing::Smooth, LcdFilterChoice::Default),
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
+        );
+        assert_eq!(
+            lcd_filter(TextSmoothing::Standard, LcdFilterChoice::Light),
+            egui::epaint::LcdFilter::LIGHT
+        );
+        assert_eq!(
+            lcd_filter(TextSmoothing::Sharp, LcdFilterChoice::Legacy),
             egui::epaint::LcdFilter::CLASSIC
         );
         assert_eq!(
-            lcd_filter(LcdFilterChoice::None),
+            lcd_filter(TextSmoothing::Sharp, LcdFilterChoice::None),
             egui::epaint::LcdFilter::NONE
         );
     }
@@ -855,5 +874,7 @@ mod tests {
             cleartype_weight(TextSmoothing::Sharp, egui::Theme::Light, &linux).1,
             0.0
         );
+        assert_eq!(text_background_luma(egui::Theme::Dark), 0.13);
+        assert_eq!(text_background_luma(egui::Theme::Light), 0.96);
     }
 }

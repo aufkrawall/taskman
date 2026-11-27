@@ -227,11 +227,17 @@ impl crate::TestRenderer for WgpuTestRenderer {
             .renderer()
             .expect("a created RenderState has a renderer")
             .write();
-        let (subpixel, gamma, contrast) = ctx.fonts(|fonts| {
+        let (subpixel, gamma, contrast, bg_luma) = ctx.fonts(|fonts| {
             let options = fonts.options();
-            (options.subpixel, options.text_gamma, options.text_contrast)
+            (
+                options.subpixel,
+                options.text_gamma,
+                options.text_contrast,
+                options.text_background_luma,
+            )
         });
         renderer.set_subpixel_text_options(subpixel, gamma, contrast);
+        renderer.set_subpixel_background_luma(bg_luma);
 
         let mut encoder =
             self.render_state

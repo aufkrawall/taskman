@@ -1,6 +1,6 @@
 # Render Pipeline
 
-Last verified: 2026-11-25 (GPU gamma compensation & sRGB linear premultiplication, `GlyphScratch` pooling, `TextureSnapshots` font-atlas deduplication, Windows RDP/portrait/focus-return policy, Linux Fontconfig contrast/hintstyle/collection index, and Light Mode `Sharp` polarity)
+Last verified: 2026-11-27 (Background-calibrated GPU ClearType blend across Unorm/sRGB matching CPU TextGamma, `SmoothMode::Lcd` hinting, and `Sharp` `LcdFilter::LIGHT` + `100%`/`150%` weight calibration)
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
@@ -351,41 +351,45 @@ For the managed atlas, `egui_lcd.wgsl` emits source color at location 0 / source
 per-channel coverage at location 0 / source 1. The pipeline blends `ONE` against
 `ONE_MINUS_SRC1`, so RGB each use their own coverage. BGR is a blend-time channel swap;
 the atlas remains RGB-filtered. The 32-byte `Locals` uniform carries the active order,
-`TextOptions::text_contrast`, and `TextOptions::text_gamma`. Dithering runs only on covered
-pixels (`coverage > 0` / `alpha > 0`), never into transparent glyph padding.
+`TextOptions::text_contrast`, `TextOptions::text_gamma`, and `TextOptions::text_background_luma`.
+Dithering runs only on covered pixels (`coverage > 0` / `alpha > 0`), never into transparent glyph padding.
 
 **GPU gamma handling:** fixed-function dual-source blending cannot read the destination pixel,
-so it cannot evaluate the software path's exact `dst^gamma` term. On non-sRGB `Unorm` surfaces
-(`fs_lcd_gamma_framebuffer`), the shader applies foreground-luminance gamma compensation
-(`mix(1 - (1 - c)^(1/g), c^(1/g), lum)`) using `Locals.subpixel_gamma` so D3D12/Vulkan text
-weight tracks CPU `TextGamma` across both dark and light UIs. On sRGB surfaces
-(`fs_lcd_linear_framebuffer`), straight foreground sRGB is converted to linear before
-premultiplying by channel coverage to conserve energy. The software renderer keeps the full
-destination-aware gamma/contrast model.
+so the shader solves for the fixed-function blend weight that lands on the software renderer's
+`TextGamma` result `(s^g * a + d^g * (1 - a))^(1/g)`: when `Locals.subpixel_bg_luma >= 0.0`
+(`0.13` Dark, `0.96` Light, provided foreground contrast matches theme polarity), `d` comes from
+that calibrated surface luminance instead of `0`/`1` endpoints, and on sRGB framebuffers
+(`fs_lcd_linear_framebuffer`) the target is converted to linear sRGB before solving linear
+blend weights (`subpixel_bg_luma < 0` falls back to foreground-luminance compensation). This
+brings CPU (`egui_software`), D3D12, and Vulkan (`egui-wgpu`) within ~1 LSB mean difference on
+both primary (`#ffffff`/`#1a1a1a`) and dim (`#9d9d9d`/`#5f5f5f`) text on `#191919`, `#2b2b2b`,
+and `#f3f3f3` surfaces. In `epaint`, `Font::glyph_info` upgrades `SmoothMode::Normal` to
+`SmoothMode::Lcd` whenever `subpixel != Off`.
 
 ## Text weight, and what `TextSmoothing` now means
 
 `DirectWrite`'s gamma and contrast describe *DirectWrite's* curve. Fed unchanged into this
 one they lift a half-covered pixel from 128 to 178 on a dark UI, which reads as fat and
-glowing next to native Windows text -- Windows errs thin. So the smoothing profile became
-a weight control, which is the useful thing left for it to be now that the coverage ramp it
-used to select is not consulted on the sub-pixel path at all:
+glowing next to native Windows text -- Windows errs thin. Under sub-pixel rendering, `Sharp`
+pairs `LcdFilter::LIGHT` (`[0, 85, 86, 85, 0]`, avoiding `FREETYPE_DEFAULT`'s `8/255` outer
+neighbor bleed around 1 px stems at 100% scaling) when the platform filter is `Default`, while
+tuning blend weight for both 100% and 150% displays:
 
-| profile | grid-fit | binning | blend (Dark) | blend (Light) |
-| --- | --- | --- | --- | --- |
-| `Sharp` | yes | no | `gamma * 0.88`, `contrast.min(0.25)` | `gamma * 1.06`, `contrast.min(0.25)` |
-| `Standard` | no (follows Linux Fontconfig `hintstyle`) | no | the display's own parameters | the display's own parameters |
-| `Smooth` | no | yes | the display's own parameters | the display's own parameters |
+| profile | grid-fit | binning | default LCD filter | blend (Dark) | blend (Light) |
+| --- | --- | --- | --- | --- | --- |
+| `Sharp` | yes | no | `LIGHT` | `gamma * 0.78`, `contrast = 0.0` | `gamma * 1.10`, `contrast = 0.0` |
+| `Standard` | no (follows Linux Fontconfig `hintstyle`) | no | `FREETYPE_DEFAULT` | the display's own parameters | the display's own parameters |
+| `Smooth` | no | yes | `FREETYPE_DEFAULT` | the display's own parameters | the display's own parameters |
 
-`theme::cleartype_weight` is the single definition, shared with the comparison harness (which
-pins thinner `Sharp` ink in both Dark and Light modes). Both the software renderer and the
-WGPU LCD shader consume gamma and contrast from `TextOptions`.
+`theme::cleartype_weight` and `theme::lcd_filter` are the single definitions, shared with the
+comparison harness (which pins thinner `Sharp` ink in both Dark and Light modes at both `1.0`
+and `1.5` `ppp`). Both the software renderer and the WGPU LCD shader consume gamma, contrast,
+and `text_background_luma` from `TextOptions`.
 
-**Measure at 150% scaling, not 100%.** At 100% the three profiles are indistinguishable
-(edge sharpness 75.4 / 75.3 / 75.5) and the weight question is invisible. At 150%, where
-stems are ~2 px, `Sharp` is ~11% less ink *and* sharper. (0.72/0.0 was tried first and
-read as too thin -- these constants are set by eye against native Windows text.) An earlier comparison at 100% led
-to the wrong conclusion for exactly this reason.
+`100%` (`ppp = 1.0`, 13 px) is especially sensitive to outer neighbor taps (`8/255` boosted by
+non-linear gamma to `~45-70/255`) and non-zero `contrast`, which previously left `Sharp` ~11.6%
+fatter than native Windows 11 WPF ClearType at 100%; moving `Sharp` from `0.88/0.25` +
+`FREETYPE_DEFAULT` to `0.78/0.0` + `LIGHT` trims 100% ink by ~10.4% and 150% ink by ~8.0%.
 
 `crates/tm-app/src/text_compare.rs` renders every profile, filter and blend to magnified
 PNGs: `TASKMAN_TEXT_COMPARE=target/t cargo test -p tm-app text_compare`. The LCD filter is

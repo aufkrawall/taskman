@@ -47,6 +47,71 @@ fn gamma_adjust_lcd_coverage(coverage: vec3<f32>, straight_rgb: vec3<f32>, gamma
     return mix(c_light_bg, c_dark_bg, lum);
 }
 
+fn calibrated_lcd_blend_weights(
+    alpha: vec3<f32>,
+    straight_rgb: vec3<f32>,
+    gamma: f32,
+    bg_luma: f32,
+    linear_framebuffer: bool,
+) -> vec3<f32> {
+    let s = clamp(straight_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let a = clamp(alpha, vec3<f32>(0.0), vec3<f32>(1.0));
+    let g = clamp(gamma, 1.0, 3.0);
+    let lum = clamp(dot(s, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+
+    var target_gamma: vec3<f32>;
+    var d: vec3<f32>;
+    if bg_luma >= 0.0 {
+        let bg = clamp(bg_luma, 0.0, 1.0);
+        // Only calibrate toward the theme background when foreground contrast follows the
+        // theme polarity; e.g. dark text on a bright accent button in dark mode falls back
+        // to the bright endpoint instead of dividing near `bg`.
+        let pol = select(vec3<f32>(1.0), vec3<f32>(0.0), lum >= bg);
+        let same_side = (bg < 0.5 && lum > bg) || (bg >= 0.5 && lum < bg);
+        let side_weight = select(0.0, smoothstep(0.04, 0.16, abs(lum - bg)), same_side);
+        let channel_trust = smoothstep(
+            vec3<f32>(0.02),
+            vec3<f32>(0.12),
+            abs(s - vec3<f32>(bg)),
+        );
+        d = mix(pol, vec3<f32>(bg), vec3<f32>(side_weight) * channel_trust);
+
+        if g <= 1.0001 {
+            target_gamma = mix(d, s, a);
+        } else {
+            let s_g = pow(s, vec3<f32>(g));
+            let d_g = pow(d, vec3<f32>(g));
+            target_gamma = pow(max(mix(d_g, s_g, a), vec3<f32>(0.0)), vec3<f32>(1.0 / g));
+        }
+    } else {
+        let weighted = gamma_adjust_lcd_coverage(a, s, g);
+        if !linear_framebuffer {
+            return weighted;
+        }
+        d = select(vec3<f32>(1.0), vec3<f32>(0.0), lum >= 0.5);
+        target_gamma = mix(d, s, weighted);
+    }
+
+    if linear_framebuffer {
+        let s_lin = linear_from_gamma_rgb(s);
+        let d_lin = linear_from_gamma_rgb(d);
+        let t_lin = linear_from_gamma_rgb(target_gamma);
+        let denom = s_lin - d_lin;
+        return select(
+            a,
+            clamp((t_lin - d_lin) / denom, vec3<f32>(0.0), vec3<f32>(1.0)),
+            abs(denom) > vec3<f32>(1e-4),
+        );
+    }
+
+    let denom = s - d;
+    return select(
+        a,
+        clamp((target_gamma - d) / denom, vec3<f32>(0.0), vec3<f32>(1.0)),
+        abs(denom) > vec3<f32>(1e-4),
+    );
+}
+
 // Only a one-texel-per-pixel, center-aligned mapping preserves the panel's horizontal
 // stripe order. A rotated, scaled or fractionally translated glyph would smear the three
 // coverages together, so it takes the grayscale fallback instead.
@@ -95,22 +160,21 @@ fn lcd_output(in: VertexOutput, linear_framebuffer: bool) -> LcdOutput {
         }
 
         let contrasted = enhance_lcd_contrast(rgb);
+        let channel_coverage = calibrated_lcd_blend_weights(
+            contrasted * in.color.a,
+            straight_rgb,
+            r_locals.subpixel_gamma,
+            r_locals.subpixel_bg_luma,
+            linear_framebuffer,
+        );
+        let mean_alpha = (channel_coverage.r + channel_coverage.g + channel_coverage.b) / 3.0;
         if linear_framebuffer {
             // Hardware blends in linear space: convert the straight text color first,
-            // then premultiply by per-channel coverage so weights stay energy-conserving.
-            let channel_coverage = contrasted * in.color.a;
+            // then premultiply by calibrated linear weights so results match TextGamma.
             let linear_rgb = linear_from_gamma_rgb(straight_rgb);
-            let mean_alpha = in.color.a * (contrasted.r + contrasted.g + contrasted.b) / 3.0;
             color = vec4<f32>(linear_rgb * channel_coverage, mean_alpha);
             coverage = vec4<f32>(channel_coverage, mean_alpha);
         } else {
-            let weighted = gamma_adjust_lcd_coverage(
-                contrasted,
-                straight_rgb,
-                r_locals.subpixel_gamma,
-            );
-            let channel_coverage = weighted * in.color.a;
-            let mean_alpha = in.color.a * (weighted.r + weighted.g + weighted.b) / 3.0;
             var gamma_rgb = straight_rgb * channel_coverage;
             if r_locals.dithering == 1 && max(channel_coverage.r, max(channel_coverage.g, channel_coverage.b)) > 0.0 {
                 gamma_rgb = dither_interleaved(gamma_rgb, 256.0, in.position);

@@ -751,7 +751,18 @@ impl FontFace {
 
         let cache_key = GlyphCacheKey::new(glyph_id, metrics, bin);
 
-        let hinting_target = self.tweak.hinting_target.into();
+        let mut hinting_target: skrifa::outline::Target = self.tweak.hinting_target.into();
+        if !atlas.options().subpixel.is_off() {
+            // Hint TrueType/CFF glyphs specifically for LCD subpixel rasterization when
+            // subpixel text is active so GETINFO reports LCD ClearType rather than grayscale.
+            if let skrifa::outline::Target::Smooth {
+                mode: mode @ skrifa::outline::SmoothMode::Normal,
+                ..
+            } = &mut hinting_target
+            {
+                *mode = skrifa::outline::SmoothMode::Lcd;
+            }
+        }
         let alloc = *self.glyph_alloc_cache.entry(cache_key).or_insert_with(|| {
             self.font
                 .allocate_glyph_uncached(

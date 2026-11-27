@@ -1378,18 +1378,20 @@ impl Painter {
             pixels_per_point,
         };
 
-        let subpixel_text_options = self.context.fonts(|fonts| {
+        let (subpixel, gamma, contrast, bg_luma) = self.context.fonts(|fonts| {
             let options = fonts.options();
-            (options.subpixel, options.text_gamma, options.text_contrast)
+            (
+                options.subpixel,
+                options.text_gamma,
+                options.text_contrast,
+                options.text_background_luma,
+            )
         });
 
         let user_cmd_bufs = {
             let mut renderer = renderer.write();
-            renderer.set_subpixel_text_options(
-                subpixel_text_options.0,
-                subpixel_text_options.1,
-                subpixel_text_options.2,
-            );
+            renderer.set_subpixel_text_options(subpixel, gamma, contrast);
+            renderer.set_subpixel_background_luma(bg_luma);
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {

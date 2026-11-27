@@ -98,6 +98,10 @@ pub struct TextOptions {
     ///
     /// Windows' default is 0.5. Zero renders thinner.
     pub text_contrast: f32,
+
+    /// TASKMAN-FORK: expected sRGB background luminance (`0.0..=1.0`) for GPU fixed-function
+    /// LCD blending calibration, or `-1.0` to estimate polarity from foreground color alone.
+    pub text_background_luma: f32,
 }
 
 impl Default for TextOptions {
@@ -112,6 +116,7 @@ impl Default for TextOptions {
             cleartype_level: 1.0,
             text_gamma: 1.8,
             text_contrast: 0.5,
+            text_background_luma: -1.0,
         }
     }
 }

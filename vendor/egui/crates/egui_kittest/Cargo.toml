@@ -61,6 +61,7 @@ tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 egui = { workspace = true, features = ["default_fonts"] }
+egui_software = { workspace = true }
 image = { workspace = true, features = ["png"] }
 egui_extras = { workspace = true, features = ["image", "http"] }
 

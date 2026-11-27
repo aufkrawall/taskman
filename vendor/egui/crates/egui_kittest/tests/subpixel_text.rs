@@ -307,3 +307,202 @@ fn hardware_sampling_dithering_and_srgb_entry_points_still_render_lcd() {
     assert!(ink(&srgb) > 0, "sRGB-framebuffer LCD path drew no ink");
     assert!(chromatic_pixels(&srgb) > 0);
 }
+
+struct SoftwareTestRenderer {
+    painter: egui_software::Painter,
+}
+
+impl SoftwareTestRenderer {
+    fn new() -> Self {
+        Self {
+            painter: egui_software::Painter::new(),
+        }
+    }
+}
+
+impl egui_kittest::TestRenderer for SoftwareTestRenderer {
+    fn handle_delta(&mut self, delta: &mut egui::TexturesDelta) {
+        #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+        for (id, images) in delta.set.drain() {
+            for image in images {
+                self.painter.set_texture(id, &image);
+            }
+        }
+        #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+        for id in delta.free.drain() {
+            self.painter.free_texture(id);
+        }
+    }
+
+    fn render(
+        &mut self,
+        ctx: &egui::Context,
+        output: &egui::FullOutput,
+    ) -> Result<image::RgbaImage, String> {
+        let opts = ctx.fonts(|f| f.options().clone());
+        self.painter
+            .set_subpixel(opts.subpixel, opts.text_gamma, opts.text_contrast);
+        let ppp = ctx.pixels_per_point();
+        let size = ctx.content_rect().size() * ppp;
+        let width = size.x.round() as u32;
+        let height = size.y.round() as u32;
+        let mut buf = vec![0_u32; (width * height) as usize];
+        let mut target = egui_software::Target::new(&mut buf, width, height)
+            .ok_or_else(|| "invalid software target dimensions".to_owned())?;
+        let font_tex_size = ctx.fonts(|f| f.font_image_size());
+        let shape_ctx = egui_software::ShapeContext {
+            pixels_per_point: ppp,
+            options: ctx.tessellation_options(|o| o.clone()),
+            font_tex_size,
+            prepared_discs: Vec::new(),
+        };
+        self.painter
+            .paint_shapes(&mut target, &shape_ctx, output.shapes.clone());
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for px in buf {
+            rgba.push(((px >> 16) & 0xff) as u8);
+            rgba.push(((px >> 8) & 0xff) as u8);
+            rgba.push((px & 0xff) as u8);
+            rgba.push(255);
+        }
+        image::RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| "failed to build RgbaImage".to_owned())
+    }
+}
+
+fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
+    renderer: R,
+    theme: Theme,
+    bg: Color32,
+    fg_primary: Color32,
+    fg_dim: Color32,
+    gamma: f32,
+    contrast: f32,
+    bg_luma: f32,
+) -> image::RgbaImage {
+    let mut harness = Harness::builder()
+        .with_size(Vec2::new(260.0, 72.0))
+        .with_pixels_per_point(1.0)
+        .renderer(renderer)
+        .build_ui(move |ui| {
+            ui.ctx().set_theme(theme);
+            ui.ctx().style_mut_of(theme, |style| {
+                let opts = &mut style.visuals.text_options;
+                opts.subpixel = SubpixelMode::Rgb;
+                opts.text_gamma = gamma;
+                opts.text_contrast = contrast;
+                opts.text_background_luma = bg_luma;
+            });
+            ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
+            let primary = ui.painter().layout_no_wrap(
+                "Hamburgefonstiv 18.4%".to_owned(),
+                FontId::proportional(13.0),
+                fg_primary,
+            );
+            ui.painter()
+                .add(TextShape::new(Pos2::new(10.0, 12.0), primary, fg_primary));
+            let dim = ui.painter().layout_no_wrap(
+                "Secondary 2410 MB".to_owned(),
+                FontId::proportional(13.0),
+                fg_dim,
+            );
+            ui.painter()
+                .add(TextShape::new(Pos2::new(10.0, 38.0), dim, fg_dim));
+        });
+    harness.run();
+    harness.render().expect("parity render")
+}
+
+#[test]
+#[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
+fn cpu_and_gpu_match_on_dark_and_light_surfaces() {
+    require_hardware("cpu_and_gpu_match_on_dark_and_light_surfaces");
+
+    let cases = [
+        (
+            "dark_surface_#191919",
+            Theme::Dark,
+            Color32::from_rgb(0x19, 0x19, 0x19),
+            Color32::WHITE,
+            Color32::from_rgb(0x9d, 0x9d, 0x9d),
+            1.35,
+            0.0,
+            0.13,
+        ),
+        (
+            "dark_elevated_#2b2b2b",
+            Theme::Dark,
+            Color32::from_rgb(0x2b, 0x2b, 0x2b),
+            Color32::WHITE,
+            Color32::from_rgb(0x9d, 0x9d, 0x9d),
+            1.35,
+            0.0,
+            0.13,
+        ),
+        (
+            "light_surface_#f3f3f3",
+            Theme::Light,
+            Color32::from_rgb(0xf3, 0xf3, 0xf3),
+            Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            Color32::from_rgb(0x5f, 0x5f, 0x5f),
+            1.9,
+            0.15,
+            0.96,
+        ),
+    ];
+
+    for (label, theme, bg, fg_primary, fg_dim, gamma, contrast, bg_luma) in cases {
+        let cpu = render_parity_scene(
+            SoftwareTestRenderer::new(),
+            theme,
+            bg,
+            fg_primary,
+            fg_dim,
+            gamma,
+            contrast,
+            bg_luma,
+        );
+        for srgb_target in [false, true] {
+            let gpu_renderer = if srgb_target {
+                WgpuTestRenderer::from_setup_and_format(
+                    setup_for_dual_source(),
+                    RendererOptions::PREDICTABLE,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                )
+            } else {
+                WgpuTestRenderer::from_setup_and_options(
+                    setup_for_dual_source(),
+                    RendererOptions::PREDICTABLE,
+                )
+            };
+            let gpu = render_parity_scene(
+                gpu_renderer,
+                theme,
+                bg,
+                fg_primary,
+                fg_dim,
+                gamma,
+                contrast,
+                bg_luma,
+            );
+            let mut max_diff = 0_u8;
+            let mut total_diff = 0_u64;
+            let mut non_bg_channels = 0_u64;
+            for (c, g) in cpu.pixels().zip(gpu.pixels()) {
+                for ch in 0..3 {
+                    let diff = c.0[ch].abs_diff(g.0[ch]);
+                    max_diff = max_diff.max(diff);
+                    if c.0[ch] != bg[ch] || g.0[ch] != bg[ch] {
+                        total_diff += u64::from(diff);
+                        non_bg_channels += 1;
+                    }
+                }
+            }
+            let mean_diff = total_diff as f64 / non_bg_channels.max(1) as f64;
+            assert!(
+                max_diff <= 6 && mean_diff <= 1.25,
+                "{label} (srgb={srgb_target}) diverged from CPU: max_diff={max_diff}, mean_diff={mean_diff:.3}"
+            );
+        }
+    }
+}

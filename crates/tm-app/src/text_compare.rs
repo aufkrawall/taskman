@@ -137,7 +137,7 @@ fn definitions(bytes: &[u8], smoothing: TextSmoothing) -> FontDefinitions {
 struct Cfg {
     smoothing: TextSmoothing,
     subpixel: SubpixelMode,
-    filter: LcdFilter,
+    filter: Option<LcdFilter>,
     theme: egui::Theme,
     /// Physical pixels per point. 1.5 is Windows' 150% scaling.
     ppp: f32,
@@ -150,7 +150,7 @@ impl Cfg {
         Self {
             smoothing,
             subpixel,
-            filter: LcdFilter::default(),
+            filter: None,
             theme: egui::Theme::Dark,
             ppp: 1.0,
             blend: None,
@@ -165,7 +165,7 @@ impl Cfg {
         self
     }
     fn filter(mut self, f: LcdFilter) -> Self {
-        self.filter = f;
+        self.filter = Some(f);
         self
     }
     fn blend(mut self, gamma: f32, contrast: f32) -> Self {
@@ -203,7 +203,9 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
         ctx.style_mut_of(t, |style| {
             let o = &mut style.visuals.text_options;
             o.subpixel = subpixel;
-            o.lcd_filter = filter;
+            o.lcd_filter = filter.unwrap_or_else(|| {
+                crate::theme::lcd_filter(smoothing, crate::theme::subpixel_params().lcd_filter)
+            });
             // Only `Smooth` asks for quarter-pixel horizontal positioning.
             o.subpixel_binning = smoothing == TextSmoothing::Smooth;
             o.font_hinting = true;
@@ -219,6 +221,7 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
                 });
                 o.text_gamma = gamma;
                 o.text_contrast = contrast;
+                o.text_background_luma = crate::theme::text_background_luma(t);
             }
         });
     }
@@ -510,27 +513,29 @@ mod tests {
     /// Windows text, which errs thin. If a future change makes the profiles equivalent
     /// again, the setting silently stops doing anything and this catches it.
     ///
-    /// Measured at 150% scaling, where taskman is actually used on a 4K display.
+    /// Measured at both 100% (1080p) and 150% (4K) scaling.
     #[test]
     fn sharp_renders_thinner_than_standard_under_subpixel() {
         let Some(bytes) = font_or_skip() else { return };
-        let at = |sm| {
-            ink(&render_cfg(
-                &bytes,
-                Cfg::new(sm, SubpixelMode::Rgb).ppp(1.5),
-            ))
-        };
-        let sharp = at(TextSmoothing::Sharp);
-        let standard = at(TextSmoothing::Standard);
-        assert!(
-            sharp < standard * 0.95,
-            "Sharp ({sharp:.0}) is not meaningfully thinner than Standard ({standard:.0});              the weight control is not reaching the renderer"
-        );
-        // ...but not so thin that stems start dropping out.
-        assert!(
-            sharp > standard * 0.6,
-            "Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0}) -- text this              faint reads as broken rather than crisp"
-        );
+        for ppp in [1.0_f32, 1.5] {
+            let at = |sm| {
+                ink(&render_cfg(
+                    &bytes,
+                    Cfg::new(sm, SubpixelMode::Rgb).ppp(ppp),
+                ))
+            };
+            let sharp = at(TextSmoothing::Sharp);
+            let standard = at(TextSmoothing::Standard);
+            assert!(
+                sharp < standard * 0.92,
+                "at ppp={ppp}, Sharp ({sharp:.0}) is not meaningfully thinner than Standard ({standard:.0}); the weight/filter control is not reaching the renderer"
+            );
+            // ...but not so thin that stems start dropping out.
+            assert!(
+                sharp > standard * 0.6,
+                "at ppp={ppp}, Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0}) -- text this faint reads as broken rather than crisp"
+            );
+        }
     }
 
     /// Total dark ink below the light background: how "fat" dark-on-light text is.
@@ -550,23 +555,25 @@ mod tests {
     #[test]
     fn sharp_renders_thinner_than_standard_under_subpixel_in_light_mode() {
         let Some(bytes) = font_or_skip() else { return };
-        let at = |sm| {
-            dark_ink(&render_cfg(
-                &bytes,
-                Cfg::new(sm, SubpixelMode::Rgb)
-                    .theme(egui::Theme::Light)
-                    .ppp(1.5),
-            ))
-        };
-        let sharp = at(TextSmoothing::Sharp);
-        let standard = at(TextSmoothing::Standard);
-        assert!(
-            sharp < standard * 0.96,
-            "Light Mode Sharp ({sharp:.0}) is not thinner than Standard ({standard:.0})"
-        );
-        assert!(
-            sharp > standard * 0.6,
-            "Light Mode Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0})"
-        );
+        for ppp in [1.0_f32, 1.5] {
+            let at = |sm| {
+                dark_ink(&render_cfg(
+                    &bytes,
+                    Cfg::new(sm, SubpixelMode::Rgb)
+                        .theme(egui::Theme::Light)
+                        .ppp(ppp),
+                ))
+            };
+            let sharp = at(TextSmoothing::Sharp);
+            let standard = at(TextSmoothing::Standard);
+            assert!(
+                sharp < standard * 0.94,
+                "Light Mode at ppp={ppp}, Sharp ({sharp:.0}) is not thinner than Standard ({standard:.0})"
+            );
+            assert!(
+                sharp > standard * 0.6,
+                "Light Mode at ppp={ppp}, Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0})"
+            );
+        }
     }
 }

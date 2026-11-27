@@ -159,9 +159,9 @@ struct UniformBuffer {
     /// Blend-space gamma from [`epaint::TextOptions::text_gamma`].
     subpixel_gamma: f32,
 
-    /// WGSL uniform structs have a 16-byte size/alignment contract. Keep the Rust layout
-    /// explicit so this stays 32 bytes.
-    _padding: u32,
+    /// Expected sRGB background luminance (`0.0..=1.0`) for calibrated LCD blending,
+    /// or `< 0.0` to use foreground-only polarity estimation. Kept 32-byte aligned with WGSL.
+    subpixel_bg_luma: f32,
 }
 
 fn subpixel_order_code(mode: epaint::text::SubpixelMode) -> u32 {
@@ -200,6 +200,14 @@ fn normalized_gamma(gamma: f32) -> f32 {
         gamma.clamp(1.0, 3.0)
     } else {
         1.8
+    }
+}
+
+fn normalized_bg_luma(bg_luma: f32) -> f32 {
+    if bg_luma.is_finite() && bg_luma >= 0.0 {
+        bg_luma.clamp(0.0, 1.0)
+    } else {
+        -1.0
     }
 }
 
@@ -585,6 +593,7 @@ pub struct Renderer {
     subpixel_mode: epaint::text::SubpixelMode,
     subpixel_gamma: f32,
     subpixel_contrast: f32,
+    subpixel_bg_luma: f32,
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
@@ -658,6 +667,12 @@ impl Renderer {
         self.subpixel_contrast = normalized_contrast(contrast);
     }
 
+    /// Publish the expected sRGB background luminance (`0.0..=1.0`) for calibrated LCD
+    /// blending, or a negative value to use foreground-only polarity estimation.
+    pub fn set_subpixel_background_luma(&mut self, bg_luma: f32) {
+        self.subpixel_bg_luma = normalized_bg_luma(bg_luma);
+    }
+
     /// Whether this renderer's pipelines were created with `options`.
     ///
     /// [`crate::RenderState`]'s renderer slot is first-call-wins, so a second caller cannot
@@ -706,7 +721,7 @@ impl Renderer {
                 subpixel_order: subpixel_order_code(epaint::text::SubpixelMode::Off),
                 subpixel_contrast: 0.5,
                 subpixel_gamma: 1.8,
-                _padding: 0,
+                subpixel_bg_luma: -1.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -946,6 +961,7 @@ impl Renderer {
             subpixel_mode: epaint::text::SubpixelMode::Off,
             subpixel_gamma: 1.8,
             subpixel_contrast: 0.5,
+            subpixel_bg_luma: -1.0,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
@@ -1506,7 +1522,7 @@ impl Renderer {
             subpixel_order: subpixel_order_code(self.subpixel_mode),
             subpixel_contrast: self.subpixel_contrast,
             subpixel_gamma: self.subpixel_gamma,
-            _padding: 0,
+            subpixel_bg_luma: self.subpixel_bg_luma,
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1796,9 +1812,10 @@ mod tests {
     use super::{
         BUFFER_SHRINK_AFTER_UPDATES, BUFFER_SHRINK_MIN_CAPACITY, UniformBuffer,
         capacity_after_sustained_underuse, enhanced_lcd_coverage, font_subpixel_after,
-        gamma_adjusted_lcd_coverage, lcd_shader_source, lcd_shader_validation, normalized_contrast,
-        normalized_gamma, subpixel_order_code, subpixel_text_supported, supports_subpixel_features,
-        texel_mapping_is_one_to_one, use_lcd_pipeline, validate_lcd_shader_source,
+        gamma_adjusted_lcd_coverage, lcd_shader_source, lcd_shader_validation, normalized_bg_luma,
+        normalized_contrast, normalized_gamma, subpixel_order_code, subpixel_text_supported,
+        supports_subpixel_features, texel_mapping_is_one_to_one, use_lcd_pipeline,
+        validate_lcd_shader_source,
     };
     use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
 
@@ -2004,6 +2021,10 @@ mod tests {
         assert_eq!(normalized_gamma(0.5), 1.0);
         assert_eq!(normalized_gamma(9.0), 3.0);
         assert_eq!(normalized_gamma(f32::NAN), 1.8);
+        assert_eq!(normalized_bg_luma(0.13), 0.13);
+        assert_eq!(normalized_bg_luma(-0.5), -1.0);
+        assert_eq!(normalized_bg_luma(1.5), 1.0);
+        assert_eq!(normalized_bg_luma(f32::NAN), -1.0);
     }
 
     #[test]
@@ -2048,8 +2069,90 @@ mod tests {
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_order), 16);
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_contrast), 20);
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_gamma), 24);
+        assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_bg_luma), 28);
         assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
         assert!(std::mem::size_of::<UniformBuffer>().is_multiple_of(16));
+    }
+
+    #[test]
+    fn calibrated_gpu_blend_matches_cpu_text_gamma_on_real_theme_surfaces() {
+        fn srgb_to_linear(c: f32) -> f32 {
+            if c < 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn linear_to_srgb(c: f32) -> f32 {
+            if c < 0.0031308 {
+                c * 12.92
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            }
+        }
+        fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+            let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+        fn gpu_calibrated_result(
+            fg: f32,
+            bg_actual: f32,
+            a: f32,
+            gamma: f32,
+            bg_luma: f32,
+            srgb_target: bool,
+        ) -> f32 {
+            let pol = if fg >= bg_luma { 0.0 } else { 1.0 };
+            let same_side = (bg_luma < 0.5 && fg > bg_luma) || (bg_luma >= 0.5 && fg < bg_luma);
+            let side_w = if same_side {
+                smoothstep(0.04, 0.16, (fg - bg_luma).abs())
+            } else {
+                0.0
+            };
+            let ch_trust = smoothstep(0.02, 0.12, (fg - bg_luma).abs());
+            let d = pol + (bg_luma - pol) * (side_w * ch_trust);
+            let target_gamma = (fg.powf(gamma) * a + d.powf(gamma) * (1.0 - a)).powf(1.0 / gamma);
+
+            if srgb_target {
+                let s_l = srgb_to_linear(fg);
+                let d_l = srgb_to_linear(d);
+                let t_l = srgb_to_linear(target_gamma);
+                let w = ((t_l - d_l) / (s_l - d_l)).clamp(0.0, 1.0);
+                linear_to_srgb(s_l * w + srgb_to_linear(bg_actual) * (1.0 - w))
+            } else {
+                let w = ((target_gamma - d) / (fg - d)).clamp(0.0, 1.0);
+                fg * w + bg_actual * (1.0 - w)
+            }
+        }
+
+        let gamma = 1.3_f32;
+        for srgb_target in [false, true] {
+            for cov in [0.15_f32, 0.5, 0.85] {
+                // Dark mode surfaces (#191919 = 0.098, #2b2b2b = 0.169) with #ffffff and #9d9d9d
+                for &bg in &[25.0 / 255.0_f32, 43.0 / 255.0] {
+                    for &fg in &[1.0_f32, 157.0 / 255.0] {
+                        let cpu =
+                            (fg.powf(gamma) * cov + bg.powf(gamma) * (1.0 - cov)).powf(1.0 / gamma);
+                        let gpu = gpu_calibrated_result(fg, bg, cov, gamma, 0.13, srgb_target);
+                        assert!(
+                            (cpu - gpu).abs() * 255.0 <= 3.0,
+                            "dark srgb={srgb_target} fg={fg} bg={bg} cov={cov}: cpu={cpu} gpu={gpu}"
+                        );
+                    }
+                }
+                // Light mode (#f3f3f3 = 0.953) with #1a1a1a and #5f5f5f
+                let bg = 243.0 / 255.0_f32;
+                for &fg in &[26.0 / 255.0_f32, 95.0 / 255.0] {
+                    let cpu =
+                        (fg.powf(gamma) * cov + bg.powf(gamma) * (1.0 - cov)).powf(1.0 / gamma);
+                    let gpu = gpu_calibrated_result(fg, bg, cov, gamma, 0.96, srgb_target);
+                    assert!(
+                        (cpu - gpu).abs() * 255.0 <= 3.0,
+                        "light srgb={srgb_target} fg={fg} cov={cov}: cpu={cpu} gpu={gpu}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
