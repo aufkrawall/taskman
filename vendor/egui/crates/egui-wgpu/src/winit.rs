@@ -1378,20 +1378,13 @@ impl Painter {
             pixels_per_point,
         };
 
-        let (subpixel, gamma, contrast, bg_luma) = self.context.fonts(|fonts| {
-            let options = fonts.options();
-            (
-                options.subpixel,
-                options.text_gamma,
-                options.text_contrast,
-                options.text_background_luma,
-            )
-        });
+        // Every text-blend input comes from the atlas's own options, so the way glyphs were
+        // rasterized and the way they are blended cannot disagree.
+        let text_options = self.context.fonts(|fonts| *fonts.options());
 
         let user_cmd_bufs = {
             let mut renderer = renderer.write();
-            renderer.set_subpixel_text_options(subpixel, gamma, contrast);
-            renderer.set_subpixel_background_luma(bg_luma);
+            renderer.set_text_options(&text_options);
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {

@@ -48,6 +48,7 @@
 
 mod damage;
 mod gamma;
+mod gray;
 mod raster;
 mod span;
 mod target;
@@ -56,6 +57,7 @@ mod texture;
 
 pub use damage::{DamageStats, MAX_BUFFER_AGE, TILE_SIZE};
 pub use gamma::TextGamma;
+pub use gray::GrayTextCurves;
 pub use target::{PixelRect, Target, clip_rect_to_pixels, pack_rgb};
 pub use text::TextBlend;
 pub use texture::{Texture, TextureStore};
@@ -112,6 +114,9 @@ pub struct Painter {
     /// Boxed: the tables are ~4.9 KB, which is far too much to carry inline in a type
     /// that gets moved around and constructed inside a render loop.
     gamma: Box<gamma::TextGamma>,
+    /// TASKMAN-FORK: render-time grayscale glyph weight (`FontColorTransferFunction::
+    /// PolarityGamma`); `None` when the atlas already holds final alpha.
+    gray_text: Option<Box<gray::GrayTextCurves>>,
     /// Primitives that named a texture we do not have. Counted rather than logged per
     /// occurrence, because a missing texture usually means *every* glyph is missing and
     /// per-primitive logging would bury the actual cause.
@@ -150,6 +155,39 @@ impl Painter {
 
     pub fn subpixel(&self) -> epaint::text::SubpixelMode {
         self.subpixel
+    }
+
+    /// Configure everything text blending needs from the font atlas's own options.
+    ///
+    /// Prefer this over [`Self::set_subpixel`]: it also picks up the render-time grayscale
+    /// curve of [`epaint::FontColorTransferFunction::PolarityGamma`], whose atlas holds raw
+    /// coverage that only a renderer can turn into polarity-correct alpha.
+    pub fn set_text_options(&mut self, options: &epaint::text::TextOptions) {
+        self.set_subpixel(options.subpixel, options.text_gamma, options.text_contrast);
+        self.set_gray_text(
+            options.color_transfer_function.render_time_exponents(),
+            epaint::polarity_split(
+                options.text_background_luma,
+                options.text_inverse_background_luma,
+            ),
+        );
+    }
+
+    /// Set (or clear) the render-time grayscale curve: `[light_text, dark_text]` exponents
+    /// and the [`epaint::polarity_split`] luma that decides a text colour's polarity.
+    pub fn set_gray_text(&mut self, exponents: Option<[f32; 2]>, split: f32) {
+        match exponents {
+            None => self.gray_text = None,
+            Some(exponents) => {
+                if !self
+                    .gray_text
+                    .as_ref()
+                    .is_some_and(|curves| curves.matches(exponents, split))
+                {
+                    self.gray_text = Some(Box::new(gray::GrayTextCurves::new(exponents, split)));
+                }
+            }
+        }
     }
 
     pub fn text_mode(&self) -> TextMode {
@@ -302,6 +340,9 @@ impl Painter {
             self.subpixel,
             self.gamma.gamma(),
             self.gamma.contrast(),
+            self.gray_text
+                .as_ref()
+                .map(|curves| (curves.exponents(), curves.split())),
         );
         let mut shape_bounds = std::mem::take(&mut self.damage_shape_bounds);
         let stats = self.damage.plan(
@@ -572,6 +613,7 @@ impl Painter {
                         let blend = text::TextBlend {
                             subpixel: self.subpixel,
                             gamma: &self.gamma,
+                            gray: self.gray_text.as_deref(),
                         };
                         if text::blit_quad(target, clip, &quad, atlas, blend) {
                             // Only mark it consumed once the blit actually happened.
@@ -590,10 +632,18 @@ impl Painter {
                     resolve(idx[1], true),
                     resolve(idx[2], true),
                 ];
+                let gray = self.gray_text.as_deref();
                 if !self.subpixel.is_off() && idx.iter().all(|i| glyphs.contains(i)) {
-                    raster::triangle_gray_lcd(target, clip, vertices, Some(atlas), &self.gamma);
+                    raster::triangle_gray_lcd(
+                        target,
+                        clip,
+                        vertices,
+                        Some(atlas),
+                        &self.gamma,
+                        gray,
+                    );
                 } else {
-                    raster::triangle(target, clip, vertices, Some(atlas));
+                    raster::triangle_font(target, clip, vertices, Some(atlas), gray);
                 }
             }
         }
@@ -675,9 +725,16 @@ impl Painter {
                     && vb.uv == epaint::WHITE_UV
                     && vc.uv == epaint::WHITE_UV);
             let sampler = if white { None } else { sampler };
-            if !white && !self.subpixel.is_off() && mesh.texture_id == epaint::TextureId::default()
-            {
-                raster::triangle_gray_lcd(target, clip, vertices, sampler, &self.gamma);
+            let font_atlas = mesh.texture_id == epaint::TextureId::default();
+            let gray = if font_atlas {
+                self.gray_text.as_deref()
+            } else {
+                None
+            };
+            if !white && !self.subpixel.is_off() && font_atlas {
+                raster::triangle_gray_lcd(target, clip, vertices, sampler, &self.gamma, gray);
+            } else if !white && font_atlas {
+                raster::triangle_font(target, clip, vertices, sampler, gray);
             } else {
                 raster::triangle(target, clip, vertices, sampler);
             }

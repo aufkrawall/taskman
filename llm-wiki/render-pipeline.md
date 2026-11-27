@@ -1,6 +1,6 @@
 # Render Pipeline
 
-Last verified: 2026-11-27 (Background-calibrated GPU ClearType blend across Unorm/sRGB matching CPU TextGamma, `SmoothMode::Lcd` hinting, and `Sharp` `LcdFilter::LIGHT` + `100%`/`150%` weight calibration)
+Last verified: 2026-11-27 (render-time polarity grayscale curve in all renderers, inverse-surface GPU LCD calibration, weight measured against native DirectWrite, hardware CPU/GPU parity numbers)
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
@@ -309,6 +309,12 @@ Two details that make it correct rather than approximately correct:
 - **Hinting is not re-run at 3x.** The outline is already grid-fit against the physical
   pixel grid and only the sampling is finer. This is what FreeType and DirectWrite both do;
   hinting at 3x would snap stems to sub-pixel boundaries.
+- **LCD hinting mode only where it means "LCD".** Under sub-pixel text, fonts hinted by their
+  own TrueType/CFF instructions (Segoe UI Variable) get skrifa's `SmoothMode::Lcd`, which
+  only flips GETINFO from grayscale to LCD ClearType. Autohinted fonts (many Linux faces)
+  keep the requested mode: for the autohinter LCD mode, like FreeType's `FT_LOAD_TARGET_LCD`,
+  turns horizontal hinting and stem adjustment off, which would silently drop the horizontal
+  grid-fitting `Sharp` asks for (`epaint` `lcd_aware_hinting_target`).
 
 **BGR panels swap R and B at blend time** rather than rebuilding the atlas. Valid because
 the filter is symmetric, so filtering in RGB and swapping is algebraically identical to
@@ -350,61 +356,91 @@ replace the required per-driver pipeline run.
 For the managed atlas, `egui_lcd.wgsl` emits source color at location 0 / source 0 and
 per-channel coverage at location 0 / source 1. The pipeline blends `ONE` against
 `ONE_MINUS_SRC1`, so RGB each use their own coverage. BGR is a blend-time channel swap;
-the atlas remains RGB-filtered. The 32-byte `Locals` uniform carries the active order,
-`TextOptions::text_contrast`, `TextOptions::text_gamma`, and `TextOptions::text_background_luma`.
-LCD sub-pixel edges skip dithering so `Unorm`, `sRGB`, and CPU output stay deterministic without
-edge sparkle; ordinary non-LCD geometry in the same mesh keeps covered-only dithering.
+the atlas remains RGB-filtered. The 48-byte `Locals` uniform carries the active order,
+`TextOptions::text_contrast`, `text_gamma`, `text_background_luma`,
+`text_inverse_background_luma` and the grayscale-curve exponents; the font atlas is drawn with a
+second uniform bind group whose `font_atlas` flag is 1, which is how `egui.wgsl` tells glyph
+coverage from user textures without a third pipeline. LCD sub-pixel edges skip dithering so
+`Unorm`, `sRGB`, and CPU output stay deterministic without edge sparkle; ordinary non-LCD
+geometry in the same mesh keeps covered-only dithering.
 
 **GPU gamma handling:** fixed-function dual-source blending cannot read the destination pixel,
-so the shader solves for the fixed-function blend weight that lands on the software renderer's
-`TextGamma` result `(s^g * a + d^g * (1 - a))^(1/g)`: when `Locals.subpixel_bg_luma >= 0.0`
-(`0.13` Dark, `0.96` Light, provided foreground contrast matches theme polarity), `d` comes from
-that calibrated surface luminance instead of `0`/`1` endpoints, and on sRGB framebuffers
-(`fs_lcd_linear_framebuffer`) the target is converted to linear sRGB before solving linear
-blend weights (`subpixel_bg_luma < 0` falls back to foreground-luminance compensation). This
-brings CPU (`egui_software`), D3D12, and Vulkan (`egui-wgpu`) within ~1–2 LSB on primary and dim
-text across `#191919`, `#2b2b2b`, `#f3f3f3`, and `#ffffff` surfaces (high-contrast colored
-backgrounds like `heat_high` cells or Light accent buttons still diverge slightly because
-fixed-function blending cannot read `dst`). Both CPU (`egui_software`) and GPU (`egui_lcd.wgsl`)
-apply enhanced contrast to glyph coverage *before* scaling by straight text opacity `alpha`, and
-both apply `TextGamma` to transformed/italic/off-grid LCD grayscale fallbacks. In `epaint`,
-`FontFace::allocate_glyph` upgrades `SmoothMode::Normal` to `SmoothMode::Lcd` whenever
-`subpixel != Off` (leaving `SmoothMode::Light` untouched).
+so the shader solves for the blend weight that lands on the software renderer's `TextGamma`
+result `(s^g * a + d^g * (1 - a))^(1/g)` for an ASSUMED background `d`, on `Unorm` and sRGB
+targets alike (sRGB solves in linear space). Text polarity splits exactly like the grayscale
+curve (`epaint::polarity_split`, below): text of the theme's polarity is assumed on the page
+(`text_background_luma`: `0.13` Dark, `0.96` Light), the rest on the inverse surface
+(`text_inverse_background_luma`: `0.13` in the Light theme, where light text is the dark toast
+UI; unknown in the Dark theme, which draws no dark text) or on the pure black/white endpoint
+when that is unknown. Calibration is exact only on the assumed surface; elsewhere the weight is
+the chord through that surface and the text colour. Modelled errors on real surfaces: <= 2 LSB on
+the pages, ~3-7 LSB at worst partial coverage on heat cells and selection rows. Measured on
+D3D12 and Vulkan by the hardware suite (`Unorm`, bundled face and Segoe UI Variable, 1.0/1.25/
+1.5/2.0 `ppp`): mean difference <= 1.04 LSB on upright text (<= 1.61 on italics), isolated pixels up to 7 LSB where
+two glyph quads overlap (the second glyph is solved against the surface, but the pixel already
+holds the first glyph's ink), italic rows up to 8 LSB (the CPU rasterizer snaps vertices to
+1/16 px, the GPU to 1/256 px, which shifts sheared edges by a fraction of a texel). Before the
+inverse surface existed, the Light theme's white toast text was solved against pure black and
+drew up to ~16 LSB heavier on the GPU. Both CPU and GPU apply enhanced contrast to glyph coverage
+*before* scaling by straight text opacity, and both apply `TextGamma` to transformed/italic/
+off-grid LCD grayscale fallbacks. LCD sub-pixel edges skip dithering. (With the earlier 1.98 Light gamma the same pixels reached 10/13 LSB; the steeper the
+curve, the more a coverage difference shows.)
 
 ## Text weight, and what `TextSmoothing` now means
 
-`DirectWrite`'s gamma and contrast describe *DirectWrite's* curve. Fed unchanged into this
-one they lift a half-covered pixel from 128 to 178 on a dark UI, which reads as fat and
-glowing next to native Windows text -- Windows errs thin. Under sub-pixel rendering, `Sharp`
-pairs `LcdFilter::LIGHT` (`[0, 85, 86, 85, 0]`, omitting `FREETYPE_DEFAULT`'s `±2` outer
-sub-pixel taps when the platform did not specify a filter, e.g. Windows; explicit Linux
-Fontconfig `lcdfilter: default` stays `FREETYPE_DEFAULT`) with `contrast = 0.0` and tuned blend
-weight for both 100% and 150% displays. When sub-pixel rendering is unavailable (`SubpixelMode::Off`
-— Linux `rgba=none`, RDP, portrait displays, or non-dual-source GPUs), `theme::grayscale_transfer`
-applies polarity-calibrated gamma curves instead of raw linear sRGB coverage (`Off`), preventing
-thin/stepped dark-mode text and fat light-mode text:
+**The weight is measured against native Windows text, not judged by eye.**
+`crates/tm-app/src/dwrite_reference.rs` renders a string with DirectWrite's own rasterizer and
+blender (an `IDWriteBitmapRenderTarget`: a GDI DIB, no window, no GPU) using Windows' default
+parameters (gamma 1.8, contrast 0.5, level 1, RGB) and `DWRITE_RENDERING_MODE_DEFAULT` -- natural
+symmetric at these sizes, what WinUI/WPF use -- on the same face (Segoe UI Variable Text), size
+and colours. `text_compare::the_weight_matches_native_directwrite_text` compares summed luma
+contrast ("ink") at 100/125/150 % in both themes, ClearType and grayscale, and prints every ratio.
+Measured 2026-11-27:
 
-| profile | grid-fit | binning | platform-default LCD filter | LCD blend (Dark / Light) | grayscale transfer (Dark / Light) |
+| profile | ClearType Dark | ClearType Light | grayscale Dark | grayscale Light |
+| --- | --- | --- | --- | --- |
+| `Sharp` | 0.89-0.93 | 0.89-0.93 | 0.90-0.93 | 0.90-0.91 |
+| `Standard` | 1.09-1.13 | 1.00-1.03 | 0.98-1.00 | 1.00 |
+
+`Sharp` is thin and crisp by design (~0.9 of native ink, between DirectWrite natural and GDI
+classic in Dark: GDI classic measures ~1.04 there). `Standard` feeds the display's parameters into
+this blend model unmodified, which in Dark ClearType lands ~10 % heavier than DirectWrite's own
+curve. The test bands are `Sharp` 0.85-0.97, `Standard` 0.92-1.17. Before this measurement the
+Light theme's `Sharp` ClearType sat at ~0.83 and its grayscale at ~0.81 -- both lighter than every
+native mode -- and the grayscale dark-text exponents assumed sRGB-space blending made dark-on-light
+text fat, while native DirectWrite dark-on-light text is in fact heavier than raw coverage.
+
+`DirectWrite`'s gamma and contrast describe *DirectWrite's* curve; fed unchanged into this one they
+lift a half-covered pixel from 128 to 178 on a dark UI. Under sub-pixel rendering `Sharp` therefore
+pairs `LcdFilter::LIGHT` (`[0, 85, 86, 85, 0]`, omitting `FREETYPE_DEFAULT`'s `±2` outer sub-pixel
+taps when the platform did not specify a filter, e.g. Windows; explicit Linux Fontconfig
+`lcdfilter: default` stays `FREETYPE_DEFAULT`) with `contrast = 0.0` and scaled gamma.
+
+**Grayscale weight is applied by the renderer, per text colour.** With sub-pixel rendering off
+(`SubpixelMode::Off` -- Linux `rgba=none`, RDP, portrait displays, non-dual-source GPUs) the atlas
+holds raw coverage (`FontColorTransferFunction::PolarityGamma`) and every renderer -- CPU blit and
+triangle paths, `egui.wgsl`, the LCD shader's ordinary-texel branch, Glow -- applies
+`alpha = coverage^e`, with `e` the light-text exponent when the text colour's luma is above
+`polarity_split` and the dark-text exponent otherwise. `polarity_split` is the midpoint of the
+page and inverse-surface lumas when both are known (Light theme: `0.545`, so light-gray toast text
+counts as light), the page luma when only it is (Dark theme: `0.13`, so mid-luma accent text such
+as `#3a63d9` stays light-on-dark), and `0.5` when neither is. A curve chosen by THEME, as before,
+thinned the Light theme's white toast text with the dark-text exponent: ~17 % below raw coverage
+(`text_compare::opposite_polarity_grayscale_text_is_not_thinned`).
+
+| profile | grid-fit | binning | platform-default LCD filter | LCD gamma (Dark / Light) | grayscale exponent (light / dark text) |
 | --- | --- | --- | --- | --- | --- |
-| `Sharp` | full on Windows/default; respects Linux Fontconfig `hintslight`/`hintmedium`/`hintnone` | no | `LIGHT` (explicit Fontconfig `default` stays `FREETYPE_DEFAULT`) | `gamma * 0.78`, `0.0` / `gamma * 1.10`, `0.0` | `Gamma(0.80)` / `Gamma(1.50)` |
-| `Standard` | follows Linux Fontconfig `hintstyle` | no | `FREETYPE_DEFAULT` | display params | `Gamma(0.65)` / `Gamma(1.30)` |
-| `Smooth` | default (`preserve_linear_metrics`) | yes | `FREETYPE_DEFAULT` | display params | `Gamma(0.65)` / `Gamma(1.30)` |
+| `Sharp` | full on Windows/default and Fontconfig `hintmedium`/`hintfull`; light for `hintslight`; off for `hintnone` | no | `LIGHT` (explicit Fontconfig `default` stays `FREETYPE_DEFAULT`) | `gamma * 0.78`, `0.0` / `gamma * 0.88`, `0.0` | `0.80` / `1.15` |
+| `Standard` | follows Fontconfig `hintstyle` (`hintmedium` = full, as FreeType's normal target) | no | `FREETYPE_DEFAULT` | display params | `0.65` / `0.95` |
+| `Smooth` | default (`preserve_linear_metrics`) | yes | `FREETYPE_DEFAULT` | display params | `0.65` / `0.95` |
 
-`theme::cleartype_weight`, `theme::lcd_filter`, and `theme::grayscale_transfer` are the single
-definitions, shared with the comparison harness (which pins thinner `Sharp` ink in both Dark and
-Light modes at both `1.0` and `1.5` `ppp` under both LCD and grayscale). Both the software
-renderer and the WGPU LCD shader consume gamma, contrast, and `text_background_luma` from
-`TextOptions`.
-
-`100%` (`ppp = 1.0`, 13 px) is especially sensitive to outer neighbor taps (`8/255` boosted by
-non-linear gamma to `~45-70/255`) and non-zero `contrast`, which previously left `Sharp` ~11.6%
-fatter than native Windows 11 WPF ClearType at 100%; moving `Sharp` from `0.88/0.25` +
-`FREETYPE_DEFAULT` to `0.78/0.0` + `LIGHT` trims 100% ink by ~10.4% and 150% ink by ~8.0%.
-
-`crates/tm-app/src/text_compare.rs` renders every profile, filter and blend to magnified
-PNGs: `TASKMAN_TEXT_COMPARE=target/t cargo test -p tm-app text_compare`. The LCD filter is
-the other real knob -- unfiltered 96.6 sharpness at 92.0 fringe, `FREETYPE_DEFAULT` 75.3 at
-64.1, `CLASSIC` 69.9 at 58.8.
+`theme::configure_text_options` is the one definition of every text option (filter, blend,
+grayscale curve, polarity surfaces, hinting switch); `apply_text_aa` and the comparison harness
+both call it, and the harness also uses the app's `fonts::hinting_target`, so `text_compare`
+renders exactly what the app renders. `TASKMAN_TEXT_COMPARE=<prefix> cargo test -p tm-app
+text_compare` writes magnified PNGs of every profile, filter and blend, plus both themes x
+100/150 % x LCD/grayscale. The LCD filter is the other real knob -- unfiltered 96.6 sharpness at
+92.0 fringe, `FREETYPE_DEFAULT` 75.3 at 64.1, `CLASSIC` 69.9 at 58.8.
 
 ## When sub-pixel text is refused
 
@@ -474,11 +510,21 @@ Everything below is headless; none of it opens a window.
   absolute font-file policy, bounded output and timeout kill/reap. Windows tests cover
   placement-key changes and conflicting-monitor fail-closed policy.
 - **Manual GPU path:** `(cd vendor/egui && TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 cargo test
-  -p egui_kittest --features wgpu --test subpixel_text -- --ignored --test-threads=1)`. The tests are
-  ignored by default and fail if the opt-in variable or a non-CPU D3D12/Vulkan dual-source
-  adapter is missing. They cover plain/off-grid text, BGR, neutral/tinted contrast,
-  opaque/translucent and colored text, hardware filtering, dithering and the sRGB
-  framebuffer entry point. This is manual hardware coverage, not portable CI coverage.
+  -p egui_kittest --features wgpu --test subpixel_text -- --ignored --test-threads=1 --nocapture)`.
+  The tests are ignored by default and fail if the opt-in variable or a non-CPU D3D12/Vulkan
+  dual-source adapter is missing (`TASKMAN_GPU_BACKEND=dx12|vulkan` narrows the run). They cover
+  plain/off-grid text, BGR, neutral/tinted contrast, opaque/translucent and colored text,
+  hardware filtering, dithering and the sRGB entry point, and the CPU-vs-GPU parity of the real
+  shaders: ClearType and grayscale, page and toast surfaces, the bundled face and the system UI
+  face with `Sharp` hinting, 1.0-2.0 `ppp`. Each case prints its measured upright/italic
+  max/mean; bounds are the measurements above plus a small margin, and
+  `TASKMAN_PARITY_DUMP=<dir>` keeps both frames of a failing case. Grayscale on sRGB targets is
+  reported, not bounded: the stock ordinary pipeline blends every fill in linear space there,
+  and TaskMan always selects `Unorm`. The `egui-wgpu` unit test of the calibration is a Rust
+  MODEL of the shader (Naga validates WGSL but cannot run it); this suite is the check for the
+  shader itself. Manual hardware coverage, not portable CI coverage.
+- `cargo test -p tm-app the_weight_matches_native_directwrite_text -- --nocapture` (Windows) -- the
+  native-weight comparison above.
 - `TASKMAN_RENDER_SNAPSHOT=target/frame.png cargo test -p tm-app write_cpu_frame_snapshot`
   writes the frame, and a `-cleartype` variant beside it, to look at.
 
@@ -520,7 +566,15 @@ on this host.
   prove.
 - **GPU hardware validation is manual.** The normal CPU-side Naga test proves WGSL syntax
   and module validity but not per-driver dual-source blend behavior. Release verification
-  must run the ignored `egui_kittest` suite on D3D12 and Vulkan hardware.
+  must run the ignored `egui_kittest` suite on D3D12 and Vulkan hardware (both passed on an
+  NVIDIA host on 2026-11-27; no AMD/Intel or Linux Vulkan driver measured yet).
+- **GPU ClearType cannot see the real background.** Exact only on the assumed page/inverse
+  surface; heat cells, selection rows and overlapping glyph margins stay a few LSB off the CPU
+  result. Removing that needs destination reads (framebuffer fetch or an offscreen copy),
+  which fixed-function dual-source blending cannot provide.
+- **Only Windows' 100/125/150 % are measured against native text**, on Segoe UI Variable.
+  175/200 % and Linux faces have CPU/GPU parity coverage (2.0 `ppp`) but no native reference;
+  Linux would need a FreeType/cairo reference renderer.
 - **Performance work.** The rasterizer and application loops are optimized for low CPU load:
   - Axis-aligned rect fast path (`span::fast_rect` with `Shape::Vec` recursive flattening for containers).
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.

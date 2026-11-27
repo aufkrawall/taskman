@@ -85,8 +85,8 @@ math in the new `subpixel.rs`.
 | File | Nature |
 | --- | --- |
 | `crates/epaint/src/text/subpixel.rs` | **new** — `SubpixelMode`, LCD filters and coverage filtering |
-| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, explicit zero-alpha LCD tag, `SmoothMode::Lcd` hinting upgrade when `subpixel` is enabled, and per-face `GlyphScratch` reuse (`BezPath`, `vello_cpu::Resources`, 3x sample/filter buffers) |
-| `crates/epaint/src/text/mod.rs` | **edit** — `subpixel`, `lcd_filter`, `cleartype_level`, `text_gamma`, `text_contrast`, `text_background_luma` |
+| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, explicit zero-alpha LCD tag, `SmoothMode::Lcd` hinting upgrade when `subpixel` is enabled for instruction-hinted fonts only (`lcd_aware_hinting_target`: under the autohinter LCD mode would drop horizontal hinting), and per-face `GlyphScratch` reuse (`BezPath`, `vello_cpu::Resources`, 3x sample/filter buffers) |
+| `crates/epaint/src/text/mod.rs` | **edit** — `subpixel`, `lcd_filter`, `cleartype_level`, `text_gamma`, `text_contrast`, `text_background_luma`, `text_inverse_background_luma` |
 | `crates/epaint/src/lib.rs` | **edit** — re-exports `LcdFilter` and `SubpixelMode` |
 
 The rasterizer branch is still shaped so grayscale stays isolated:
@@ -341,18 +341,19 @@ feature, the ordinary pipeline remains selected.
 | File | Change | Why |
 | --- | --- | --- |
 | `crates/egui-wgpu/src/egui_lcd.wgsl` | **new** — dual-source fragment outputs, per-channel coverage blend, RGB/BGR swap, contrast curve, background-luminance (`subpixel_bg_luma`) calibrated blend inverse matching CPU `TextGamma` on both gamma (`Unorm`) and sRGB (`linear_framebuffer`) surfaces (with polarity-only fallback when `subpixel_bg_luma < 0`), no dithering on LCD coverage edges (covered-only dithering retained on the ordinary fallback branch), one-texel-per-pixel derivative/center test | A fixed-function GPU needs source color and per-channel source alpha separately; background-calibrated blend weights solve `target = (s^g * a + d^g * (1 - a))^(1/g)` against real non-black/non-white surfaces (Dark `#191919`/`#2b2b2b`, Light `#f3f3f3`) and convert cleanly to sRGB linear weights, matching CPU `TextGamma` within ~1–2 LSB without dithering sparkle |
-| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()` with non-white UVs; 32-byte padded order/contrast/gamma/`subpixel_bg_luma` uniform (`Locals`); Naga validation and 250 ms-bounded Validation/Internal/OutOfMemory error scopes; an LCD atlas uploaded to a renderer that has no LCD pipeline is converted on the fly to mean-coverage premultiplied gray (`atlas_upload_needs_grayscale`, `lcd_texel_as_grayscale`, one `warn!` per renderer) | Keep non-font textures, all-white solid geometry, color glyphs and unsupported devices on the byte-identical ordinary path, never advertise a pipeline that failed validation, and degrade instead of corrupting: the pipeline is decided from a prediction the backend can still reject, and the ordinary premultiplied blend would draw the atlas's zero alpha as invisible text on a dark background and additive text on a light one |
+| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()` with non-white UVs; 48-byte order/contrast/gamma/background/inverse-background/grayscale-curve uniform (`Locals`), duplicated into a font-atlas bind group (`font_atlas = 1`, see #21); Naga validation and 250 ms-bounded Validation/Internal/OutOfMemory error scopes; an LCD atlas uploaded to a renderer that has no LCD pipeline is converted on the fly to mean-coverage premultiplied gray (`atlas_upload_needs_grayscale`, `lcd_texel_as_grayscale`, one `warn!` per renderer) | Keep non-font textures, all-white solid geometry, color glyphs and unsupported devices on the byte-identical ordinary path, never advertise a pipeline that failed validation, and degrade instead of corrupting: the pipeline is decided from a prediction the backend can still reject, and the ordinary premultiplied blend would draw the atlas's zero alpha as invisible text on a dark background and additive text on a light one |
 | `crates/egui-wgpu/src/setup.rs` | request `DUAL_SOURCE_BLENDING` as `adapter.features() & DUAL_SOURCE_BLENDING` | Request only what the selected adapter advertises; never make device creation fail for an unsupported adapter |
-| `crates/egui-wgpu/src/winit.rs` | publish current `TextOptions` (`subpixel`, `text_gamma`, `text_contrast`, `text_background_luma`) to the renderer each frame; expose whether the LCD pipeline exists | The renderer needs the atlas order, gamma, weight, and expected theme background luminance without guessing from draw colors |
+| `crates/egui-wgpu/src/winit.rs` | publish the atlas's whole `TextOptions` (`Renderer::set_text_options`) to the renderer each frame; expose whether the LCD pipeline exists | The renderer needs the atlas order, gamma, weight, and expected theme background luminance without guessing from draw colors |
 | `crates/egui_software/src/{gamma.rs,raster.rs,texture.rs,text.rs,lib.rs}` | transformed glyph triangles convert LCD texels to mean grayscale before filtering and blend through `TextGamma`; translucent direct blits apply enhanced contrast before opacity scaling (`blend_channel_alpha_fast`); direct blits choose LCD vs ordinary blending per texel | Rotated/scaled/italic software text must not smear color fringes while keeping the same perceptual weight as upright LCD text and `egui_lcd.wgsl`, translucent solid interiors must not be contrast-boosted, and mixed grayscale/color glyphs must keep their normal blend |
 | `crates/egui_kittest/tests/subpixel_text.rs` | **new, manual** — ignored GPU color/BGR/transform/contrast/sampling/dithering/sRGB coverage plus CPU-vs-GPU (`Unorm` & `sRGB`, `1.0`/`1.5` `ppp`, predictable & hardware-dithered, upright/translucent/italic, across available D3D12/Vulkan adapters) Dark/Light surface parity test; requires `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1` and a suitable adapter | Detect shader/pipeline regressions and CPU/GPU blend drift on real dual-source hardware without claiming portable CI coverage or reporting a missing-adapter skip as a pass |
 
-The GPU path carries the selected `TextOptions::text_gamma`, `TextOptions::text_contrast`, `TextOptions::text_background_luma`, and RGB/BGR order through the 32-byte `Locals` uniform. When `subpixel_bg_luma >= 0.0` (and foreground contrast aligns with the theme polarity), `calibrated_lcd_blend_weights` solves the exact fixed-function blend weight that matches CPU `TextGamma` on real Dark (`#191919`/`#2b2b2b`, `0.13`) and Light (`#f3f3f3`/`#ffffff`, `0.96`) surfaces on both `Unorm` and `sRGB` framebuffers (falling back to polarity-only compensation when `subpixel_bg_luma < 0.0` or when dark-on-bright pill text is drawn in dark mode). The software path keeps its full destination-aware gamma/contrast model.
+The GPU path carries `TextOptions::text_gamma`, `text_contrast`, `text_background_luma`, `text_inverse_background_luma` and the RGB/BGR order through the `Locals` uniform. `calibrated_lcd_blend_weights` splits text polarity like the grayscale curve (`polarity_split`), assumes text of the theme's polarity sits on the page and the rest on the inverse surface (or the pure black/white endpoint when unknown), and solves the fixed-function blend weight that lands on CPU `TextGamma` against that surface, on `Unorm` and sRGB targets alike. It is exact only on the assumed surface; the hardware suite measures a mean of ~1 LSB with isolated pixels up to 7-8 LSB where glyph quads overlap or italics are sheared. The software path keeps its full destination-aware gamma/contrast model.
 
 **Coverage:** `egui-wgpu` unit tests cover feature detection/request, full/partial atlas
 state transitions, default-texture/non-white-UV selection, transform mapping, order/contrast
-fields, the 32-byte uniform layout, and Naga parse+validation of both LCD fragment entry
-points. `egui_software` covers neutral contrast, tinted/full/zero coverage, mixed-atlas
+fields, the 48-byte uniform layout, a Rust model of the calibration against `TextGamma`
+(an algorithm check -- Naga validates the WGSL but cannot run it), and Naga parse+validation
+of both LCD fragment entry points. `egui_software` covers neutral contrast, tinted/full/zero coverage, mixed-atlas
 per-texel direct blits, and transformed grayscale conversion. The `egui_kittest` suite is
 ignored/manual and is not part of the shipped fork gate:
 
@@ -489,6 +490,31 @@ aging rule), with unchanged frames presented and skipped, and requires every
 presented buffer to equal a full repaint bit for bit. The 2-buffer test also
 requires the steady-state frames to be partial. Measured (headless sway, 4K at 1.5×):
 idle Processes page UI thread 1.4 % → 0.3 %, scripted scroll 45 % → 29 %.
+
+### 21. Render-time grayscale glyph weight (all renderers)
+
+A coverage-to-alpha curve baked into the shared atlas serves one text polarity: the curve
+that keeps dark-on-light text from looking fat thins a white label on a dark toast. With
+`FontColorTransferFunction::PolarityGamma { light_text, dark_text }` the atlas stores raw
+coverage and each renderer applies `alpha = coverage^e` per draw, `e` chosen by the text
+colour's luma against `epaint::polarity_split(text_background_luma,
+text_inverse_background_luma)`. A renderer that does not know the variant draws raw coverage.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/epaint/src/image.rs`, `crates/epaint/src/lib.rs` | `PolarityGamma` variant (atlas keeps raw coverage), `render_time_exponents`, `polarity_exponent`; `polarity_split` and `text_is_light` as the one polarity rule | One definition every renderer implements |
+| `crates/egui/src/style.rs` | destructures the new `TextOptions` field | exhaustive pattern |
+| `crates/egui_software/src/{gray.rs,text.rs,raster.rs,lib.rs,damage.rs}` | **new** `GrayTextCurves` (two LUTs + split); the glyph blitter picks the LUT per quad colour, the font-atlas triangle path (`triangle_font`, and the ordinary-texel arm of `triangle_gray_lcd`) per interpolated colour; `Painter::set_text_options`; the curve is keyed in `FrameKey` | Blit and triangle paths stay in agreement (`tests/text.rs`), a curve change repaints |
+| `crates/egui-wgpu/src/{egui.wgsl,egui_lcd.wgsl,renderer.rs}` | `gray_text_texel` in `fs_main_*` and in the LCD shader's ordinary-texel branch; the font atlas is drawn with a second uniform bind group whose `font_atlas` flag is 1 (no extra pipeline) | The shader must tell glyph coverage from user textures; a third pipeline would cost startup compile time |
+| `crates/egui_glow/src/{painter.rs,shader/fragment.glsl}` | `u_gray_text` uniform set per mesh (enabled only for `TextureId::default()`), `Painter::set_text_options` | The diagnostic GL fallback draws the same weight |
+| `crates/eframe/src/native/{software_integration,glow_integration}.rs` | publish the atlas's `TextOptions` to the painter before painting | |
+| `crates/egui_kittest/{src/wgpu.rs,tests/subpixel_text.rs}` | `set_text_options`; the parity suite adds grayscale and inverse-surface (toast) cases, the system UI font with TaskMan's `Sharp` hinting, 1.25x and 2x, one device per backend, per-case measured output, upright/italic bounds, `TASKMAN_PARITY_DUMP=<dir>` for failing frames | Hardware evidence for the shader paths, with bounds taken from measurements |
+
+**Coverage:** `egui_software` unit tests for the LUTs, polarity and the damage key;
+`tests/text.rs` `identical_with_the_render_time_grayscale_curve`; `egui-wgpu` uniform layout
+and Naga validation; the manual hardware suite (grayscale on `Unorm`: max 3 LSB, mean
+<= 0.57; on sRGB targets the stock ordinary pipeline blends in linear space for every fill,
+so grayscale text there is reported but not bounded -- TaskMan always selects `Unorm`).
 
 ## Rebase runbook
 

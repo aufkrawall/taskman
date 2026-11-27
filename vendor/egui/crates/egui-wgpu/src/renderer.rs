@@ -159,9 +159,21 @@ struct UniformBuffer {
     /// Blend-space gamma from [`epaint::TextOptions::text_gamma`].
     subpixel_gamma: f32,
 
-    /// Expected sRGB background luminance (`0.0..=1.0`) for calibrated LCD blending,
-    /// or `< 0.0` to use foreground-only polarity estimation. Kept 32-byte aligned with WGSL.
+    /// Expected sRGB background luminance (`0.0..=1.0`), or `< 0.0` when unknown. Calibrates
+    /// the LCD blend and decides grayscale text polarity.
     subpixel_bg_luma: f32,
+
+    /// TASKMAN-FORK: render-time grayscale exponents
+    /// ([`epaint::FontColorTransferFunction::render_time_exponents`]); `0.0` = off.
+    gray_text_gamma_light: f32,
+    gray_text_gamma_dark: f32,
+
+    /// `1` in the font-atlas uniform bind group, `0` in the ordinary one.
+    font_atlas: u32,
+
+    /// Expected luminance under opposite-polarity text, or `< 0.0` when unknown. Also keeps
+    /// the struct at 48 bytes (WGSL's 16-byte uniform size contract).
+    subpixel_inverse_bg_luma: f32,
 }
 
 fn subpixel_order_code(mode: epaint::text::SubpixelMode) -> u32 {
@@ -594,6 +606,11 @@ pub struct Renderer {
     subpixel_gamma: f32,
     subpixel_contrast: f32,
     subpixel_bg_luma: f32,
+    subpixel_inverse_bg_luma: f32,
+
+    /// `[light_text, dark_text]` render-time grayscale exponents, `[0, 0]` when the atlas
+    /// holds final alpha.
+    gray_text_gamma: [f32; 2],
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
@@ -601,6 +618,11 @@ pub struct Renderer {
     uniform_buffer: wgpu::Buffer,
     previous_uniform_buffer_content: UniformBuffer,
     uniform_bind_group: wgpu::BindGroup,
+
+    /// The same uniforms with `font_atlas = 1`, bound while drawing the managed font atlas
+    /// so the shader can tell glyph coverage from user textures without another pipeline.
+    font_uniform_buffer: wgpu::Buffer,
+    font_uniform_bind_group: wgpu::BindGroup,
     texture_bind_group_layout: wgpu::BindGroupLayout,
 
     /// Map of egui texture IDs to textures and their associated bindgroups (texture view +
@@ -673,6 +695,36 @@ impl Renderer {
         self.subpixel_bg_luma = normalized_bg_luma(bg_luma);
     }
 
+    /// Publish the expected luminance under opposite-polarity text (`0.0..=1.0`), or a
+    /// negative value when unknown.
+    pub fn set_subpixel_inverse_background_luma(&mut self, luma: f32) {
+        self.subpixel_inverse_bg_luma = normalized_bg_luma(luma);
+    }
+
+    /// Publish the render-time grayscale curve of a raw-coverage atlas
+    /// ([`epaint::FontColorTransferFunction::render_time_exponents`]), or `None` when the
+    /// atlas already holds final alpha.
+    pub fn set_gray_text_gamma(&mut self, exponents: Option<[f32; 2]>) {
+        self.gray_text_gamma = exponents.map_or([0.0; 2], |[light, dark]| {
+            let sanitize = |e: f32| {
+                if e.is_finite() {
+                    e.clamp(0.25, 4.0)
+                } else {
+                    1.0
+                }
+            };
+            [sanitize(light), sanitize(dark)]
+        });
+    }
+
+    /// Publish everything text blending needs from the font atlas's own options.
+    pub fn set_text_options(&mut self, options: &epaint::text::TextOptions) {
+        self.set_subpixel_text_options(options.subpixel, options.text_gamma, options.text_contrast);
+        self.set_subpixel_background_luma(options.text_background_luma);
+        self.set_subpixel_inverse_background_luma(options.text_inverse_background_luma);
+        self.set_gray_text_gamma(options.color_transfer_function.render_time_exponents());
+    }
+
     /// Whether this renderer's pipelines were created with `options`.
     ///
     /// [`crate::RenderState`]'s renderer slot is first-call-wins, so a second caller cannot
@@ -722,6 +774,27 @@ impl Renderer {
                 subpixel_contrast: 0.5,
                 subpixel_gamma: 1.8,
                 subpixel_bg_luma: -1.0,
+                gray_text_gamma_light: 0.0,
+                gray_text_gamma_dark: 0.0,
+                font_atlas: 0,
+                subpixel_inverse_bg_luma: -1.0,
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let font_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("egui_font_uniform_buffer"),
+            contents: bytemuck::cast_slice(&[UniformBuffer {
+                screen_size_in_points: [0.0, 0.0],
+                dithering: u32::from(options.dithering),
+                predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
+                subpixel_order: subpixel_order_code(epaint::text::SubpixelMode::Off),
+                subpixel_contrast: 0.5,
+                subpixel_gamma: 1.8,
+                subpixel_bg_luma: -1.0,
+                gray_text_gamma_light: 0.0,
+                gray_text_gamma_dark: 0.0,
+                font_atlas: 1,
+                subpixel_inverse_bg_luma: -1.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -752,6 +825,21 @@ impl Renderer {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &uniform_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                }],
+            })
+        };
+        let font_uniform_bind_group = {
+            profiling::scope!("create_bind_group");
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("egui_font_uniform_bind_group"),
+                layout: &uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &font_uniform_buffer,
                         offset: 0,
                         size: None,
                     }),
@@ -962,6 +1050,8 @@ impl Renderer {
             subpixel_gamma: 1.8,
             subpixel_contrast: 0.5,
             subpixel_bg_luma: -1.0,
+            subpixel_inverse_bg_luma: -1.0,
+            gray_text_gamma: [0.0; 2],
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
@@ -978,6 +1068,8 @@ impl Renderer {
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer::zeroed(),
             uniform_bind_group,
+            font_uniform_buffer,
+            font_uniform_bind_group,
             texture_bind_group_layout,
             textures: HashMap::default(),
             next_user_texture_id: 0,
@@ -1012,6 +1104,7 @@ impl Renderer {
         // run.
         let mut needs_reset = true;
         let mut lcd_pipeline_set = false;
+        let mut font_uniforms_set = false;
 
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
@@ -1033,6 +1126,7 @@ impl Renderer {
                 render_pass.set_pipeline(&self.pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 lcd_pipeline_set = false;
+                font_uniforms_set = false;
                 needs_reset = false;
             }
 
@@ -1088,6 +1182,19 @@ impl Renderer {
                         if lcd_pipeline.is_some() != lcd_pipeline_set {
                             render_pass.set_pipeline(lcd_pipeline.unwrap_or(&self.pipeline));
                             lcd_pipeline_set = lcd_pipeline.is_some();
+                        }
+                        let font_atlas = mesh.texture_id == epaint::TextureId::default();
+                        if font_atlas != font_uniforms_set {
+                            render_pass.set_bind_group(
+                                0,
+                                if font_atlas {
+                                    &self.font_uniform_bind_group
+                                } else {
+                                    &self.uniform_bind_group
+                                },
+                                &[],
+                            );
+                            font_uniforms_set = font_atlas;
                         }
                         render_pass.set_bind_group(1, bind_group, &[]);
                         render_pass.set_index_buffer(
@@ -1523,6 +1630,10 @@ impl Renderer {
             subpixel_contrast: self.subpixel_contrast,
             subpixel_gamma: self.subpixel_gamma,
             subpixel_bg_luma: self.subpixel_bg_luma,
+            gray_text_gamma_light: self.gray_text_gamma[0],
+            gray_text_gamma_dark: self.gray_text_gamma[1],
+            font_atlas: 0,
+            subpixel_inverse_bg_luma: self.subpixel_inverse_bg_luma,
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1530,6 +1641,14 @@ impl Renderer {
                 &self.uniform_buffer,
                 0,
                 bytemuck::cast_slice(&[uniform_buffer_content]),
+            );
+            queue.write_buffer(
+                &self.font_uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[UniformBuffer {
+                    font_atlas: 1,
+                    ..uniform_buffer_content
+                }]),
             );
             self.previous_uniform_buffer_content = uniform_buffer_content;
         }
@@ -2070,7 +2189,20 @@ mod tests {
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_contrast), 20);
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_gamma), 24);
         assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_bg_luma), 28);
-        assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
+        assert_eq!(
+            std::mem::offset_of!(UniformBuffer, gray_text_gamma_light),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(UniformBuffer, gray_text_gamma_dark),
+            36
+        );
+        assert_eq!(std::mem::offset_of!(UniformBuffer, font_atlas), 40);
+        assert_eq!(
+            std::mem::offset_of!(UniformBuffer, subpixel_inverse_bg_luma),
+            44
+        );
+        assert_eq!(std::mem::size_of::<UniformBuffer>(), 48);
         assert!(std::mem::size_of::<UniformBuffer>().is_multiple_of(16));
     }
 
@@ -2088,8 +2220,14 @@ mod tests {
         );
     }
 
+    /// A Rust model of `calibrated_lcd_blend_weights` checked against CPU `TextGamma`.
+    ///
+    /// This proves the ALGORITHM lands within tolerance on the real theme surfaces; it
+    /// cannot prove the WGSL implements it (Naga validates, but does not execute, shaders).
+    /// The ignored `egui_kittest` `subpixel_text` suite renders the real shader on D3D12 and
+    /// Vulkan against the CPU renderer and is the check for the shader itself.
     #[test]
-    fn calibrated_gpu_blend_matches_cpu_text_gamma_on_real_theme_surfaces() {
+    fn calibrated_gpu_blend_model_matches_cpu_text_gamma_on_real_theme_surfaces() {
         fn srgb_to_linear(c: f32) -> f32 {
             if c < 0.04045 {
                 c / 12.92
@@ -2117,23 +2255,37 @@ mod tests {
             gamma: f32,
             contrast: f32,
             bg_luma: f32,
+            inverse_luma: f32,
             srgb_target: bool,
         ) -> [f32; 3] {
             let lum = (0.299 * fg[0] + 0.587 * fg[1] + 0.114 * fg[2]).clamp(0.0, 1.0);
             let a = enhanced_lcd_coverage(cov, contrast) * alpha;
             let mut out = [0.0; 3];
+            let light_text = lum > epaint::polarity_split(bg_luma, inverse_luma);
+            let surface = if light_text == (bg_luma < 0.5) {
+                bg_luma
+            } else {
+                inverse_luma
+            };
             for ch in 0..3 {
                 let s = fg[ch];
-                let pol = if lum >= bg_luma { 0.0 } else { 1.0 };
-                let same_side =
-                    (bg_luma < 0.5 && lum > bg_luma) || (bg_luma >= 0.5 && lum < bg_luma);
-                let side_w = if same_side {
-                    smoothstep(0.04, 0.16, (lum - bg_luma).abs())
+                let endpoint = if light_text { 0.0 } else { 1.0 };
+                let d = if surface >= 0.0 {
+                    let on_side = if light_text {
+                        lum > surface
+                    } else {
+                        lum < surface
+                    };
+                    let side_w = if on_side {
+                        smoothstep(0.04, 0.16, (lum - surface).abs())
+                    } else {
+                        0.0
+                    };
+                    let ch_trust = smoothstep(0.02, 0.12, (s - surface).abs());
+                    endpoint + (surface - endpoint) * (side_w * ch_trust)
                 } else {
-                    0.0
+                    endpoint
                 };
-                let ch_trust = smoothstep(0.02, 0.12, (s - bg_luma).abs());
-                let d = pol + (bg_luma - pol) * (side_w * ch_trust);
                 let target_gamma =
                     (s.powf(gamma) * a + d.powf(gamma) * (1.0 - a)).powf(1.0 / gamma);
 
@@ -2172,6 +2324,7 @@ mod tests {
                 1.404,
                 0.0,
                 0.13,
+                -1.0,
             ),
             (
                 "dark_sharp_2b_white",
@@ -2181,6 +2334,7 @@ mod tests {
                 1.404,
                 0.0,
                 0.13,
+                -1.0,
             ),
             (
                 "dark_sharp_19_dim",
@@ -2190,6 +2344,7 @@ mod tests {
                 1.404,
                 0.0,
                 0.13,
+                -1.0,
             ),
             (
                 "dark_sharp_19_accent",
@@ -2199,6 +2354,7 @@ mod tests {
                 1.404,
                 0.0,
                 0.13,
+                -1.0,
             ),
             (
                 "dark_sharp_19_kernel",
@@ -2208,6 +2364,7 @@ mod tests {
                 1.404,
                 0.0,
                 0.13,
+                -1.0,
             ),
             // Dark Standard translucent (gamma=1.8, contrast=0.5, alpha=0.5)
             (
@@ -2218,38 +2375,54 @@ mod tests {
                 1.8,
                 0.5,
                 0.13,
+                -1.0,
             ),
-            // Light Sharp (gamma=1.98, contrast=0.0) on #f3f3f3 and #ffffff with neutral + accent
+            // Light Sharp (gamma=1.584, contrast=0.0) on #f3f3f3 and #ffffff with neutral + accent
             (
                 "light_sharp_f3_text",
                 rgb(0x1a, 0x1a, 0x1a),
                 rgb(0xf3, 0xf3, 0xf3),
                 1.0,
-                1.98,
+                1.584,
                 0.0,
                 0.96,
+                0.13,
             ),
             (
                 "light_sharp_f3_dim",
                 rgb(0x5f, 0x5f, 0x5f),
                 rgb(0xf3, 0xf3, 0xf3),
                 1.0,
-                1.98,
+                1.584,
                 0.0,
                 0.96,
+                0.13,
             ),
             (
                 "light_sharp_ff_accent",
                 rgb(0x00, 0x78, 0xd4),
                 rgb(0xff, 0xff, 0xff),
                 1.0,
-                1.98,
+                1.584,
                 0.0,
                 0.96,
+                0.13,
+            ),
+            // Light Sharp white toast text on `from_black_alpha(220)` over the page: the
+            // opposite-polarity case, solved against the inverse surface.
+            (
+                "light_sharp_toast_white",
+                rgb(255, 255, 255),
+                rgb(0x21, 0x21, 0x21),
+                1.0,
+                1.584,
+                0.0,
+                0.96,
+                0.13,
             ),
         ];
 
-        for (label, fg, bg, alpha, gamma, contrast, bg_luma) in scenarios {
+        for (label, fg, bg, alpha, gamma, contrast, bg_luma, inverse_luma) in scenarios {
             for srgb_target in [false, true] {
                 for cov in [0.15_f32, 0.5, 0.85] {
                     let a = enhanced_lcd_coverage(cov, contrast) * alpha;
@@ -2261,6 +2434,7 @@ mod tests {
                         gamma,
                         contrast,
                         bg_luma,
+                        inverse_luma,
                         srgb_target,
                     );
                     let limit = if gamma > 1.5 && bg[0] < 0.5 { 3.5 } else { 3.0 };

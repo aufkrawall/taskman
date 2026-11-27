@@ -356,6 +356,15 @@ fn render_with(subpixel: egui::epaint::text::SubpixelMode) -> Vec<u32> {
     apply(&mut painter, &mut warmup);
     let mut output = build_frame(&ctx);
     apply(&mut painter, &mut output);
+    // The app's grayscale curve is applied at render time, from the atlas's own options.
+    let text_options = ctx.fonts(|f| *f.options());
+    painter.set_gray_text(
+        text_options.color_transfer_function.render_time_exponents(),
+        egui::epaint::polarity_split(
+            text_options.text_background_luma,
+            text_options.text_inverse_background_luma,
+        ),
+    );
 
     // Paint from untessellated shapes so the glyph blitter is exercised -- that is the
     // path the Software renderer uses, and the one sub-pixel text will hang off.

@@ -25,9 +25,24 @@ struct Locals {
     /// Blend-space gamma for LCD text weight compensation on non-sRGB targets.
     subpixel_gamma: f32,
 
-    /// Expected sRGB background luminance in 0..=1 for calibrated fixed-function
-    /// LCD blending (matching CPU TextGamma), or < 0.0 for polarity-only fallback.
+    /// Expected sRGB background luminance in 0..=1 (`TextOptions::text_background_luma`), or
+    /// < 0.0 when unknown. Calibrates the fixed-function LCD blend and decides grayscale
+    /// text polarity.
     subpixel_bg_luma: f32,
+
+    /// TASKMAN-FORK: render-time grayscale glyph exponents for raw-coverage atlases
+    /// (`FontColorTransferFunction::PolarityGamma`); 0 when the atlas holds final alpha.
+    gray_text_gamma_light: f32,
+    gray_text_gamma_dark: f32,
+
+    /// 1 while the bound texture is the managed font atlas (the font-atlas uniform bind
+    /// group), 0 for every other texture.
+    font_atlas: u32,
+
+    /// Expected luminance under opposite-polarity text (`TextOptions::
+    /// text_inverse_background_luma`), or < 0.0 when unknown. Moves the polarity split and
+    /// calibrates the LCD blend for that text.
+    subpixel_inverse_bg_luma: f32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 
@@ -143,10 +158,52 @@ fn sample_texture(in: VertexOutput) -> vec4<f32> {
     }
 }
 
+// TASKMAN-FORK: render-time grayscale glyph weight for raw-coverage atlases
+// (`FontColorTransferFunction::PolarityGamma`). Premultiplied white coverage `(c, c, c, c)`
+// from the managed font atlas becomes `(a, a, a, a)` with `a = c^e`: `e` is the light-text
+// exponent for text brighter than the expected background and the dark-text exponent
+// otherwise (`epaint::text_is_light`). `egui_software`'s `gray` module applies the same rule
+// through two LUTs; anything that is not white coverage passes through untouched.
+// TASKMAN-FORK: the text luma above which text counts as light-on-dark
+// (`epaint::polarity_split`): the midpoint of the page and inverse surface when both are
+// known, the page alone when only it is, 0.5 when neither is.
+fn polarity_split(bg_luma: f32, inverse_bg_luma: f32) -> f32 {
+    if bg_luma < 0.0 {
+        return 0.5;
+    }
+    if inverse_bg_luma < 0.0 {
+        return min(bg_luma, 1.0);
+    }
+    return 0.5 * (min(bg_luma, 1.0) + min(inverse_bg_luma, 1.0));
+}
+
+fn gray_text_texel(tex: vec4<f32>, color: vec4<f32>) -> vec4<f32> {
+    if r_locals.font_atlas == 0u || r_locals.gray_text_gamma_light <= 0.0 {
+        return tex;
+    }
+    let c = tex.a;
+    if c <= 0.0 || c >= 1.0 || any(abs(tex.rgb - vec3<f32>(c)) > vec3<f32>(0.5 / 255.0)) {
+        return tex;
+    }
+    let straight = select(
+        vec3<f32>(0.0),
+        clamp(color.rgb / max(color.a, 1e-5), vec3<f32>(0.0), vec3<f32>(1.0)),
+        color.a > 0.0,
+    );
+    let luma = dot(straight, vec3<f32>(0.299, 0.587, 0.114));
+    let split = polarity_split(r_locals.subpixel_bg_luma, r_locals.subpixel_inverse_bg_luma);
+    let e = select(
+        r_locals.gray_text_gamma_dark,
+        r_locals.gray_text_gamma_light,
+        luma > split,
+    );
+    return vec4<f32>(pow(c, e));
+}
+
 @fragment
 fn fs_main_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
     // We expect "normal" textures that are NOT sRGB-aware.
-    let tex_gamma = sample_texture(in);
+    let tex_gamma = gray_text_texel(sample_texture(in), in.color);
     var out_color_gamma = in.color * tex_gamma;
     // Dither the float color down to eight bits to reduce banding.
     // This step is optional for egui backends.
@@ -163,7 +220,7 @@ fn fs_main_linear_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main_gamma_framebuffer(in: VertexOutput) -> @location(0) vec4<f32> {
     // We expect "normal" textures that are NOT sRGB-aware.
-    let tex_gamma = sample_texture(in);
+    let tex_gamma = gray_text_texel(sample_texture(in), in.color);
     var out_color_gamma = in.color * tex_gamma;
     // Dither the float color down to eight bits to reduce banding.
     // This step is optional for egui backends.

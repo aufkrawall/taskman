@@ -394,6 +394,24 @@ pub enum FontColorTransferFunction {
     /// See <https://www.desmos.com/calculator/w0ndf5blmn> for a comparison to gamma=0.5.
     #[default]
     TwoCoverageMinusCoverageSq,
+
+    /// TASKMAN-FORK: `alpha = coverage^gamma` applied by the *renderer*, per draw, with the
+    /// exponent chosen by the text colour's polarity.
+    ///
+    /// One curve baked into a shared atlas has to serve every text colour, so a curve that
+    /// keeps dark-on-light text from looking fat also thins the white label on an accent
+    /// button, and the reverse. With this variant the atlas stores raw coverage (exactly
+    /// like [`Self::Off`]) and a renderer that understands it picks `light_text` for text
+    /// brighter than [`polarity_split`] and `dark_text` otherwise; see
+    /// [`Self::polarity_exponent`]. A renderer that does not understand it draws raw
+    /// coverage.
+    PolarityGamma {
+        /// Exponent for text brighter than the expected background (light-on-dark).
+        light_text: f32,
+
+        /// Exponent for text darker than the expected background (dark-on-light).
+        dark_text: f32,
+    },
 }
 
 impl FontColorTransferFunction {
@@ -408,7 +426,7 @@ impl FontColorTransferFunction {
     #[inline(always)]
     pub fn to_atlas_color(self, input_color: Color32) -> Color32 {
         match self {
-            Self::Off | Self::Gamma(1.0) => input_color,
+            Self::Off | Self::Gamma(1.0) | Self::PolarityGamma { .. } => input_color,
 
             Self::Gamma(gamma) => {
                 let coverage = linear_f32_from_linear_u8(input_color.a());
@@ -429,10 +447,52 @@ impl FontColorTransferFunction {
     pub fn alpha_from_coverage(self, coverage: f32) -> f32 {
         let coverage = coverage.clamp(0.0, 1.0);
         match self {
-            Self::Off | Self::Gamma(1.0) => coverage,
+            // The polarity curve is the renderer's to apply; the atlas keeps raw coverage.
+            Self::Off | Self::Gamma(1.0) | Self::PolarityGamma { .. } => coverage,
             Self::Gamma(gamma) => coverage.powf(gamma),
             Self::TwoCoverageMinusCoverageSq => 2.0 * coverage - coverage * coverage,
         }
+    }
+
+    /// TASKMAN-FORK: the sanitized `[light_text, dark_text]` exponents a renderer must apply
+    /// to grayscale font-atlas coverage, or `None` when the atlas already holds final alpha.
+    pub fn render_time_exponents(self) -> Option<[f32; 2]> {
+        let sanitize = |e: f32| {
+            if e.is_finite() {
+                e.clamp(0.25, 4.0)
+            } else {
+                1.0
+            }
+        };
+        match self {
+            Self::PolarityGamma {
+                light_text,
+                dark_text,
+            } => Some([sanitize(light_text), sanitize(dark_text)]),
+            Self::Off | Self::Gamma(_) | Self::TwoCoverageMinusCoverageSq => None,
+        }
+    }
+
+    /// TASKMAN-FORK: the exponent for one draw under [`Self::PolarityGamma`].
+    ///
+    /// `straight_rgb` is the unmultiplied sRGB text colour in `0..=1`; see
+    /// [`text_is_light`] for the polarity rule. Renderers implement exactly this rule
+    /// (`egui.wgsl`'s `gray_text_texel`, `egui_glow`'s fragment shader, `egui_software`'s
+    /// LUT choice), so it is the one definition of polarity.
+    pub fn polarity_exponent(
+        self,
+        straight_rgb: [f32; 3],
+        background_luma: f32,
+        inverse_background_luma: f32,
+    ) -> Option<f32> {
+        let [light, dark] = self.render_time_exponents()?;
+        Some(
+            if text_is_light(straight_rgb, background_luma, inverse_background_luma) {
+                light
+            } else {
+                dark
+            },
+        )
     }
 
     #[inline(always)]
@@ -447,8 +507,39 @@ impl FontColorTransferFunction {
             Self::Off => 1.0,
             Self::Gamma(gamma) => gamma,
             Self::TwoCoverageMinusCoverageSq => 0.5, // approximately the same
+            Self::PolarityGamma {
+                light_text,
+                dark_text,
+            } => 0.5 * (light_text + dark_text),
         }
     }
+}
+
+/// TASKMAN-FORK: the text luma above which text counts as light-on-dark.
+///
+/// With both surfaces known (the page, and the surface under opposite-polarity text such as
+/// a dark toast in a light theme) it is their midpoint: light-gray toast text is darker
+/// than a light page yet plainly sits on the dark toast. With only the page known it is the
+/// page itself, so mid-luma accent text on a dark page stays light-on-dark. Unknown: `0.5`.
+pub fn polarity_split(background_luma: f32, inverse_background_luma: f32) -> f32 {
+    let known = |luma: f32| luma.is_finite() && luma >= 0.0;
+    match (known(background_luma), known(inverse_background_luma)) {
+        (false, _) => 0.5,
+        (true, false) => background_luma.min(1.0),
+        (true, true) => 0.5 * (background_luma.min(1.0) + inverse_background_luma.min(1.0)),
+    }
+}
+
+/// TASKMAN-FORK: whether text of this unmultiplied sRGB colour (`0..=1`) is light-on-dark:
+/// its Rec.601 luma is above [`polarity_split`].
+pub fn text_is_light(
+    straight_rgb: [f32; 3],
+    background_luma: f32,
+    inverse_background_luma: f32,
+) -> bool {
+    let [r, g, b] = straight_rgb;
+    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    luma > polarity_split(background_luma, inverse_background_luma)
 }
 
 // ----------------------------------------------------------------------------

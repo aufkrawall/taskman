@@ -56,6 +56,9 @@ pub(crate) struct FrameKey {
     pub subpixel: u8,
     pub gamma_bits: u32,
     pub contrast_bits: u32,
+    /// Render-time grayscale curve: light/dark exponents and polarity split (`0` bits when
+    /// the atlas holds final alpha). Applied after hashing like gamma, so keyed.
+    pub gray_text_bits: [u32; 3],
     pub round_rects_to_pixels: bool,
     pub round_text_to_pixels: bool,
     pub round_line_segments_to_pixels: bool,
@@ -82,6 +85,7 @@ impl FrameKey {
         subpixel: epaint::text::SubpixelMode,
         gamma: f32,
         contrast: f32,
+        gray_text: Option<([f32; 2], f32)>,
     ) -> Self {
         Self {
             width,
@@ -95,6 +99,9 @@ impl FrameKey {
             subpixel: subpixel as u8,
             gamma_bits: f32_bits(gamma),
             contrast_bits: f32_bits(contrast),
+            gray_text_bits: gray_text.map_or([0; 3], |([light, dark], split)| {
+                [f32_bits(light), f32_bits(dark), f32_bits(split)]
+            }),
             // Every tessellation option that changes pixels for unmodified shapes, not just
             // the ones the app happens to set at startup: a tile hash is only sound if two
             // frames with equal hashes and an equal key really do produce equal pixels.
@@ -922,6 +929,19 @@ mod tests {
         let text =
             painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
         assert_eq!(text.dirty_tiles, text.total_tiles, "text rects");
+
+        painter.set_gray_text(Some([0.8, 1.5]), 0.13);
+        let gray =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(gray.dirty_tiles, gray.total_tiles, "grayscale text curve");
+
+        painter.set_gray_text(Some([0.8, 1.5]), 0.545);
+        let polarity =
+            painter.paint_shapes_damaged(&mut target, &ctx, Vec::new(), Color32::WHITE, false);
+        assert_eq!(
+            polarity.dirty_tiles, polarity.total_tiles,
+            "grayscale polarity reference"
+        );
     }
 
     /// Damage rects are physical pixels and must stay inside the target even when the window

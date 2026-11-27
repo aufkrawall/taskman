@@ -10,6 +10,12 @@
 
 uniform sampler2D u_sampler;
 
+// TASKMAN-FORK: render-time grayscale glyph weight for raw-coverage atlases
+// (`FontColorTransferFunction::PolarityGamma`): (light-text exponent, dark-text exponent,
+// polarity split luma (`epaint::polarity_split`), 1 while drawing the managed font atlas). Same rule as
+// `egui.wgsl`'s `gray_text_texel` and `egui_software`'s `gray` module.
+uniform vec4 u_gray_text;
+
 #if NEW_SHADER_INTERFACE
     in vec4 v_rgba_in_gamma;
     in vec2 v_tc;
@@ -43,8 +49,27 @@ vec3 dither_interleaved(vec3 rgb, float levels) {
     return rgb + noise / (levels - 1.0);
 }
 
+vec4 gray_text_texel(vec4 tex, vec4 color) {
+    if (u_gray_text.w < 0.5) {
+        return tex;
+    }
+    float c = tex.a;
+    float tolerance = 0.5 / 255.0;
+    if (c <= 0.0 || c >= 1.0
+        || abs(tex.r - c) > tolerance || abs(tex.g - c) > tolerance || abs(tex.b - c) > tolerance) {
+        return tex;
+    }
+    vec3 straight = vec3(0.0);
+    if (color.a > 0.0) {
+        straight = clamp(color.rgb / max(color.a, 1e-5), 0.0, 1.0);
+    }
+    float luma = dot(straight, vec3(0.299, 0.587, 0.114));
+    float e = luma > u_gray_text.z ? u_gray_text.x : u_gray_text.y;
+    return vec4(pow(c, e));
+}
+
 void main() {
-    vec4 texture_in_gamma = texture2D(u_sampler, v_tc);
+    vec4 texture_in_gamma = gray_text_texel(texture2D(u_sampler, v_tc), v_rgba_in_gamma);
 
     // We multiply the colors in gamma space, because that's the only way to get text to look right.
     vec4 frag_color_gamma = v_rgba_in_gamma * texture_in_gamma;

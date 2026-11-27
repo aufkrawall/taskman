@@ -42,8 +42,22 @@ struct Frame {
 
 /// Run a UI closure and capture everything needed to paint it twice.
 fn capture(ppp: f32, build: impl FnMut(&mut egui::Ui)) -> Frame {
+    capture_with_transfer(ppp, None, build)
+}
+
+/// [`capture`] with the atlas built for a given coverage transfer function.
+fn capture_with_transfer(
+    ppp: f32,
+    transfer: Option<egui::epaint::FontColorTransferFunction>,
+    build: impl FnMut(&mut egui::Ui),
+) -> Frame {
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(ppp);
+    if let Some(transfer) = transfer {
+        ctx.all_styles_mut(|style| {
+            style.visuals.text_options.color_transfer_function = transfer;
+        });
+    }
 
     let mut build = build;
     let input = || egui::RawInput {
@@ -88,8 +102,15 @@ fn capture(ppp: f32, build: impl FnMut(&mut egui::Ui)) -> Frame {
 }
 
 fn render(frame: &Frame, mode: TextMode) -> Vec<u32> {
+    render_with_gray(frame, mode, None)
+}
+
+fn render_with_gray(frame: &Frame, mode: TextMode, gray: Option<([f32; 2], f32)>) -> Vec<u32> {
     let mut painter = Painter::new();
     painter.set_text_mode(mode);
+    if let Some((exponents, background)) = gray {
+        painter.set_gray_text(Some(exponents), background);
+    }
     for (id, delta) in &frame.textures {
         painter.set_texture(*id, delta);
     }
@@ -111,8 +132,12 @@ fn render(frame: &Frame, mode: TextMode) -> Vec<u32> {
 }
 
 fn assert_identical(frame: &Frame, what: &str) {
-    let blit = render(frame, TextMode::Blit);
-    let tess = render(frame, TextMode::Tessellate);
+    assert_identical_with_gray(frame, what, None);
+}
+
+fn assert_identical_with_gray(frame: &Frame, what: &str, gray: Option<([f32; 2], f32)>) {
+    let blit = render_with_gray(frame, TextMode::Blit, gray);
+    let tess = render_with_gray(frame, TextMode::Tessellate, gray);
 
     let bg = pack_rgb(BG.r(), BG.g(), BG.b());
     let painted = blit.iter().filter(|&&p| p != bg).count();
@@ -262,6 +287,32 @@ fn identical_with_faded_and_coloured_text() {
         });
     });
     assert_identical(&frame, "faded and coloured text");
+}
+
+/// The render-time grayscale curve (`PolarityGamma`) is applied by the blitter and by the
+/// triangle rasterizer alike, for both polarities, so the two paths still agree.
+#[test]
+fn identical_with_the_render_time_grayscale_curve() {
+    let transfer = egui::epaint::FontColorTransferFunction::PolarityGamma {
+        light_text: 0.8,
+        dark_text: 1.5,
+    };
+    let frame = capture_with_transfer(1.5, Some(transfer), |ui| {
+        ui.label(egui::RichText::new("light text").size(13.0));
+        ui.label(
+            egui::RichText::new("dark text on light")
+                .color(Color32::from_rgb(0x1a, 0x1a, 0x1a))
+                .background_color(Color32::from_rgb(0xf3, 0xf3, 0xf3))
+                .size(13.0),
+        );
+    });
+    let curve = Some(([0.8, 1.5], egui::epaint::polarity_split(0.13, -1.0)));
+    assert_identical_with_gray(&frame, "render-time grayscale curve", curve);
+    assert_ne!(
+        render_with_gray(&frame, TextMode::Blit, curve),
+        render(&frame, TextMode::Blit),
+        "the curve must actually change raw-coverage text"
+    );
 }
 
 /// Text clipped mid-glyph must be clipped identically in both modes.

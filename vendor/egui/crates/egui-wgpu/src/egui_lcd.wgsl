@@ -15,10 +15,14 @@
 // * On both gamma (`Unorm`) and linear (sRGB-converting) framebuffers, fixed-function
 //   dual-source blending cannot read `dst`, so `calibrated_lcd_blend_weights` solves for
 //   the per-channel blend weight that lands on the software renderer's `TextGamma` result
-//   `(s^g * a + d^g * (1 - a))^(1/g)` against `r_locals.subpixel_bg_luma` (falling back
-//   to foreground-luminance polarity compensation when `subpixel_bg_luma < 0` or when
-//   foreground polarity opposes the theme background). On sRGB targets, the target color
-//   and endpoints are converted to linear sRGB before solving linear blend weights.
+//   `(s^g * a + d^g * (1 - a))^(1/g)` against `r_locals.subpixel_bg_luma`. Text whose
+//   polarity opposes the theme (white toast text in a light theme) is solved against
+//   `r_locals.subpixel_inverse_bg_luma` instead, or against the pure black/white endpoint
+//   when that is unknown; with `subpixel_bg_luma < 0` the foreground-luminance polarity
+//   compensation is used. On sRGB targets, the target color and endpoints are converted to
+//   linear sRGB before solving linear blend weights. The weight is exact only on the
+//   assumed background; on others (heat cells, selection) it is the chord through that
+//   background and the text colour, a few LSB off the true curve.
 // * LCD sub-pixel edges intentionally skip dithering so `Unorm`, `sRGB`, and CPU output
 //   stay sharp and deterministic without spatial edge sparkle.
 
@@ -53,6 +57,7 @@ fn calibrated_lcd_blend_weights(
     straight_rgb: vec3<f32>,
     gamma: f32,
     bg_luma: f32,
+    inverse_bg_luma: f32,
     linear_framebuffer: bool,
 ) -> vec3<f32> {
     let s = clamp(straight_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -64,18 +69,26 @@ fn calibrated_lcd_blend_weights(
     var d: vec3<f32>;
     if bg_luma >= 0.0 {
         let bg = clamp(bg_luma, 0.0, 1.0);
-        // Only calibrate toward the theme background when foreground contrast follows the
-        // theme polarity; e.g. dark text on a bright accent button in dark mode falls back
-        // to the bright endpoint instead of dividing near `bg`.
-        let pol = select(vec3<f32>(1.0), vec3<f32>(0.0), lum >= bg);
-        let same_side = (bg < 0.5 && lum > bg) || (bg >= 0.5 && lum < bg);
-        let side_weight = select(0.0, smoothstep(0.04, 0.16, abs(lum - bg)), same_side);
-        let channel_trust = smoothstep(
-            vec3<f32>(0.02),
-            vec3<f32>(0.12),
-            abs(s - vec3<f32>(bg)),
-        );
-        d = mix(pol, vec3<f32>(bg), vec3<f32>(side_weight) * channel_trust);
+        // Polarity splits exactly like the grayscale curve's. Text whose polarity matches
+        // the theme sits on the page; the rest on the inverse surface, or on the pure
+        // black/white endpoint when that is unknown.
+        let light_text = lum > polarity_split(bg, inverse_bg_luma);
+        let surface = select(inverse_bg_luma, bg, light_text == (bg < 0.5));
+        let endpoint = select(vec3<f32>(1.0), vec3<f32>(0.0), light_text);
+        d = endpoint;
+        if surface >= 0.0 {
+            // Calibrate only against a surface the text actually contrasts with, so the
+            // solve never divides near `s == d`.
+            // Parenthesized: WGSL would read `a < b, c > d` as a template list.
+            let on_side = select((lum < surface), (lum > surface), light_text);
+            let side_weight = select(0.0, smoothstep(0.04, 0.16, abs(lum - surface)), on_side);
+            let channel_trust = smoothstep(
+                vec3<f32>(0.02),
+                vec3<f32>(0.12),
+                abs(s - vec3<f32>(surface)),
+            );
+            d = mix(endpoint, vec3<f32>(surface), vec3<f32>(side_weight) * channel_trust);
+        }
 
         if g <= 1.0001 {
             target_gamma = mix(d, s, a);
@@ -166,6 +179,7 @@ fn lcd_output(in: VertexOutput, linear_framebuffer: bool) -> LcdOutput {
             straight_rgb,
             r_locals.subpixel_gamma,
             r_locals.subpixel_bg_luma,
+            r_locals.subpixel_inverse_bg_luma,
             linear_framebuffer,
         );
         let mean_alpha = (channel_coverage.r + channel_coverage.g + channel_coverage.b) / 3.0;
@@ -182,8 +196,9 @@ fn lcd_output(in: VertexOutput, linear_framebuffer: bool) -> LcdOutput {
         }
     } else {
         // Color glyphs, grayscale glyphs, and WHITE_UV untextured geometry merged into
-        // the same mesh pass through unchanged on the ordinary premultiplied blend.
-        color = in.color * sampled;
+        // the same mesh use the ordinary premultiplied blend, with the render-time grayscale
+        // curve applied to white coverage exactly as `fs_main_*` does.
+        color = in.color * gray_text_texel(sampled, in.color);
         coverage = vec4<f32>(color.a);
         if r_locals.dithering == 1 && color.a > 0.0 {
             color = vec4<f32>(

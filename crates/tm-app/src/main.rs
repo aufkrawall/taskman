@@ -20,6 +20,8 @@ mod action_executor;
 mod app;
 mod app_ui;
 mod dialogs;
+#[cfg(all(test, windows))]
+mod dwrite_reference;
 mod icon_cache;
 mod icons;
 /// Headless CPU rendering of the real widgets; see the module docs.

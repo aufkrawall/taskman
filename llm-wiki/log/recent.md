@@ -1,3 +1,24 @@
+## 2026-11-27 - Font rendering review fixes
+
+- Review of 2f191f6b/ca991bb9 found: a theme-keyed grayscale curve that thinned the Light
+  theme's white toast text (~17 % below raw coverage); the GPU LCD blend solving
+  opposite-polarity text against pure black (up to ~16 LSB heavy); `SmoothMode::Lcd` also
+  disabling horizontal hinting for autohinted fonts; `hintmedium` mapped to light hinting; a
+  harness that did not mirror the app; parity docs quoting ~1-2 LSB against an 8 LSB test;
+  and an untested "matches Windows 11" claim.
+- Fixes: `FontColorTransferFunction::PolarityGamma` applied at render time in all four
+  renderers, `polarity_split`, `text_inverse_background_luma`, `lcd_aware_hinting_target`,
+  `theme::configure_text_options` shared with `text_compare`, a hardware parity suite with
+  measured bounds, and a DirectWrite reference (`tm-app/src/dwrite_reference.rs`).
+- The DirectWrite measurement overturned the Light calibration: `Sharp` Light was ~0.83 of
+  native ink (Dark ~0.91), and native dark-on-light text is heavier than raw sRGB coverage.
+  Retuned: Light gamma scale 1.10 -> 0.88, grayscale dark-text exponents 1.50/1.30 ->
+  1.15/0.95. Needs a visual check by the user on the installed build.
+- Debug trap: in WGSL `select(a < b, c > d, x)` parses as a template list; parenthesize.
+- Parity diagnosis: isolated 10 LSB pixels on upright text (7 after the Light retune) were overlapping glyph margins
+  (second glyph solved against the surface, pixel already inked), not calibration drift;
+  `TASKMAN_PARITY_DUMP=<dir>` writes the frames.
+
 ## 2026-11-26 - Linux sampling-engine cost
 
 - After the renderer work, an idle window's main cost was `tm-engine`: 2.7 % of

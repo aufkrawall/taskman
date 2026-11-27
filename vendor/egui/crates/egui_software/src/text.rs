@@ -35,6 +35,7 @@ use ecolor::Color32;
 use epaint::text::SubpixelMode;
 
 use crate::gamma::TextGamma;
+use crate::gray::GrayTextCurves;
 use crate::raster::ScreenVertex;
 use crate::target::{PixelRect, Target};
 use crate::texture::Texture;
@@ -49,6 +50,10 @@ pub struct TextBlend<'a> {
     /// path must stay bit-identical to the triangle rasterizer, and applying gamma there
     /// would silently change every existing rendering.
     pub gamma: &'a TextGamma,
+    /// TASKMAN-FORK: render-time grayscale curve for raw-coverage atlases
+    /// (`FontColorTransferFunction::PolarityGamma`). The triangle rasterizer applies the
+    /// same table to font-atlas texels, so the two paths stay in agreement.
+    pub gray: Option<&'a GrayTextCurves>,
 }
 
 /// How close a coordinate must be to an integer to count as pixel-aligned.
@@ -161,7 +166,15 @@ fn blit_rect(
     let s_lin_r = blend.gamma.linear_u16(sr);
     let s_lin_g = blend.gamma.linear_u16(sg);
     let s_lin_b = blend.gamma.linear_u16(sb);
+    // One glyph quad has one colour, so its polarity -- and its table -- is fixed here.
+    let gray_lut = blend
+        .gray
+        .map(|curves| curves.lut_for_straight([sr, sg, sb]));
     let ordinary_texel = |texel: Color32, dst: u32| -> Option<u32> {
+        let texel = match gray_lut {
+            Some(lut) => crate::gray::apply(lut, texel),
+            None => texel,
+        };
         let [tr, tg, tb, ta] = texel.to_array();
         if (ta | tr | tg | tb) == 0 {
             return None;
@@ -321,6 +334,7 @@ mod tests {
         TextBlend {
             subpixel: SubpixelMode::Off,
             gamma: gamma_tables(),
+            gray: None,
         }
     }
 
@@ -328,6 +342,7 @@ mod tests {
         TextBlend {
             subpixel: mode,
             gamma: gamma_tables(),
+            gray: None,
         }
     }
 
@@ -600,6 +615,7 @@ mod tests {
                 TextBlend {
                     subpixel: SubpixelMode::Rgb,
                     gamma: &gamma,
+                    gray: None,
                 },
             );
             buf[0]
@@ -630,6 +646,7 @@ mod tests {
                 let blend = TextBlend {
                     subpixel: SubpixelMode::Rgb,
                     gamma: &gamma,
+                    gray: None,
                 };
                 let mut buf = vec![0u32; 4];
                 let mut target = Target::new(&mut buf, 2, 2).unwrap();

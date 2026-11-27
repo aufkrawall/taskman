@@ -30,8 +30,8 @@
 //! perceived thickness.
 
 use eframe::egui::epaint::text::{
-    FontData, FontDefinitions, FontFamily, FontTweak, HintingTarget, LcdFilter, SmoothHinting,
-    SubpixelMode, VariationCoords,
+    FontData, FontDefinitions, FontFamily, FontTweak, HintingTarget, LcdFilter, SubpixelMode,
+    VariationCoords,
 };
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, pos2, vec2};
 use egui_software::{Painter, ShapeContext, Target};
@@ -43,16 +43,9 @@ const H: u32 = 44;
 const ZOOM: u32 = 5;
 const SAMPLE: &str = "Brave Browser (43)  18.4%  2410 MB";
 
-/// The grid-fitting profile, mirroring `fonts::hinting_target`.
+/// The grid-fitting profile: the app's own map, with the platform's hint style.
 fn hinting_target(smoothing: TextSmoothing) -> HintingTarget {
-    match smoothing {
-        TextSmoothing::Sharp => HintingTarget::Smooth(SmoothHinting {
-            light: false,
-            symmetric_rendering: false,
-            preserve_linear_metrics: false,
-        }),
-        TextSmoothing::Standard | TextSmoothing::Smooth => HintingTarget::default(),
-    }
+    crate::fonts::hinting_target(smoothing, crate::theme::subpixel_params().hint_style)
 }
 
 /// Largest font face the comparison will load.
@@ -144,6 +137,10 @@ struct Cfg {
     ppp: f32,
     /// `None` uses the display's own DirectWrite parameters.
     blend: Option<(f32, f32)>,
+    /// `(background, text)`; `None` uses the theme's page and body-text colours.
+    colors: Option<(Color32, Color32)>,
+    /// Overrides the app's grayscale coverage curve.
+    transfer: Option<egui::epaint::FontColorTransferFunction>,
 }
 
 impl Cfg {
@@ -155,7 +152,17 @@ impl Cfg {
             theme: egui::Theme::Dark,
             ppp: 1.0,
             blend: None,
+            colors: None,
+            transfer: None,
         }
+    }
+    fn colors(mut self, background: Color32, text: Color32) -> Self {
+        self.colors = Some((background, text));
+        self
+    }
+    fn transfer(mut self, transfer: egui::epaint::FontColorTransferFunction) -> Self {
+        self.transfer = Some(transfer);
+        self
     }
     fn theme(mut self, theme: egui::Theme) -> Self {
         self.theme = theme;
@@ -196,6 +203,8 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
         theme,
         ppp,
         blend,
+        colors,
+        transfer,
     } = cfg;
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(ppp);
@@ -203,27 +212,24 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
     for t in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.style_mut_of(t, |style| {
             let o = &mut style.visuals.text_options;
-            o.color_transfer_function = crate::theme::grayscale_transfer(smoothing, t);
-            o.subpixel = subpixel;
-            o.lcd_filter = filter.unwrap_or_else(|| {
-                crate::theme::lcd_filter(smoothing, crate::theme::subpixel_params().lcd_filter)
-            });
-            // Only `Smooth` asks for quarter-pixel horizontal positioning.
-            o.subpixel_binning = smoothing == TextSmoothing::Smooth;
-            o.font_hinting = true;
-            if !subpixel.is_off() {
-                // The atlas ceiling is not settable from a style:
-                // `Context::update_fonts_mut` overwrites `max_texture_side` with
-                // `RawInput`'s value on every pass, so a write here would be
-                // discarded. The harness only renders a short sample anyway.
-                // Either an explicit sweep value, or exactly what the app would pick
-                // for this profile -- so the profile rows show real behaviour.
-                let (gamma, contrast) = blend.unwrap_or_else(|| {
-                    crate::theme::cleartype_weight(smoothing, t, &crate::theme::subpixel_params())
-                });
+            // Exactly what the app would pick for this profile, so the profile rows show
+            // real behaviour; the sweeps below then override single knobs.
+            crate::theme::configure_text_options(
+                o,
+                smoothing,
+                t,
+                subpixel,
+                &crate::theme::subpixel_params(),
+            );
+            if let Some(filter) = filter {
+                o.lcd_filter = filter;
+            }
+            if let (Some((gamma, contrast)), false) = (blend, subpixel.is_off()) {
                 o.text_gamma = gamma;
                 o.text_contrast = contrast;
-                o.text_background_luma = crate::theme::text_background_luma(t);
+            }
+            if let Some(transfer) = transfer {
+                o.color_transfer_function = transfer;
             }
         });
     }
@@ -231,7 +237,7 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
         egui::Theme::Dark => egui::ThemePreference::Dark,
         egui::Theme::Light => egui::ThemePreference::Light,
     });
-    let (bg_color, fg_color) = match theme {
+    let (bg_color, fg_color) = colors.unwrap_or(match theme {
         egui::Theme::Dark => (
             Color32::from_rgb(0x19, 0x19, 0x19),
             Color32::from_rgb(0xe6, 0xe6, 0xe6),
@@ -240,7 +246,7 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
             Color32::from_rgb(0xf3, 0xf3, 0xf3),
             Color32::from_rgb(0x1a, 0x1a, 0x1a),
         ),
-    };
+    });
 
     let build = |ui: &mut egui::Ui| {
         ui.painter().text(
@@ -283,6 +289,15 @@ fn render_cfg(bytes: &[u8], cfg: Cfg) -> Vec<u32> {
         let (gamma, contrast) = ctx.fonts(|f| (f.options().text_gamma, f.options().text_contrast));
         painter.set_subpixel(subpixel, gamma, contrast);
     }
+    // ...and the render-time grayscale curve, as `software_integration` does.
+    let text_options = ctx.fonts(|f| *f.options());
+    painter.set_gray_text(
+        text_options.color_transfer_function.render_time_exponents(),
+        egui::epaint::polarity_split(
+            text_options.text_background_luma,
+            text_options.text_inverse_background_luma,
+        ),
+    );
 
     let shape_ctx = ShapeContext {
         pixels_per_point: out.pixels_per_point,
@@ -477,6 +492,28 @@ mod tests {
         // Grayscale `Sharp` for reference: what the app drew before this work.
         let buf = render(&bytes, TextSmoothing::Sharp, SubpixelMode::Off);
         write_zoomed(&base.join(format!("{prefix}-sharp-gray.png")), &buf);
+
+        // Every profile in both themes, LCD and grayscale, at 100% and 150%: what the
+        // weight tests measure, to look at.
+        for (theme_name, theme) in [("dark", egui::Theme::Dark), ("light", egui::Theme::Light)] {
+            for (scale_name, ppp) in [("100", 1.0_f32), ("150", 1.5)] {
+                for (aa_name, subpixel) in [("lcd", SubpixelMode::Rgb), ("gray", SubpixelMode::Off)]
+                {
+                    for (name, sm) in [
+                        ("sharp", TextSmoothing::Sharp),
+                        ("standard", TextSmoothing::Standard),
+                    ] {
+                        let cfg = Cfg::new(sm, subpixel).theme(theme).ppp(ppp);
+                        write_zoomed(
+                            &base.join(format!(
+                                "{prefix}-{theme_name}-{scale_name}-{aa_name}-{name}.png"
+                            )),
+                            &render_cfg(&bytes, cfg),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Under sub-pixel rendering, `Sharp` and `Standard` must produce distinct output
@@ -572,6 +609,125 @@ mod tests {
             assert!(
                 sharp > standard * 0.6,
                 "Light Mode at ppp={ppp}, Sharp ({sharp:.0}) is far lighter than Standard ({standard:.0})"
+            );
+        }
+    }
+
+    /// Total ink of light text above an arbitrary background colour.
+    fn ink_over(buf: &[u32], background: Color32) -> f64 {
+        let luma = |r: u32, g: u32, b: u32| (299 * r + 587 * g + 114 * b) / 1000;
+        let bg = luma(
+            u32::from(background.r()),
+            u32::from(background.g()),
+            u32::from(background.b()),
+        );
+        buf.iter()
+            .map(|&px| {
+                let l = luma((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+                f64::from(l.saturating_sub(bg)) / 255.0
+            })
+            .sum()
+    }
+
+    /// TaskMan's text weight against native DirectWrite text: the claim "weighs like
+    /// Windows" as a measurement.
+    ///
+    /// The reference is DirectWrite's own rasterizer and blender (`dwrite_reference`,
+    /// Windows-default parameters, `DWRITE_RENDERING_MODE_DEFAULT` -- natural symmetric at
+    /// these sizes, what WinUI/WPF text uses) on the same face, size and colours. Ink is
+    /// summed luma contrast against the background. Measured 2026-11-27 on Segoe UI
+    /// Variable Text: Sharp keeps 0.89-0.94 of native ink (thin and crisp, by design),
+    /// Standard 0.95-1.13 (it uses the display's parameters unmodified). Every ratio is
+    /// printed so the documentation can quote real numbers.
+    #[cfg(windows)]
+    #[test]
+    fn the_weight_matches_native_directwrite_text() {
+        use crate::dwrite_reference::{Antialias, render as dwrite};
+        use windows::Win32::Graphics::DirectWrite::DWRITE_RENDERING_MODE_DEFAULT;
+        let Some(bytes) = font_or_skip() else { return };
+        let mut failures = Vec::new();
+        for ppp in [1.0_f32, 1.25, 1.5] {
+            for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                let (bg, fg) = match theme {
+                    egui::Theme::Dark => ([0x19u8; 3], [0xe6u8; 3]),
+                    egui::Theme::Light => ([0xf3u8; 3], [0x1au8; 3]),
+                };
+                let measure = |buf: &[u32]| match theme {
+                    egui::Theme::Dark => ink(buf),
+                    egui::Theme::Light => dark_ink(buf),
+                };
+                for (aa_name, aa, subpixel) in [
+                    (
+                        "cleartype",
+                        Antialias::ClearType(DWRITE_RENDERING_MODE_DEFAULT),
+                        SubpixelMode::Rgb,
+                    ),
+                    (
+                        "grayscale",
+                        Antialias::Grayscale(DWRITE_RENDERING_MODE_DEFAULT),
+                        SubpixelMode::Off,
+                    ),
+                ] {
+                    let native = dwrite(
+                        SAMPLE,
+                        13.0 * ppp,
+                        (6.0 * ppp, 12.0 * ppp),
+                        (W, H),
+                        bg,
+                        fg,
+                        aa,
+                    )
+                    .expect("DirectWrite reference rendering failed");
+                    let native_ink = measure(&native);
+                    for (name, smoothing, band) in [
+                        ("sharp", TextSmoothing::Sharp, 0.85..=0.97),
+                        ("standard", TextSmoothing::Standard, 0.92..=1.17),
+                    ] {
+                        let ours = measure(&render_cfg(
+                            &bytes,
+                            Cfg::new(smoothing, subpixel).theme(theme).ppp(ppp),
+                        ));
+                        let ratio = ours / native_ink;
+                        let what = format!("ppp={ppp} {theme:?} {aa_name} {name}");
+                        eprintln!("directwrite ink ratio {what}: {ratio:.3}");
+                        if !band.contains(&ratio) {
+                            failures.push(format!("{what}: {ratio:.3} outside {band:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "text weight drifted from native DirectWrite:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Grayscale text whose polarity opposes the theme -- the Light theme's white label on
+    /// an accent button -- must keep light-on-dark weight. A curve chosen by theme thinned
+    /// it with the dark-text exponent, below even raw linear coverage.
+    #[test]
+    fn opposite_polarity_grayscale_text_is_not_thinned() {
+        let Some(bytes) = font_or_skip() else { return };
+        let accent = Color32::from_rgb(0x00, 0x78, 0xd4);
+        for ppp in [1.0_f32, 1.5] {
+            let cfg = Cfg::new(TextSmoothing::Sharp, SubpixelMode::Off)
+                .theme(egui::Theme::Light)
+                .ppp(ppp)
+                .colors(accent, Color32::WHITE);
+            let app = ink_over(&render_cfg(&bytes, cfg), accent);
+            let linear = ink_over(
+                &render_cfg(
+                    &bytes,
+                    cfg.transfer(egui::epaint::FontColorTransferFunction::Off),
+                ),
+                accent,
+            );
+            assert!(
+                app > linear * 1.02,
+                "ppp={ppp}: white-on-accent ink {app:.0} is not above linear coverage \
+                 {linear:.0}; light text is being thinned like dark text"
             );
         }
     }

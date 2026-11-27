@@ -801,6 +801,7 @@ impl GlowWinitRunning<'_> {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
+            painter.set_text_options(&integration.egui_ctx.fonts(|f| *f.options()));
             painter.paint_and_update_textures(
                 screen_size_in_pixels,
                 pixels_per_point,
@@ -1698,6 +1699,9 @@ fn render_immediate_viewport(
         [0.0, 0.0, 0.0, 0.0],
     );
 
+    painter
+        .borrow_mut()
+        .set_text_options(&egui_ctx.fonts(|f| *f.options()));
     painter.borrow_mut().paint_and_update_textures(
         screen_size_in_pixels,
         pixels_per_point,

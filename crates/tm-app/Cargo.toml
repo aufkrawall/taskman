@@ -80,6 +80,15 @@ wgpu = { version = "30", default-features = false, features = ["metal"], optiona
 egui_software = { path = "../../vendor/egui/crates/egui_software" }
 png = "0.18"
 
+[target.'cfg(windows)'.dev-dependencies]
+# `src/dwrite_reference.rs`: native DirectWrite text as the ground truth for the
+# text-weight tests. tm-platform already compiles these features into `windows`.
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Gdi",
+] }
+
 [lints.rust]
 # Rust 1.97 promotes otherwise harmless Zig/lld stderr (notably the deprecated
 # `-O1` optimization spelling) to a compiler warning during Linux zigbuilds.

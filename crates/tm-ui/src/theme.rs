@@ -430,21 +430,40 @@ pub fn install_visuals(ctx: &egui::Context) {
 /// * `subpixel_binning` caches each glyph at four fractional x-offsets rasterized from
 ///   shifted vector outlines and blitted 1:1 — more even spacing, softer stems. Only
 ///   [`TextSmoothing::Smooth`] asks for it.
-/// * The coverage→alpha gamma curve (`grayscale_transfer`) matches our calibrated ClearType
-///   polarity: Dark uses `< 1.0` (`0.80` Sharp / `0.65` Standard, avoiding both thin/stepped
-///   linear coverage and `2c - c²` bloat) while Light uses `> 1.0` (`1.50` Sharp / `1.30`
-///   Standard, preventing fat linear dark-on-light stems).
+/// * The coverage→alpha curve (`grayscale_transfer`) is applied by the renderer per draw,
+///   by the TEXT colour's polarity (`epaint::polarity_split`): light-on-dark text gets
+///   `0.80` Sharp / `0.65` Standard, dark-on-light text `1.15` Sharp / `0.95` Standard --
+///   measured against native DirectWrite text (`text_compare`), Sharp keeps ~0.9 of
+///   native ink in both themes and Standard ~1.0. A curve chosen by theme would also hit
+///   opposite-polarity text -- the Light theme's white toast labels -- with the wrong
+///   direction.
 fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     let smoothing = env_smoothing().unwrap_or_else(text_smoothing);
+    configure_text_options(opts, smoothing, theme, subpixel_mode(), &subpixel_params());
+}
+
+/// Every text option the app derives from a smoothing profile, theme, renderer-gated
+/// sub-pixel mode and platform parameters.
+///
+/// The one definition, shared with `text_compare` so the comparison harness renders
+/// exactly what the app renders (hinting, filter, blend and grayscale curve alike).
+pub fn configure_text_options(
+    opts: &mut egui::epaint::TextOptions,
+    smoothing: TextSmoothing,
+    theme: egui::Theme,
+    subpixel: egui::epaint::text::SubpixelMode,
+    params: &tm_platform::text_rendering::Params,
+) {
     let binning = matches!(smoothing, TextSmoothing::Smooth);
-    opts.color_transfer_function = grayscale_transfer(smoothing, theme);
+    opts.color_transfer_function = grayscale_transfer(smoothing);
     opts.subpixel_binning = binning;
+    // The polarity reference for the grayscale curve, and the GPU LCD blend calibration.
+    opts.text_background_luma = text_background_luma(theme);
+    opts.text_inverse_background_luma = text_inverse_background_luma(theme);
 
     // Sub-pixel (ClearType) coverage. Orthogonal to the grayscale weight above: it
     // changes how glyphs are RASTERIZED, and is gated on the active renderer being able
     // to blend per channel at all.
-    let subpixel = subpixel_mode();
-    let params = subpixel_params();
     opts.subpixel = subpixel;
     if !subpixel.is_off() {
         opts.cleartype_level = params.cleartype_level;
@@ -453,12 +472,10 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
         // Under sub-pixel rendering the smoothing profile becomes a WEIGHT and filter
         // control: `Sharp` pairs `LcdFilter::LIGHT` (omitting `FREETYPE_DEFAULT`'s `±2`
         // outer taps when the platform did not specify a filter) with `contrast = 0.0`
-        // and polarity-appropriate gamma tuning so 13 px rows stay crisp and lean
-        // alongside native Windows 11 ClearType.
-        let (gamma, contrast) = cleartype_weight(smoothing, theme, &params);
+        // and polarity-appropriate gamma tuning so 13 px rows stay crisp and lean.
+        let (gamma, contrast) = cleartype_weight(smoothing, theme, params);
         opts.text_gamma = gamma;
         opts.text_contrast = contrast;
-        opts.text_background_luma = text_background_luma(theme);
     }
     // The atlas ceiling is NOT set here. `Context::update_fonts_mut` overwrites
     // `TextOptions::max_texture_side` with `RawInput::max_texture_side` on every
@@ -470,22 +487,30 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     opts.font_hinting = params.hint_style != tm_platform::text_rendering::HintStyleChoice::None;
 }
 
-/// Calibrated grayscale coverage-to-alpha transfer curve for `SubpixelMode::Off`.
+/// Calibrated grayscale coverage-to-alpha curve for `SubpixelMode::Off` glyphs.
 ///
-/// Shared with `text_compare` so grayscale comparisons mirror app rendering.
-/// Dark exponents (`< 1.0`) lift partial coverage toward our ClearType Dark curve without
-/// `TwoCoverageMinusCoverageSq`'s bloat; Light exponents (`> 1.0`) thin partial coverage
-/// so dark-on-light text does not render fat in sRGB blending.
+/// Shared with `text_compare` so grayscale comparisons mirror app rendering. The renderer
+/// picks the exponent per draw from the text colour's polarity
+/// ([`egui::epaint::FontColorTransferFunction::PolarityGamma`]).
+///
+/// Calibrated against native DirectWrite grayscale text (Windows-default parameters,
+/// `text_compare::the_weight_matches_native_directwrite_text`): Sharp keeps ~0.9 of native
+/// ink in both themes, Standard ~1.0, at 100/125/150%. Native dark-on-light text is heavier
+/// than raw coverage blended in sRGB (DirectWrite's gamma and contrast add weight there),
+/// so the dark-text exponents sit near 1, not above it.
 pub const fn grayscale_transfer(
     smoothing: TextSmoothing,
-    theme: egui::Theme,
 ) -> egui::epaint::FontColorTransferFunction {
-    use egui::epaint::FontColorTransferFunction::Gamma;
-    match (smoothing, theme) {
-        (TextSmoothing::Sharp, egui::Theme::Dark) => Gamma(0.80),
-        (TextSmoothing::Standard | TextSmoothing::Smooth, egui::Theme::Dark) => Gamma(0.65),
-        (TextSmoothing::Sharp, egui::Theme::Light) => Gamma(1.50),
-        (TextSmoothing::Standard | TextSmoothing::Smooth, egui::Theme::Light) => Gamma(1.30),
+    use egui::epaint::FontColorTransferFunction::PolarityGamma;
+    match smoothing {
+        TextSmoothing::Sharp => PolarityGamma {
+            light_text: 0.80,
+            dark_text: 1.15,
+        },
+        TextSmoothing::Standard | TextSmoothing::Smooth => PolarityGamma {
+            light_text: 0.65,
+            dark_text: 0.95,
+        },
     }
 }
 
@@ -515,8 +540,8 @@ pub fn lcd_filter(
     }
 }
 
-/// Expected sRGB background luminance used to calibrate GPU fixed-function LCD blending
-/// against CPU `TextGamma`.
+/// Expected sRGB background luminance: the polarity reference for grayscale text, and the
+/// background GPU fixed-function LCD blending calibrates against to match CPU `TextGamma`.
 pub const fn text_background_luma(theme: egui::Theme) -> f32 {
     match theme {
         egui::Theme::Dark => 0.13,
@@ -524,13 +549,30 @@ pub const fn text_background_luma(theme: egui::Theme) -> f32 {
     }
 }
 
+/// Expected luminance under text whose polarity opposes the theme, or `-1.0` for none.
+///
+/// The Light theme's light text is the toast UI, drawn on `from_black_alpha(220)` over the
+/// page (`#212121`, luma ~0.13); without this the GPU LCD blend assumed pure black there and
+/// drew that text up to ~16 LSB heavier than the CPU renderer, and polarity would split at
+/// the 0.96 page, misreading light-gray toast text as dark-on-light. The Dark theme draws no
+/// dark text, and an inverse surface there would move the polarity split above mid-luma
+/// accent text (`#3a63d9`, luma ~0.39) that sits on the dark page.
+pub const fn text_inverse_background_luma(theme: egui::Theme) -> f32 {
+    match theme {
+        egui::Theme::Dark => -1.0,
+        egui::Theme::Light => text_background_luma(egui::Theme::Dark),
+    }
+}
+
 /// Weight tuning for [`TextSmoothing::Sharp`] under sub-pixel rendering.
 ///
-/// Dropping `contrast` to `0.0` avoids lifting 1px stem edges at 100% scaling while
-/// lowering Dark gamma (`~1.40` on Windows `1.8`) and slightly raising Light gamma
-/// (`~1.98`) aligns both themes with native Windows 11 ClearType without stem erosion.
+/// Dropping `contrast` to `0.0` avoids lifting 1px stem edges at 100% scaling. Measured
+/// against native DirectWrite ClearType (Windows-default parameters,
+/// `text_compare::the_weight_matches_native_directwrite_text`), Dark gamma `~1.40` and
+/// Light gamma `~1.58` (on Windows' `1.8`) both keep ~0.9 of native ink at 100-150%: thin
+/// and crisp in both themes. (Light used to be `~1.98`, which left only ~0.83.)
 const SHARP_DARK_GAMMA_SCALE: f32 = 0.78;
-const SHARP_LIGHT_GAMMA_SCALE: f32 = 1.10;
+const SHARP_LIGHT_GAMMA_SCALE: f32 = 0.88;
 const SHARP_CONTRAST: f32 = 0.0;
 
 /// Blend gamma and contrast for a smoothing profile under sub-pixel rendering.
@@ -750,28 +792,60 @@ mod tests {
     }
 
     #[test]
-    fn grayscale_transfer_calibrates_dark_and_light_polarity() {
-        let dark_sharp = grayscale_transfer(TextSmoothing::Sharp, egui::Theme::Dark);
-        let dark_std = grayscale_transfer(TextSmoothing::Standard, egui::Theme::Dark);
-        let light_sharp = grayscale_transfer(TextSmoothing::Sharp, egui::Theme::Light);
-        let light_std = grayscale_transfer(TextSmoothing::Standard, egui::Theme::Light);
+    fn grayscale_transfer_follows_text_polarity_not_theme() {
+        let half = |smoothing, rgb: [f32; 3], theme| {
+            let exponent = grayscale_transfer(smoothing)
+                .polarity_exponent(
+                    rgb,
+                    text_background_luma(theme),
+                    text_inverse_background_luma(theme),
+                )
+                .expect("the grayscale curve is applied at render time");
+            0.5_f32.powf(exponent)
+        };
+        let white = [1.0; 3];
+        let ink = [0x1a as f32 / 255.0; 3];
+        let accent_text_dark = [0.0, 0x1b as f32 / 255.0, 0x2e as f32 / 255.0];
 
-        // Dark lifts partial coverage above raw linear (0.5) without `2c - c^2` bloat (0.75),
-        // with Sharp staying leaner than Standard.
-        let ds = dark_sharp.alpha_from_coverage(0.5);
-        let dt = dark_std.alpha_from_coverage(0.5);
+        // Light-on-dark lifts partial coverage above raw linear (0.5) without `2c - c^2`
+        // bloat (0.75), with Sharp leaner than Standard.
+        let ds = half(TextSmoothing::Sharp, white, egui::Theme::Dark);
+        let dt = half(TextSmoothing::Standard, white, egui::Theme::Dark);
         assert!(
             ds > 0.5 && ds < dt && dt < 0.70,
-            "dark: sharp={ds} std={dt}"
+            "light text: sharp={ds} std={dt}"
         );
 
-        // Light thins partial coverage below raw linear (0.5) so dark-on-light text is not fat,
-        // with Sharp staying leaner than Standard.
-        let ls = light_sharp.alpha_from_coverage(0.5);
-        let lt = light_std.alpha_from_coverage(0.5);
+        // Dark-on-light stays near raw coverage (native DirectWrite is not thin there),
+        // Sharp leaner than Standard.
+        let ls = half(TextSmoothing::Sharp, ink, egui::Theme::Light);
+        let lt = half(TextSmoothing::Standard, ink, egui::Theme::Light);
         assert!(
-            ls < lt && lt < 0.5 && ls > 0.25,
-            "light: sharp={ls} std={lt}"
+            ls < lt && ls > 0.4 && lt < 0.6,
+            "dark text: sharp={ls} std={lt}"
+        );
+
+        // Opposite-polarity text keeps its own direction: the Light theme's white and
+        // light-gray toast text is lifted like Dark-theme text, dark text thinned anywhere.
+        let light_gray = [0xc8 as f32 / 255.0; 3];
+        assert_eq!(half(TextSmoothing::Sharp, white, egui::Theme::Light), ds);
+        assert_eq!(
+            half(TextSmoothing::Sharp, light_gray, egui::Theme::Light),
+            ds
+        );
+        assert_eq!(
+            half(TextSmoothing::Sharp, accent_text_dark, egui::Theme::Dark),
+            ls
+        );
+        // Mid-luma accent text on the dark page stays light-on-dark.
+        let kernel_blue = [
+            0x3a as f32 / 255.0,
+            0x63 as f32 / 255.0,
+            0xd9 as f32 / 255.0,
+        ];
+        assert_eq!(
+            half(TextSmoothing::Sharp, kernel_blue, egui::Theme::Dark),
+            ds
         );
     }
 
@@ -906,9 +980,12 @@ mod tests {
             dark_g < win.gamma,
             "dark Sharp should lower gamma to thin white ink"
         );
+        // Light used to RAISE gamma to thin dark ink; measured against native DirectWrite
+        // that left Light ~0.83 of native ink. Both themes now sit below Windows' gamma and
+        // the weight itself is pinned by `text_compare`'s DirectWrite comparison.
         assert!(
-            light_g > win.gamma,
-            "light Sharp must raise gamma (not lower it) to thin dark ink"
+            (1.0..win.gamma).contains(&light_g) && light_g > dark_g,
+            "light Sharp gamma {light_g} must stay below Windows' and above dark's {dark_g}"
         );
         assert!(dark_c < win.contrast && light_c < win.contrast);
 
@@ -929,5 +1006,7 @@ mod tests {
         );
         assert_eq!(text_background_luma(egui::Theme::Dark), 0.13);
         assert_eq!(text_background_luma(egui::Theme::Light), 0.96);
+        assert_eq!(text_inverse_background_luma(egui::Theme::Light), 0.13);
+        assert_eq!(text_inverse_background_luma(egui::Theme::Dark), -1.0);
     }
 }

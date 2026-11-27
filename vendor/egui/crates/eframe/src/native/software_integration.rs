@@ -1126,11 +1126,9 @@ impl SoftwareWinitRunning<'_> {
             // Sub-pixel mode *and* its blend parameters both come from the atlas's
             // options, so the way glyphs were rasterized and the way they are blended
             // cannot disagree.
-            let (subpixel, gamma, contrast) = self.integration.egui_ctx.fonts(|f| {
-                let o = f.options();
-                (o.subpixel, o.text_gamma, o.text_contrast)
-            });
-            self.painter.set_subpixel(subpixel, gamma, contrast);
+            let text_options = self.integration.egui_ctx.fonts(|f| *f.options());
+            self.painter.set_text_options(&text_options);
+            let subpixel = text_options.subpixel;
 
             let clear = self.app.clear_color(
                 &self

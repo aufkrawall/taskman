@@ -339,9 +339,8 @@ impl egui_kittest::TestRenderer for SoftwareTestRenderer {
         ctx: &egui::Context,
         output: &egui::FullOutput,
     ) -> Result<image::RgbaImage, String> {
-        let opts = ctx.fonts(|f| f.options().clone());
-        self.painter
-            .set_subpixel(opts.subpixel, opts.text_gamma, opts.text_contrast);
+        let opts = ctx.fonts(|f| *f.options());
+        self.painter.set_text_options(&opts);
         let ppp = ctx.pixels_per_point();
         let size = ctx.content_rect().size() * ppp;
         let width = size.x.round() as u32;
@@ -422,65 +421,214 @@ fn setup_for_dual_source_backend(backend: wgpu::Backend) -> WgpuSetup {
     setup
 }
 
-#[expect(clippy::too_many_arguments)]
-fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
-    renderer: R,
+/// One CPU-vs-GPU parity scene: text colours, background and the text options under test.
+#[derive(Clone, Copy)]
+struct ParityCase {
+    label: &'static str,
     theme: Theme,
-    ppp: f32,
     bg: Color32,
     fg_primary: Color32,
     fg_dim: Color32,
+    subpixel: SubpixelMode,
     gamma: f32,
     contrast: f32,
     bg_luma: f32,
+    inverse_bg_luma: f32,
+}
+
+/// TaskMan's grayscale curve for `Sharp` (`tm_ui::theme::grayscale_transfer`).
+const SHARP_GRAY: egui::epaint::FontColorTransferFunction =
+    egui::epaint::FontColorTransferFunction::PolarityGamma {
+        light_text: 0.80,
+        dark_text: 1.15,
+    };
+
+/// A face to run the parity scene with, beyond egui's bundled default.
+///
+/// The product renders the OS UI font (Segoe UI Variable on Windows 11) with TaskMan's
+/// `Sharp` hinting tweak, so parity on the bundled face alone would leave the shipped
+/// glyph shapes and hinting unchecked.
+fn system_ui_font() -> Option<(&'static str, Vec<u8>)> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            r"C:\Windows\Fonts\SegUIVar.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+        ]
+    } else {
+        &[
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    };
+    candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes)))
+}
+
+fn sharp_font_definitions(bytes: &[u8]) -> egui::FontDefinitions {
+    use egui::epaint::text::{FontData, FontTweak, HintingTarget, SmoothHinting};
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "system-ui".to_owned(),
+        Arc::new(FontData::from_owned(bytes.to_vec()).tweak(FontTweak {
+            hinting_target: HintingTarget::Smooth(SmoothHinting {
+                light: false,
+                symmetric_rendering: false,
+                preserve_linear_metrics: false,
+            }),
+            ..Default::default()
+        })),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "system-ui".to_owned());
+    }
+    fonts
+}
+
+fn render_parity_scene<R: egui_kittest::TestRenderer + 'static>(
+    renderer: R,
+    case: ParityCase,
+    ppp: f32,
+    font: Option<&[u8]>,
 ) -> image::RgbaImage {
     let mut harness = Harness::builder()
         .with_size(Vec2::new(260.0, 96.0))
         .with_pixels_per_point(ppp)
         .renderer(renderer)
         .build_ui(move |ui| {
-            ui.ctx().set_theme(theme);
-            ui.ctx().style_mut_of(theme, |style| {
+            ui.ctx().set_theme(case.theme);
+            ui.ctx().style_mut_of(case.theme, |style| {
                 let opts = &mut style.visuals.text_options;
-                opts.subpixel = SubpixelMode::Rgb;
-                opts.text_gamma = gamma;
-                opts.text_contrast = contrast;
-                opts.text_background_luma = bg_luma;
+                opts.subpixel = case.subpixel;
+                opts.text_gamma = case.gamma;
+                opts.text_contrast = case.contrast;
+                opts.text_background_luma = case.bg_luma;
+                opts.text_inverse_background_luma = case.inverse_bg_luma;
+                opts.color_transfer_function = SHARP_GRAY;
             });
-            ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
+            ui.painter()
+                .rect_filled(ui.ctx().content_rect(), 0.0, case.bg);
             let primary = ui.painter().layout_no_wrap(
                 "Hamburgefonstiv 18.4%".to_owned(),
                 FontId::proportional(13.0),
-                fg_primary,
+                case.fg_primary,
             );
-            ui.painter()
-                .add(TextShape::new(Pos2::new(10.0, 10.0), primary, fg_primary));
+            ui.painter().add(TextShape::new(
+                Pos2::new(10.0, 10.0),
+                primary,
+                case.fg_primary,
+            ));
             let dim = ui.painter().layout_no_wrap(
                 "Secondary 2410 MB".to_owned(),
                 FontId::proportional(13.0),
-                fg_dim,
+                case.fg_dim,
             );
             ui.painter()
-                .add(TextShape::new(Pos2::new(10.0, 34.0), dim, fg_dim));
+                .add(TextShape::new(Pos2::new(10.0, 34.0), dim, case.fg_dim));
             let mut italic_job = egui::text::LayoutJob::default();
             italic_job.append(
                 "Italic fallback 42%",
                 0.0,
                 egui::TextFormat {
                     font_id: FontId::proportional(13.0),
-                    color: fg_primary,
+                    color: case.fg_primary,
                     italics: true,
                     ..Default::default()
                 },
             );
             let italic = ui.painter().layout_job(italic_job);
-            ui.painter()
-                .add(TextShape::new(Pos2::new(10.0, 58.0), italic, fg_primary));
+            ui.painter().add(TextShape::new(
+                Pos2::new(10.0, 58.0),
+                italic,
+                case.fg_primary,
+            ));
         });
+    if let Some(bytes) = font {
+        harness.ctx.set_fonts(sharp_font_definitions(bytes));
+    }
     harness.run();
     harness.render().expect("parity render")
 }
 
+/// Per-channel difference statistics over pixels that are not plain background.
+struct Divergence {
+    max: u8,
+    mean: f64,
+    worst: (u32, u32, [u8; 4], [u8; 4]),
+}
+
+fn divergence(
+    cpu: &image::RgbaImage,
+    gpu: &image::RgbaImage,
+    bg: Color32,
+    rows: std::ops::Range<u32>,
+) -> Divergence {
+    let mut max = 0_u8;
+    let mut worst = (0_u32, 0_u32, [0_u8; 4], [0_u8; 4]);
+    let mut total = 0_u64;
+    let mut channels = 0_u64;
+    for (idx, (c, g)) in cpu.pixels().zip(gpu.pixels()).enumerate() {
+        if !rows.contains(&(idx as u32 / cpu.width())) {
+            continue;
+        }
+        for ch in 0..3 {
+            let diff = c.0[ch].abs_diff(g.0[ch]);
+            if diff > max {
+                max = diff;
+                worst = (idx as u32 % cpu.width(), idx as u32 / cpu.width(), c.0, g.0);
+            }
+            if c.0[ch] != bg[ch] || g.0[ch] != bg[ch] {
+                total += u64::from(diff);
+                channels += 1;
+            }
+        }
+    }
+    Divergence {
+        max,
+        mean: total as f64 / channels.max(1) as f64,
+        worst,
+    }
+}
+
+/// `(max, mean)` per-channel LSB bounds for upright and italic rows.
+struct ParityBounds {
+    upright: (u8, f64),
+    italic: (u8, f64),
+}
+
+/// Bounds from the D3D12 and Vulkan measurements of 2026-11-27; see
+/// `llm-wiki/render-pipeline.md`.
+///
+/// The LCD maxima are isolated pixels with known causes, not drift: where two glyph quads
+/// overlap (adjacent glyphs' one-pixel LCD margins) the GPU blends the second glyph as if
+/// it landed on the calibrated surface, but the pixel already holds the first glyph's ink
+/// (measured up to 7 LSB; 10 under an earlier, steeper 1.98 Light gamma); italic rows add
+/// the 1/16 px vs 1/256 px vertex-snapping difference on sheared edges (up to 8, was 13).
+/// The maxima keep headroom for the steeper curve a user's ClearType tuning can select;
+/// the means are what pins the calibration.
+fn parity_bounds(grayscale: bool) -> ParityBounds {
+    if grayscale {
+        ParityBounds {
+            upright: (3, 0.6),
+            italic: (4, 0.75),
+        }
+    } else {
+        ParityBounds {
+            upright: (11, 1.15),
+            italic: (14, 1.7),
+        }
+    }
+}
+
+/// The real shaders against the CPU renderer, on the surfaces and scales TaskMan ships.
+///
+/// Tolerances are the measured worst case plus a small margin, not a loose bound: a
+/// regression in `egui_lcd.wgsl`'s calibration or `egui.wgsl`'s grayscale curve shows up as
+/// a broken bound here. Every case prints its measured numbers, so the documentation can
+/// quote real results.
 #[test]
 #[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
 fn cpu_and_gpu_match_on_dark_and_light_surfaces() {
@@ -491,51 +639,101 @@ fn cpu_and_gpu_match_on_dark_and_light_surfaces() {
         "no D3D12 or Vulkan dual-source adapter matched"
     );
 
+    let dark = |label, bg, fg_primary, fg_dim, subpixel, gamma, contrast| ParityCase {
+        label,
+        theme: Theme::Dark,
+        bg,
+        fg_primary,
+        fg_dim,
+        subpixel,
+        gamma,
+        contrast,
+        bg_luma: 0.13,
+        inverse_bg_luma: -1.0,
+    };
+    let light = |label, bg, fg_primary, fg_dim, subpixel| ParityCase {
+        label,
+        theme: Theme::Light,
+        bg,
+        fg_primary,
+        fg_dim,
+        subpixel,
+        gamma: 1.584,
+        contrast: 0.0,
+        bg_luma: 0.96,
+        inverse_bg_luma: 0.13,
+    };
+    let rgb = Color32::from_rgb;
     let cases = [
-        (
-            "dark_sharp_#191919",
-            Theme::Dark,
-            Color32::from_rgb(0x19, 0x19, 0x19),
+        dark(
+            "lcd_dark_sharp_#191919",
+            rgb(0x19, 0x19, 0x19),
             Color32::WHITE,
-            Color32::from_rgb(0x9d, 0x9d, 0x9d),
+            rgb(0x9d, 0x9d, 0x9d),
+            SubpixelMode::Rgb,
             1.404,
             0.0,
-            0.13,
         ),
-        (
-            "dark_sharp_#2b2b2b",
-            Theme::Dark,
-            Color32::from_rgb(0x2b, 0x2b, 0x2b),
+        dark(
+            "lcd_dark_sharp_#2b2b2b",
+            rgb(0x2b, 0x2b, 0x2b),
             Color32::WHITE,
-            Color32::from_rgb(0x9d, 0x9d, 0x9d),
+            rgb(0x9d, 0x9d, 0x9d),
+            SubpixelMode::Rgb,
             1.404,
             0.0,
-            0.13,
         ),
-        (
-            "dark_standard_translucent",
-            Theme::Dark,
-            Color32::from_rgb(0x21, 0x21, 0x21),
+        dark(
+            "lcd_dark_standard_translucent",
+            rgb(0x21, 0x21, 0x21),
             Color32::from_white_alpha(128),
-            Color32::from_rgb(0x9d, 0x9d, 0x9d),
+            rgb(0x9d, 0x9d, 0x9d),
+            SubpixelMode::Rgb,
             1.8,
             0.5,
-            0.13,
         ),
-        (
-            "light_sharp_#f3f3f3",
-            Theme::Light,
-            Color32::from_rgb(0xf3, 0xf3, 0xf3),
-            Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            Color32::from_rgb(0x5f, 0x5f, 0x5f),
-            1.98,
+        light(
+            "lcd_light_sharp_#f3f3f3",
+            rgb(0xf3, 0xf3, 0xf3),
+            rgb(0x1a, 0x1a, 0x1a),
+            rgb(0x5f, 0x5f, 0x5f),
+            SubpixelMode::Rgb,
+        ),
+        // White toast text in the Light theme: opposite polarity, inverse surface.
+        light(
+            "lcd_light_sharp_toast_#212121",
+            rgb(0x21, 0x21, 0x21),
+            Color32::WHITE,
+            rgb(0xc8, 0xc8, 0xc8),
+            SubpixelMode::Rgb,
+        ),
+        dark(
+            "gray_dark_sharp_#191919",
+            rgb(0x19, 0x19, 0x19),
+            Color32::WHITE,
+            rgb(0x9d, 0x9d, 0x9d),
+            SubpixelMode::Off,
+            1.404,
             0.0,
-            0.96,
+        ),
+        light(
+            "gray_light_sharp_#f3f3f3",
+            rgb(0xf3, 0xf3, 0xf3),
+            rgb(0x1a, 0x1a, 0x1a),
+            rgb(0x5f, 0x5f, 0x5f),
+            SubpixelMode::Off,
+        ),
+        light(
+            "gray_light_sharp_toast_#212121",
+            rgb(0x21, 0x21, 0x21),
+            Color32::WHITE,
+            rgb(0xc8, 0xc8, 0xc8),
+            SubpixelMode::Off,
         ),
     ];
 
     let renderer_configs = [
-        ("predictable", RendererOptions::PREDICTABLE),
+        // eframe's default options and an `Unorm` surface: what TaskMan ships.
         (
             "hardware_dithered",
             RendererOptions {
@@ -543,77 +741,119 @@ fn cpu_and_gpu_match_on_dark_and_light_surfaces() {
                 predictable_texture_filtering: false,
                 ..RendererOptions::default()
             },
+            false,
         ),
+        ("predictable", RendererOptions::PREDICTABLE, false),
+        (
+            "hardware_dithered_srgb",
+            RendererOptions {
+                dithering: true,
+                predictable_texture_filtering: false,
+                ..RendererOptions::default()
+            },
+            true,
+        ),
+        ("predictable_srgb", RendererOptions::PREDICTABLE, true),
     ];
 
+    let system = system_ui_font();
+    match &system {
+        Some((path, _)) => eprintln!("parity: system UI font {path}"),
+        None => eprintln!("parity: no system UI font found; bundled face only"),
+    }
+    let mut fonts: Vec<(&str, Option<&[u8]>)> = vec![("bundled", None)];
+    if let Some((_, bytes)) = &system {
+        fonts.push(("system", Some(bytes.as_slice())));
+    }
+
+    let mut failures = Vec::new();
     for backend in backends {
-        for ppp in [1.0_f32, 1.5] {
-            for (label, theme, bg, fg_primary, fg_dim, gamma, contrast, bg_luma) in cases {
-                let cpu = render_parity_scene(
-                    SoftwareTestRenderer::new(),
-                    theme,
-                    ppp,
-                    bg,
-                    fg_primary,
-                    fg_dim,
-                    gamma,
-                    contrast,
-                    bg_luma,
-                );
-                for (opt_label, options) in renderer_configs {
-                    for srgb_target in [false, true] {
-                        let setup = setup_for_dual_source_backend(backend);
+        // One device per backend; every render compiles a fresh renderer on it.
+        let base = egui_kittest::wgpu::create_render_state(
+            setup_for_dual_source_backend(backend),
+            RendererOptions::PREDICTABLE,
+        );
+        let existing = || {
+            WgpuSetup::Existing(egui_wgpu::WgpuSetupExisting {
+                instance: base.instance.clone(),
+                adapter: base.adapter.clone(),
+                device: base.device.clone(),
+                queue: base.queue.clone(),
+            })
+        };
+        for &(font_label, font) in &fonts {
+            for ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+                // Every renderer configuration on the bundled face at the two shipped
+                // scales; the shipped configuration everywhere else.
+                let configs = if font.is_none() && (ppp == 1.0 || ppp == 1.5) {
+                    &renderer_configs[..]
+                } else {
+                    &renderer_configs[..1]
+                };
+                for case in cases {
+                    let cpu = render_parity_scene(SoftwareTestRenderer::new(), case, ppp, font);
+                    for &(opt_label, options, srgb_target) in configs {
                         let gpu_renderer = if srgb_target {
                             WgpuTestRenderer::from_setup_and_format(
-                                setup,
+                                existing(),
                                 options,
                                 wgpu::TextureFormat::Rgba8UnormSrgb,
                             )
                         } else {
-                            WgpuTestRenderer::from_setup_and_options(setup, options)
+                            WgpuTestRenderer::from_setup_and_options(existing(), options)
                         };
-                        let gpu = render_parity_scene(
-                            gpu_renderer,
-                            theme,
-                            ppp,
-                            bg,
-                            fg_primary,
-                            fg_dim,
-                            gamma,
-                            contrast,
-                            bg_luma,
+                        let gpu = render_parity_scene(gpu_renderer, case, ppp, font);
+                        // Upright rows (1:1 glyph blits) and the italic row (triangle path)
+                        // are bounded separately: the CPU rasterizer snaps vertices to 1/16 px,
+                        // the GPU to 1/256 px, which moves sheared glyph edges by a fraction of
+                        // a texel -- a coverage difference that steep blend curves amplify.
+                        let italic_top = (52.0 * ppp) as u32;
+                        let upright = divergence(&cpu, &gpu, case.bg, 0..italic_top);
+                        let italic = divergence(&cpu, &gpu, case.bg, italic_top..u32::MAX);
+                        let what = format!(
+                            "{backend:?} {font_label} {} ppp={ppp} {opt_label}",
+                            case.label
                         );
-                        let mut max_diff = 0_u8;
-                        let mut worst = (0_u32, 0_u32, [0_u8; 4], [0_u8; 4]);
-                        let mut total_diff = 0_u64;
-                        let mut non_bg_channels = 0_u64;
-                        for (idx, (c, g)) in cpu.pixels().zip(gpu.pixels()).enumerate() {
-                            for ch in 0..3 {
-                                let diff = c.0[ch].abs_diff(g.0[ch]);
-                                if diff > max_diff {
-                                    max_diff = diff;
-                                    let x = idx as u32 % cpu.width();
-                                    let y = idx as u32 / cpu.width();
-                                    worst = (x, y, c.0, g.0);
+                        eprintln!(
+                            "parity: {what}: upright max={} mean={:.3} italic max={} mean={:.3}",
+                            upright.max, upright.mean, italic.max, italic.mean
+                        );
+                        // The ordinary pipeline blends in linear space on sRGB targets (stock
+                        // egui behaviour, every fill included), so grayscale text there cannot
+                        // match the gamma-space CPU blend; TaskMan always selects an `Unorm`
+                        // surface. Reported above, not bounded.
+                        if case.subpixel.is_off() && srgb_target {
+                            continue;
+                        }
+                        let bounds = parity_bounds(case.subpixel.is_off());
+                        for (row_label, d, (max_allowed, mean_allowed)) in [
+                            ("upright", &upright, bounds.upright),
+                            ("italic", &italic, bounds.italic),
+                        ] {
+                            if d.max > max_allowed || d.mean > mean_allowed {
+                                // `TASKMAN_PARITY_DUMP=<dir>` keeps both frames of a failing
+                                // case for inspection.
+                                if let Some(dir) = std::env::var_os("TASKMAN_PARITY_DUMP") {
+                                    let dir = std::path::PathBuf::from(dir);
+                                    std::fs::create_dir_all(&dir).ok();
+                                    let stem = what.replace([' ', '#', '='], "_");
+                                    cpu.save(dir.join(format!("{stem}-cpu.png"))).ok();
+                                    gpu.save(dir.join(format!("{stem}-gpu.png"))).ok();
                                 }
-                                if c.0[ch] != bg[ch] || g.0[ch] != bg[ch] {
-                                    total_diff += u64::from(diff);
-                                    non_bg_channels += 1;
-                                }
+                                failures.push(format!(
+                                    "{what} {row_label}: max_diff={} at ({},{}) cpu={:?}                                      gpu={:?}, mean_diff={:.3}",
+                                    d.max, d.worst.0, d.worst.1, d.worst.2, d.worst.3, d.mean
+                                ));
                             }
                         }
-                        let mean_diff = total_diff as f64 / non_bg_channels.max(1) as f64;
-                        assert!(
-                            max_diff <= 8 && mean_diff <= 1.5,
-                            "{backend:?} {label} (ppp={ppp}, {opt_label}, srgb={srgb_target}) diverged from CPU: max_diff={max_diff} at ({},{}) cpu={:?} gpu={:?}, mean_diff={mean_diff:.3}",
-                            worst.0,
-                            worst.1,
-                            worst.2,
-                            worst.3,
-                        );
                     }
                 }
             }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "GPU diverged from CPU:\n{}",
+        failures.join("\n")
+    );
 }

@@ -33,6 +33,7 @@
 use ecolor::Color32;
 
 use crate::gamma::TextGamma;
+use crate::gray::GrayTextCurves;
 use crate::target::{PixelRect, Target};
 use crate::texture::{LcdAtlasSample, Texture};
 
@@ -93,7 +94,22 @@ pub fn triangle(
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
 ) {
-    triangle_impl(target, clip, v, texture, None);
+    triangle_impl(target, clip, v, texture, None, None);
+}
+
+/// Rasterize a triangle that samples the managed font atlas.
+///
+/// Identical to [`triangle`] except that `gray` -- the render-time grayscale curve of a
+/// raw-coverage atlas -- is applied to each filtered coverage texel, using the
+/// interpolated vertex colour's polarity, exactly where the GPU shaders apply it.
+pub(crate) fn triangle_font(
+    target: &mut Target<'_>,
+    clip: PixelRect,
+    v: [ScreenVertex; 3],
+    texture: Option<&Texture>,
+    gray: Option<&GrayTextCurves>,
+) {
+    triangle_impl(target, clip, v, texture, None, gray);
 }
 
 /// Rasterize transformed text whose font-atlas mesh contains LCD coverage.
@@ -107,8 +123,9 @@ pub(crate) fn triangle_gray_lcd(
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
     gamma: &TextGamma,
+    gray: Option<&GrayTextCurves>,
 ) {
-    triangle_impl(target, clip, v, texture, Some(gamma));
+    triangle_impl(target, clip, v, texture, Some(gamma), gray);
 }
 
 fn triangle_impl(
@@ -117,6 +134,7 @@ fn triangle_impl(
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
     lcd_gamma: Option<&TextGamma>,
+    gray: Option<&GrayTextCurves>,
 ) {
     let mut v = v;
 
@@ -290,11 +308,17 @@ fn triangle_impl(
                         }
                     }
                     LcdAtlasSample::Ordinary(texel) => {
+                        let mut src = interpolated_vertex_color(&v, l0, l1, l2);
+                        let texel = match gray {
+                            Some(curves) => {
+                                crate::gray::apply(curves.lut_for_premultiplied_f32(src), texel)
+                            }
+                            None => texel,
+                        };
                         let t = texel.to_array();
                         if t[3] > 0
                             && let Some(dst) = row.get_mut(x)
                         {
-                            let mut src = interpolated_vertex_color(&v, l0, l1, l2);
                             for i in 0..4 {
                                 src[i] = src[i] * t[i] as f32 * (1.0 / 255.0);
                             }
@@ -342,7 +366,7 @@ fn triangle_impl(
             let l1 = w[1] as f32 * inv_area;
             let l2 = 1.0 - l0 - l1;
 
-            let src = shade(&v, l0, l1, l2, texture);
+            let src = shade(&v, l0, l1, l2, texture, gray);
             if src[3] > 0.0
                 && let Some(dst) = row.get_mut(x)
             {
@@ -390,13 +414,25 @@ fn interpolated_vertex_color(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32) -
 /// it bit-for-bit; the integer and SIMD fast paths come later, guarded by the parity test
 /// this enables.
 #[inline]
-fn shade(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32, texture: Option<&Texture>) -> [f32; 4] {
+fn shade(
+    v: &[ScreenVertex; 3],
+    l0: f32,
+    l1: f32,
+    l2: f32,
+    texture: Option<&Texture>,
+    gray: Option<&GrayTextCurves>,
+) -> [f32; 4] {
     let mut out = interpolated_vertex_color(v, l0, l1, l2);
 
     if let Some(tex) = texture {
         let u = v[0].u * l0 + v[1].u * l1 + v[2].u * l2;
         let vv = v[0].v * l0 + v[1].v * l1 + v[2].v * l2;
-        let texel = tex.sample(u, vv).to_array();
+        let texel = tex.sample(u, vv);
+        let texel = match gray {
+            Some(curves) => crate::gray::apply(curves.lut_for_premultiplied_f32(out), texel),
+            None => texel,
+        }
+        .to_array();
         for i in 0..4 {
             out[i] = out[i] * texel[i] as f32 * (1.0 / 255.0);
         }
@@ -872,6 +908,7 @@ mod tests {
             tri,
             Some(&lcd_tex),
             &gamma,
+            None,
         );
         let expected_channel = gamma.blend_channel(255, 0x19, 128);
         assert_eq!(
@@ -888,6 +925,7 @@ mod tests {
             tri,
             Some(&color_tex),
             &gamma,
+            None,
         );
         assert_eq!(
             color_buf[0],

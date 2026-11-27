@@ -751,18 +751,14 @@ impl FontFace {
 
         let cache_key = GlyphCacheKey::new(glyph_id, metrics, bin);
 
-        let mut hinting_target: skrifa::outline::Target = self.tweak.hinting_target.into();
-        if !atlas.options().subpixel.is_off() {
-            // Hint TrueType/CFF glyphs specifically for LCD subpixel rasterization when
-            // subpixel text is active so GETINFO reports LCD ClearType rather than grayscale.
-            if let skrifa::outline::Target::Smooth {
-                mode: mode @ skrifa::outline::SmoothMode::Normal,
-                ..
-            } = &mut hinting_target
-            {
-                *mode = skrifa::outline::SmoothMode::Lcd;
-            }
-        }
+        let hinting_target = lcd_aware_hinting_target(
+            self.tweak.hinting_target.into(),
+            !atlas.options().subpixel.is_off(),
+            self.font
+                .borrow_dependent()
+                .outline_glyphs
+                .prefer_interpreter(),
+        );
         let alloc = *self.glyph_alloc_cache.entry(cache_key).or_insert_with(|| {
             self.font
                 .allocate_glyph_uncached(
@@ -779,6 +775,33 @@ impl FontFace {
 
         (alloc, h_pos_round)
     }
+}
+
+/// TASKMAN-FORK: the hinting target actually used for one glyph.
+///
+/// Under sub-pixel text, fonts hinted by their own TrueType/CFF instructions get
+/// `SmoothMode::Lcd` so `GETINFO` reports LCD `ClearType` instead of grayscale `ClearType`;
+/// for those fonts that is the only effect. Fonts without instructions go through the
+/// autohinter, where `SmoothMode::Lcd` (like `FreeType`'s `FT_LOAD_TARGET_LCD`) also turns
+/// horizontal hinting and stem adjustment OFF. That would silently drop the horizontal
+/// grid-fitting a `light: false` profile asks for, so the autohinter keeps the requested
+/// mode.
+fn lcd_aware_hinting_target(
+    requested: skrifa::outline::Target,
+    subpixel: bool,
+    uses_interpreter: bool,
+) -> skrifa::outline::Target {
+    let mut target = requested;
+    if subpixel
+        && uses_interpreter
+        && let skrifa::outline::Target::Smooth {
+            mode: mode @ skrifa::outline::SmoothMode::Normal,
+            ..
+        } = &mut target
+    {
+        *mode = skrifa::outline::SmoothMode::Lcd;
+    }
+    target
 }
 
 /// Positioning info for a single glyph, ready for atlas allocation.
@@ -1016,6 +1039,31 @@ pub(super) fn is_cjk(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::lcd_texel;
+
+    #[test]
+    fn lcd_hinting_upgrade_applies_only_to_instruction_hinted_fonts() {
+        use skrifa::outline::{SmoothMode, Target};
+        let full = Target::Smooth {
+            mode: SmoothMode::Normal,
+            symmetric_rendering: false,
+            preserve_linear_metrics: false,
+        };
+        let lcd = Target::Smooth {
+            mode: SmoothMode::Lcd,
+            symmetric_rendering: false,
+            preserve_linear_metrics: false,
+        };
+        assert_eq!(super::lcd_aware_hinting_target(full, true, true), lcd);
+        // The autohinter would drop horizontal hinting under `SmoothMode::Lcd`.
+        assert_eq!(super::lcd_aware_hinting_target(full, true, false), full);
+        assert_eq!(super::lcd_aware_hinting_target(full, false, true), full);
+        let light: Target = SmoothMode::Light.into();
+        assert_eq!(super::lcd_aware_hinting_target(light, true, true), light);
+        assert_eq!(
+            super::lcd_aware_hinting_target(Target::Mono, true, true),
+            Target::Mono
+        );
+    }
 
     #[test]
     fn lcd_texels_use_zero_alpha_as_the_subpixel_tag() {

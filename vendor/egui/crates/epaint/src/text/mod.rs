@@ -100,9 +100,20 @@ pub struct TextOptions {
     /// Windows' default is 0.5. Zero renders thinner.
     pub text_contrast: f32,
 
-    /// TASKMAN-FORK: expected sRGB background luminance (`0.0..=1.0`) for GPU fixed-function
-    /// LCD blending calibration, or `-1.0` to estimate polarity from foreground color alone.
+    /// TASKMAN-FORK: expected sRGB background luminance (`0.0..=1.0`), or `-1.0` when
+    /// unknown (polarity is then judged against `0.5`).
+    ///
+    /// Two consumers: the GPU fixed-function LCD blend calibrates against it, and
+    /// [`crate::FontColorTransferFunction::PolarityGamma`] uses it to decide whether a text
+    /// colour is light-on-dark or dark-on-light.
     pub text_background_luma: f32,
+
+    /// TASKMAN-FORK: expected sRGB luminance (`0.0..=1.0`) of the surface under text whose
+    /// polarity opposes [`Self::text_background_luma`] -- light text in a light theme sits on
+    /// a dark toast or badge, not on the page -- or `-1.0` when unknown (the GPU LCD blend
+    /// then assumes the pure black/white endpoint). When known, text polarity splits at the
+    /// midpoint of the two surfaces ([`crate::polarity_split`]).
+    pub text_inverse_background_luma: f32,
 }
 
 impl Default for TextOptions {
@@ -118,6 +129,7 @@ impl Default for TextOptions {
             text_gamma: 1.8,
             text_contrast: 0.5,
             text_background_luma: -1.0,
+            text_inverse_background_luma: -1.0,
         }
     }
 }

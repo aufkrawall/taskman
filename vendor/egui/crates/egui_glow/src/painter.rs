@@ -87,6 +87,11 @@ pub struct Painter {
     program: glow::Program,
     u_screen_size: glow::UniformLocation,
     u_sampler: glow::UniformLocation,
+    /// TASKMAN-FORK: render-time grayscale curve uniform (`None` if the driver dropped it).
+    u_gray_text: Option<glow::UniformLocation>,
+    /// `[light_text, dark_text, polarity_split]` for raw-coverage atlases, or `None` when
+    /// the atlas already holds final alpha.
+    gray_text: Option<[f32; 3]>,
     is_webgl_1: bool,
     vao: crate::vao::VertexArrayObject,
     srgb_textures: bool,
@@ -212,6 +217,7 @@ impl Painter {
             gl.delete_shader(frag);
             let u_screen_size = gl.get_uniform_location(program, "u_screen_size").unwrap();
             let u_sampler = gl.get_uniform_location(program, "u_sampler").unwrap();
+            let u_gray_text = gl.get_uniform_location(program, "u_gray_text");
 
             let vbo = gl.create_buffer()?;
 
@@ -258,6 +264,8 @@ impl Painter {
                 program,
                 u_screen_size,
                 u_sampler,
+                u_gray_text,
+                gray_text: None,
                 is_webgl_1,
                 vao,
                 srgb_textures,
@@ -467,10 +475,38 @@ impl Painter {
         }
     }
 
+    /// TASKMAN-FORK: take the render-time grayscale curve from the font atlas's options
+    /// ([`egui::epaint::FontColorTransferFunction::PolarityGamma`]). Without this call a
+    /// raw-coverage atlas draws raw coverage.
+    pub fn set_text_options(&mut self, options: &egui::epaint::text::TextOptions) {
+        self.gray_text =
+            options
+                .color_transfer_function
+                .render_time_exponents()
+                .map(|[light, dark]| {
+                    let split = egui::epaint::polarity_split(
+                        options.text_background_luma,
+                        options.text_inverse_background_luma,
+                    );
+                    [light, dark, split]
+                });
+    }
+
     #[inline(never)] // Easier profiling
     fn paint_mesh(&mut self, mesh: &Mesh) {
         debug_assert!(mesh.is_valid(), "Mesh is not valid");
         if let Some(texture) = self.texture(mesh.texture_id) {
+            if let Some(location) = &self.u_gray_text {
+                let gray = self
+                    .gray_text
+                    .filter(|_| mesh.texture_id == egui::TextureId::default());
+                let [light, dark, reference] = gray.unwrap_or([0.0; 3]);
+                let enabled = if gray.is_some() { 1.0 } else { 0.0 };
+                unsafe {
+                    self.gl
+                        .uniform_4_f32(Some(location), light, dark, reference, enabled);
+                }
+            }
             unsafe {
                 self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
                 self.gl.buffer_data_u8_slice(
