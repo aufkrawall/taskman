@@ -3660,11 +3660,14 @@ mod tests {
             large_rss + 100 * 1024 * 1024,
             base + std::time::Duration::from_secs(1),
         ));
+        // The threshold scales with the RSS being sampled, so the growth that
+        // clears it is 5 % of the *new* value: growing the old value by exactly
+        // `large_rss / 20` is only ~4.76 % of the result and stays below it.
         assert!(private_ws_refresh_needed(
             &large_entry,
             7,
             200,
-            large_rss + large_rss / 20 + 4096,
+            large_rss + large_rss / 10,
             base + std::time::Duration::from_secs(1),
         ));
 
