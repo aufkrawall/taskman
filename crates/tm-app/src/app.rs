@@ -514,6 +514,7 @@ pub struct TaskManApp {
     taskbar_config_applied: Option<tm_platform::taskbar_monitor::Config>,
     last_taskbar_interval_active: bool,
     pending_hidden_trim_at: Option<std::time::Instant>,
+    pending_idle_trim_at: Option<std::time::Instant>,
     /// Last viewport outer/inner rects observed in `ui`, used to refresh the
     /// taskbar monitor when our own window moves or resizes (since own-process
     /// windows skip `EVENT_OBJECT_LOCATIONCHANGE` hooks).
@@ -1208,6 +1209,9 @@ impl TaskManApp {
             taskbar_config_applied: None,
             last_taskbar_interval_active: false,
             pending_hidden_trim_at: None,
+            pending_idle_trim_at: Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            ),
             last_viewport_rects: None,
             input_stats,
             icons_prefetch: IconPrefetch::default(),
@@ -1581,8 +1585,18 @@ impl TaskManApp {
     /// back in it restores all three and forces one immediate sample so the
     /// restored window does not open on data up to [`HIDDEN_INTERVAL`] old.
     fn sync_surface_visibility(&mut self) {
+        let now = std::time::Instant::now();
+        if self.shared.icons.in_flight_count() > 0 {
+            self.pending_idle_trim_at = Some(now + std::time::Duration::from_secs(2));
+        } else if let Some(trim_at) = self.pending_idle_trim_at
+            && now >= trim_at
+        {
+            self.pending_idle_trim_at = None;
+            tm_platform::xdg_icons::shrink_transient_caches();
+            tm_platform::trim_process_memory();
+        }
         if let Some(trim_at) = self.pending_hidden_trim_at
-            && std::time::Instant::now() >= trim_at
+            && now >= trim_at
         {
             self.pending_hidden_trim_at = None;
             tm_platform::trim_process_memory();

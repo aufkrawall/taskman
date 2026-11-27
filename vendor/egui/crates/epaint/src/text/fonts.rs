@@ -978,7 +978,7 @@ impl FontsImpl {
     /// Create a new [`FontsImpl`] for text layout.
     /// This call is expensive, so only create one [`FontsImpl`] and then reuse it.
     pub fn new(options: TextOptions, definitions: FontDefinitions) -> Self {
-        let texture_width = options.max_texture_side.at_most(16 * 1024);
+        let texture_width = options.max_texture_side.at_most(2048);
         let initial_height = 32; // Keep initial font atlas small, so it is fast to upload to GPU. This will expand as needed anyways.
         let atlas = TextureAtlas::new([texture_width, initial_height], options);
 

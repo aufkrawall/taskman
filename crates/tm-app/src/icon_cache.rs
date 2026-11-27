@@ -256,6 +256,10 @@ impl IconCache {
         let _ = self.repaint.set(ctx.clone());
     }
 
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Queue the platform's default application icon, so the first row
     /// without an icon of its own does not wait for it.
     pub fn warm_default_icon(&self, actions: &Arc<dyn tm_platform::actions::PlatformActions>) {

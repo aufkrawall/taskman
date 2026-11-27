@@ -852,9 +852,9 @@ impl<'app> SoftwareWinitApp<'app> {
             event_loop,
             Some(window.scale_factor() as f32),
             event_loop.system_theme(),
-            // A CPU renderer has no texture-size limit of its own; this only bounds the
-            // glyph atlas, and epaint already caps that through `TextOptions`.
-            Some(16 * 1024),
+            // Keep initial font atlas width modest (matching epaint's default) so
+            // sparse glyphs do not preallocate multi-megabyte horizontal bands.
+            Some(2048),
         );
 
         let integration = EpiIntegration::new(

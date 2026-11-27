@@ -1066,6 +1066,7 @@ impl IconResolver {
     fn shrink_caches(&self) {
         let mut caches = tm_core::sync::lock(&self.caches);
         caches.decoded.clear();
+        caches.listings.clear();
         let skew = caches.clock_skew;
         caches
             .theme_dirs
