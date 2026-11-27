@@ -219,8 +219,8 @@ pub enum VisibilityChange {
     None,
     /// Hide a mapped surface: attach a null buffer and commit.
     Unmap,
-    /// Hide a surface that never received a buffer: there is nothing to unmap,
-    /// and the renderers simply do not present while hidden.
+    /// Hide a surface that is already awaiting its initial commit: there is
+    /// nothing to unmap, and the renderers simply do not present while hidden.
     HideUnmapped,
     /// Show an unmapped surface: commit without a buffer (the initial commit),
     /// then present only after the compositor's new configure.
@@ -236,7 +236,11 @@ fn visibility_change(
     needs_initial_commit: &mut bool,
 ) -> VisibilityChange {
     if hidden {
-        if *presented {
+        // `Window::new` and `Remap` both perform an initial `wl_surface.commit()`
+        // and receive a configure before any buffer is attached. On compositors
+        // such as KWin, that configured `xdg_toplevel` already creates a
+        // taskbar entry until a null-buffer commit explicitly unmaps it.
+        if *presented || !*needs_initial_commit {
             *presented = false;
             *needs_initial_commit = true;
             VisibilityChange::Unmap
@@ -1398,17 +1402,38 @@ mod tests {
     /// the initial commit again (and waits for its configure), and a window
     /// hidden before its first present is neither unmapped nor remapped.
     #[test]
-    fn visibility_changes_unmap_only_mapped_surfaces_and_remap_once() {
+    fn visibility_changes_unmap_configured_surfaces_and_remap_once() {
         let (mut presented, mut initial) = (true, false);
         assert_eq!(visibility_change(true, &mut presented, &mut initial), VisibilityChange::Unmap);
         assert_eq!(visibility_change(false, &mut presented, &mut initial), VisibilityChange::Remap);
         assert!(!initial && !presented);
-        // Hidden again before the remapped window presented: nothing to unmap.
+        // Hidden again before the remapped window presented: `Remap` already
+        // issued the initial commit, so it must still unmap with a null buffer.
+        assert_eq!(
+            visibility_change(true, &mut presented, &mut initial),
+            VisibilityChange::Unmap
+        );
+        assert!(initial && !presented);
+        // Already awaiting its initial commit: nothing to unmap again.
         assert_eq!(
             visibility_change(true, &mut presented, &mut initial),
             VisibilityChange::HideUnmapped
         );
+        assert_eq!(visibility_change(false, &mut presented, &mut initial), VisibilityChange::Remap);
+        assert!(!initial);
         assert_eq!(visibility_change(false, &mut presented, &mut initial), VisibilityChange::Redraw);
+    }
+
+    #[test]
+    fn visibility_change_unmaps_initial_configured_surface_on_start_minimized() {
+        // `Window::new` performs the initial commit (`needs_initial_commit = false`)
+        // before any frame is presented (`presented = false`). Hiding for
+        // `--minimized-to-tray` must still unmap the configured `xdg_toplevel`.
+        let (mut presented, mut initial) = (false, false);
+        assert_eq!(visibility_change(true, &mut presented, &mut initial), VisibilityChange::Unmap);
+        assert!(initial && !presented);
+        assert_eq!(visibility_change(false, &mut presented, &mut initial), VisibilityChange::Remap);
+        assert!(!initial);
     }
 
     #[test]

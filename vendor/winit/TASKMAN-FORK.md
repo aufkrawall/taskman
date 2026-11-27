@@ -155,10 +155,12 @@ commit that maps it anew; the compositor answers with a fresh configure.
 
 - `src/platform_impl/linux/wayland/window/state.rs`
   - `hidden`, `presented`, `needs_initial_commit` and
-    `awaiting_remap_configure` on `WindowState`. `presented` is set by
-    `request_frame_callback()` — i.e. by `pre_present_notify()`, which both
-    eframe renderers call right before every present — so a window that never
-    received a buffer is not "unmapped" (there is nothing to unmap).
+    `awaiting_remap_configure` on `WindowState`. `Window::new` and `Remap`
+    both send an initial commit, which already registers a configured
+    `xdg_toplevel` on compositors like KWin even before any buffer is
+    attached; `set_hidden(true)` therefore unmaps whenever `!needs_initial_commit`
+    (including `--minimized-to-tray` before the first present), not only when
+    `presented` is true.
   - `set_hidden()` resets the frame-callback throttle (an unmapped surface
     gets no frame callbacks; a stale `Requested` would block the first redraw
     after remapping forever) and returns a `VisibilityChange` from the pure
