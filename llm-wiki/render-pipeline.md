@@ -583,15 +583,39 @@ on this host.
   Light grayscale Sharp 0.92-0.94, Standard ~1.0; **Light subpixel Sharp 0.85-0.87 and
   Standard 0.80-0.83** -- lighter than cairo, and Standard lighter than Sharp, because Linux
   reports `contrast = 0` and Standard then blends dark ink at the raw gamma 1.8 while Sharp
-  scales it down to ~1.58. Open decision: calibrate Linux LCD weight toward cairo (the
-  desktop's look) or keep the Windows-calibrated gamma-corrected look; either way the
-  Standard/Sharp inversion should go. Qt and GTK 4 blend differently from cairo's image
-  surface, so this reference is the GTK3/cairo look, not "Linux".
+  scales it down to ~1.58. Open decision, **deferred until the bare-metal runs below**:
+  calibrate Linux LCD weight toward cairo (the desktop's look) or keep the Windows-calibrated
+  gamma-corrected look; either way the Standard/Sharp inversion should go. Qt and GTK 4 blend
+  differently from cairo's image surface, so this reference is the GTK3/cairo look, not
+  "Linux". Leading proposal if calibrating: Light Sharp ~0.9 of cairo and Standard ~1.0 (the
+  Windows relation), Dark unchanged (its surplus over cairo is cairo's ungamma'd blend).
 - **WSL cannot test the GPU LCD path.** Its Vulkan device is Mesa Dozen on the Windows
   D3D12 driver and reports `dualSrcBlend = false`, so TaskMan falls back to grayscale there and
   the hardware suite fails (correctly, not a skip); the test process then segfaulted at teardown
   inside the Dozen/loader stack. WSLg presents through Weston + RDP, so visual checks there are
   not representative either. RADV/ANV/NVIDIA-Linux need bare-metal runs.
+- **Bare-metal Linux runbook (NVIDIA proprietary driver, Wayland; not yet run).** In order:
+  1. Desktop policy: `fc-match -v sans-serif | grep -E 'rgba|lcdfilter|hintstyle|antialias'`
+     and the face. KDE defaults to `rgba=rgb`, `lcdfilter=lcddefault`, `hintslight`, Noto
+     Sans; GNOME to grayscale. TaskMan enables LCD text only for horizontal `rgb`/`bgr`.
+  2. GPU parity, real driver: `(cd vendor/egui && TASKMAN_GPU_BACKEND=vulkan
+     TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 TASKMAN_PARITY_DUMP=/tmp/parity cargo test -p egui_kittest
+     --features wgpu --test subpixel_text -- --ignored --test-threads=1 --nocapture)`. Compare
+     the printed max/mean with the Windows numbers above; the system face is found if it is
+     Adwaita/Noto/DejaVu at a listed path.
+  3. Weight vs cairo with the desktop's real settings: `TASKMAN_LINUX_TEXT_REFERENCE=1 cargo
+     test -p tm-app linux_weight_against_freetype_cairo -- --nocapture` (needs
+     `/usr/bin/pango-view`). Repeat with the face and `rgba` of the other desktop if both
+     matter.
+  4. Visual, by the user (GUI checks are manual): TaskMan on CPU and on Vulkan next to a Qt
+     app (Dolphin/Kate) and a GTK app, Light and Dark, at 100 % and the fractional scale in
+     use. Capture with `grim` for side-by-side zooms; note whether TaskMan looks lighter in
+     Light/subpixel as measured.
+  5. Fractional scaling: confirm TaskMan's surface is not compositor-resampled
+     (`WAYLAND_DEBUG=1` shows `wp_fractional_scale_v1`/`wp_viewport` in use, and LCD fringes
+     stay crisp at 125/150 %). A resampled surface smears sub-pixel text into colour noise.
+  6. Then decide the calibration above; any change gets a ratio band in the Linux diagnostic
+     and a CHANGELOG entry.
 - **Performance work.** The rasterizer and application loops are optimized for low CPU load:
   - Axis-aligned rect fast path (`span::fast_rect` with `Shape::Vec` recursive flattening for containers).
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.

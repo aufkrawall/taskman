@@ -20,6 +20,8 @@
   (Linux `contrast = 0`). Dozen in WSL has no dual-source blending, so no GPU LCD testing in
   WSL. A WSL target dir in `$HOME` (`CARGO_TARGET_DIR=$HOME/tm-target`) keeps builds off
   `/mnt/c` and away from the Windows target dir.
+- Decision (user, 2026-11-27): no Linux calibration yet; run the bare-metal NVIDIA/Wayland
+  runbook in `render-pipeline.md` (Still open) first.
 - Parity diagnosis: isolated 10 LSB pixels on upright text (7 after the Light retune) were overlapping glyph margins
   (second glyph solved against the surface, pixel already inked), not calibration drift;
   `TASKMAN_PARITY_DUMP=<dir>` writes the frames.
