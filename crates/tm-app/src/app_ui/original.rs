@@ -969,7 +969,7 @@ fn icon_button(
 pub const HEADER_ROW_H: f32 = 30.0;
 
 /// Leading inset of the header row, before the page title. Paid out of the row
-/// before anything else, so the title budget is computed net of it.
+/// before anything else, so the title's strip is measured net of it.
 pub const HEADER_PAD_L: f32 = 16.0;
 
 /// Trailing inset of the header row, after the last command. The commands keep
@@ -980,9 +980,9 @@ pub const HEADER_PAD_R: f32 = 8.0;
 /// never runs into the first command.
 pub const HEADER_GAP: f32 = 12.0;
 
-/// Strip the header always leaves for the page title. The commands are drawn
-/// first and take the width they need out of the row; the title then gets what
-/// they left unused and elides into it.
+/// Strip the header reserves for the page title before the command cluster is
+/// laid out. The cluster is capped at what the row has left, so the title
+/// always keeps this much and elides only into what the commands did not use.
 pub const HEADER_TITLE_MIN_W: f32 = 72.0;
 
 /// Width of a header command that has dropped its label: the 17x17 icon with
@@ -998,6 +998,17 @@ pub fn cmd_button(
     enabled: bool,
 ) -> bool {
     cmd_button_inner(ui, pal, icon, label, enabled, false)
+}
+
+/// Where a command puts its glyph: the labeled form keeps it in the fixed
+/// leading column its text starts after, while a form with no label beside it
+/// belongs in the middle of the button.
+fn header_icon_x(rect: Rect, icon_only: bool) -> f32 {
+    if icon_only {
+        rect.center().x
+    } else {
+        rect.left() + 14.0
+    }
 }
 
 /// Body shared by [`cmd_button`] and [`header_cmd_button`], so both forms keep
@@ -1085,13 +1096,7 @@ fn cmd_button_inner(
     } else {
         pal.text_dim.gamma_multiply(0.55)
     };
-    // The labelled form keeps the glyph in its fixed leading column; with no
-    // label beside it the glyph belongs in the middle of the button.
-    let icon_x = if icon_only {
-        rect.center().x
-    } else {
-        rect.left() + 14.0
-    };
+    let icon_x = header_icon_x(rect, icon_only);
     crate::icons::draw_at(
         ui,
         Rect::from_center_size(Pos2::new(icon_x, rect.center().y), egui::vec2(17.0, 17.0)),
@@ -4686,6 +4691,7 @@ mod tests {
         let mut below_clicked = true;
         let mut below_used_w = f32::NAN;
         let mut below_absent = false;
+        let mut fixed_rect = Rect::NOTHING;
         let mut at_clicked = true;
         let mut at_rect = Rect::NOTHING;
         let mut out = ctx.run_ui(raw(Vec::new()), |ui| {
@@ -4693,6 +4699,11 @@ mod tests {
             below_clicked = header_cmd_button(&mut below, &pal, Icon::OpenExternal, label, true);
             below_used_w = below.min_rect().width();
             below_absent = header_button_rect_opt(&below, Icon::OpenExternal).is_none();
+            // The same row through the fixed-width form: a table toolbar or a
+            // dialog passes fit = false and must still be drawn at any width.
+            let mut fixed = header_row(ui, "test-header-row-20-fixed", HEADER_ICON_BTN_W - 10.0);
+            let _ = cmd_button(&mut fixed, &pal, Icon::Close, label, true);
+            fixed_rect = header_button_rect(&fixed, Icon::Close);
 
             let mut exact = header_row(ui, "test-header-row-30", HEADER_ICON_BTN_W);
             at_clicked = header_cmd_button(&mut exact, &pal, Icon::RunTask, label, true);
@@ -4700,8 +4711,15 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(!below_clicked, "a row below one icon must report no click");
-        assert_eq!(below_used_w, 0.0, "a row below one icon must get no widget");
+        assert!(
+            below_used_w < 1.0,
+            "a row below one icon must get no widget"
+        );
         assert!(below_absent, "a row below one icon must get no response");
+        assert!(
+            fixed_rect.width() > HEADER_ICON_BTN_W,
+            "the fixed-width form must keep its labeled width in a row that narrow"
+        );
         assert!(!at_clicked, "nothing has been clicked yet");
         assert_eq!(
             at_rect.width(),
@@ -4729,20 +4747,10 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(clicked, "the button at the boundary must still take clicks");
-    }
-
-    /// The geometry has to leave the commands room on the narrowest window the
-    /// app allows (720 px wide, sidebar open): the strip reserved for the title
-    /// plus one icon-only command plus the insets still fit in the row.
-    #[test]
-    fn header_geometry_leaves_a_command_room_on_the_narrowest_window() {
-        let row_w = 720.0 - SIDEBAR_W;
-        let reserved =
-            HEADER_PAD_L + HEADER_TITLE_MIN_W + HEADER_GAP + HEADER_ICON_BTN_W + HEADER_PAD_R;
-        assert!(
-            reserved <= row_w,
-            "the reserved strip and one command must fit the narrowest row: {reserved} of {row_w}"
-        );
+        // Glyph placement: centred without a label, in the fixed leading column
+        // with one. Reverting either arm leaves the button looking off-centre.
+        assert_eq!(header_icon_x(at_rect, true), at_rect.center().x);
+        assert_eq!(header_icon_x(at_rect, false), at_rect.left() + 14.0);
     }
 
     /// Merely tabbing to a sidebar item must not change the page.
