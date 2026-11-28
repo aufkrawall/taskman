@@ -3301,6 +3301,11 @@ fn ellipsize(ui: &egui::Ui, s: &str, font: &egui::FontId, max_w: f32) -> String 
             hi = mid - 1;
         }
     }
+    if lo == 0 {
+        // Not even the bare ellipsis fits: painting it would overshoot the
+        // budget, which is the single thing this function must never do.
+        return String::new();
+    }
     let mut t: String = chars[..lo].iter().collect();
     while t.ends_with(' ') {
         t.pop();
@@ -3308,6 +3313,10 @@ fn ellipsize(ui: &egui::Ui, s: &str, font: &egui::FontId, max_w: f32) -> String 
     t.push('…');
     t
 }
+
+/// Width of the dump dialog's content column: a 460 px window holding a
+/// 440 px row. Narrow enough that a long image name has to give way.
+const DUMP_ROW_W: f32 = 440.0;
 
 /// Space the process name may use in the dump dialog's target row. The type
 /// tag sits in a right_to_left group, which egui anchors at the row's right
@@ -3320,8 +3329,14 @@ fn dump_name_budget(
     batch_text: Option<&str>,
     row_w: f32,
 ) -> f32 {
+    // The PID and batch labels are drawn at the theme's 13 pt body size and
+    // the tag at the 12 pt it asks for, so they are measured at exactly those
+    // sizes: a silent mismatch would under-measure what the row reserves.
     let tag_font = egui::FontId::proportional(12.0);
     let small_font = egui::FontId::proportional(13.0);
+    // The row draws three separators (name, PID, batch, tag); the fourth gap
+    // is rounding margin, because measured and painted advances can differ by
+    // a fraction.
     let reserved = measure_text(ui, tag, &tag_font)
         + measure_text(ui, pid_text, &small_font)
         + batch_text.map_or(0.0, |text| measure_text(ui, text, &small_font))
@@ -3397,7 +3412,7 @@ pub fn dump_progress_dialog(
         .fixed_size([460.0, 190.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
-            ui.set_width(440.0);
+            ui.set_width(DUMP_ROW_W);
             ui.add_space(4.0);
 
             // Target header
@@ -3409,13 +3424,13 @@ pub fn dump_progress_dialog(
                     DumpType::Full => i18n::tr(K::DumpFull),
                 };
                 let pid_text = format!("(PID {})", current.pid);
-                let batch_text = (current.total > 1)
-                    .then(|| format!("[{}/{}]", current.index, current.total));
+                let batch_text =
+                    (current.total > 1).then(|| format!("[{}/{}]", current.index, current.total));
                 // The type tag sits in a right_to_left group, which egui
                 // anchors at the row's right edge and never clamps: this row
-                // is a fixed 440 px wide, so the tag and the two short labels
-                // before it have their width reserved here and the free-text
-                // process name is trimmed to what is really left over.
+                // has a fixed width (DUMP_ROW_W), so the tag and the two short
+                // labels before it have their width reserved here and the
+                // free-text process name is trimmed to what is left over.
                 let name_font = crate::theme::font_semibold_in(ui, 15.0);
                 let name = ellipsize(
                     ui,
@@ -3429,25 +3444,14 @@ pub fn dump_progress_dialog(
                         ui.available_width(),
                     ),
                 );
-                let name_label = ui.label(
-                    egui::RichText::new(&name)
-                        .font(name_font)
-                        .color(pal.text),
-                );
+                let name_label =
+                    ui.label(egui::RichText::new(&name).font(name_font).color(pal.text));
                 if name != current.process_name {
                     name_label.on_hover_text(&current.process_name);
                 }
-                ui.label(
-                    egui::RichText::new(pid_text)
-                        .size(13.0)
-                        .color(pal.text_dim),
-                );
+                ui.label(egui::RichText::new(pid_text).size(13.0).color(pal.text_dim));
                 if let Some(batch) = batch_text {
-                    ui.label(
-                        egui::RichText::new(batch)
-                            .size(13.0)
-                            .color(pal.accent),
-                    );
+                    ui.label(egui::RichText::new(batch).size(13.0).color(pal.accent));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -5294,17 +5298,18 @@ mod tests {
         assert_eq!(info2.process_name, "proc2.exe");
     }
 
-    /// The dump dialog's target row is a fixed 440 px wide and its type tag
-    /// is drawn by a right_to_left group, which egui anchors at the row's
-    /// right edge without clamping. The free-text process name therefore has
-    /// to be trimmed to whatever the tag and the two short labels leave over.
+    /// The dump dialog's target row has a fixed width (DUMP_ROW_W) and its
+    /// type tag is drawn by a right_to_left group, which egui anchors at the
+    /// row's right edge without clamping. The free-text process name
+    /// therefore has to be trimmed to whatever the tag and the two short
+    /// labels leave over.
     #[test]
     fn dump_header_trims_the_name_beside_the_reserved_type_tag() {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(440.0, 190.0),
+                egui::vec2(800.0, 600.0),
             )),
             ..Default::default()
         };
@@ -5312,7 +5317,7 @@ mod tests {
             let name_font = crate::theme::font_semibold_in(ui, 15.0);
             let name = "WindowsInternal.ComposableShell.Experiences.TextInput.InputApp.exe";
             let max_name_w =
-                dump_name_budget(ui, i18n::tr(K::DumpFull), "(PID 41208)", None, 440.0);
+                dump_name_budget(ui, i18n::tr(K::DumpFull), "(PID 41208)", None, DUMP_ROW_W);
             let trimmed = ellipsize(ui, name, &name_font, max_name_w);
             assert_ne!(trimmed.as_str(), name, "overlong name is trimmed");
             assert!(trimmed.ends_with('…'), "trimmed name is marked as elided");
@@ -5322,7 +5327,11 @@ mod tests {
             );
             // A name that already fits is left alone.
             assert_eq!(ellipsize(ui, "mrt.exe", &name_font, max_name_w), "mrt.exe");
-            // No budget at all paints nothing rather than a bare ellipsis.
+            // A budget that cannot even hold the bare ellipsis paints
+            // nothing: an ellipsis wider than the budget would be the very
+            // overlap this function exists to prevent.
+            let ellipsis_w = measure_text(ui, "…", &name_font);
+            assert_eq!(ellipsize(ui, name, &name_font, ellipsis_w - 0.5), "");
             assert_eq!(ellipsize(ui, name, &name_font, 0.0), "");
         });
         output.drop_without_applying_deltas();
