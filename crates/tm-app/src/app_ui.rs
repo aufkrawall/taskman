@@ -140,42 +140,71 @@ fn elide_to_width(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) ->
     out
 }
 
-/// Split one header row between the page title and the command cluster.
+/// Ceiling for the width the page title reserves in a header row.
 ///
-/// The title owns the left edge and only the width `original::header_title_budget`
-/// grants it; the cluster owns the right edge, inset by `HEADER_PAD_R` — the
-/// same 8 px the row used to add as a leading space — and takes what is left.
-/// Both rects come out of one split, so neither can grow into the other, which
-/// is exactly what happened while the cluster was laid out right to left inside
-/// a row it could overrun.
+/// The longest page title this app ships is the German "Startauswirkungen",
+/// about 133 px at 15.5 px semibold. Capping the reservation near that keeps
+/// that name intact while stopping a pathological or unusually long
+/// localisation from eating the command row. The 133 px is an approximation,
+/// not a promise: the reservation is measured every frame and only clamped by
+/// this bound.
+const HEADER_TITLE_MAX_W: f32 = 140.0;
+
+/// The command cluster's allotment in one header row: everything right of the
+/// title's reservation, inset by `HEADER_PAD_R` — the same 8 px the row used to
+/// add as a leading space, so the rightmost command lands where it always did.
 ///
-/// A row too narrow for padding, title and gap collapses the cluster onto the
-/// right edge instead of producing a rect whose minimum sits past its maximum.
-pub(crate) fn header_geometry(row: egui::Rect, title_full_w: f32) -> (egui::Rect, egui::Rect) {
-    let title_left = row.left() + original::HEADER_PAD_L;
-    let cluster_right = row.right() - original::HEADER_PAD_R;
-    let title_budget = original::header_title_budget(row.width(), title_full_w);
-    // The gap belongs to neither rect, so the two never touch even where the
-    // row is too narrow to honor the budget.
-    let title_right =
-        (title_left + title_budget).min((cluster_right - original::HEADER_GAP).max(title_left));
-    let title_rect = egui::Rect::from_min_max(
-        egui::pos2(title_left, row.top()),
-        egui::pos2(title_right, row.bottom()),
-    );
-    let cluster_left = title_right + original::HEADER_GAP;
-    let cluster_rect = if cluster_left <= cluster_right {
-        egui::Rect::from_min_max(
-            egui::pos2(cluster_left, row.top()),
-            egui::pos2(cluster_right, row.bottom()),
-        )
-    } else {
-        egui::Rect::from_min_max(
-            egui::pos2(cluster_right, row.top()),
-            egui::pos2(cluster_right, row.bottom()),
-        )
-    };
-    (title_rect, cluster_rect)
+/// `title_reserve` is the page title's own measured width, clamped to
+/// `HEADER_TITLE_MIN_W ..= HEADER_TITLE_MAX_W` by the caller. A fixed floor
+/// would elide the page name itself whenever the cluster filled the row, and no
+/// single number is right for every font metric and localisation. A reserve is
+/// not an estimate of the cluster's width either: the real split is still read
+/// back from what the cluster draws.
+///
+/// A row too narrow for that reservation collapses the cluster onto the right
+/// edge instead of producing a rect whose minimum sits past its maximum.
+pub(crate) fn header_cluster_rect(row: egui::Rect, title_reserve: f32) -> egui::Rect {
+    let right = row.right() - original::HEADER_PAD_R;
+    let reserved = row.left() + original::HEADER_PAD_L + title_reserve + original::HEADER_GAP;
+    let left = reserved.min(right);
+    egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
+}
+
+/// The page title's rect, given the left edge the command cluster actually used.
+///
+/// The title takes exactly what the commands left over, minus the gap, so the
+/// commands keep their full labels whenever the row can hold them and only then
+/// degrade to icons. The priority is deliberate: interactive commands over a
+/// decorative page name, and the name elides rather than colliding. Nothing
+/// here estimates the cluster's width.
+///
+/// With the reservation sized to the measured name, a cluster that stays inside
+/// its allotment always leaves the full name intact, at every width the cluster
+/// can serve. Elision is left for rows so narrow that the cluster overruns its
+/// allotment, which is what the cluster's clip is for.
+///
+/// Both bounds are built so the result can never invert, whatever the row and
+/// the reported edge are.
+pub(crate) fn header_title_rect(row: egui::Rect, cluster_used_left: f32) -> egui::Rect {
+    let left = row.left() + original::HEADER_PAD_L;
+    let right_bound = (row.right() - original::HEADER_PAD_R).max(left);
+    let right = (cluster_used_left - original::HEADER_GAP)
+        .max(left)
+        .min(right_bound);
+    egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
+}
+
+/// Gap between the page title and the selection count beside it.
+const HEADER_CHIP_GAP: f32 = 10.0;
+
+/// Whether the selection count still fits beside the page title inside a title
+/// rect `title_rect_w` wide.
+///
+/// Every input is measured at the font the row paints with, never estimated: the
+/// count is the last thing the row can spare, so it may only appear when the
+/// title keeps its own width.
+fn chip_fits(title_rect_w: f32, title_w: f32, item_spacing: f32, chip_w: f32) -> bool {
+    title_rect_w >= title_w + item_spacing + HEADER_CHIP_GAP + chip_w
 }
 
 /// The command cluster's own ui: laid out right to left inside `rect` and
@@ -184,7 +213,7 @@ pub(crate) fn header_geometry(row: egui::Rect, title_full_w: f32) -> (egui::Rect
 /// A right-to-left layout walks leftwards from `rect`'s right edge and never
 /// stops at its left edge, so a cluster wider than its share keeps going over
 /// the title. The clip is the net that holds every command inside the cluster's
-/// half of the row, and it keeps the clipped-away part unclickable too.
+/// own allotment of the row, and it keeps the clipped-away part unclickable too.
 fn header_cluster_ui(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Ui {
     let mut cluster = ui.new_child(
         egui::UiBuilder::new()
@@ -199,10 +228,11 @@ fn header_cluster_ui(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Ui {
 /// on either Processes or Details gets the same Restart command native Task
 /// Manager exposes for the shell process.
 ///
-/// The row is split once up front: the command cluster owns the right side and
-/// the page title the left, each drawn into its own rect and clipped to it.
-/// A cluster wider than its share now gives up the leftmost buttons instead of
-/// painting them over the title.
+/// The command cluster draws first into its own rect, clipped to that rect; the
+/// page title then gets exactly what the commands left unused. So the commands
+/// keep their full labels for as long as the row can hold them, the title
+/// elides instead of colliding, and a cluster wider than its allotment is cut
+/// off at its own edge instead of painting over the title.
 pub fn tab_header(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -228,7 +258,12 @@ pub fn tab_header(
         egui::Sense::hover(),
     );
     let title_font = crate::theme::font_semibold_in(ui, 15.5);
-    let (title_rect, cluster_rect) = header_geometry(row, text_width(ui, title, &title_font));
+    // The title reserves what its own name measures, within bounds: a fixed
+    // floor elided the page name whenever the commands filled the row, and no
+    // single number is right for every font metric and localisation.
+    let title_reserve =
+        text_width(ui, title, &title_font).clamp(original::HEADER_TITLE_MIN_W, HEADER_TITLE_MAX_W);
+    let cluster_rect = header_cluster_rect(row, title_reserve);
 
     // The cluster is drawn first because the title is elided against the space
     // it leaves behind. Order and behavior are the ones the row always had.
@@ -278,6 +313,17 @@ pub fn tab_header(
         app.run_dialog_open = true;
     }
 
+    // What the cluster used decides the split, so the commands never give up a
+    // label for a title that would have elided anyway. A cluster that drew
+    // nothing leaves `Rect::NOTHING` behind, whose left edge is infinite.
+    let used_left = cluster.min_rect().left();
+    let used_left = if used_left.is_finite() {
+        used_left
+    } else {
+        row.right() - original::HEADER_PAD_R
+    };
+    let title_rect = header_title_rect(row, used_left);
+
     // Then the title strip, which ends where the cluster begins. The count is
     // measured as well, so a long page name can never push either of them under
     // the commands.
@@ -299,13 +345,15 @@ pub fn tab_header(
     }
     if let Some(count) = selected {
         let chip = i18n::trf(K::SelectedCount, &[&count.to_string()]);
+        // What `RichText::size(12.0)` resolves to: the body family at 12 px.
         let chip_font = egui::FontId::proportional(12.0);
         let chip_w = text_width(&title_ui, &chip, &chip_font);
         let gap = title_ui.spacing().item_spacing.x;
-        // The count is a hint next to the page name, so it yields when the row
-        // is narrow; the page name never does.
-        if title_rect.width() - title_w - gap >= 10.0 + chip_w {
-            title_ui.add_space(10.0);
+        // Priority, top to bottom: the interactive commands, then the page name,
+        // then this count. The table already shows which rows are selected, so
+        // the count is the first part of the row that can do without.
+        if chip_fits(title_rect.width(), title_w, gap, chip_w) {
+            title_ui.add_space(HEADER_CHIP_GAP);
             title_ui.add(
                 egui::Label::new(egui::RichText::new(chip).size(12.0).color(pal.text_dim)).extend(),
             );
@@ -457,6 +505,11 @@ mod tests {
 
     // ------------------------------------------------------ header row split
 
+    // No test here can drive the real `tab_header`: `TaskManApp::new` takes an
+    // `eframe::CreationContext`, which needs a window. The geometry helpers and
+    // the cluster clip test below are the contract this header is held to, not
+    // a stand-in for an end-to-end render.
+
     fn header_row(width: f32) -> egui::Rect {
         egui::Rect::from_min_size(
             egui::pos2(0.0, 10.0),
@@ -464,54 +517,220 @@ mod tests {
         )
     }
 
-    /// The reported defect: at 960 logical px the Processes cluster is wider
-    /// than the space left of it, and a right-to-left layout walked straight
-    /// over the page title. The split has to hold at every width the window can
-    /// have, from the 720 px minimum upwards.
+    /// The reported defect: the command cluster laid itself out right to left
+    /// without a floor and painted over the page title. Both rects now come out
+    /// of one split, at every width the window can have and for every reserve the
+    /// clamp can produce.
     #[test]
     fn title_and_command_cluster_never_share_a_pixel() {
+        let reserves = [original::HEADER_TITLE_MIN_W, 76.0, HEADER_TITLE_MAX_W];
         let mut width = 200.0;
         while width <= 2000.0 {
-            let row = header_row(width);
-            let (title, cluster) = header_geometry(row, 500.0);
-            assert!(!title.intersects(cluster), "overlap at {width} px");
-            assert!(
-                row.contains_rect(title),
-                "title leaves the row at {width} px"
-            );
-            assert!(
-                row.contains_rect(cluster),
-                "cluster leaves the row at {width} px"
-            );
-            assert!(title.left() >= row.left() + original::HEADER_PAD_L - 0.01);
-            assert!(cluster.right() <= row.right() - original::HEADER_PAD_R + 0.01);
+            for reserve in reserves {
+                let row = header_row(width);
+                let cluster = header_cluster_rect(row, reserve);
+                // Worst case for the title: the cluster used all of its allotment.
+                let title = header_title_rect(row, cluster.left());
+                assert!(
+                    (cluster.right() - (row.right() - original::HEADER_PAD_R)).abs() < 0.01,
+                    "cluster right edge moved at {width} px, reserve {reserve}"
+                );
+                let reserved = row.left() + original::HEADER_PAD_L + reserve + original::HEADER_GAP;
+                if reserved <= row.right() - original::HEADER_PAD_R {
+                    assert!(
+                        cluster.left() >= reserved - 0.01,
+                        "title reservation ignored at {width} px, reserve {reserve}"
+                    );
+                }
+                assert!(
+                    !title.intersects(cluster),
+                    "overlap at {width} px, reserve {reserve}"
+                );
+                if cluster.width() > 0.0 {
+                    assert!(
+                        title.right() + original::HEADER_GAP <= cluster.left() + 0.01,
+                        "the gap to the cluster shrank at {width} px, reserve {reserve}"
+                    );
+                }
+                assert!(
+                    row.contains_rect(title),
+                    "title leaves the row at {width} px, reserve {reserve}"
+                );
+                assert!(
+                    row.contains_rect(cluster),
+                    "cluster leaves the row at {width} px, reserve {reserve}"
+                );
+                assert!(
+                    !title.is_negative() && !cluster.is_negative(),
+                    "negative rect at {width} px, reserve {reserve}"
+                );
+            }
             width += 1.0;
         }
     }
 
-    /// A long page name must not squeeze the commands out of existence, and a
-    /// row too narrow for both halves collapses the cluster instead of
-    /// inverting it into a negative rect.
+    /// The headline case: a cluster that fills its whole allotment hands the
+    /// title back exactly the width it reserved, whatever that is. At the
+    /// reported 748 px row this is what keeps "Processes" — about 76 px at
+    /// 15.5 px semibold — from coming out elided as "Process…".
     #[test]
-    fn a_long_title_keeps_the_cluster_its_share() {
+    fn a_filled_cluster_still_leaves_the_title_its_reserved_width() {
+        let mut reserve = original::HEADER_TITLE_MIN_W;
+        while reserve <= HEADER_TITLE_MAX_W {
+            let row = header_row(748.0);
+            let cluster = header_cluster_rect(row, reserve);
+            let allotment = 748.0
+                - original::HEADER_PAD_L
+                - reserve
+                - original::HEADER_GAP
+                - original::HEADER_PAD_R;
+            assert!(
+                (cluster.width() - allotment).abs() < 0.01,
+                "allotment for reserve {reserve} was {}",
+                cluster.width()
+            );
+            let title = header_title_rect(row, cluster.left());
+            assert_eq!(
+                title.width(),
+                reserve,
+                "a full cluster left the title {} instead of {reserve} px",
+                title.width()
+            );
+            reserve += 1.0;
+        }
+
+        // The reported window size, spelled out: 748 px row, ~76 px name.
         let row = header_row(748.0);
-        let (title, cluster) = header_geometry(row, 500.0);
-        let content = 748.0 - original::HEADER_PAD_L - original::HEADER_PAD_R;
-        assert!(
-            cluster.width() + 0.01 >= content * 0.5 - original::HEADER_GAP,
-            "cluster shrank to {} px",
-            cluster.width()
+        let title = header_title_rect(row, header_cluster_rect(row, 76.0).left());
+        assert_eq!(
+            title.width(),
+            76.0,
+            "the reported window would still elide \"Processes\""
         );
+    }
+
+    /// At the reported window size (960 px window, 212 px sidebar, 748 px row) a
+    /// labelled Processes cluster is about 630 px wide. That has to fit inside
+    /// the cluster's allotment and still leave room for "Processes" beside it.
+    #[test]
+    fn a_wide_cluster_still_leaves_the_title_its_minimum() {
+        let row = header_row(748.0);
+        let reserve = 76.0;
+        let used = 630.0;
+        let cluster_used_left = row.right() - original::HEADER_PAD_R - used;
         assert!(
-            title.width() <= content * 0.5 + 0.01,
-            "title took {} px",
+            header_cluster_rect(row, reserve).width() >= used,
+            "the allotment cannot hold a labelled cluster"
+        );
+        let title = header_title_rect(row, cluster_used_left);
+        assert!(title.width() >= reserve, "title got {} px", title.width());
+        assert!(title.right() + original::HEADER_GAP <= cluster_used_left + 0.01);
+    }
+
+    /// A cluster that drew nothing — every Windows-only command is absent on
+    /// Linux, or everything is disabled — leaves the title the whole content
+    /// width, minus the gap the row always keeps.
+    #[test]
+    fn an_empty_cluster_leaves_the_title_the_content_width() {
+        let row = header_row(748.0);
+        let content = 748.0 - original::HEADER_PAD_L - original::HEADER_PAD_R;
+        let title = header_title_rect(row, row.right() - original::HEADER_PAD_R);
+        assert!(
+            title.width() + 0.01 >= content - original::HEADER_GAP,
+            "title got only {} px",
             title.width()
         );
-        assert!(title.width() >= original::HEADER_TITLE_MIN_W - 0.01);
+        assert!(
+            title.right() + original::HEADER_GAP <= row.right() - original::HEADER_PAD_R + 0.01
+        );
+    }
 
-        let (_, collapsed) = header_geometry(header_row(60.0), 500.0);
-        assert!(!collapsed.is_negative());
-        assert_eq!(collapsed.width(), 0.0);
+    /// When the cluster overruns even its allotment the title gives way, but it
+    /// never inverts and never reaches the commands; the clip holds the rest.
+    #[test]
+    fn an_overflowing_cluster_shrinks_the_title_without_inverting_it() {
+        let row = header_row(748.0);
+        let reserve = 76.0;
+        let cluster = header_cluster_rect(row, reserve);
+        // 20 px wider than the allotment, so the cluster's left edge moves out.
+        let title = header_title_rect(row, cluster.left() - 20.0);
+        assert!(title.width() < reserve, "the title should have given way");
+        assert!(!title.is_negative());
+        assert!(!title.intersects(cluster));
+        assert!(
+            row.contains_rect(title),
+            "title leaves the row when squeezed"
+        );
+        assert!(
+            title.right() + original::HEADER_GAP <= cluster.left(),
+            "a squeezed title still keeps its gap"
+        );
+
+        // A cluster that used the whole row cannot invert the title either.
+        let squashed = header_title_rect(row, row.left() - 500.0);
+        assert!(!squashed.is_negative());
+        assert_eq!(squashed.width(), 0.0);
+    }
+
+    /// A row narrower than the reservation cannot hold it at all: both rects must
+    /// stay non-negative, inside the row and disjoint instead of inverting.
+    #[test]
+    fn a_degenerate_row_collapses_without_panicking() {
+        let row = header_row(60.0);
+        let cluster = header_cluster_rect(row, original::HEADER_TITLE_MIN_W);
+        let title = header_title_rect(row, cluster.left());
+        assert_eq!(cluster.width(), 0.0);
+        assert!(!title.is_negative() && !cluster.is_negative());
+        assert!(row.contains_rect(title), "title leaves a 60 px row");
+        assert!(row.contains_rect(cluster), "cluster leaves a 60 px row");
+        assert!(!title.intersects(cluster));
+    }
+
+    /// The selection count yields before the page title does: it appears beside
+    /// the name when the room is there (a 2560 px window has plenty) and drops
+    /// out while the name keeps its full width when it is not.
+    #[test]
+    fn the_selection_count_yields_before_the_page_title() {
+        // Measured width of a fully labelled Processes cluster.
+        const CLUSTER_USED: f32 = 640.0;
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let title_font = crate::theme::font_semibold_in(ui, 15.5);
+            let title_w = text_width(ui, "Processes", &title_font);
+            let chip_w = text_width(ui, "3 selected", &egui::FontId::proportional(12.0));
+            let gap = ui.spacing().item_spacing.x;
+
+            // 2560 px window minus the 212 px sidebar.
+            let wide_row = header_row(2348.0);
+            let wide_used_left = wide_row.right() - original::HEADER_PAD_R - CLUSTER_USED;
+            let wide = header_title_rect(wide_row, wide_used_left);
+            assert!(
+                chip_fits(wide.width(), title_w, gap, chip_w),
+                "no count beside the title in a 2348 px row"
+            );
+
+            let mut dropped_with_full_title = false;
+            let mut width = 400.0;
+            while width <= 2000.0 {
+                let row = header_row(width);
+                let used_left = row.right() - original::HEADER_PAD_R - CLUSTER_USED;
+                let title = header_title_rect(row, used_left);
+                if chip_fits(title.width(), title_w, gap, chip_w) {
+                    assert!(
+                        title.width() >= title_w,
+                        "count drawn while the title was squeezed at {width} px"
+                    );
+                } else if title.width() >= title_w {
+                    dropped_with_full_title = true;
+                }
+                width += 1.0;
+            }
+            assert!(
+                dropped_with_full_title,
+                "no width drops the count while the title keeps its width"
+            );
+        });
+        out.textures_delta.clear();
     }
 
     /// The title is the only part allowed to shrink silently, so the elision
@@ -552,14 +771,14 @@ mod tests {
         out.textures_delta.clear();
     }
 
-    /// The clip is what holds a cluster wider than its share inside its own
-    /// half of the row: right-to-left layout keeps walking left instead of
-    /// stopping, so without it the buttons repaint over the title.
+    /// The clip is what holds a cluster wider than its allotment inside that
+    /// allotment: right-to-left layout keeps walking left instead of stopping,
+    /// so without it the buttons repaint over the title.
     #[test]
     fn cluster_painting_stays_inside_its_rect() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0));
-        let (_, cluster_rect) = header_geometry(header_row(748.0), 500.0);
+        let cluster_rect = header_cluster_rect(header_row(748.0), original::HEADER_TITLE_MIN_W);
         let mut out = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(screen),
