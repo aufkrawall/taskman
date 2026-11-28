@@ -820,7 +820,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let mut cluster = header_cluster_ui(ui, cluster_rect);
+                let cluster = header_cluster_ui(ui, cluster_rect);
                 assert_eq!(cluster.clip_rect(), cluster_rect);
                 // Deliberately far too wide for the cluster.
                 cluster.painter().text(
