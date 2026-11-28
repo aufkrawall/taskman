@@ -3317,9 +3317,9 @@ fn ellipsize(ui: &egui::Ui, s: &str, font: &egui::FontId, max_w: f32) -> String 
 }
 
 /// Width of the dump dialog's content column. `fixed_size` is the OUTER
-/// window size, frame included (6 px each side by default), so the column is
-/// set explicitly inside it — this constant, not the frame arithmetic, is
-/// what the row is laid out to.
+/// window size, frame and its stroke included, so the column is set explicitly
+/// inside it — this constant, not the frame arithmetic, is what the row is
+/// laid out to.
 const DUMP_ROW_W: f32 = 440.0;
 
 /// Space the process name may use in the dump dialog's target row. The type
@@ -3335,8 +3335,8 @@ fn dump_name_budget(
 ) -> f32 {
     // Measured in the fonts the row paints in: the PID and batch labels are
     // body text, so they resolve from the style exactly as their labels do,
-    // and the tag keeps its explicit 12 pt size because RichText::size does
-    // not inherit from the style.
+    // and the tag takes Body's family at an explicit 12 pt because .size()
+    // overrides only the size and leaves the family to the style.
     let small_font = egui::TextStyle::Body.resolve(ui.style());
     let tag_font = egui::FontId::new(12.0, small_font.family.clone());
     // Only three separators sit between the four widgets: left-to-right
@@ -3441,6 +3441,7 @@ pub fn dump_progress_dialog(
                 // labels before it have their width reserved here and the
                 // free-text process name is trimmed to what is left over.
                 let small_font = egui::TextStyle::Body.resolve(ui.style());
+                let tag_family = small_font.family.clone();
                 let name_font = crate::theme::font_semibold_in(ui, 15.0);
                 let name = ellipsize(
                     ui,
@@ -3466,9 +3467,13 @@ pub fn dump_progress_dialog(
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Painted with the same font the budget measured the tag
+                    // in: RichText::size alone would leave the family to the
+                    // style, so a themed family could silently diverge from
+                    // the measurement.
                     ui.label(
                         egui::RichText::new(type_label)
-                            .size(12.0)
+                            .font(egui::FontId::new(12.0, tag_family.clone()))
                             .color(pal.text_dim),
                     );
                 });
