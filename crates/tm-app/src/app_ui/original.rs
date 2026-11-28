@@ -980,9 +980,9 @@ pub const HEADER_PAD_R: f32 = 8.0;
 /// never runs into the first command.
 pub const HEADER_GAP: f32 = 12.0;
 
-/// Width the page title may keep before it is treated as having no room to
-/// show anything readable. A floor for the title budget, never a demand: a row
-/// with less room than this still wins.
+/// Strip the header always leaves for the page title. The commands are drawn
+/// first and take the width they need out of the row; the title then gets what
+/// they left unused and elides into it.
 pub const HEADER_TITLE_MIN_W: f32 = 72.0;
 
 /// Width of a header command that has dropped its label: the 17x17 icon with
@@ -1005,8 +1005,10 @@ pub fn cmd_button(
 /// handoff and the toolbar bookkeeping identical.
 ///
 /// `fit` allows the button to give up its label when the layout has less room
-/// left than the labeled form needs. Callers that live in a table toolbar or a
-/// dialog pass `false`: there the width is known to be available.
+/// left than the labeled form needs, and to draw nothing at all when there is
+/// not even room for the icon alone. Callers that live in a table toolbar or a
+/// dialog pass `false`: there the width is known to be available, and the
+/// button is drawn at any width.
 fn cmd_button_inner(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -1015,6 +1017,14 @@ fn cmd_button_inner(
     enabled: bool,
     fit: bool,
 ) -> bool {
+    // A button the row cannot pay for is worse than no button at all: the
+    // header clips it away, so it is invisible and unclickable, yet it would
+    // still hold a stop in the toolbar order and a node in the accesskit tree,
+    // and Tab would land on it. The header keeps the row wide enough that this
+    // never happens in practice; this is the backstop underneath it.
+    if fit && ui.available_width() < HEADER_ICON_BTN_W {
+        return false;
+    }
     let text_w = ui
         .painter()
         .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), Color32::WHITE)
@@ -1028,11 +1038,7 @@ fn cmd_button_inner(
     let icon_only = fit && full_w > ui.available_width();
     // Allocate what is painted: reserving the label's width for an icon-only
     // button would push the cluster out of the row just the same.
-    let w = if icon_only {
-        HEADER_ICON_BTN_W
-    } else {
-        full_w
-    };
+    let w = if icon_only { HEADER_ICON_BTN_W } else { full_w };
     // Disabled buttons leave the Tab order entirely: with the click sense
     // they would be focusable dead stops the keyboard has to walk around on
     // every table header. Hover-only sensing keeps the pointer behavior; the
@@ -1043,7 +1049,7 @@ fn cmd_button_inner(
         Sense::hover()
     };
     let id = ui.id().with(("cmd-button", icon as u32));
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, HEADER_ROW_H), Sense::hover());
     let resp = ui.interact(rect, id, sense);
     // An icon-only button shows nothing but its glyph, so the name it dropped
     // has to stay reachable with the pointer.
@@ -1079,12 +1085,16 @@ fn cmd_button_inner(
     } else {
         pal.text_dim.gamma_multiply(0.55)
     };
+    // The labelled form keeps the glyph in its fixed leading column; with no
+    // label beside it the glyph belongs in the middle of the button.
+    let icon_x = if icon_only {
+        rect.center().x
+    } else {
+        rect.left() + 14.0
+    };
     crate::icons::draw_at(
         ui,
-        Rect::from_center_size(
-            Pos2::new(rect.left() + 14.0, rect.center().y),
-            egui::vec2(17.0, 17.0),
-        ),
+        Rect::from_center_size(Pos2::new(icon_x, rect.center().y), egui::vec2(17.0, 17.0)),
         icon,
         color,
     );
@@ -1144,11 +1154,13 @@ fn cmd_button_inner(
 /// space beside the page title therefore simply paints over it. This button
 /// asks the layout for the room first and drops its label while the full width
 /// no longer fits, which is the one dimension the cluster can give up without
-/// losing a command.
+/// losing a command. A row with even less than one icon's width left is treated
+/// as having no room at all: nothing is drawn, focused or announced there.
 ///
 /// The name survives in both forms: the tooltip carries it for the pointer, and
-/// the widget info carries the full label for accesskit and the toolbar focus
-/// order.
+/// the widget info keeps the full label for accesskit and for tests that read
+/// it. The toolbar focus order does not depend on it — that is
+/// `register_toolbar_item`, which both forms call.
 pub fn header_cmd_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -1157,21 +1169,6 @@ pub fn header_cmd_button(
     enabled: bool,
 ) -> bool {
     cmd_button_inner(ui, pal, icon, label, enabled, true)
-}
-
-/// Width the page title may take in a row `row_w` wide when the title itself
-/// would need `title_full_w`.
-///
-/// The title never takes more than half the row, so the commands always keep
-/// room beside it. The leading inset and the gap come off the row first,
-/// because they are paid whether or not the title fits. The result never drops
-/// below [`HEADER_TITLE_MIN_W`] while the row can still afford it, and never
-/// below zero.
-pub fn header_title_budget(row_w: f32, title_full_w: f32) -> f32 {
-    let cap = (row_w * 0.5)
-        .max(HEADER_TITLE_MIN_W)
-        .min((row_w - HEADER_PAD_L - HEADER_GAP).max(0.0));
-    title_full_w.min(cap).max(0.0)
 }
 
 pub fn vsep(ui: &mut egui::Ui, pal: &Palette) {
@@ -4557,11 +4554,25 @@ mod tests {
         )
     }
 
-    /// The rect a command button allocated in the frame that draws it.
-    fn header_button_rect(row: &egui::Ui, icon: Icon) -> Rect {
+    /// The rect a command button allocated in the frame that draws it, or
+    /// `None` when the row got no button at all.
+    fn header_button_rect_opt(row: &egui::Ui, icon: Icon) -> Option<Rect> {
         row.ctx()
             .read_response(row.id().with(("cmd-button", icon as u32)))
-            .map_or(Rect::NOTHING, |response| response.rect)
+            .map(|response| response.rect)
+    }
+
+    /// The rect a command button allocated in the frame that draws it.
+    fn header_button_rect(row: &egui::Ui, icon: Icon) -> Rect {
+        header_button_rect_opt(row, icon).unwrap_or(Rect::NOTHING)
+    }
+
+    /// Whether the frame painted `text` as a label anywhere.
+    fn paints_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> bool {
+        shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Text(shape) => shape.galley.text().contains(text),
+            _ => false,
+        })
     }
 
     /// A header command keeps its label while the row still holds the full
@@ -4596,6 +4607,10 @@ mod tests {
                 );
             },
         );
+        assert!(
+            paints_text(&out.shapes, label),
+            "the labeled form must paint its label"
+        );
         out.textures_delta.clear();
         assert!(
             button.width() > HEADER_ICON_BTN_W,
@@ -4603,12 +4618,11 @@ mod tests {
         );
     }
 
-    /// Regression: at 960 logical px the header cluster is wider than the space
-    /// left beside the page title, and egui's right-to-left layout places its
-    /// children from the row's right edge without pulling them back to the left
-    /// edge, so the leftmost commands painted on top of "Processes". A button
-    /// that does not fit gives up its label, takes only the icon width, and
-    /// still reports its full name.
+    /// The fallback fires when the row cannot hold the labelled form, and only
+    /// then: the button takes the icon width, paints no label, and still
+    /// reports its full name. A right-to-left row never pulls an oversized
+    /// child back inside itself, so a width it cannot pay for is the one thing
+    /// that would end up on top of the page title.
     #[test]
     fn header_cmd_button_drops_to_the_icon_when_the_row_is_narrow() {
         let pal = theme::DARK;
@@ -4636,9 +4650,13 @@ mod tests {
                 assert_eq!(
                     reported.as_deref(),
                     Some(label),
-                    "the icon-only form must keep the name accesskit and the toolbar use"
+                    "the icon-only form must still report the full name"
                 );
             },
+        );
+        assert!(
+            !paints_text(&out.shapes, label),
+            "the icon-only form must paint no label"
         );
         out.textures_delta.clear();
         assert_eq!(
@@ -4648,38 +4666,82 @@ mod tests {
         );
     }
 
-    /// The title never gets more than half the row, so the commands keep room
-    /// beside it, and never a negative width.
+    /// A row with less than one icon's width left gets no button at all, while
+    /// exactly that width still draws a live, clickable one.
     #[test]
-    fn header_title_budget_leaves_the_commands_their_half() {
-        assert_eq!(header_title_budget(748.0, 90.0), 90.0);
-        assert_eq!(header_title_budget(748.0, 500.0), 374.0);
-        assert_eq!(header_title_budget(700.0, 40.0), 40.0);
-        assert_eq!(header_title_budget(0.0, 100.0), 0.0);
-        // A row too short for the leading inset and the gap is left with the
-        // little room it has, not with a negative width.
-        assert_eq!(header_title_budget(40.0, 300.0), 12.0);
+    fn header_cmd_button_disappears_below_its_own_icon_width() {
+        let pal = theme::DARK;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let label = "Windows Task Manager";
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+
+        // Frame 1: the row below the icon width is given nothing, the row at it
+        // exactly one icon-only button.
+        let mut below_clicked = true;
+        let mut below_used_w = f32::NAN;
+        let mut below_absent = false;
+        let mut at_clicked = true;
+        let mut at_rect = Rect::NOTHING;
+        let mut out = ctx.run_ui(raw(Vec::new()), |ui| {
+            let mut below = header_row(ui, "test-header-row-20", HEADER_ICON_BTN_W - 10.0);
+            below_clicked = header_cmd_button(&mut below, &pal, Icon::OpenExternal, label, true);
+            below_used_w = below.min_rect().width();
+            below_absent = header_button_rect_opt(&below, Icon::OpenExternal).is_none();
+
+            let mut exact = header_row(ui, "test-header-row-30", HEADER_ICON_BTN_W);
+            at_clicked = header_cmd_button(&mut exact, &pal, Icon::RunTask, label, true);
+            at_rect = header_button_rect(&exact, Icon::RunTask);
+        });
+        out.textures_delta.clear();
+        assert!(!below_clicked, "a row below one icon must report no click");
+        assert_eq!(below_used_w, 0.0, "a row below one icon must get no widget");
+        assert!(below_absent, "a row below one icon must get no response");
+        assert!(!at_clicked, "nothing has been clicked yet");
+        assert_eq!(
+            at_rect.width(),
+            HEADER_ICON_BTN_W,
+            "room for exactly one icon must draw exactly one icon"
+        );
+
+        // Frames 2 and 3: the button at the boundary is live and takes a click.
+        let at = at_rect.center();
+        let mut out = ctx.run_ui(raw(vec![egui::Event::PointerMoved(at)]), |ui| {
+            let mut exact = header_row(ui, "test-header-row-30", HEADER_ICON_BTN_W);
+            let _ = header_cmd_button(&mut exact, &pal, Icon::RunTask, label, true);
+        });
+        out.textures_delta.clear();
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut clicked = false;
+        let mut out = ctx.run_ui(raw(vec![pointer(true), pointer(false)]), |ui| {
+            let mut exact = header_row(ui, "test-header-row-30", HEADER_ICON_BTN_W);
+            clicked = header_cmd_button(&mut exact, &pal, Icon::RunTask, label, true);
+        });
+        out.textures_delta.clear();
+        assert!(clicked, "the button at the boundary must still take clicks");
     }
 
     /// The geometry has to leave the commands room on the narrowest window the
-    /// app allows (720 px wide, sidebar open): the title still gets half the
-    /// row, and the icon-only cluster plus the trailing inset still fit beside
-    /// it.
+    /// app allows (720 px wide, sidebar open): the strip reserved for the title
+    /// plus one icon-only command plus the insets still fit in the row.
     #[test]
-    fn header_geometry_leaves_the_commands_room_on_the_narrowest_window() {
+    fn header_geometry_leaves_a_command_room_on_the_narrowest_window() {
         let row_w = 720.0 - SIDEBAR_W;
-        let budget = header_title_budget(row_w, 200.0);
+        let reserved =
+            HEADER_PAD_L + HEADER_TITLE_MIN_W + HEADER_GAP + HEADER_ICON_BTN_W + HEADER_PAD_R;
         assert!(
-            budget >= HEADER_TITLE_MIN_W,
-            "a readable title must fit, got {budget}"
-        );
-        assert!(
-            budget <= row_w * 0.5,
-            "the commands must keep half the row, got {budget}"
-        );
-        assert!(
-            HEADER_ICON_BTN_W + HEADER_PAD_R <= row_w - budget,
-            "the icon-only cluster and the trailing inset must fit beside the title"
+            reserved <= row_w,
+            "the reserved strip and one command must fit the narrowest row: {reserved} of {row_w}"
         );
     }
 
