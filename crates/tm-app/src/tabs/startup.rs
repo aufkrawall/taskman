@@ -178,7 +178,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             });
             let can_enable = sel.as_ref().is_some_and(|s| !s.enabled);
             let can_disable = sel.as_ref().is_some_and(|s| s.enabled);
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::Check,
@@ -187,7 +187,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ) {
                 toggle_selected(app, true, ui.ctx());
             }
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::SlashCircle,
@@ -196,7 +196,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ) {
                 toggle_selected(app, false, ui.ctx());
             }
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::Properties,
