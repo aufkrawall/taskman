@@ -3301,9 +3301,11 @@ fn ellipsize(ui: &egui::Ui, s: &str, font: &egui::FontId, max_w: f32) -> String 
             hi = mid - 1;
         }
     }
-    if lo == 0 {
+    if lo == 0 && !fits("…") {
         // Not even the bare ellipsis fits: painting it would overshoot the
-        // budget, which is the single thing this function must never do.
+        // budget, which is the single thing this function must never do. When
+        // the ellipsis alone does fit, lo == 0 is a real answer and the code
+        // below builds it from the empty prefix.
         return String::new();
     }
     let mut t: String = chars[..lo].iter().collect();
@@ -3314,8 +3316,10 @@ fn ellipsize(ui: &egui::Ui, s: &str, font: &egui::FontId, max_w: f32) -> String 
     t
 }
 
-/// Width of the dump dialog's content column: a 460 px window holding a
-/// 440 px row. Narrow enough that a long image name has to give way.
+/// Width of the dump dialog's content column. `fixed_size` is the OUTER
+/// window size, frame included (6 px each side by default), so the column is
+/// set explicitly inside it — this constant, not the frame arithmetic, is
+/// what the row is laid out to.
 const DUMP_ROW_W: f32 = 440.0;
 
 /// Space the process name may use in the dump dialog's target row. The type
@@ -3329,14 +3333,19 @@ fn dump_name_budget(
     batch_text: Option<&str>,
     row_w: f32,
 ) -> f32 {
-    // The PID and batch labels are drawn at the theme's 13 pt body size and
-    // the tag at the 12 pt it asks for, so they are measured at exactly those
-    // sizes: a silent mismatch would under-measure what the row reserves.
-    let tag_font = egui::FontId::proportional(12.0);
-    let small_font = egui::FontId::proportional(13.0);
-    // The row draws three separators (name, PID, batch, tag); the fourth gap
-    // is rounding margin, because measured and painted advances can differ by
-    // a fraction.
+    // Measured in the fonts the row paints in: the PID and batch labels are
+    // body text, so they resolve from the style exactly as their labels do,
+    // and the tag keeps its explicit 12 pt size because RichText::size does
+    // not inherit from the style.
+    let small_font = egui::TextStyle::Body.resolve(ui.style());
+    let tag_font = egui::FontId::new(12.0, small_font.family.clone());
+    // Only three separators sit between the four widgets: left-to-right
+    // advances by each widget's width plus item_spacing, and the tag sits
+    // flush at the row's right edge. The fourth gap is one spare gap that
+    // absorbs sub-pixel rounding between measuring and painting: item_spacing.x
+    // is 8.0 in tm-ui/src/theme.rs, so that margin is 8 px today, and a
+    // margin expressed as a fraction of item_spacing would vanish if the
+    // spacing ever became 0.
     let reserved = measure_text(ui, tag, &tag_font)
         + measure_text(ui, pid_text, &small_font)
         + batch_text.map_or(0.0, |text| measure_text(ui, text, &small_font))
@@ -3431,27 +3440,30 @@ pub fn dump_progress_dialog(
                 // has a fixed width (DUMP_ROW_W), so the tag and the two short
                 // labels before it have their width reserved here and the
                 // free-text process name is trimmed to what is left over.
+                let small_font = egui::TextStyle::Body.resolve(ui.style());
                 let name_font = crate::theme::font_semibold_in(ui, 15.0);
                 let name = ellipsize(
                     ui,
                     &current.process_name,
                     &name_font,
-                    dump_name_budget(
-                        ui,
-                        type_label,
-                        &pid_text,
-                        batch_text.as_deref(),
-                        ui.available_width(),
-                    ),
+                    dump_name_budget(ui, type_label, &pid_text, batch_text.as_deref(), DUMP_ROW_W),
                 );
                 let name_label =
                     ui.label(egui::RichText::new(&name).font(name_font).color(pal.text));
                 if name != current.process_name {
                     name_label.on_hover_text(&current.process_name);
                 }
-                ui.label(egui::RichText::new(pid_text).size(13.0).color(pal.text_dim));
+                ui.label(
+                    egui::RichText::new(pid_text)
+                        .font(small_font.clone())
+                        .color(pal.text_dim),
+                );
                 if let Some(batch) = batch_text {
-                    ui.label(egui::RichText::new(batch).size(13.0).color(pal.accent));
+                    ui.label(
+                        egui::RichText::new(batch)
+                            .font(small_font)
+                            .color(pal.accent),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -5327,10 +5339,13 @@ mod tests {
             );
             // A name that already fits is left alone.
             assert_eq!(ellipsize(ui, "mrt.exe", &name_font, max_name_w), "mrt.exe");
-            // A budget that cannot even hold the bare ellipsis paints
-            // nothing: an ellipsis wider than the budget would be the very
-            // overlap this function exists to prevent.
+            // A budget that holds only the marker still paints it: the binary
+            // search never tests a bare ellipsis, so the zero-length prefix
+            // has to survive to the build step.
             let ellipsis_w = measure_text(ui, "…", &name_font);
+            assert_eq!(ellipsize(ui, name, &name_font, ellipsis_w + 0.5), "…");
+            // Below that the marker itself would overshoot the budget, so
+            // nothing is painted rather than overlapping the neighbour.
             assert_eq!(ellipsize(ui, name, &name_font, ellipsis_w - 0.5), "");
             assert_eq!(ellipsize(ui, name, &name_font, 0.0), "");
         });
