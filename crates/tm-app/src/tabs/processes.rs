@@ -319,7 +319,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             } else {
                 (Icon::Pause, i18n::tr(K::SuspendProc))
             };
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 suspend_icon,
@@ -333,7 +333,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     .collect();
                 app.set_suspended_batch(&ctx, targets, !suspended);
             }
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::Leaf,
@@ -350,7 +350,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     }
                 }
             }
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::Close,

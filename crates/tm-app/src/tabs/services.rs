@@ -153,7 +153,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             let busy = app.shared.service_control_busy();
             let running = selected_status == Some(ServiceStatus::Running);
             let stopped = selected_status == Some(ServiceStatus::Stopped);
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::Play,
@@ -162,7 +162,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ) {
                 control(app, &frame_ctx, tm_platform::actions::ServiceAction::Start);
             }
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::StopSquare,
@@ -171,7 +171,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ) {
                 control(app, &frame_ctx, tm_platform::actions::ServiceAction::Stop);
             }
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::Restart,
@@ -186,7 +186,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
             if capabilities.open_services_app {
                 crate::app_ui::vsep(ui, &pal);
-                if crate::app_ui::cmd_button(
+                if crate::app_ui::header_cmd_button(
                     ui,
                     &pal,
                     Icon::OpenExternal,

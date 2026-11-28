@@ -363,7 +363,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |app, ui| {
             let enabled = app.selected_user.is_some() && caps.user_disconnect;
-            if crate::app_ui::cmd_button(
+            if crate::app_ui::header_cmd_button(
                 ui,
                 &pal,
                 Icon::SlashCircle,
@@ -378,8 +378,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     tm_platform::actions::UserSessionAction::Disconnect,
                 );
             }
-            if crate::app_ui::cmd_button(ui, &pal, Icon::Person, i18n::tr(K::SignOut), enabled)
-                && let Some(id) = app.selected_user
+            if crate::app_ui::header_cmd_button(
+                ui,
+                &pal,
+                Icon::Person,
+                i18n::tr(K::SignOut),
+                enabled,
+            ) && let Some(id) = app.selected_user
             {
                 session_action(
                     app,
@@ -389,7 +394,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 );
             }
             if caps.manage_user_accounts
-                && crate::app_ui::cmd_button(
+                && crate::app_ui::header_cmd_button(
                     ui,
                     &pal,
                     Icon::Users,
