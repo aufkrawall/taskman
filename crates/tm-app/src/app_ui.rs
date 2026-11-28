@@ -142,12 +142,12 @@ fn elide_to_width(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) ->
 
 /// Ceiling for the width the page title reserves in a header row.
 ///
-/// The longest page title this app ships is the German "Startauswirkungen",
-/// about 133 px at 15.5 px semibold. Capping the reservation near that keeps
-/// that name intact while stopping a pathological or unusually long
-/// localisation from eating the command row. The 133 px is an approximation,
-/// not a promise: the reservation is measured every frame and only clamped by
-/// this bound.
+/// The longest page title this app ships is the German "Autostart von Apps",
+/// about 132 px at 15.5 px semibold. Capping the reservation just above that
+/// keeps every shipped name intact while stopping a pathological or unusually
+/// long localisation from eating the command row. The 132 px is an
+/// approximation, not a promise: the reservation is measured every frame and
+/// only clamped by this bound.
 const HEADER_TITLE_MAX_W: f32 = 140.0;
 
 /// The command cluster's allotment in one header row: everything right of the
@@ -164,7 +164,9 @@ const HEADER_TITLE_MAX_W: f32 = 140.0;
 /// A row too narrow for that reservation collapses the cluster onto the right
 /// edge instead of producing a rect whose minimum sits past its maximum.
 pub(crate) fn header_cluster_rect(row: egui::Rect, title_reserve: f32) -> egui::Rect {
-    let right = row.right() - original::HEADER_PAD_R;
+    // A row narrower than the trailing inset itself would otherwise collapse
+    // the cluster left of the row, outside the band it is clipped to.
+    let right = (row.right() - original::HEADER_PAD_R).max(row.left());
     let reserved = row.left() + original::HEADER_PAD_L + title_reserve + original::HEADER_GAP;
     let left = reserved.min(right);
     egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
@@ -172,11 +174,14 @@ pub(crate) fn header_cluster_rect(row: egui::Rect, title_reserve: f32) -> egui::
 
 /// The page title's rect, given the left edge the command cluster actually used.
 ///
-/// The title takes exactly what the commands left over, minus the gap, so the
-/// commands keep their full labels whenever the row can hold them and only then
-/// degrade to icons. The priority is deliberate: interactive commands over a
-/// decorative page name, and the name elides rather than colliding. Nothing
-/// here estimates the cluster's width.
+/// The title takes exactly what the commands left over, minus the gap. The
+/// commands never give up a label for a title that would have elided anyway: a
+/// cluster narrower than `original::HEADER_CLUSTER_LABELS_MIN_W` draws icons as
+/// a whole, which is what leaves a titled page name room on a docked
+/// half-screen window. One button at a time is only degraded above that width,
+/// where the labels genuinely overrun the room left. The priority is
+/// deliberate: interactive commands over a decorative page name, and the name
+/// elides rather than colliding. Nothing here estimates the cluster's width.
 ///
 /// With the reservation sized to the measured name, a cluster that stays inside
 /// its allotment always leaves the full name intact, at every width the cluster
@@ -188,9 +193,7 @@ pub(crate) fn header_cluster_rect(row: egui::Rect, title_reserve: f32) -> egui::
 pub(crate) fn header_title_rect(row: egui::Rect, cluster_used_left: f32) -> egui::Rect {
     let left = row.left() + original::HEADER_PAD_L;
     let right_bound = (row.right() - original::HEADER_PAD_R).max(left);
-    let right = (cluster_used_left - original::HEADER_GAP)
-        .max(left)
-        .min(right_bound);
+    let right = (cluster_used_left - original::HEADER_GAP).clamp(left, right_bound);
     egui::Rect::from_min_max(egui::pos2(left, row.top()), egui::pos2(right, row.bottom()))
 }
 
@@ -314,11 +317,14 @@ pub fn tab_header(
     }
 
     // What the cluster used decides the split, so the commands never give up a
-    // label for a title that would have elided anyway. A cluster that drew
-    // nothing leaves `Rect::NOTHING` behind, whose left edge is infinite.
+    // label for a title that would have elided anyway. It is also read from the
+    // painted ink, not from the allotment: `min_rect` still counts commands and
+    // separators whose box the clip erased, and those must not pull the title's
+    // rect leftwards. A cluster that drew nothing leaves `Rect::NOTHING`, whose
+    // left edge is infinite.
     let used_left = cluster.min_rect().left();
     let used_left = if used_left.is_finite() {
-        used_left
+        used_left.max(cluster_rect.left())
     } else {
         row.right() - original::HEADER_PAD_R
     };
@@ -571,7 +577,7 @@ mod tests {
 
     /// The headline case: a cluster that fills its whole allotment hands the
     /// title back exactly the width it reserved, whatever that is. At the
-    /// reported 748 px row this is what keeps "Processes" — about 76 px at
+    /// reported 748 px row this is what keeps "Processes" — about 66 px at
     /// 15.5 px semibold — from coming out elided as "Process…".
     #[test]
     fn a_filled_cluster_still_leaves_the_title_its_reserved_width() {
@@ -599,32 +605,56 @@ mod tests {
             reserve += 1.0;
         }
 
-        // The reported window size, spelled out: 748 px row, ~76 px name.
+        // The reported window size, spelled out: 748 px row, the measured name.
+        const TITLE_W: f32 = 66.3;
         let row = header_row(748.0);
-        let title = header_title_rect(row, header_cluster_rect(row, 76.0).left());
+        let title = header_title_rect(row, header_cluster_rect(row, TITLE_W).left());
         assert_eq!(
             title.width(),
-            76.0,
+            TITLE_W,
             "the reported window would still elide \"Processes\""
         );
     }
 
-    /// At the reported window size (960 px window, 212 px sidebar, 748 px row) a
-    /// labelled Processes cluster is about 630 px wide. That has to fit inside
-    /// the cluster's allotment and still leave room for "Processes" beside it.
+    /// Measured widths of the Processes header at the shipped fonts, used by the
+    /// layout tests below.
+    ///
+    /// The fully labelled cluster is the overflow menu, Suspend, Efficiency
+    /// mode, End task, Restart, Windows Task Manager and Run new task with their
+    /// separators and spacing at the 13 px label font.
+    const PROCESSES_CLUSTER_LABELLED_W: f32 = 758.5;
+    /// The same commands once every one of them has dropped its label.
+    const PROCESSES_CLUSTER_ICONS_W: f32 = 311.0;
+    /// "Processes" at 15.5 px semibold.
+    const PROCESSES_TITLE_W: f32 = 66.3;
+
+    /// At the reported window size (960 px window, 212 px sidebar, 748 px row)
+    /// the labelled Processes cluster does not fit the 640 px the row can give
+    /// it — 758.5 px against 640 — so the header narrows the whole cluster to
+    /// icons instead of paying for the commands drawn first and dropping the one
+    /// drawn last. This pins both halves of that: the labels genuinely cannot
+    /// fit, and the icons leave the page name intact.
     #[test]
-    fn a_wide_cluster_still_leaves_the_title_its_minimum() {
+    fn a_wide_cluster_narrows_to_icons_and_keeps_the_page_name() {
         let row = header_row(748.0);
-        let reserve = 76.0;
-        let used = 630.0;
-        let cluster_used_left = row.right() - original::HEADER_PAD_R - used;
+        let allotment = header_cluster_rect(row, PROCESSES_TITLE_W).width();
         assert!(
-            header_cluster_rect(row, reserve).width() >= used,
-            "the allotment cannot hold a labelled cluster"
+            allotment > PROCESSES_CLUSTER_ICONS_W + original::HEADER_PAD_R,
+            "the reported row must hold the icon-only cluster, got {allotment} px"
         );
-        let title = header_title_rect(row, cluster_used_left);
-        assert!(title.width() >= reserve, "title got {} px", title.width());
-        assert!(title.right() + original::HEADER_GAP <= cluster_used_left + 0.01);
+        assert!(
+            allotment < PROCESSES_CLUSTER_LABELLED_W,
+            "a labelled cluster must not be claimed to fit the reported row"
+        );
+
+        let used_left = row.right() - original::HEADER_PAD_R - PROCESSES_CLUSTER_ICONS_W;
+        let title = header_title_rect(row, used_left);
+        assert!(
+            title.width() >= PROCESSES_TITLE_W,
+            "the page name came out {} px wide and would elide",
+            title.width()
+        );
+        assert!(title.right() + original::HEADER_GAP <= used_left + 0.01);
     }
 
     /// A cluster that drew nothing — every Windows-only command is absent on
@@ -691,8 +721,6 @@ mod tests {
     /// out while the name keeps its full width when it is not.
     #[test]
     fn the_selection_count_yields_before_the_page_title() {
-        // Measured width of a fully labelled Processes cluster.
-        const CLUSTER_USED: f32 = 640.0;
         let ctx = egui::Context::default();
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let title_font = crate::theme::font_semibold_in(ui, 15.5);
@@ -700,34 +728,41 @@ mod tests {
             let chip_w = text_width(ui, "3 selected", &egui::FontId::proportional(12.0));
             let gap = ui.spacing().item_spacing.x;
 
-            // 2560 px window minus the 212 px sidebar.
+            // 2560 px window minus the 212 px sidebar, labels and all.
             let wide_row = header_row(2348.0);
-            let wide_used_left = wide_row.right() - original::HEADER_PAD_R - CLUSTER_USED;
+            let wide_used_left =
+                wide_row.right() - original::HEADER_PAD_R - PROCESSES_CLUSTER_LABELLED_W;
             let wide = header_title_rect(wide_row, wide_used_left);
             assert!(
                 chip_fits(wide.width(), title_w, gap, chip_w),
                 "no count beside the title in a 2348 px row"
             );
 
-            let mut dropped_with_full_title = false;
-            let mut width = 400.0;
-            while width <= 2000.0 {
-                let row = header_row(width);
-                let used_left = row.right() - original::HEADER_PAD_R - CLUSTER_USED;
-                let title = header_title_rect(row, used_left);
-                if chip_fits(title.width(), title_w, gap, chip_w) {
-                    assert!(
-                        title.width() >= title_w,
-                        "count drawn while the title was squeezed at {width} px"
-                    );
-                } else if title.width() >= title_w {
-                    dropped_with_full_title = true;
-                }
-                width += 1.0;
-            }
+            // 960 px window: the cluster is icon-only here, and the count still
+            // has room beside the whole page name.
+            let docked_row = header_row(748.0);
+            let docked_used_left =
+                docked_row.right() - original::HEADER_PAD_R - PROCESSES_CLUSTER_ICONS_W;
+            let docked = header_title_rect(docked_row, docked_used_left);
             assert!(
-                dropped_with_full_title,
-                "no width drops the count while the title keeps its width"
+                chip_fits(docked.width(), title_w, gap, chip_w),
+                "no count beside the title in a 748 px row"
+            );
+
+            // The width where the two compete: a cluster that leaves the title
+            // five pixels more than the name itself drops the count and keeps
+            // the name whole. This is the property the row relies on, not the
+            // arithmetic of `chip_fits` restated.
+            let tight_used_left = original::HEADER_PAD_L + title_w + 5.0 + original::HEADER_GAP;
+            let tight = header_title_rect(header_row(748.0), tight_used_left);
+            assert!(
+                tight.width() >= title_w,
+                "the name must survive a tight row, got {} px",
+                tight.width()
+            );
+            assert!(
+                !chip_fits(tight.width(), title_w, gap, chip_w),
+                "the count must yield while the name is still whole"
             );
         });
         out.textures_delta.clear();

@@ -990,6 +990,18 @@ pub const HEADER_TITLE_MIN_W: f32 = 72.0;
 /// window docked to half of a 1920 px screen.
 pub const HEADER_ICON_BTN_W: f32 = 30.0;
 
+/// Below this allotment a header cluster drops every label at once.
+///
+/// The widest labelled cluster the shipped pages draw is the Processes one on
+/// Windows — the overflow menu, Suspend, Efficiency mode, End task, Restart,
+/// Windows Task Manager and Run new task with their separators and spacing —
+/// which measures about 760 px at the 13 px label font. A cluster narrower than
+/// this cannot hold those labels, and degrading one button at a time would drop
+/// the leftmost command outright while its neighbours kept their names. The
+/// margin above the measured width leaves room for the longer German labels,
+/// which are about 40 px wider for the same commands.
+pub const HEADER_CLUSTER_LABELS_MIN_W: f32 = 900.0;
+
 pub fn cmd_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -1015,11 +1027,12 @@ fn header_icon_x(rect: Rect, icon_only: bool) -> f32 {
 /// the disabled handling, the hover fill, the focus ring, the ArrowDown
 /// handoff and the toolbar bookkeeping identical.
 ///
-/// `fit` allows the button to give up its label when the layout has less room
-/// left than the labeled form needs, and to draw nothing at all when there is
-/// not even room for the icon alone. Callers that live in a table toolbar or a
-/// dialog pass `false`: there the width is known to be available, and the
-/// button is drawn at any width.
+/// `fit` allows the button to give up its label when its cluster is too narrow
+/// for labels at all (see [`HEADER_CLUSTER_LABELS_MIN_W`]) or when the layout
+/// has less room left than the labeled form needs, and to draw nothing at all
+/// when there is not even room for the icon alone. Callers that live in a table
+/// toolbar or a dialog pass `false`: there the width is known to be available,
+/// and the button is drawn at any width.
 fn cmd_button_inner(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -1042,11 +1055,19 @@ fn cmd_button_inner(
         .size()
         .x;
     let full_w = 28.0 + text_w + 6.0;
+    // A header cluster narrows to icons as a whole. Deciding button by button
+    // would be worse than useless in a cluster that cannot hold its labels at
+    // all: the walk comes from the right, so the leftmost command — the one
+    // furthest from the title — would be the one dropped, and the user would
+    // lose "Run new task" at the width where a docked half-screen window sits
+    // rather than a label. Width of the allotment, not of the room left, is
+    // what decides, so every command in the cluster agrees.
+    let cluster_too_narrow = fit && ui.max_rect().width() < HEADER_CLUSTER_LABELS_MIN_W;
     // `available_width` is the room the layout still has left for this widget.
     // In the header's right-to-left cluster that is the space between the
     // cursor and the row's left edge, which is exactly what the button may
     // take before it would reach the page title.
-    let icon_only = fit && full_w > ui.available_width();
+    let icon_only = fit && (cluster_too_narrow || full_w > ui.available_width());
     // Allocate what is painted: reserving the label's width for an icon-only
     // button would push the cluster out of the row just the same.
     let w = if icon_only { HEADER_ICON_BTN_W } else { full_w };
@@ -1177,6 +1198,11 @@ pub fn header_cmd_button(
 }
 
 pub fn vsep(ui: &mut egui::Ui, pal: &Palette) {
+    // A divider with no command left of it would trail the cluster and split
+    // nothing; the room it would take belongs to the command after it.
+    if ui.available_width() < 9.0 {
+        return;
+    }
     let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 26.0), Sense::hover());
     ui.painter().line_segment(
         [
@@ -4580,13 +4606,14 @@ mod tests {
         })
     }
 
-    /// A header command keeps its label while the row still holds the full
-    /// width: the narrow fallback must not fire on a normal window.
+    /// A header command keeps its label while its cluster is wide enough to
+    /// carry labels at all: the narrow fallback must not fire on a normal
+    /// window.
     #[test]
     fn header_cmd_button_keeps_its_label_while_the_row_has_room() {
         let pal = theme::DARK;
         let ctx = egui::Context::default();
-        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 600.0));
         let label = "Windows Task Manager";
         let mut button = Rect::NOTHING;
         let mut out = ctx.run_ui(
@@ -4595,7 +4622,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let mut row = header_row(ui, "test-header-row-wide", 400.0);
+                let mut row = header_row(ui, "test-header-row-wide", 1200.0);
                 let text_w = row
                     .painter()
                     .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), Color32::WHITE)
@@ -4607,7 +4634,7 @@ mod tests {
                 // labeled width within one point.
                 assert!(
                     (button.width() - (28.0 + text_w + 6.0)).abs() < 1.0,
-                    "a 400 px row must paint the labeled form at its full width, got {}",
+                    "a 1200 px row must paint the labeled form at its full width, got {}",
                     button.width()
                 );
             },
@@ -4619,8 +4646,44 @@ mod tests {
         out.textures_delta.clear();
         assert!(
             button.width() > HEADER_ICON_BTN_W,
-            "a 400 px row must not fall back to the icon alone"
+            "a 1200 px row must not fall back to the icon alone"
         );
+    }
+
+    /// A cluster narrower than the label threshold drops every label at once.
+    /// The row below still has room to spare for this label, which is the point:
+    /// degrading button by button would spend that room on the buttons drawn
+    /// first and leave the leftmost command unpaid for.
+    #[test]
+    fn a_narrow_cluster_drops_every_label_at_once() {
+        let pal = theme::DARK;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 600.0));
+        let label = "End task";
+        let mut button = Rect::NOTHING;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                // 600 px would hold this label with room to spare, so only the
+                // cluster-wide rule can be what drops it.
+                let mut row = header_row(ui, "test-header-row-narrow-cluster", 600.0);
+                let _ = header_cmd_button(&mut row, &pal, Icon::Close, label, true);
+                button = header_button_rect(&row, Icon::Close);
+            },
+        );
+        assert_eq!(
+            button.width(),
+            HEADER_ICON_BTN_W,
+            "a 600 px cluster cannot carry labels, so the command keeps only its icon"
+        );
+        assert!(
+            !paints_text(&out.shapes, label),
+            "no label may be painted in a cluster that dropped them"
+        );
+        out.textures_delta.clear();
     }
 
     /// The fallback fires when the row cannot hold the labelled form, and only
